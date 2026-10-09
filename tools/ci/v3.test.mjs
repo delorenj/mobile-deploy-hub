@@ -18,7 +18,7 @@ import { createIpad, pickApp, pickIpad } from './lib/devicectl.mjs';
 import { bbEmitPath, correlationFor, deploymentEvent, emitArgs, sanitizeReason, targetOf, uuidv5 } from './lib/announce.mjs';
 import { loadDevices, parseDevices } from './lib/devices.mjs';
 import { parseManifest } from './lib/manifest.mjs';
-import { android, announce, plan, release } from './hub.mjs';
+import { android, announce, plan, preflightIos, release } from './hub.mjs';
 import { checkPhone, lanesFrom, parseArguments, phone } from '../deploy.mjs';
 
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
@@ -510,6 +510,19 @@ test('devices.json names the S26, the iPad, the team and the Mac once, and is va
   const text = readFileSync(join(repoRoot, 'tools/ci/devices.json'), 'utf8');
   assert.throws(() => parseDevices(text.replace('"R5GL43A7PCH"', '"R5GL 43"')), /android\.serial/);
   assert.throws(() => parseDevices(text.replace('"Library/Caches/mobile-deploy-hub/handoff"', '"../etc"')), /handoff_dir/);
+});
+
+test('an app without an iPad lane passes the Mac preflight, unless ios was asked for by name', async () => {
+  const f = await gitFixture();
+  try {
+    const output = join(f.root, 'out.txt');
+    await writeFile(output, '');
+    const env = { ...f.env, GITHUB_OUTPUT: output };
+    const result = await quiet(() => preflightIos({ ...parseConfig(['preflight-ios', '--manifest', 'mobile-deploy.json', '--out', f.out], env), cwd: f.app }, { env }));
+    assert.deepEqual(result, { skipped: true });
+    assert.match(readFileSync(output, 'utf8'), /^ipad_version=\nipad_build=\n$/);
+    await assert.rejects(preflightIos({ ...parseConfig(['preflight-ios', '--manifest', 'mobile-deploy.json', '--platform', 'ios', '--out', f.out], env), cwd: f.app }, { env }), /platform ios but the manifest has no ios section/);
+  } finally { await f.cleanup(); }
 });
 
 test('a schema 2 manifest is strict: project, version read and bump, an APK lane, an iPad hook', () => {

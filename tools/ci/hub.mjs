@@ -628,9 +628,16 @@ export async function preflightIos(config, { env = process.env, home = homedir()
     await setOutputs({ ipad_version: '', ipad_build: '' }, env);
     return { skipped: true };
   }
+  if (!manifest.ios) {
+    // The workflow cannot read the manifest before this job, so an app without an iPad lane (both = every declared
+    // lane) passes here and the plan leaves the iOS jobs out. Only asking for ios by name is an error.
+    if (config.platform === 'ios') throw new Error('platform ios but the manifest has no ios section');
+    console.log('HUB_PREFLIGHT_IOS skipped: the manifest declares no ios section (no iPad lane)');
+    await setOutputs({ ipad_version: '', ipad_build: '' }, env);
+    return { skipped: true };
+  }
   return guarded('preflight-ios', join(config.out, 'preflight'), config, env, async track => {
     track.stage = 'preflight';
-    if (!manifest.ios) throw new Error('platform includes ios but the manifest has no ios section');
     const spec = manifest.ios;
     const devices = loadDevices(env);
     const notes = [];
