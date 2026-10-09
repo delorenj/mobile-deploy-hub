@@ -54,3 +54,15 @@ export function checkCaller({ policy, env, read, template = () => readFileSync(t
   }
   return { hash, ref: ref.slice(expected.length) };
 }
+
+// Every hub command, inside a workflow job (v1.1.3): only the app's own caller may run it. The gate and the plan also
+// hash that caller; the other jobs check that the run was started by it, so a second workflow that `uses:` the hub's
+// action or its reusable workflow, at any ref, does nothing. Outside a job (tests, a person at a shell) it is a no-op.
+export function checkCallerRef({ policy, env }) {
+  if (env.GITHUB_ACTIONS !== 'true') return null;
+  const repo = env.GITHUB_REPOSITORY ?? '';
+  const ref = env.GITHUB_WORKFLOW_REF ?? '';
+  const expected = `${repo}/${policy.callers.workflow}@`;
+  if (!repo || !ref.startsWith(expected)) throw refusal('caller', `this job was started by ${ref || 'an unknown workflow'}; the hub runs only from ${expected}<ref>, the copy of templates/deploy.yml. A second workflow cannot call the hub's action or reusable workflow`);
+  return ref.slice(expected.length);
+}

@@ -1,6 +1,6 @@
 // Helpers every hub command shares: the policy banner, failure receipts, receipts on disk, big-chungus staging, the
-// code the catch-up units run, the iPad's reachability and the Mac's disk and secret checks.
-import { closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync } from 'node:fs';
+// code the catch-up units run, the iPad's reachability, the Mac's link and the Mac's disk and secret checks.
+import { closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
@@ -8,6 +8,8 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { freeGiB } from '../lib/apple.mjs';
 import { createGit } from '../lib/git.mjs';
+import { compareSemver } from '../lib/latest.mjs';
+import { macLink, macProbeOver, runnerStatusOver, tailscaleStatus } from '../lib/metered.mjs';
 import { loadPolicy } from '../lib/policy.mjs';
 import { buildReceipt, writeReceipt } from '../lib/receipt.mjs';
 
@@ -94,20 +96,60 @@ export function pruneStaging(devices, { home = homedir(), days = 7, now = Date.n
 }
 
 // The code the catch-up units run (E1): ~/.local/share/mobile-deploy-hub/current -> releases/<hub ref>, refreshed by
-// each real run from the action's own tools/ (a local copy, no network). Only released hub code goes there.
+// each real run from the action's own tools/ (a local copy, no network). Only released hub code goes there, and only
+// forward: a rerun of an older run (which keeps its original hub version) never rolls the catch-up and its policy back.
 export function installCurrent({ hubRef, home = homedir(), source = fileURLToPath(new URL('../..', import.meta.url)), log = console.log }) {
   if (!releaseRef.test(hubRef ?? '')) { log(`HUB_CURRENT skipped: hub ref ${hubRef || '(none)'} is not a release tag`); return null; }
   const root = join(home, '.local/share/mobile-deploy-hub');
+  const link = join(root, 'current');
+  let target = null;
+  try { target = readlinkSync(link); } catch { /* no catch-up code yet */ }
+  const now = /(?:^|\/)releases\/v(\d+\.\d+\.\d+)$/.exec(target ?? '')?.[1] ?? null;
+  if (now && compareSemver(now, hubRef.slice(1)) > 0) {
+    log(`HUB_CURRENT kept ${link} -> releases/v${now}: newer than this run's ${hubRef}`);
+    return null;
+  }
   const release = join(root, 'releases', hubRef);
   mkdirSync(release, { recursive: true });
   cpSync(source, join(release, 'tools'), { recursive: true, force: true, filter: path => !/\/(node_modules|\.git)(\/|$)/.test(path) });
-  const link = join(root, 'current');
   const temp = `${link}.${process.pid}`;
   rmSync(temp, { force: true });
   symlinkSync(join('releases', hubRef), temp);
   renameSync(temp, link);
   log(`HUB_CURRENT ${link} -> releases/${hubRef}`);
   return release;
+}
+
+// The catch-up's mode on this host (tools/catchup/catchup.mjs mode): live installs pending builds, watch only logs
+// what it would do. No mode file is watch.
+export const catchupModeFile = (env = process.env, home = homedir()) => join(env.XDG_CONFIG_HOME || join(home, '.config'), 'mobile-deploy-hub/catchup.json');
+export function readCatchupMode({ env = process.env, home = homedir() } = {}) {
+  try { return JSON.parse(readFileSync(catchupModeFile(env, home), 'utf8'))?.mode === 'live' ? 'live' : 'watch'; } catch { return 'watch'; }
+}
+
+// A pending device whose host's catch-up is in watch mode will not be installed when it comes back: its reason says so.
+export function catchupNote(reason, mode, host) {
+  if (mode !== 'watch') return reason ?? null;
+  return `${reason ? `${reason}; ` : ''}catch-up off on ${host} (catchup.mjs mode live)`.slice(0, 300);
+}
+
+// The Mac's link as the gate reads it (and the plan, again, right before the iPad lane): tailscale, this app's own
+// runner process and the catch-up mode over one ssh, and GitHub's view of this app's runner. Never throws.
+export function readMacLink({ policy, devices, env = process.env, tailscale = () => tailscaleStatus({ env }), probe = null, github = null }) {
+  const repo = env.GITHUB_REPOSITORY ?? '';
+  const own = devices.mac.runners?.[repo] ?? null;
+  try {
+    return macLink({
+      status: tailscale(),
+      peer: devices.mac.peer,
+      lanCidr: policy.mac.lan_cidr,
+      probe: probe ?? macProbeOver(devices.mac.host, { runnerDir: own?.dir ?? null, env }),
+      github: github ?? runnerStatusOver(repo, own?.name, { env }),
+      runnerName: own?.name ?? 'the Mac runner',
+    });
+  } catch (error) {
+    return { link: 'offline', addr: null, reason: `tailscale status failed (${error.message.split('\n')[0]})`, catchup: null };
+  }
 }
 
 // The app's own receipt names the version it built; it must be the version the plan announced.
@@ -138,20 +180,20 @@ export function checkDisk(path, devices) {
 
 // The iPad, waited for up to waitMs: listed by devicectl and not "unavailable". A listed iPad that is unpaired, of the
 // wrong model or without Developer Mode is a real failure; an absent or unavailable one is pending (the catch-up
-// installs it later).
+// installs it later). The reason is plain words for the event and the page; devicectl's detail is for the run log.
 export async function reachIpad(ipad, { waitMs = 60_000, pollMs = 5000, sleep = ms => new Promise(done => setTimeout(done, ms)), now = Date.now } = {}) {
   const deadline = now() + waitMs;
-  let why = 'not listed';
+  let detail = 'not listed';
   for (;;) {
     try {
       const found = ipad.find();
       if (found.tunnel !== 'unavailable') return { reachable: true, found };
-      why = `listed but unavailable (tunnel ${found.tunnel}, transport ${found.transport ?? 'none'})`;
+      detail = `listed by devicectl but unavailable (tunnel ${found.tunnel}, transport ${found.transport ?? 'none'})`;
     } catch (error) {
       if (!/not listed by devicectl/.test(error.message)) throw error;
-      why = 'not listed by devicectl on this Mac';
+      detail = 'not listed by devicectl on this Mac';
     }
-    if (now() >= deadline) return { reachable: false, reason: `the iPad is ${why}` };
+    if (now() >= deadline) return { reachable: false, reason: 'asleep or away', detail: `the iPad is ${detail}` };
     await sleep(pollMs);
   }
 }

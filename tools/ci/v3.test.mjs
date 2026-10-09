@@ -828,3 +828,39 @@ test('a real plan names its version in inflight.json once the bump is pushed', a
     assert.equal(JSON.parse(inflight.text).run.id, '777');
   } finally { await f.cleanup(); }
 });
+
+// ---------------------------------------------------------------------------------------------------- v1.1.3 plan re-checks
+
+test('the plan refuses a manifest that changed on main after the dispatch: the bump never lands on rules the gate did not check', async () => {
+  const f = await gitFixture();
+  try {
+    const host = await laneHost(f);
+    await host.installApk('io.example.app 0.2.1 4');
+    // main moves on while the deploy waits for the S26: the manifest gains a new name (a rename, a new lane...).
+    git(f.seed, ['pull', '-q', f.origin, 'main'], f.env);
+    await writeFile(join(f.seed, 'mobile-deploy.json'), JSON.stringify(v3Manifest({ project: { slug: 'example-app', name: 'Example App 2' } })));
+    git(f.seed, ['commit', '-q', '-am', 'rename'], f.env);
+    git(f.seed, ['push', '-q', f.origin, 'main'], f.env);
+    const before = f.remote(['rev-parse', 'main']);
+    await assert.rejects(quiet(() => plan(host.configure('plan', ['--dry-run', 'false']), { env: host.env, home: f.root, fetchImpl: noLatest, s3Factory: async () => host.s3 })), /HUB_GATE_REFUSED manifest: mobile-deploy\.json changed on main since the dispatched commit .*Nothing was bumped/);
+    assert.equal(f.remote(['rev-parse', 'main']), before, 'nothing pushed');
+    assert.equal(f.remote(['tag', '--list']), '', 'no version spent');
+    assert.equal(host.s3.writes.length, 0, 'no inflight.json');
+  } finally { await f.cleanup(); }
+});
+
+test('a Mac that went away after the gate turns the iPad lane into skip-lost before any Mac job is queued', async () => {
+  const f = await gitFixture({ manifest: v3Manifest({ ios: { bundle: 'io.example.app', device: 'true', device_artifact: 'App.xcarchive' } }) });
+  try {
+    const host = await laneHost(f);
+    await host.installApk('io.example.app 0.2.1 4');
+    const logs = [];
+    const planned = await plan(host.configure('plan', ['--dry-run', 'false', '--ios-lane', 'run', '--ipad-version', 'unreachable', '--ipad-build', 'unreachable']), { env: host.env, home: f.root, fetchImpl: noLatest, s3Factory: async () => host.s3, log: line => logs.push(line), macLinkNow: () => ({ link: 'offline', reason: 'carries-macbook-air did not answer over ssh on a remote link' }) });
+    assert.deepEqual([planned.run_ios, planned.ios_lane, planned.run_android], [false, 'skip-lost', true]);
+    const out = host.outputs();
+    assert.deepEqual([out.run_ios, out.ios_lane, out.run_ios_export], ['false', 'skip-lost', 'false'], 'the later value of each output wins in GITHUB_OUTPUT');
+    assert.ok(logs.some(line => /^HUB_IOS_SKIPPED lost: the Mac went offline after the gate/.test(line)), logs.join('\n'));
+    const inflight = JSON.parse(host.s3.writes.find(write => write.key === 'example-app/inflight.json').text);
+    assert.deepEqual(inflight.platforms, ['android'], 'the catch-up keeps holding only what this run builds');
+  } finally { await f.cleanup(); }
+});

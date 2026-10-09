@@ -12,6 +12,10 @@
 // If the tree delta fails, the fallbacks are Homebrew's rsync on the Mac when it exists, then the tarball itself sent
 // with rsync against the previous one (the app writes it with sorted entries, a pinned mtime and gzip --rsyncable).
 // Every transfer logs HUB_MAC_BYTES from rsync --stats, and the receipt keeps the numbers.
+//
+// v1.1.3: a transfer that breaks keeps its partial file on the Mac (--partial-dir, which openrsync takes), so a retry
+// sends only the rest instead of the whole file again; the bytes a failed attempt already moved (GNU rsync's progress
+// on big-chungus, an upper bound) count into HUB_MAC_BYTES and the receipt.
 import { createHash } from 'node:crypto';
 import { copyFileSync, createReadStream, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -22,6 +26,8 @@ import { sha256File } from './receipt.mjs';
 
 const safe = /^[A-Za-z0-9._-]+$/;
 const safePath = /^[A-Za-z0-9._/-]+$/;
+// rsync keeps a broken transfer's partial file here, inside each destination folder; never part of a tree.
+export const partialDir = '.rsync-partial';
 
 // <owner>-<repo>/<run id>, relative to the handoff base on the Mac.
 export function handoffFolder(env = process.env) {
@@ -41,6 +47,7 @@ export async function treeDigest(dir) {
   const walk = relative => {
     for (const entry of readdirSync(join(dir, relative), { withFileTypes: true })) {
       const path = relative ? `${relative}/${entry.name}` : entry.name;
+      if (entry.isDirectory() && entry.name === partialDir) continue;
       if (entry.isDirectory()) walk(path);
       else if (entry.isFile() || entry.isSymbolicLink()) entries.push(path);
     }
@@ -92,9 +99,20 @@ function check({ host, base, cache }) {
   for (const path of [base, cache]) if (!safePath.test(path) || path.startsWith('/') || path.split('/').includes('..')) throw new Error(`bad handoff path "${path}"`);
 }
 
-function rsync(args, { env, runner, timeout = 30 * 60_000, label }) {
-  const out = runner('rsync', ['--stats', '-e', sshCommand, ...args], { env, timeout, label });
-  return parseRsyncStats(out);
+// The largest byte count in GNU rsync's --info=progress2 lines ("  12,345,678  45%  ..."): what a failed attempt moved.
+export function progressBytes(text) {
+  const values = [...String(text ?? '').matchAll(/(?:^|[\r\n\s])([\d,]+)\s+\d{1,3}%/g)].map(match => Number(match[1].replace(/,/g, '')));
+  return values.length > 0 ? Math.max(...values) : 0;
+}
+
+function rsync(args, { env, runner, timeout = 30 * 60_000, label, failed = null }) {
+  try {
+    const out = runner('rsync', ['--stats', '--info=progress2', `--partial-dir=${partialDir}`, '-e', sshCommand, ...args], { env, timeout, label });
+    return parseRsyncStats(out);
+  } catch (error) {
+    if (failed) failed.bytes += progressBytes(error.message);
+    throw error;
+  }
 }
 
 // Linux side. archives: [{ name, tgz }] (the export's tarballs); receipts: small JSON files sent alongside.
@@ -107,6 +125,7 @@ export async function sendHandoffDelta({ host, base, cache, archives, receipts =
   const remoteCache = `${cache}/${repo}`;
   const total = { in: 0, out: 0 };
   const add = stats => { total.in += stats.sent ?? 0; total.out += stats.received ?? 0; };
+  const failed = { bytes: 0 };
   try {
     // Every value here is validated (host, fixed bases, owner/repo/run id), so the remote shell sees no input.
     retried(() => runner('ssh', [...sshOptions, host, `find '${base}' -mindepth 2 -maxdepth 2 -type d -mtime +3 -exec rm -rf {} + 2>/dev/null; mkdir -p '${remoteRun}' '${remoteCache}'`], { env, timeout: 90_000, label: `ssh ${host}` }), { log, label: `ssh ${host}`, ...retryOptions });
@@ -123,7 +142,7 @@ export async function sendHandoffDelta({ host, base, cache, archives, receipts =
     runner('tar', ['-xzf', tgz, '-C', tree], { env, timeout: 10 * 60_000, label: `tar -x ${name}` });
     const digest = await treeDigest(tree);
     const attempt = rsyncPath => {
-      add(rsync(['-rlpt', '-z', '--checksum', '--delete', ...(rsyncPath ? [`--rsync-path=${rsyncPath}`] : []), `${tree}/`, `${host}:${remoteCache}/${stem}/`], { env, runner, label: `rsync ${stem} to ${host}` }));
+      add(rsync(['-rlpt', '-z', '--checksum', '--delete', ...(rsyncPath ? [`--rsync-path=${rsyncPath}`] : []), `${tree}/`, `${host}:${remoteCache}/${stem}/`], { env, runner, label: `rsync ${stem} to ${host}`, failed }));
       runner('ssh', [...sshOptions, host, `rm -rf '${remoteRun}/${stem}.tree' && (cp -cR '${remoteCache}/${stem}' '${remoteRun}/${stem}.tree' 2>/dev/null || cp -R '${remoteCache}/${stem}' '${remoteRun}/${stem}.tree')`], { env, timeout: 10 * 60_000, label: `ssh ${host} clone ${stem}` });
     };
     let mode = 'tree';
@@ -142,7 +161,7 @@ export async function sendHandoffDelta({ host, base, cache, archives, receipts =
         mode = 'tree';
       } catch {
         // The tarball against the previous one: the app writes it sorted, mtime-pinned and gzip --rsyncable.
-        retried(() => add(rsync(['-t', '-z', tgz, `${host}:${remoteCache}/${name}`], { env, runner, label: `rsync ${name} to ${host}` })), { log, label: `rsync ${name}`, ...retryOptions });
+        retried(() => add(rsync(['-t', '-z', tgz, `${host}:${remoteCache}/${name}`], { env, runner, label: `rsync ${name} to ${host}`, failed })), { log, label: `rsync ${name}`, ...retryOptions });
         retried(() => runner('ssh', [...sshOptions, host, `rm -f '${remoteRun}/${name}' && (cp -c '${remoteCache}/${name}' '${remoteRun}/${name}' 2>/dev/null || cp '${remoteCache}/${name}' '${remoteRun}/${name}')`], { env, timeout: 10 * 60_000, label: `ssh ${host} clone ${name}` }), { log, label: `ssh ${host}`, ...retryOptions });
         mode = 'tgz';
       }
@@ -150,7 +169,11 @@ export async function sendHandoffDelta({ host, base, cache, archives, receipts =
     results.push({ name, mode, tree_sha256: digest.sha256, files: digest.files, bytes: digest.bytes });
     rmSync(tree, { recursive: true, force: true });
   }
-  if (receipts.length > 0) add(retried(() => rsync(['-t', ...receipts, `${host}:${remoteRun}/`], { env, runner, label: `rsync receipts to ${host}` }), { log, label: 'rsync receipts', ...retryOptions }));
+  if (receipts.length > 0) add(retried(() => rsync(['-t', ...receipts, `${host}:${remoteRun}/`], { env, runner, label: `rsync receipts to ${host}`, failed }), { log, label: 'rsync receipts', ...retryOptions }));
+  if (failed.bytes > 0) {
+    total.in += failed.bytes;
+    log(`HUB_MAC_BYTES_RETRIED ${failed.bytes} bytes moved by failed attempts (kept as partial files and resumed)`);
+  }
   log(`HUB_MAC_BYTES in=${total.in} out=${total.out} (Xcode handoff to ${host})`);
   log(`HUB_HANDOFF_DELTA bytes=${total.in + total.out} ${results.map(item => `${item.name}=${item.mode}`).join(' ')} -> ${host}:${remoteRun}`);
   return { host, folder: remoteRun, archives: results, receipts: receipts.map(file => basename(file)), mac_bytes: total };

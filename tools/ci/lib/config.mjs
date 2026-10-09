@@ -12,8 +12,12 @@ export const channels = Object.freeze(['sideload', 'play']);
 export const playStatuses = Object.freeze(['draft', 'completed', 'inProgress', 'halted']);
 export const meteredModes = Object.freeze(['auto', 'allow']);
 // The gate's verdict on the iPad lane: run it, or skip it because the Mac is offline, over its data budget on a
-// metered link, or out of the platform's scope.
-export const iosLanes = Object.freeze(['run', 'skip-offline', 'skip-metered', 'skip-platform']);
+// metered link, or out of the platform's scope. The plan can still turn run into skip-lost: the Mac went offline
+// after the gate (its own probe right before the iPad lane).
+export const iosLanes = Object.freeze(['run', 'skip-offline', 'skip-metered', 'skip-platform', 'skip-lost']);
+// Which half of the build directory a deliver job publishes: the APK (deliver-android, which never waits for the
+// Mac) or the IPA (deliver-ios). both is for a local run.
+export const deliverScopes = Object.freeze(['both', 'android', 'ios']);
 export const macLinks = Object.freeze(['home', 'metered', 'offline', 'unknown']);
 
 const flags = Object.freeze({
@@ -45,6 +49,7 @@ const flags = Object.freeze({
   '--ios-store': 'iosStore',
   '--linux-runner': 'linuxRunner',
   '--mac-runner': 'macRunner',
+  '--scope': 'scope',
 });
 
 const environment = Object.freeze({
@@ -76,6 +81,7 @@ const environment = Object.freeze({
   iosStore: 'HUB_IOS_STORE',
   linuxRunner: 'HUB_LINUX_RUNNER',
   macRunner: 'HUB_MAC_RUNNER',
+  scope: 'HUB_SCOPE',
 });
 
 function bool(name, value, fallback) {
@@ -168,6 +174,7 @@ export function parseConfig(argv, env = process.env) {
     iosStore: iosStore(raw.iosStore),
     linuxRunner: labels('linux_runner', raw.linuxRunner, '["self-hosted","Linux"]'),
     macRunner: labels('mac_runner', raw.macRunner, '["self-hosted","macOS"]'),
+    scope: oneOf('scope', raw.scope || 'both', deliverScopes),
     cwd: process.cwd(),
   };
 }

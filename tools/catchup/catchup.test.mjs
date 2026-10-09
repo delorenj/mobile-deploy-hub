@@ -19,7 +19,7 @@ import { compareBuild, validateLatest } from '../ci/lib/latest.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import {
   androidPass, androidPlan, compareIos, hubWriter, inCidr, iosPass, iosPlan, latestProblems, linuxContext,
-  loadSettings, macContext, parseRecordArgs, readMode, reasonText, record, recordArgs, retry, serviceAccountEnv, settingsFrom, sshRecordCommand, writeMode,
+  loadSettings, macContext, parseRecordArgs, readMode, reasonText, record, recordArgs, retry, serviceAccountEnv, settingsFrom, sshRecordCommand, withFallback, writeMode,
 } from './catchup.mjs';
 import { catchupEvent, producer, sendCatchupEvent } from './report.mjs';
 import { downloadVerified, readJson } from './store.mjs';
@@ -128,6 +128,8 @@ case "$1" in
       "getprop ro.product.model") echo SM-S948U ;;
       "dumpsys package") f="${state}/apps/$3.apk"; [ -f "$f" ] || exit 0; set -- $(cat "$f"); printf 'Packages:\\n  Package [%s] (1):\\n    versionCode=%s minSdk=24\\n    versionName=%s\\n' "$1" "$3" "$2" ;;
       "pm path") echo "package:/data/app/$3/base.apk" ;;
+      "dumpsys activity") if [ -f "${state}/playing" ]; then echo "  topResumedActivity=ActivityRecord{1a2b u0 $(cat "${state}/playing")/com.godot.game.GodotApp t9}"; else echo "  topResumedActivity=ActivityRecord{1a2b u0 com.android.launcher3/.Launcher t1}"; fi ;;
+      "dumpsys power") if [ -f "${state}/asleep" ]; then echo "  mWakefulness=Asleep"; else echo "  mWakefulness=Awake"; fi ;;
       "sha256sum /data/app/"*) p=\${2#/data/app/}; p=\${p%/base.apk}; sha256sum "${state}/apps/$p.apk" | cut -d' ' -f1 | sed "s#\\$#  $2#" ;;
       *) echo "fake adb: unknown shell $*" >&2; exit 1 ;;
     esac ;;
@@ -161,6 +163,8 @@ function linuxHost({ mode = 'live', s3 = fakeS3(), emit, writer, pages = async (
     away: () => writeFileSync(join(state, 'away'), ''),
     back: () => rmSync(join(state, 'away'), { force: true }),
     refuse: on => (on ? writeFileSync(join(state, 'refuse'), '') : rmSync(join(state, 'refuse'), { force: true })),
+    playing: name => (name ? writeFileSync(join(state, 'playing'), name) : rmSync(join(state, 'playing'), { force: true })),
+    asleep: on => (on ? writeFileSync(join(state, 'asleep'), '') : rmSync(join(state, 'asleep'), { force: true })),
     calls: () => { try { return readFileSync(join(state, 'calls.log'), 'utf8'); } catch { return ''; } },
     clearCalls: () => rmSync(join(state, 'calls.log'), { force: true }),
   };
@@ -224,7 +228,7 @@ test('latest.json is held to the contract before anything acts on it', () => {
 
 // ---------------------------------------------------------------------------------------------------- the S26 pass
 
-test('only pending builds are acted on; a build the deploy installed is never touched; the inflight version waits', async () => {
+test('only pending builds are acted on; a build the deploy installed is never touched; a deploy in flight holds every older pending build', async () => {
   const host = linuxHost();
   try {
     publish(host.s3, { latest: latestDoc({ android: androidBlock({ status: 'installed', by: 'deploy' }) }), apk: apkText() });
@@ -238,11 +242,18 @@ test('only pending builds are acted on; a build the deploy installed is never to
     host.s3.put(`${slug}/inflight.json`, { version: '0.2.2', run: runId, started_at: '2026-10-10T11:50:00Z' });
     await androidPass(host.ctx);
     assert.equal(host.phone.calls(), '', 'a deploy is publishing this version: hands off');
-    assert.equal(host.lines(/HUB_CATCHUP_IDLE tower-of-dumb-things android 0\.2\.2 \(4\): deploy run 37940000000 is publishing that version/).length, 1);
+    assert.equal(host.lines(/HUB_CATCHUP_IDLE tower-of-dumb-things android 0\.2\.2 \(4\): deploy run 37940000000 is publishing 0\.2\.2/).length, 1);
 
-    host.s3.put(`${slug}/inflight.json`, { version: '0.2.3', run: '37950000000', started_at: '2026-10-10T11:50:00Z' });
+    // A newer deploy in flight holds the older pending build too: it would be replaced minutes later (v1.1.3).
+    host.s3.put(`${slug}/inflight.json`, { version: '0.2.3', run: '37950000000', started_at: '2026-10-10T11:50:00Z', platforms: ['android', 'ios'] });
     await androidPass(host.ctx);
-    assert.match(host.phone.installed(), /^io\.automaticai\.towerofdumbthings 0\.2\.2 4 /, 'another version in flight does not hold this one back');
+    assert.equal(host.phone.calls(), '', 'an older pending build waits for the deploy of 0.2.3');
+    assert.equal(host.lines(/deploy run 37950000000 is publishing 0\.2\.3/).length, 1);
+
+    // That deploy's APK half is published (deliver-android took android off inflight.json): the S26 is free again.
+    host.s3.put(`${slug}/inflight.json`, { version: '0.2.3', run: '37950000000', started_at: '2026-10-10T11:50:00Z', platforms: ['ios'] });
+    await androidPass(host.ctx);
+    assert.match(host.phone.installed(), /^io\.automaticai\.towerofdumbthings 0\.2\.2 4 /, 'a deploy that is only building the iPad does not hold the S26');
   } finally { host.cleanup(); }
 });
 
@@ -527,6 +538,7 @@ function macHost({ mode = 'live', linux = linuxHost(), metered = true, tunnel = 
       const [, version, build] = readFileSync(app, 'utf8').split(' ');
       ipadState.installed = { version, build, developer: true };
     },
+    running: () => { ipadState.calls.push('processes'); return ipadState.running === true; },
   };
   const unpack = ipa => {
     const [bundle, version, build] = readFileSync(ipa, 'utf8').split(' ');
@@ -549,7 +561,7 @@ function macHost({ mode = 'live', linux = linuxHost(), metered = true, tunnel = 
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, `${version}-${build}.ipa`), text);
   };
-  return { root, ctx, linux, ipadState, reports, logs, link, outbox, lines: pattern => logs.filter(line => pattern.test(line)), cleanup: () => { rmSync(root, { recursive: true, force: true }); linux.cleanup(); } };
+  return { root, env, ctx, linux, ipadState, reports, logs, link, outbox, lines: pattern => logs.filter(line => pattern.test(line)), cleanup: () => { rmSync(root, { recursive: true, force: true }); linux.cleanup(); } };
 }
 
 test('iPad: unavailable is idle; an older build is installed from the outbox, read back and reported over the record arguments', async () => {
@@ -828,4 +840,99 @@ test('units: the S26 pass every 2 minutes under systemd, the iPad pass every 5 i
     const result = spawnSync('systemd-analyze', ['--user', 'verify', join(hubRoot, 'tools/catchup/units/mobile-deploy-hub-catchup.timer')], { encoding: 'utf8' });
     assert.doesNotMatch(`${result.stdout}${result.stderr}`, /mobile-deploy-hub-catchup\.(timer|service):\d+:/, 'systemd accepts the units');
   }
+});
+
+// ---------------------------------------------------------------------------------------------------- v1.1.3
+
+test('pins: a latest.json whose package, signer or bundle is not the policy\'s is refused before anything is fetched', async () => {
+  const host = linuxHost();
+  try {
+    const foreign = androidBlock();
+    foreign.signer_sha256 = 'f'.repeat(64);
+    publish(host.s3, { latest: latestDoc({ android: foreign }), apk: apkText({ signerSha: 'f'.repeat(64) }) });
+    host.phone.install(apkText({ version: '0.2.1', code: 3 }));
+    await androidPass(host.ctx);
+    assert.equal(host.lines(/^HUB_CATCHUP_ERROR tower-of-dumb-things: latest\.json refused \(android\.signer_sha256 is not the policy's signer\)/).length, 1, host.logs.join('\n'));
+    assert.doesNotMatch(host.phone.calls(), /\binstall\b/);
+    assert.equal(host.s3.requests.filter(request => request.key.endsWith('.apk')).length, 0, 'nothing fetched');
+    const app = settingsFrom(policy).apps.find(entry => entry.slug === slug);
+    const ios = iosBlock();
+    ios.bundle = 'io.example.other';
+    assert.match(latestProblems(latestDoc({ android: null, ios }), slug, 'https://s3.delo.sh/builds', app).join(' '), /ios\.bundle io\.example\.other is not the policy's/);
+    assert.deepEqual(latestProblems(latestDoc(), slug, 'https://s3.delo.sh/builds', app), []);
+  } finally { host.cleanup(); }
+});
+
+test('the S26 is not updated under a kid: the app on top with the screen on waits; with the screen off it installs', async () => {
+  const host = linuxHost();
+  try {
+    publish(host.s3, { latest: latestDoc(), apk: apkText() });
+    host.phone.install(apkText({ version: '0.2.1', code: 3 }));
+    host.phone.playing(pkg);
+    await androidPass(host.ctx);
+    assert.equal(host.lines(/^HUB_CATCHUP_IDLE tower-of-dumb-things android 0\.2\.2 \(4\): io\.automaticai\.towerofdumbthings is on screen on the S26/).length, 1, host.logs.join('\n'));
+    assert.doesNotMatch(host.phone.calls(), /\binstall\b/);
+    assert.deepEqual([host.events.length, host.s3.writer.writes.length], [0, 0], 'waiting is not a failed attempt');
+    host.phone.asleep(true);
+    await androidPass(host.ctx);
+    assert.match(host.phone.installed(), /^io\.automaticai\.towerofdumbthings 0\.2\.2 4 /);
+  } finally { host.cleanup(); }
+});
+
+test('iPad: while the app runs the install waits, up to 45 minutes from the first sighting, then goes ahead', async () => {
+  const mac = macHost();
+  try {
+    publish(mac.linux.s3, { latest: latestDoc({ android: null, ios: iosBlock() }), ipa: ipaText() });
+    mac.ipadState.installed = { version: '0.2.1', build: '4' };
+    mac.outbox(ipaText());
+    mac.ipadState.running = true;
+    await iosPass(mac.ctx);
+    assert.ok(!mac.ipadState.calls.some(call => call.startsWith('install ')), 'not under a kid');
+    assert.match(mac.lines(/^HUB_CATCHUP_IDLE tower-of-dumb-things ios/)[0], /is running on the iPad; the install waits .* \(0 of 45 minutes\)/);
+    // An app that stays suspended in the background must not hold the iPad forever.
+    const journal = join(mac.env.XDG_STATE_HOME, 'mobile-deploy-hub/catchup-journal.json');
+    const document = JSON.parse(readFileSync(journal, 'utf8'));
+    document.busy[`${slug}/ios`].since = '2026-10-10T11:00:00Z';
+    writeFileSync(journal, JSON.stringify(document));
+    await iosPass(mac.ctx);
+    assert.ok(mac.ipadState.calls.some(call => call.startsWith('install ')));
+    assert.equal(mac.lines(/^HUB_CATCHUP_BUSY tower-of-dumb-things ios: .* running for 60 minutes; installing now/).length, 1);
+  } finally { mac.cleanup(); }
+});
+
+test('iPad: a deploy in flight holds the older pending build too (both passes read inflight.json)', async () => {
+  const mac = macHost();
+  try {
+    publish(mac.linux.s3, { latest: latestDoc({ android: null, ios: iosBlock() }), ipa: ipaText() });
+    mac.ipadState.installed = { version: '0.2.1', build: '4' };
+    mac.outbox(ipaText());
+    mac.linux.s3.put(`${slug}/inflight.json`, { version: '0.2.3', run: { id: '37950000000' }, started_at: '2026-10-10T11:50:00Z', platforms: ['android', 'ios'] });
+    await iosPass(mac.ctx);
+    assert.deepEqual(mac.ipadState.calls, [], 'not even devicectl: the deploy owns the iPad');
+    assert.equal(mac.lines(/^HUB_CATCHUP_IDLE tower-of-dumb-things ios 0\.2\.2 \(4\): deploy run 37950000000 is publishing 0\.2\.3/).length, 1);
+  } finally { mac.cleanup(); }
+});
+
+test('the Mac revalidates its pointers with the strong tag, uncompressed, and reads over ssh when https fails', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-catchup-etag-'));
+  try {
+    const seen = [];
+    const fetchImpl = async (url, options) => {
+      seen.push(options.headers);
+      if (options.headers['if-none-match'] === '"abc"') return new Response(null, { status: 304 });
+      return new Response('{"a":1}', { status: 200, headers: { etag: 'W/"abc"' } });
+    };
+    const cacheFile = join(dir, 'x.json');
+    assert.deepEqual((await readJson('https://s3.delo.sh/builds/x/latest.json', { fetchImpl, cacheFile })).value, { a: 1 });
+    const again = await readJson('https://s3.delo.sh/builds/x/latest.json', { fetchImpl, cacheFile });
+    assert.equal(again.cached, true, 'a 304: headers only');
+    assert.deepEqual(seen[1], { 'accept-encoding': 'identity', 'if-none-match': '"abc"' }, 'never the weak W/ tag MinIO cannot match');
+    assert.equal(seen[0]['accept-encoding'], 'identity');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+
+  const reads = [];
+  const store = withFallback({ latest: async () => { throw new Error('GET https://s3.delo.sh/builds/x/latest.json: HTTP 522'); }, inflight: async () => null }, { read: key => { reads.push(key); return { ok: true }; }, log: () => {}, host: 'big-chungus' });
+  assert.deepEqual(await store.latest('tower-of-dumb-things'), { ok: true });
+  assert.deepEqual(reads, ['tower-of-dumb-things/latest.json']);
+  assert.equal(await store.inflight('tower-of-dumb-things'), null, 'a missing object is not a failure: no fallback');
 });

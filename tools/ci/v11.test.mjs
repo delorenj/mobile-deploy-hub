@@ -95,13 +95,18 @@ test('every caller deviation is refused: strict false, runners, manifest, no REA
 
 // ---------------------------------------------------------------------------------------------------- the gate
 
+// Tower's pins, as policy.json carries them: the gate, plan and deliver hold a manifest and an APK to these.
+const towerPin = policy.apps['delorenj/pile-of-dumb-things'];
+const towerPackage = towerPin.android.package;
+const towerSigner = towerPin.android.signer_sha256;
+
 function towerManifest(extra = {}) {
   return {
     schema: 2,
     project: { slug: 'tower-of-dumb-things', name: 'Tower of Lost Things' },
     version: { read: 'node version.mjs', bump: 'node version.mjs bump' },
-    android: { package: 'io.example.app', export: 'true', artifact: 'artifacts/App.apk', signer_sha256: 'a'.repeat(64) },
-    ios: { bundle: 'io.example.app', device: 'true', device_artifact: 'App.xcarchive' },
+    android: { package: towerPackage, export: 'true', artifact: 'artifacts/App.apk', signer_sha256: towerSigner },
+    ios: { bundle: towerPin.ios.bundle, device: 'true', device_artifact: 'App.xcarchive' },
     ...extra,
   };
 }
@@ -128,7 +133,7 @@ async function gateFixture({ manifest = towerManifest(), caller = template, repo
   const configure = (extra = [], more = {}) => ({ ...parseConfig(['gate', '--manifest', 'tools/ci/mobile-deploy.json', '--out', join(root, 'out'), ...extra], { ...env, ...more }), cwd: app });
   const s3 = fakeS3();
   const logs = [];
-  const deps = (more = {}) => ({ env, home: root, fetchImpl: notFound, s3Factory: async () => s3, tailscale: () => peer('76.98.73.87:11349'), runnerAlive: () => true, adbFactory: noPhone, log: line => logs.push(line), ...more });
+  const deps = (more = {}) => ({ env, home: root, fetchImpl: notFound, s3Factory: async () => s3, tailscale: () => peer('76.98.73.87:11349'), macProbe: () => ({ runner: 'alive', catchup: 'live' }), runnerStatus: () => ({ status: 'online', busy: false }), adbFactory: noPhone, log: line => logs.push(line), ...more });
   const outputs = () => Object.fromEntries(readFileSync(output, 'utf8').trim().split('\n').filter(Boolean).map(line => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
   return { root, app, env, configure, s3, logs, deps, outputs, cleanup: () => rm(root, { recursive: true, force: true }) };
 }
@@ -137,9 +142,10 @@ test('the gate passes a well-formed run and reads the state of things: metered M
   const f = await gateFixture();
   try {
     const result = await gate(f.configure(), f.deps());
-    assert.deepEqual([result.ios_lane, result.mac_link, result.metered, result.slug, result.bundle], ['run', 'metered', true, 'tower-of-dumb-things', 'io.example.app']);
+    assert.deepEqual([result.ios_lane, result.mac_link, result.metered, result.slug, result.bundle], ['run', 'metered', true, 'tower-of-dumb-things', towerPin.ios.bundle]);
+    assert.ok(f.logs.some(line => /^HUB_CATCHUP_MODE big-chungus=watch mac=live$/.test(line)), 'the gate reads the catch-up mode on both hosts');
     assert.ok(f.logs.some(line => /^HUB_POLICY sha256=[0-9a-f]{8}$/.test(line)), f.logs.join('\n'));
-    assert.ok(f.logs.some(line => /^HUB_MAC_LINK metered peer=carries-macbook-air addr=76\.98\.73\.87/.test(line)));
+    assert.ok(f.logs.some(line => /^HUB_MAC_LINK metered peer=carries-macbook-air runner=carries-macbook-air addr=76\.98\.73\.87/.test(line)), 'the gate checks this app\'s own Mac runner');
     assert.ok(f.logs.some(line => /^HUB_GATE ok policy=[0-9a-f]{8} mac=metered s26=away s3=ok/.test(line)), f.logs.join('\n'));
     assert.deepEqual(f.s3.writes.map(write => [write.op, write.key]), [['put', '.probe/555'], ['rm', '.probe/555']], 'the probe leaves nothing behind');
     assert.equal(f.outputs().ios_lane, 'run');
@@ -153,7 +159,10 @@ test('the gate decides the iPad lane: home runs it, offline skips it, a metered 
   try {
     assert.equal((await gate(f.configure(), f.deps({ tailscale: () => peer('192.168.1.23:41641') }))).mac_link, 'home');
     assert.equal((await gate(f.configure(), f.deps({ tailscale: () => peer('', false) }))).ios_lane, 'skip-offline');
-    assert.equal((await gate(f.configure(), f.deps({ runnerAlive: () => false }))).ios_lane, 'skip-offline', 'no Runner.Listener on the Mac');
+    assert.equal((await gate(f.configure(), f.deps({ macProbe: () => ({ runner: 'missing', catchup: 'live' }) }))).ios_lane, 'skip-offline', 'no Runner.Listener of this app\'s own runner on the Mac');
+    assert.equal((await gate(f.configure(), f.deps({ runnerStatus: () => ({ status: 'offline', busy: false }) }))).ios_lane, 'skip-offline', 'GitHub shows this app\'s Mac runner offline');
+    assert.equal((await gate(f.configure(), f.deps({ macProbe: () => null }))).ios_lane, 'skip-offline', 'off the LAN, an ssh with no answer is a Mac that is gone');
+    assert.equal((await gate(f.configure(), f.deps({ macProbe: () => null, tailscale: () => peer('192.168.1.23:41641') }))).ios_lane, 'run', 'on the LAN, a failed ssh alone does not skip the iPad');
     const heavy = JSON.stringify(sampleLatest({ mac_bytes: 400 * 1024 * 1024 }));
     assert.equal((await gate(f.configure(), f.deps({ fetchImpl: serve(heavy) }))).ios_lane, 'skip-metered');
     assert.ok(f.logs.some(line => /^HUB_IOS_DEFERRED /.test(line)));
@@ -238,22 +247,22 @@ async function deliverFixture({ iosSent = true, iosStatus = 'pending', androidSt
   const out = join(root, 'out');
   const sdk = join(root, 'sdk/build-tools/35.0.0');
   await Promise.all([app, out, sdk].map(dir => mkdir(dir, { recursive: true })));
-  await writeFile(join(app, 'mobile-deploy.json'), JSON.stringify(towerManifest({ android: { package: 'io.example.app', export: 'true', artifact: 'artifacts/App.apk', signer_sha256: 'c'.repeat(64) } })));
-  await script(join(sdk, 'apksigner'), `echo "Signer #1 certificate SHA-256 digest: ${'c'.repeat(64)}"`);
+  await writeFile(join(app, 'mobile-deploy.json'), JSON.stringify(towerManifest()));
+  await script(join(sdk, 'apksigner'), `echo "Signer #1 certificate SHA-256 digest: ${towerSigner}"`);
   await script(join(sdk, 'aapt2'), 'set -- $(cat "$3"); echo "package: name=\'$1\' versionCode=\'$3\' versionName=\'$2\'"');
   const staging = join(root, '.cache/mobile-deploy-hub/staging/delorenj-pile-of-dumb-things/777');
   await mkdir(join(staging, 'android'), { recursive: true });
   await mkdir(join(staging, 'ios'), { recursive: true });
   const apkName = 'tower-of-dumb-things-0.2.2-5.apk';
-  await writeFile(join(staging, 'android', apkName), 'io.example.app 0.2.2 5');
+  await writeFile(join(staging, 'android', apkName), `${towerPackage} 0.2.2 5`);
   const sha = text => execFileSync('sha256sum', [], { input: text }).toString().slice(0, 64);
-  const apkSha = sha('io.example.app 0.2.2 5');
+  const apkSha = sha(`${towerPackage} 0.2.2 5`);
   const ipaName = 'tower-of-dumb-things-0.2.2-5.ipa';
   if (iosSent) await writeFile(join(staging, 'ios', ipaName), 'ipa bytes');
   const receipts = join(out, 'receipts');
   await mkdir(receipts, { recursive: true });
-  await writeFile(join(receipts, 'hub-receipt-android.json'), JSON.stringify({ lane: 'android', version: '0.2.2', staged: { name: apkName, bytes: 22, sha256: apkSha }, quickdrop: { status: 'written', name: apkName }, delivery: { platform: 'android', status: androidStatus, reason: androidStatus === 'pending' ? "not on big-chungus's adb" : null, sha256: apkSha } }));
-  await writeFile(join(receipts, 'hub-receipt-ios.json'), JSON.stringify({ lane: 'ios', version: '0.2.2', ipa: { verified: true, sha256: sha('ipa bytes'), bytes: 9, build: '5', sent: iosSent, staged_name: iosSent ? ipaName : null }, delivery: { platform: 'ios', status: iosStatus, reason: iosStatus === 'pending' ? 'the iPad is listed but unavailable' : null }, mac_bytes: { in: 1000, out: 9 } }));
+  await writeFile(join(receipts, 'hub-receipt-android.json'), JSON.stringify({ lane: 'android', outcome: 'success', version: '0.2.2', staged: { name: apkName, bytes: 22, sha256: apkSha }, quickdrop: { status: 'written', name: apkName }, delivery: { platform: 'android', status: androidStatus, reason: androidStatus === 'pending' ? "not on big-chungus's adb" : null, sha256: apkSha } }));
+  await writeFile(join(receipts, 'hub-receipt-ios.json'), JSON.stringify({ lane: 'ios', outcome: 'success', version: '0.2.2', ipa: { verified: true, sha256: sha('ipa bytes'), bytes: 9, build: '5', sent: iosSent, staged_name: iosSent ? ipaName : null }, delivery: { platform: 'ios', status: iosStatus, reason: iosStatus === 'pending' ? 'asleep or away' : null }, mac_bytes: { in: 1000, out: 9 } }));
   const env = { PATH: process.env.PATH, ANDROID_HOME: join(root, 'sdk'), JAVA_HOME: join(root, 'java'), GITHUB_REPOSITORY: 'delorenj/pile-of-dumb-things', GITHUB_RUN_ID: '777', GITHUB_RUN_ATTEMPT: '1', HUB_REF: 'v1.1.0', HUB_LOCK_DIR: join(root, 'locks'), HUB_NEEDS: JSON.stringify({ plan: { result: 'success' }, android: { result: 'success' }, ios: { result: 'success' } }) };
   const configure = (extra = []) => ({ ...parseConfig(['deliver', '--manifest', 'mobile-deploy.json', '--out', out, '--version', '0.2.2', '--android-code', '5', '--build-sha', 'b'.repeat(40), ...extra], env), cwd: app });
   const s3 = fakeS3();
@@ -265,7 +274,8 @@ async function deliverFixture({ iosSent = true, iosStatus = 'pending', androidSt
 test('deliver publishes in order: versioned objects, manifest.plist, latest.json, then the pages; then retention and inflight', async () => {
   const f = await deliverFixture();
   try {
-    const result = await deliver(f.configure(['--dry-run', 'false']), { env: f.env, home: f.root, fetchImpl: notFound, s3Factory: async () => f.s3, log: line => f.logs.push(line) });
+    const inflight = JSON.stringify({ version: '0.2.2', run: { repo: 'delorenj/pile-of-dumb-things', id: '777', attempt: 1, url: null }, started_at: '2026-10-09T20:00:00Z', platforms: ['android', 'ios'] });
+    const result = await deliver(f.configure(['--dry-run', 'false']), { env: f.env, home: f.root, fetchImpl: serve(inflight, 'tower-of-dumb-things/inflight.json'), s3Factory: async () => f.s3, log: line => f.logs.push(line) });
     const keys = f.s3.writes.map(write => `${write.op} ${write.key}`);
     const at = key => keys.indexOf(key);
     assert.ok(at('put tower-of-dumb-things/0.2.2/tower-of-dumb-things-0.2.2-5.apk') >= 0, keys.join('\n'));
@@ -292,7 +302,7 @@ test('a dry run deliver checks and renders everything and writes nothing', async
     assert.equal(result.dryRun, true);
     assert.equal(f.s3.writes.length, 0);
     assert.ok(f.logs.some(line => /^HUB_PUBLISH_DRY_RUN would publish .*tower-of-dumb-things-0\.2\.2-5\.apk.*nothing was written$/.test(line)), f.logs.join('\n'));
-    assert.equal(existsSync(f.staging), false, 'a dry run\'s staging is removed');
+    assert.equal(existsSync(join(f.staging, 'android')) || existsSync(join(f.staging, 'ios')), false, 'a dry run\'s staging is removed (each deliver job removes its own half)');
     assert.ok(result.published.ota, 'the would-be links reach the checked event');
   } finally { await f.cleanup(); }
 });
@@ -306,9 +316,8 @@ test('the pointer only moves forward: an older run keeps the newer block and upl
     await deliver(f.configure(['--dry-run', 'false']), { env: f.env, home: f.root, fetchImpl: serve(JSON.stringify(newer), 'tower-of-dumb-things/latest.json'), s3Factory: async () => f.s3, log: line => f.logs.push(line) });
     assert.ok(f.logs.filter(line => /^HUB_POINTER kept 0\.2\.3/.test(line)).length === 2, f.logs.join('\n'));
     assert.ok(!f.s3.writes.some(write => /0\.2\.2-5\.(apk|ipa)$/.test(write.key)), 'no older bytes uploaded');
-    const written = parseLatest(f.s3.writes.find(write => write.key === 'tower-of-dumb-things/latest.json').text);
-    assert.equal(written.version, '0.2.3', 'the top level does not move back either');
-    assert.equal(written.android.code, 9);
+    assert.ok(!f.s3.writes.some(write => /latest\.json$|index\.html$/.test(write.key)), 'no block moved: latest.json, its top level and the pages stay as they are');
+    assert.ok(f.logs.some(line => /^HUB_PUBLISHED nothing for android and ios: the pointer stays/.test(line)), f.logs.join('\n'));
   } finally { await f.cleanup(); }
 });
 
@@ -383,7 +392,7 @@ function fakeGh({ red = false, conclusion = () => 0, repo = 'delorenj/gruvato' }
   const calls = [];
   let dispatched = 0;
   const runs = () => [
-    ...(red ? [{ databaseId: 10, headSha: 'a'.repeat(40), event: 'workflow_dispatch', status: 'completed', conclusion: 'failure', url: 'https://x/10', displayTitle: 'Deploy REAL both bump=patch' }] : []),
+    ...(red ? [{ databaseId: 10, headSha: 'a'.repeat(40), event: 'workflow_dispatch', status: 'completed', conclusion: 'failure', url: 'https://x/10', displayTitle: 'Deploy REAL both bump=patch', createdAt: red === true ? '2026-10-08T12:00:00Z' : red }] : []),
     ...(dispatched > 0 ? [{ databaseId: 20 + dispatched, headSha: 'a'.repeat(40), event: 'workflow_dispatch', status: 'in_progress', url: `https://x/${20 + dispatched}`, displayTitle: 'Deploy (dry run)' }] : []),
   ];
   const gh = (args, options = {}) => {
@@ -416,9 +425,18 @@ test('the front door: no iPad proof ledger, --metered passes through, and the tr
 test('a red last real run earns an offer of the rerun, never a refusal; an offline Mac and an away S26 earn notes', async () => {
   const { gh, calls } = fakeGh({ red: true });
   const logs = [];
-  const result = await frontDoor.deploy(parseArguments(['--dry-run', 'false', '--repo', 'delorenj/gruvato']), { gh, git: () => 'main\n', adb: args => (args[0] === 'devices' ? 'List of devices attached\n' : ''), host: 'big-chungus', prompt: null, log: line => logs.push(line), sleep: async () => {}, timeoutMs: 5000, pollMs: 1 });
+  const now = () => Date.parse('2026-10-09T12:00:00Z');
+  const result = await frontDoor.deploy(parseArguments(['--dry-run', 'false', '--repo', 'delorenj/gruvato']), { gh, git: () => 'main\n', adb: args => (args[0] === 'devices' ? 'List of devices attached\n' : ''), host: 'big-chungus', prompt: null, log: line => logs.push(line), sleep: async () => {}, timeoutMs: 5000, pollMs: 1, now });
   assert.equal(result.status, 0);
   assert.ok(logs.some(line => /^DEPLOY_LAST_REAL_RED 10 failure .*gh run rerun 10 --failed/.test(line)), logs.join('\n'));
+  // Past the 7-day window its receipts and staging are gone, so a rerun would publish nothing: no offer.
+  const old = fakeGh({ red: '2026-09-30T12:00:00Z' });
+  const oldLogs = [];
+  let asked = false;
+  await frontDoor.deploy(parseArguments(['--dry-run', 'false', '--repo', 'delorenj/gruvato']), { gh: old.gh, git: () => 'main\n', prompt: async () => { asked = true; return 'y'; }, log: line => oldLogs.push(line), sleep: async () => {}, timeoutMs: 5000, pollMs: 1, now });
+  assert.equal(asked, false, 'no rerun offered for a run older than 7 days');
+  assert.ok(oldLogs.some(line => /^DEPLOY_LAST_REAL_RED 10 failure .*9 days old, past the 7-day window/.test(line)), oldLogs.join('\n'));
+  assert.ok(old.calls.some(call => /^workflow run deploy\.yml/.test(call)), 'a new version is dispatched instead');
   assert.ok(logs.some(line => /^DEPLOY_NOTE the iPad lane will be skipped: mac offline/.test(line)));
   assert.ok(logs.some(line => /^DEPLOY_NOTE the S26 is away; it will be pending/.test(line)));
   assert.ok(calls.some(call => /^workflow run deploy\.yml --ref main --repo delorenj\/gruvato .*-f metered=auto$/.test(call)), calls.join('\n'));
@@ -513,7 +531,7 @@ test('the Xcode handoff is a tree delta into the Mac cache, cloned per run, chec
     assert.deepEqual(sent.mac_bytes, { in: 1234, out: 56 });
     assert.equal(sent.archives[0].mode, 'tree');
     assert.equal(sent.archives[0].tree_sha256, (await treeDigest(src)).sha256);
-    assert.ok(calls.some(call => /^rsync --stats -e ssh .* -rlpt -z --checksum --delete .*\/A-ipad\.tree\/ hub-mac:Library\/Caches\/mobile-deploy-hub\/handoff-cache\/delorenj-pile-of-dumb-things\/A-ipad\/$/.test(call)), calls.join('\n'));
+    assert.ok(calls.some(call => /^rsync --stats --info=progress2 --partial-dir=\.rsync-partial -e ssh .* -rlpt -z --checksum --delete .*\/A-ipad\.tree\/ hub-mac:Library\/Caches\/mobile-deploy-hub\/handoff-cache\/delorenj-pile-of-dumb-things\/A-ipad\/$/.test(call)), calls.join('\n'));
     assert.ok(calls.some(call => /cp -cR 'Library\/Caches\/mobile-deploy-hub\/handoff-cache\/delorenj-pile-of-dumb-things\/A-ipad' 'Library\/Caches\/mobile-deploy-hub\/handoff\/delorenj-pile-of-dumb-things\/42\/A-ipad\.tree'/.test(call)), 'the run gets its own clone');
     assert.ok(logs.some(line => /^HUB_MAC_BYTES in=1234 out=56/.test(line)) && logs.some(line => /^HUB_HANDOFF_DELTA bytes=1290 A-ipad\.tgz=tree/.test(line)));
 

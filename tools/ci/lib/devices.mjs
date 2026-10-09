@@ -24,6 +24,17 @@ export function parseDevices(source) {
   const under = path => /^[A-Za-z0-9._/-]+$/.test(path ?? '') && !path.startsWith('/') && !path.split('/').includes('..');
   for (const key of ['handoff_dir', 'handoff_cache', 'outbox']) if (!under(mac?.[key])) fail(`mac.${key} must be a path under the Mac home`);
   if (!(Number(mac?.min_free_gib) > 0)) fail('mac.min_free_gib must be positive');
+  // Each app's own Mac runner (its GitHub name and its folder under the Mac home): three runners share the one Mac, and
+  // only an app's own runner can take that app's iPad jobs, so the gate and the watchdog check that one.
+  if (mac?.runners !== undefined) {
+    if (mac.runners === null || typeof mac.runners !== 'object' || Array.isArray(mac.runners)) fail('mac.runners must map owner/repo to {name, dir}');
+    for (const [repo, entry] of Object.entries(mac.runners)) {
+      if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) fail(`mac.runners key "${repo}" must be owner/repo`);
+      if (!/^[A-Za-z0-9._-]+$/.test(entry?.name ?? '')) fail(`mac.runners.${repo}.name must be the runner's GitHub name`);
+      if (!under(entry?.dir)) fail(`mac.runners.${repo}.dir must be a path under the Mac home`);
+    }
+  }
+  if (android?.syncthing !== undefined && !/^[A-Z0-9]{7}(-[A-Z0-9]{7}){7}$/.test(android.syncthing)) fail('android.syncthing must be the S26\'s Syncthing device ID');
   if (!/^[A-Za-z0-9.-]+$/.test(linux?.host ?? '')) fail('linux.host must be a host name (an ssh alias on the Mac)');
   if (!under(linux?.staging_dir)) fail('linux.staging_dir must be a path under the big-chungus home');
   return devices;

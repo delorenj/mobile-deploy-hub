@@ -33,6 +33,15 @@ export function parseBaseApk(output) {
 
 export const parseSha256 = output => /\b([0-9a-f]{64})\b/.exec(output)?.[1] ?? null;
 
+// `dumpsys activity activities`: the package of the activity on top (topResumedActivity on Android 10+,
+// mResumedActivity before), or null.
+export function parseResumedPackage(output) {
+  return /\b(?:topResumedActivity|mResumedActivity)[=:]\s*ActivityRecord\{\S+\s+u\d+\s+([A-Za-z][\w.]*)\//.exec(output ?? '')?.[1] ?? null;
+}
+
+// `dumpsys power`: whether the screen is on.
+export const parseAwake = output => /\bmWakefulness=Awake\b/.test(output ?? '') || /Display Power: state=ON\b/.test(output ?? '');
+
 // `adb mdns services`: the phone's wireless debugging endpoint, by the serial in its service name.
 export function parseMdnsEndpoint(output, serial) {
   for (const line of output.split('\n')) {
@@ -62,6 +71,8 @@ export function createAdb({ env: given = process.env, home = homedir(), runner =
     sha256: (id, path) => parseSha256(call(['-s', id, 'shell', 'sha256sum', path], 120_000)),
     // In place, data kept. Nothing else in the hub installs on a phone.
     install: (id, apk) => call(['-s', id, 'install', '-r', apk], 600_000),
+    // Someone is playing: the app is the resumed activity and the screen is on (an install would close it mid-game).
+    inUse: (id, pkg) => parseResumedPackage(call(['-s', id, 'shell', 'dumpsys', 'activity', 'activities'], 60_000)) === pkg && parseAwake(call(['-s', id, 'shell', 'dumpsys', 'power'], 60_000)),
   };
 }
 

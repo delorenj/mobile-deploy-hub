@@ -384,13 +384,18 @@ test('the reusable workflow is hardened: no hosted runners, no shell interpolati
   assert.doesNotMatch(workflow, /github\.job|pull_request_target|secrets\./);
   assert.doesNotMatch(workflow, /client_payload|repository_dispatch/);
   const jobs = [...workflow.matchAll(/^ {2}([\w-]+):\n/gm)].map(match => match[1]).filter(name => !['workflow_call'].includes(name));
-  assert.deepEqual(jobs.slice(-8), ['gate', 'preflight-ios', 'plan', 'android', 'ios-export', 'ios', 'deliver', 'announce']);
+  assert.deepEqual(jobs.slice(-9), ['gate', 'preflight-ios', 'plan', 'android', 'ios-export', 'ios', 'deliver-android', 'deliver-ios', 'announce']);
   const groups = [...workflow.matchAll(/^\s+group: (mobile-deploy-[\w-]+)-\$\{\{ github\.repository \}\}$/gm)].map(match => match[1]);
-  assert.deepEqual(groups, ['mobile-deploy-plan', 'mobile-deploy-android', 'mobile-deploy-ios-export', 'mobile-deploy-ios', 'mobile-deploy-deliver']);
-  assert.equal([...workflow.matchAll(/cancel-in-progress: false/g)].length, 5);
-  // gate, plan and announce check out the dispatched commit; the lanes and deliver the plan's commit (the bump).
+  assert.deepEqual(groups, ['mobile-deploy-plan', 'mobile-deploy-android', 'mobile-deploy-ios-export', 'mobile-deploy-ios', 'mobile-deploy-deliver-android', 'mobile-deploy-deliver-ios']);
+  assert.equal([...workflow.matchAll(/cancel-in-progress: false/g)].length, 6);
+  // runs-on is the policy's self-hosted labels, never a caller input: a caller cannot put a job on a hosted runner.
+  assert.doesNotMatch(workflow, /runs-on: \$\{\{/, 'runs-on takes no expression');
+  const labels = [...workflow.matchAll(/runs-on: \[([^\]]+)\]/g)].map(match => match[1]);
+  assert.equal(labels.length, 9);
+  for (const label of labels) assert.match(label, /^self-hosted, (Linux|macOS)$/);
+  // gate, plan and announce check out the dispatched commit; the lanes and the deliver jobs the plan's commit (the bump).
   assert.equal([...workflow.matchAll(/uses: actions\/checkout@v4\n\s+with:\n\s+ref: \$\{\{ github\.sha \}\}/g)].length, 3);
-  assert.equal([...workflow.matchAll(/uses: actions\/checkout@v4\n\s+with:\n\s+ref: \$\{\{ needs\.plan\.outputs\.build_sha \}\}/g)].length, 4);
+  assert.equal([...workflow.matchAll(/uses: actions\/checkout@v4\n\s+with:\n\s+ref: \$\{\{ needs\.plan\.outputs\.build_sha \}\}/g)].length, 5);
   assert.match(workflow, /ref: \$\{\{ github\.sha \}\}\n\s+fetch-depth: 0\n\s+fetch-tags: true\n/, 'the plan bumps on full history');
   const refs = new Set([...workflow.matchAll(/uses: delorenj\/mobile-deploy-hub\/actions\/hub@(\S+)/g)].map(match => match[1]));
   assert.equal(refs.size, 1, 'one exact hub ref everywhere; mise run release flips them together');
@@ -403,11 +408,18 @@ test('the reusable workflow is hardened: no hosted runners, no shell interpolati
   assert.match(preflight, /receipt: \$\{\{ steps\.hub\.outputs\.receipt \}\}/, 'its receipt goes back as a job output');
   assert.match(workflow, /plan:\n\s+needs: \[gate, preflight-ios\]\n\s+if: \$\{\{ !cancelled\(\) && needs\.gate\.result == 'success' && \(needs\.preflight-ios\.result == 'success' \|\| needs\.preflight-ios\.result == 'skipped'\) \}\}/);
   assert.match(workflow, /ios:\n\s+needs: \[gate, plan, ios-export\]/);
-  assert.match(workflow, /deliver:\n\s+needs: \[gate, plan, android, ios-export, ios\]\n\s+if: \$\{\{ !cancelled\(\) && needs\.plan\.result == 'success' \}\}/, 'deliver publishes whatever the lanes staged once the plan spent a version');
-  assert.match(workflow, /announce:\n\s+needs: \[gate, preflight-ios, plan, android, ios-export, ios, deliver\]\n\s+if: \$\{\{ always\(\) \}\}/, 'one event per run attempt, whatever happened');
+  // The APK half never waits for the Mac: deliver-android needs no Mac job; deliver-ios runs when the ios job ran.
+  assert.match(workflow, /deliver-android:\n\s+needs: \[gate, plan, android\]\n\s+if: \$\{\{ !cancelled\(\) && needs\.plan\.result == 'success' && \(needs\.android\.result == 'success' \|\| needs\.android\.result == 'failure'\) \}\}/);
+  assert.match(workflow, /deliver-ios:\n\s+needs: \[gate, plan, ios-export, ios\]\n\s+if: \$\{\{ !cancelled\(\) && needs\.plan\.result == 'success' && \(needs\.ios\.result == 'success' \|\| needs\.ios\.result == 'failure'\) \}\}/);
+  const deliverAndroid = workflow.slice(workflow.indexOf('\n  deliver-android:\n'), workflow.indexOf('\n  deliver-ios:\n'));
+  assert.doesNotMatch(deliverAndroid, /needs\.(ios|preflight-ios|ios-export)\b|ios-out|ios-receipt|mac_link/, 'nothing in deliver-android waits on or reads the Mac');
+  assert.match(deliverAndroid, /scope: android/);
+  assert.match(workflow.slice(workflow.indexOf('\n  deliver-ios:\n'), workflow.indexOf('\n  announce:\n')), /scope: ios/);
+  assert.match(workflow, /announce:\n\s+needs: \[gate, preflight-ios, plan, android, ios-export, ios, deliver-android, deliver-ios\]\n\s+if: \$\{\{ always\(\) \}\}/, 'one event per run attempt, whatever happened');
+  assert.match(workflow, /ios_lane: \$\{\{ steps\.hub\.outputs\.ios_lane \}\}\n\s+steps:\n\s+# Full history/, 'the plan has the last word on the iPad lane');
   // Every upload can be redone by "Re-run failed jobs", and receipts upload even when the lane failed.
   const uploads = workflow.split('uses: actions/upload-artifact@v4').slice(1).map(block => block.split(/\n {6}- |\n\n/)[0]);
-  assert.deepEqual(uploads.map(block => /name: (\S+)/.exec(block)[1]), ['gate-out', 'plan-out', 'android-out', 'ios-receipt', 'ios-out', 'deliver-out']);
+  assert.deepEqual(uploads.map(block => /name: (\S+)/.exec(block)[1]), ['gate-out', 'plan-out', 'android-out', 'ios-receipt', 'ios-out', 'deliver-android-out', 'deliver-ios-out']);
   for (const block of uploads) assert.match(block, /^\s+overwrite: true$/m, block);
   // The build itself never takes artifact quota: staging, the build directory and the Release hold it.
   assert.match(workflow, /name: android-out\n\s+path: \$\{\{ runner\.temp \}\}\/hub-out\/android\/\*\.json\n/);

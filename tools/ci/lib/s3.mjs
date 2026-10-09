@@ -174,10 +174,11 @@ export function historyOf(listing, policy, slug) {
 }
 
 // The app page, then (under the s3-index lock, shared by every app) index.json and index.html from every app's
-// latest.json. deliver and the catch-up reporter both call this after they write latest.json.
-export async function publishPages({ s3, policy, slug, latest, deliveries = [], fetchImpl = fetch, env = process.env }) {
+// latest.json. deliver and the catch-up reporter both call this after they write latest.json, so the page always
+// shows latest.json's device states (a per-run list would vanish on a catch-up re-render).
+export async function publishPages({ s3, policy, slug, latest, fetchImpl = fetch, env = process.env }) {
   const history = historyOf(s3.list(`${slug}/`), policy, slug);
-  s3.putText(appPage({ latest, history, deliveries }), pageKey(slug));
+  s3.putText(appPage({ latest, history }), pageKey(slug));
   await withLock('s3-index', async () => {
     const apps = [];
     for (const app of Object.values(policy.apps)) {

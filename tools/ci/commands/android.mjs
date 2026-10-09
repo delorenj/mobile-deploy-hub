@@ -1,6 +1,8 @@
-// android (Linux): build and check the APK as v3 did, stage it on big-chungus for deliver, drop it in Quickdrop (real
-// runs), then look for the S26 for 30 s: present means `adb install -r` and readback (installed), away means pending.
-// play and release are unchanged: the private Release vX.Y.Z is published after the build checks, S26 or not.
+// android (Linux): build and check the APK as v3 did, stage it on big-chungus for deliver, then look for the S26 for
+// 30 s: present means `adb install -r` and readback (installed), away means pending. Then Quickdrop (real runs, and
+// only while the S26 syncs from the LAN; never over a newer APK). play and release publish after the build checks, S26
+// or not; since v1.1.3 each writes its own receipt, so a failed upload is reported at stage deliver and never turns
+// the S26's delivery into a failure.
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, mkdirSync, statSync } from 'node:fs';
 import { copyFile, mkdir } from 'node:fs/promises';
@@ -16,13 +18,13 @@ import { apkName } from '../lib/latest.mjs';
 import { withLock } from '../lib/lock.mjs';
 import { loadManifest } from '../lib/manifest.mjs';
 import { uploadBundle } from '../lib/play.mjs';
-import { dropApk } from '../lib/quickdrop.mjs';
+import { dropApk, s26OnLan } from '../lib/quickdrop.mjs';
 import { buildReceipt, sha256File, writeReceipt } from '../lib/receipt.mjs';
 import { applyBump, checkAppReceipt, exists, guarded, policyBanner, requirePlan, semver, stagingDir } from './common.mjs';
 
 const notOnAdb = error => /is not on this host's adb server/.test(error.message);
 
-async function androidLane(config, manifest, { env, home, track, policy, log }) {
+async function androidLane(config, manifest, { env, home, track, policy, log, quickdropLink }) {
   const spec = manifest.android ?? (() => { throw new Error('the manifest has no android section'); })();
   const devices = loadDevices(env);
   requirePlan(config);
@@ -70,14 +72,6 @@ async function androidLane(config, manifest, { env, home, track, policy, log }) 
   const staged = { name, bytes, sha256 };
   track.receipt.staged = staged;
   log(`HUB_STAGED ${name} ${bytes} bytes for deliver`);
-
-  // Quickdrop: real runs only. A dry run writes nothing a phone could pick up.
-  let quickdrop = { status: 'skipped', reason: 'dry run' };
-  if (!config.dryRun) {
-    const dropped = dropApk({ apk, dir: join(home, policy.delivery.quickdrop.dir), name, slug: manifest.project.slug, maxBytes: policy.delivery.quickdrop.max_mb * 1_000_000, keep: policy.delivery.quickdrop.keep, log });
-    quickdrop = { status: dropped.status, bytes: dropped.bytes, name: dropped.status === 'written' ? name : null, reason: dropped.status === 'skipped' ? `over the ${policy.delivery.quickdrop.max_mb} MB cap` : null };
-  }
-  track.receipt.quickdrop = quickdrop;
 
   const planned = Number(config.androidCode);
   const delivery = { platform: 'android', target: devices.android.model, device: devices.android.name, version: config.version, build: String(planned), sha256, verified: false, status: 'pending', reason: null };
@@ -130,30 +124,53 @@ async function androidLane(config, manifest, { env, home, track, policy, log }) 
     log(`HUB_S26_INSTALLED ${config.version} (${planned}) over ${was}, sha256 verified`);
   }, { env, timeoutMs: 20 * 60_000 });
 
+  // Quickdrop: real runs only (a dry run writes nothing a phone could pick up), after the S26's own checks, and only
+  // while the S26 syncs from the LAN.
+  let quickdrop = { status: 'skipped', reason: 'dry run' };
+  if (!config.dryRun) {
+    const link = quickdropLink ? await quickdropLink() : await s26OnLan({ deviceId: devices.android.syncthing, lanCidr: policy.mac.lan_cidr, home });
+    if (!link.onLan) {
+      quickdrop = { status: 'deferred', bytes, name: null, reason: link.reason };
+      log(`HUB_QUICKDROP_DEFERRED ${name}: ${link.reason}; Install APK (S3) and the catch-up deliver it`);
+    } else {
+      const dropped = dropApk({ apk, dir: join(home, policy.delivery.quickdrop.dir), name, slug: manifest.project.slug, maxBytes: policy.delivery.quickdrop.max_mb * 1_000_000, keep: policy.delivery.quickdrop.keep, log });
+      quickdrop = { status: dropped.status, bytes: dropped.bytes, name: dropped.status === 'written' ? name : null, reason: dropped.reason ?? null };
+    }
+  }
+  track.receipt.quickdrop = quickdrop;
+
   await writeReceipt(out, buildReceipt({ lane: 'android', config, env, version: config.version, androidCode: config.androidCode, artifacts, signer, notes, delivery, staged, quickdrop }), env);
   return { out, artifact: apk, sha256, signer, delivery, staged, quickdrop };
 }
 
-export async function android(config, { env = process.env, home = homedir(), log = console.log } = {}) {
+export async function android(config, { env = process.env, home = homedir(), log = console.log, quickdropLink = null } = {}) {
   const { policy } = policyBanner(log);
   const manifest = await loadManifest(config.cwd, config.manifest);
-  return guarded('android', join(config.out, 'android'), config, env, track => androidLane(config, manifest, { env, home, track, policy, log }));
+  return guarded('android', join(config.out, 'android'), config, env, track => androidLane(config, manifest, { env, home, track, policy, log, quickdropLink }));
 }
 
+// The Play upload and the Release run as later steps of the android job. Each writes its own receipt (lane android-play,
+// android-release), so a failure there is reported at stage deliver while the android lane's receipt keeps the S26's
+// real delivery (installed or pending).
 export async function play(config, { env = process.env, fetchImpl } = {}) {
-  if (config.dryRun) throw new Error('refusing to contact Play on a dry run');
-  const manifest = await loadManifest(config.cwd, config.manifest);
-  if (!config.play) throw new Error('the play command needs --play true');
-  const spec = manifest.android;
-  if (!spec?.bundle_artifact) throw new Error('the manifest declares no android.bundle_artifact');
-  return uploadBundle({
-    pkg: spec.package,
-    track: config.track,
-    aab: join(config.out, 'android', basename(spec.bundle_artifact)),
-    token: env.PLAY_TOKEN,
-    expectedCode: config.androidCode ? Number(config.androidCode) : undefined,
-    status: config.playStatus,
-    fetchImpl,
+  return guarded('android-play', join(config.out, 'android'), config, env, async track => {
+    track.stage = 'deliver';
+    if (config.dryRun) throw new Error('refusing to contact Play on a dry run');
+    const manifest = await loadManifest(config.cwd, config.manifest);
+    if (!config.play) throw new Error('the play command needs --play true');
+    const spec = manifest.android;
+    if (!spec?.bundle_artifact) throw new Error('the manifest declares no android.bundle_artifact');
+    const uploaded = await uploadBundle({
+      pkg: spec.package,
+      track: config.track,
+      aab: join(config.out, 'android', basename(spec.bundle_artifact)),
+      token: env.PLAY_TOKEN,
+      expectedCode: config.androidCode ? Number(config.androidCode) : undefined,
+      status: config.playStatus,
+      fetchImpl,
+    });
+    await writeReceipt(join(config.out, 'android'), buildReceipt({ lane: 'android-play', config, env, version: config.version, androidCode: config.androidCode, notes: [`Play ${config.track}: uploaded`] }), env);
+    return uploaded;
   });
 }
 
@@ -162,6 +179,15 @@ export function releaseArguments({ tag, repo, sha, title, notes, assets, verifyT
 }
 
 export async function release(config, { env = process.env } = {}) {
+  return guarded('android-release', join(config.out, 'android'), config, env, async track => {
+    track.stage = 'deliver';
+    const done = await releaseLane(config, { env });
+    await writeReceipt(join(config.out, 'android'), buildReceipt({ lane: 'android-release', config, env, version: config.version, androidCode: config.androidCode, notes: [`${done.updated ? 'updated' : 'published'} the private Release ${done.tag}`] }), env);
+    return done;
+  });
+}
+
+async function releaseLane(config, { env }) {
   if (config.dryRun) throw new Error('refusing to publish a release on a dry run');
   const manifest = await loadManifest(config.cwd, config.manifest);
   if (!semver.test(config.version)) throw new Error('release needs the plan version');

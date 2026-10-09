@@ -3,10 +3,13 @@
 // `gh api` at each app's main, so it works from any machine with gh:
 //   - the caller (.github/workflows/deploy.yml) is an accepted copy of templates/deploy.yml (policy callers.accept);
 //   - the manifest is schema 2 and declares every lane the policy gives the app;
-//   - no other workflow uploads builds (gh release create or upload, altool, TestFlight uploads, APK/IPA artifacts);
+//   - no other workflow references the hub at any ref (its reusable workflow or its actions/hub action: a second
+//     caller would run hub code without the gate) or uploads builds (gh release create or upload, altool, TestFlight
+//     uploads, APK/IPA artifacts);
 //   - no mise task tags v*, bumps the version or announces a deploy (the task's run text and the scripts it runs).
-// GitHub Free has no rulesets for these private repos, so this, the global pre-commit guard and the event's hub_ref
-// are what make a deploy around the hub visible. Exceptions are listed below with the reason and when they end.
+// GitHub Free has no rulesets for these private repos, so this (also run by every deploy's gate on its own checkout),
+// the global pre-commit guard and the event's hub_ref are what make a deploy around the hub visible. Exceptions are
+// listed below with the reason, the form they must keep and when they end.
 import { spawnSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,9 +17,16 @@ import { callerHash } from './ci/lib/caller.mjs';
 import { parseManifest } from './ci/lib/manifest.mjs';
 import { loadPolicy } from './ci/lib/policy.mjs';
 
+// A workflow exception holds only while the file keeps its documented form (`when`); a hub reference is never excepted.
+// The trigger keys of a workflow's top-level `on:` block (two-space indented), or null for another form.
+export function triggersOf(text) {
+  const block = /^on:[ \t]*\n((?:[ \t]+[^\n]*\n|[ \t]*\n)*)/m.exec(String(text ?? ''));
+  return block ? [...block[1].matchAll(/^ {2}([\w-]+):/gm)].map(match => match[1]) : null;
+}
+const dispatchOnly = text => { const triggers = triggersOf(text); return Array.isArray(triggers) && triggers.length === 1 && triggers[0] === 'workflow_dispatch'; };
 export const exceptions = Object.freeze({
   'delorenj/pile-of-dumb-things': {
-    '.github/workflows/testflight.yml': 'the pre-hub TestFlight fallback; deleted after the first hub --testflight run (design A3)',
+    '.github/workflows/testflight.yml': { reason: 'the pre-hub TestFlight fallback, dispatched by hand only (no tag trigger); deleted after the first hub --testflight run (design A3)', when: dispatchOnly },
     'task testflight': 'dispatches testflight.yml (above); deleted with it',
   },
   'delorenj/gruvato': {
@@ -55,10 +65,16 @@ export function miseTasks(text) {
 // The repo scripts a task runs (one level deep): scripts/…, tools/…, .mise/scripts/….
 export const scriptsOf = body => [...new Set([...String(body).matchAll(/(?:^|[\s'"/}])((?:scripts|tools|\.mise\/scripts|native\/tools)\/[\w./-]+\.(?:sh|mjs|js|py))/g)].map(match => match[1]))];
 
+// The hub's reusable workflow or its action, at any ref: only deploy.yml may name it.
+export const hubReference = /\bdelorenj\/mobile-deploy-hub\b(?:\/[\w./-]*)?@/;
+
 export function checkWorkflow(repo, path, text) {
   if (path === '.github/workflows/deploy.yml') return [];
-  if (exceptions[repo]?.[path]) return [];
-  return uploadPatterns.filter(([pattern]) => pattern.test(text)).map(([, what]) => `${repo} ${path}: ${what} outside the hub`);
+  const problems = hubReference.test(text) ? [`${repo} ${path}: calls mobile-deploy-hub; only .github/workflows/deploy.yml (the template) may`] : [];
+  const exception = exceptions[repo]?.[path];
+  if (exception && (typeof exception === 'string' || exception.when(text))) return problems;
+  if (exception) problems.push(`${repo} ${path}: the exception holds only in its documented form (${exception.reason})`);
+  return [...problems, ...uploadPatterns.filter(([pattern]) => pattern.test(text)).map(([, what]) => `${repo} ${path}: ${what} outside the hub`)];
 }
 
 export function checkTasks(repo, mise, readScript) {

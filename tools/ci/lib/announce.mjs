@@ -11,12 +11,19 @@
 //
 // "Re-run failed jobs" re-runs announce too, so one deploy can send .failed (attempt 1) and then .completed
 // (attempt 2). Both carry the same correlation (UUIDv5 of repo and run id) and data.run.attempt.
+//
+// v1.1.3: a lane that reached its device keeps that device's real status (installed, pending) when a later step of
+// its job failed (the Release, Play, TestFlight, a receipt upload): the run is .failed at stage deliver, the device is
+// not. A lane that succeeded without a receipt announce can read is failed ("receipt missing"), never a quiet
+// pending. A Mac job that no runner ever picked up (the Mac went away after the gate) makes the iPad skipped. The
+// install buttons carry the download's size.
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { isCredentialVariable } from './config.mjs';
 import { attempt } from './exec.mjs';
+import { megabytes } from './pages.mjs';
 
 const urlNamespace = '6ba7b811-9dad-11d1-80b4-00c04fd430c8';
 
@@ -61,14 +68,28 @@ function failureOf(job, result, receipt, fallbackStage) {
 export const iosSkipReasons = Object.freeze({
   'skip-offline': 'the Mac was offline, so the iPad build was not made',
   'skip-metered': 'the Mac was on a metered link and the iPad build would have gone over its data budget',
+  'skip-lost': 'the Mac went offline after the gate, so the iPad build was not made',
 });
 
+// A failure after a lane reached its device: a later step of the job (the Release, Play, TestFlight, an upload).
+function laterStepFailure(job, result, receipts) {
+  for (const side of [`${job}-release`, `${job}-play`]) {
+    const receipt = receipts[side];
+    if (receipt?.outcome === 'failure') return { job, stage: 'deliver', reason: sanitizeReason(receipt.reason, `the ${side.replace(`${job}-`, '')} step failed`) };
+  }
+  const own = receipts[job];
+  if (own?.outcome === 'failure' && own.stage === 'deliver') return { job, stage: 'deliver', reason: sanitizeReason(own.reason, 'a publishing step failed') };
+  return { job, stage: 'deliver', reason: `a step after the ${job} lane ${result === 'cancelled' ? 'was cancelled' : 'failed'} (the Release, Play or the receipt upload); the device's delivery stands` };
+}
+
 // The deliveries and the outcome, from the job results first and the receipts second. `declared` is every lane the
-// app declares; a lane the run's platform leaves out is listed as skipped.
-export function deliveriesFrom({ declared, platform = 'both', devices, needs, receipts, version, iosLane = 'run' }) {
+// app declares; a lane the run's platform leaves out is listed as skipped. `lostMac` names a Mac job that no runner
+// ever picked up ({job, reason}), from GitHub's record of the run.
+export function deliveriesFrom({ declared, platform = 'both', devices, needs, receipts, version, iosLane = 'run', lostMac = null }) {
   const result = job => needs?.[job]?.result;
   const gateFailure = broke(result('gate')) && failureOf('gate', result('gate'), receipts.gate, 'preflight');
-  const preflightFailure = broke(result('preflight-ios')) && failureOf('preflight-ios', result('preflight-ios'), receipts['preflight-ios'], 'preflight');
+  const preflightLost = lostMac?.job === 'preflight-ios' && broke(result('preflight-ios'));
+  const preflightFailure = broke(result('preflight-ios')) && (preflightLost ? { job: 'preflight-ios', stage: 'preflight', reason: sanitizeReason(lostMac.reason) } : failureOf('preflight-ios', result('preflight-ios'), receipts['preflight-ios'], 'preflight'));
   const planFailure = broke(result('plan')) && failureOf('plan', result('plan'), receipts.plan, 'preflight');
   const exportFailure = broke(result('ios-export')) && failureOf('ios-export', result('ios-export'), receipts['ios-export'], 'build');
   // A refused gate, a failed Mac preflight or a failed plan stops every lane.
@@ -82,15 +103,25 @@ export function deliveriesFrom({ declared, platform = 'both', devices, needs, re
     };
     if (platform !== 'both' && platform !== name) return { delivery: { ...base, status: 'skipped', reason: `--platform ${platform}` } };
     if (name === 'ios' && iosSkipReasons[iosLane] && !gateFailure) return { delivery: { ...base, status: 'skipped', reason: iosSkipReasons[iosLane] } };
-    if (ok(result(job))) {
+    if (name === 'ios' && lostMac?.job === 'ios' && !receipt && broke(result(job))) return { delivery: { ...base, status: 'skipped', reason: sanitizeReason(lostMac.reason) } };
+    const outcome = result(job);
+    // The lane reached its device: its receipt is a success, or it failed only at a publishing step (stage deliver).
+    const reached = receipt?.outcome === 'success' || (receipt?.outcome === 'failure' && receipt.stage === 'deliver');
+    if (ok(outcome) && !receipt) {
+      const failure = { job, stage: 'deliver', reason: `the ${job} job succeeded but its receipt is missing (the artifact did not download); the device's state is unknown` };
+      return { delivery: { ...base, status: 'failed', stage: failure.stage, reason: failure.reason }, failure };
+    }
+    if (ok(outcome) || (broke(outcome) && reached)) {
       const status = deliveryStatuses.includes(from.status) ? from.status : (from.verified === true ? 'installed' : 'pending');
       const delivery = { ...base, status, verified: status === 'installed' };
       if (from.reason && status !== 'installed') delivery.reason = sanitizeReason(from.reason);
+      if (status === 'failed' && from.stage) delivery.stage = from.stage;
       if (status === 'installed') delivery.by = 'deploy';
-      return { delivery };
+      const failure = broke(outcome) ? laterStepFailure(job, outcome, receipts) : (status === 'failed' ? { job, stage: stages.includes(receipt?.stage) ? receipt.stage : 'install', reason: sanitizeReason(from.reason ?? receipt?.reason, `the ${name === 'android' ? 'S26' : 'iPad'} refused the build`) } : null);
+      return failure ? { delivery, failure } : { delivery };
     }
     let failure;
-    if (broke(result(job))) failure = failureOf(job, result(job), receipt, 'install');
+    if (broke(outcome)) failure = failureOf(job, outcome, receipt, 'install');
     else failure = (name === 'ios' && exportFailure) || upstream || { job, stage: 'preflight', reason: `the ${job} job did not run` };
     return { delivery: { ...base, status: 'failed', stage: failure.stage, reason: failure.reason }, failure };
   };
@@ -98,10 +129,14 @@ export function deliveriesFrom({ declared, platform = 'both', devices, needs, re
     ...(declared.android ? [lane('android', 'android', devices.android)] : []),
     ...(declared.ios ? [lane('ios', 'ios', devices.ios)] : []),
   ];
-  const deliverFailure = broke(result('deliver')) && failureOf('deliver', result('deliver'), receipts.deliver, 'deliver');
+  const deliverFailure = ['deliver', 'deliver-android', 'deliver-ios'].map(job => broke(result(job)) && failureOf(job, result(job), receipts[job], 'deliver')).find(Boolean) || null;
   const failure = upstream || exportFailure || lanes.find(entry => entry.failure)?.failure || deliverFailure || null;
   return { deliveries: lanes.map(entry => entry.delivery), failure };
 }
+
+// "Install APK (74.7 MB)": the size rides in the label (at most 32 characters), so a phone on cellular sees it before
+// the tap, whatever the notifier does.
+const sized = (label, bytes) => (Number.isSafeInteger(bytes) && bytes > 0 ? `${label} (${megabytes(bytes)})` : label);
 
 // G1: what the notification can offer, from what deliver published.
 export function linksFor({ type, published, runUrl, deliveries, trigger = 'deploy' }) {
@@ -109,8 +144,8 @@ export function linksFor({ type, published, runUrl, deliveries, trigger = 'deplo
   const ipad = deliveries.find(item => item.platform === 'ios');
   if (type.endsWith('.completed')) {
     if (trigger === 'deploy') {
-      if (published?.apk) links.push({ rel: 'apk', label: 'Install APK', url: published.apk });
-      if (published?.ota && ipad?.status !== 'installed') links.push({ rel: 'ota', label: 'Install on iPad', url: published.ota });
+      if (published?.apk) links.push({ rel: 'apk', label: sized('Install APK', published.apk_bytes), url: published.apk });
+      if (published?.ota && ipad?.status !== 'installed') links.push({ rel: 'ota', label: sized('Install on iPad', published.ipa_bytes), url: published.ota });
     }
     if (published?.page) links.push({ rel: 'page', label: 'Builds', url: published.page });
     if (runUrl && trigger === 'deploy') links.push({ rel: 'run', label: 'Run', url: runUrl });
@@ -133,8 +168,8 @@ export function summaryOf({ name, version, androidCode, commit, deliveries, veri
   return line.length > 200 ? `${line.slice(0, 199)}…` : line;
 }
 
-export function deploymentEvent({ project, declared, platform = 'both', devices, needs, receipts, version, androidCode, commit, iosLane = 'run', published = null, env = process.env, now = new Date(), extras = [] }) {
-  const { deliveries, failure } = deliveriesFrom({ declared, platform, devices, needs, receipts, version, iosLane });
+export function deploymentEvent({ project, declared, platform = 'both', devices, needs, receipts, version, androidCode, commit, iosLane = 'run', published = null, env = process.env, now = new Date(), extras = [], lostMac = null }) {
+  const { deliveries, failure } = deliveriesFrom({ declared, platform, devices, needs, receipts, version, iosLane, lostMac });
   const scope = { android: deliveries.some(item => item.platform === 'android'), ios: deliveries.some(item => item.platform === 'ios') };
   const built = { android: declared.android && (platform === 'both' || platform === 'android'), ios: declared.ios && (platform === 'both' || platform === 'ios') };
   const target = targetOf(scope.android || scope.ios ? scope : { android: true, ios: false }, devices);

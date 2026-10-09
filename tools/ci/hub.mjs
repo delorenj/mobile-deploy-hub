@@ -16,7 +16,9 @@
 //   announce       the event (real) or `bb-emit --check` of it (dry run), with statuses and download links
 //
 // Hooks come from the app's committed manifest and run under bash in the app root. Nothing here reads a hook, a ref
-// or a command from an event payload, and no rule comes from an input: the policy is the file at the hub tag.
+// or a command from an event payload, and no rule comes from an input: the policy is the file at the hub tag. Inside
+// a workflow job every command first checks that the run was started by the app's own deploy.yml (checkCallerRef),
+// so a second workflow that `uses:` this action or the reusable workflow does nothing.
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { android, play, release, releaseArguments } from './commands/android.mjs';
@@ -25,12 +27,15 @@ import { deliver, mergeLatest } from './commands/deliver.mjs';
 import { checkManifest, checkRun, gate } from './commands/gate.mjs';
 import { ios, iosExport, keepInOutbox, newerOnDevice } from './commands/ios.mjs';
 import { plan, preflightIos, sampleEvent } from './commands/plan.mjs';
+import { checkCallerRef } from './lib/caller.mjs';
 import { parseConfig } from './lib/config.mjs';
+import { loadPolicy } from './lib/policy.mjs';
 
 export { android, announce, checkManifest, checkRun, deliver, gate, ios, iosExport, keepInOutbox, mergeLatest, newerOnDevice, plan, play, preflightIos, release, releaseArguments, sampleEvent };
 
 export async function main(argv = process.argv.slice(2), env = process.env) {
   const config = parseConfig(argv, env);
+  checkCallerRef({ policy: loadPolicy().policy, env });
   const commands = { gate, 'preflight-ios': preflightIos, plan, android, play, release, 'ios-export': iosExport, ios, deliver, announce };
   return commands[config.command](config, { env });
 }

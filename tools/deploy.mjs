@@ -145,9 +145,12 @@ export async function checkPhone({ adb, log = console.log, sleep = ms => new Pro
   }
 }
 
+// A real run's receipts (artifacts) and big-chungus staging last 7 days; a rerun after that would publish nothing.
+export const rerunWindowDays = 7;
+
 export async function deploy(options, {
   gh, git, adb = null, host = hostname(), prompt = null, cwd = process.cwd(),
-  sleep = ms => new Promise(done => setTimeout(done, ms)), log = console.log, timeoutMs = 120_000, pollMs = 3000,
+  sleep = ms => new Promise(done => setTimeout(done, ms)), log = console.log, timeoutMs = 120_000, pollMs = 3000, now = Date.now,
 }) {
   const dispatch = dispatchArguments(options);
   if (options.print) {
@@ -195,7 +198,10 @@ export async function deploy(options, {
   const before = runs();
   if (!options.dryRun) {
     const last = lastRealRun(before);
-    if (last && last.status === 'completed' && last.conclusion !== 'success') {
+    const ageDays = last ? (now() - Date.parse(last.createdAt ?? '')) / 86_400_000 : 0;
+    if (last && last.status === 'completed' && last.conclusion !== 'success' && !(ageDays < rerunWindowDays)) {
+      log(`DEPLOY_LAST_REAL_RED ${last.databaseId} ${last.conclusion} ${last.url}: ${Number.isFinite(ageDays) ? `${Math.floor(ageDays)} days old` : 'of unknown age'}, past the ${rerunWindowDays}-day window of its receipts and staging, so a rerun would publish nothing; this deploy is a new version`);
+    } else if (last && last.status === 'completed' && last.conclusion !== 'success') {
       log(`DEPLOY_LAST_REAL_RED ${last.databaseId} ${last.conclusion} ${last.url}: \`gh run rerun ${last.databaseId} --failed\` finishes it (same version, same commit); the catch-up converges the devices either way`);
       const rerun = prompt ? /^y(es)?$/i.test((await prompt(`The last real deploy (${last.url}) is red. Re-run its failed jobs instead of a new deploy? [y/N] `)).trim()) : false;
       if (rerun) {

@@ -10,8 +10,15 @@
 //            writes nothing and sends nothing. A host without a mode file is in watch mode.
 //
 // The guarantees are a deploy's: installs are in place only (adb install -r, devicectl device install app), never
-// over a newer build, only after the bytes match latest.json (sha256, and on Android the signer and identity), and
-// every install is read back. One event per status change, none for a device the deploy itself installed.
+// over a newer build, only after the bytes match latest.json (sha256) and the policy's pins (on Android the package and
+// the signer, on iOS the bundle: a latest.json that disagrees with the policy is refused, whoever wrote it), and every
+// install is read back. One event per status change, none for a device the deploy itself installed.
+//
+// v1.1.3: a deploy in flight holds every pending build of that app at or below its version, on both passes (an older
+// build is never installed minutes before the deploy installs a newer one); a device in use waits for the next pass
+// (the S26 while the app is on top with the screen on; the iPad while the app runs, for up to 45 minutes, since
+// devicectl cannot tell the foreground); the Mac reads its pointers with a strong ETag (a weak one never revalidates)
+// and over ssh from big-chungus when https://s3.delo.sh does not answer.
 //
 // latest.json is the hub's contract (tools/ci/lib/latest.mjs parses, validates and updates it); the rules come from
 // tools/ci/policy.json at the code this runs; writes go through the hub's builds writer (tools/ci/lib/s3.mjs).
@@ -25,7 +32,7 @@ import { sanitizeReason } from '../ci/lib/announce.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
 import { createDevicectl, createIpad } from '../ci/lib/devicectl.mjs';
 import { runBounded } from '../ci/lib/exec.mjs';
-import { apkKey, compareRelease, inflightKey, ipaKey, latestKey, platforms, serializeLatest, updateDevice, validateLatest } from '../ci/lib/latest.mjs';
+import { apkKey, compareRelease, compareSemver, inflightKey, ipaKey, latestKey, platforms, serializeLatest, updateDevice, validateLatest } from '../ci/lib/latest.mjs';
 import { withLock } from '../ci/lib/lock.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { sha256File } from '../ci/lib/receipt.mjs';
@@ -41,6 +48,8 @@ const slugPattern = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 const buildPattern = /^[0-9][0-9.]{0,39}$/;
 const reasonPattern = /^[\w .,:;()+=#@%<>-]{1,300}$/;
 const inflightStaleMs = 6 * 3600_000;
+// How long the iPad pass waits while the app runs (devicectl cannot tell a game on screen from a suspended one).
+export const iosBusyCapMs = 45 * 60_000;
 
 const stamp = date => date.toISOString().replace(/\.\d{3}Z$/, 'Z');
 const oneLine = error => sanitizeReason(error?.message ?? error, 'failed').replace(/\s+/g, ' ').slice(0, 240);
@@ -54,7 +63,8 @@ const releaseOf = (platform, version, build) => (platform === 'android' ? { vers
 export function settingsFrom(policy) {
   const { s3 } = policy.delivery;
   return {
-    apps: Object.entries(policy.apps).map(([repo, app]) => ({ repo, slug: app.slug, lanes: app.lanes })),
+    // Each app's pins (android: package, signer_sha256; ios: bundle) come with it: latest.json must agree with them.
+    apps: Object.entries(policy.apps).map(([repo, app]) => ({ repo, slug: app.slug, lanes: app.lanes, android: app.android ?? null, ios: app.ios ?? null })),
     policy,
     bucket: s3.bucket,
     publicRoot: s3.public,
@@ -91,8 +101,9 @@ export function inCidr(address, cidr) {
 // ---------------------------------------------------------------------------------------------------- latest.json
 
 // The hub's validator, plus what the catch-up needs on top: each key names exactly that release's file (the
-// download URL is built from the key, never taken from the url field).
-export function latestProblems(latest, slug, base) {
+// download URL is built from the key, never taken from the url field), and the package, signer and bundle are the
+// policy's pins (`app`), so a latest.json written by anyone else cannot point a device at another app or another key.
+export function latestProblems(latest, slug, base, app = null) {
   try {
     validateLatest(latest, { slug, base });
   } catch (error) {
@@ -101,6 +112,17 @@ export function latestProblems(latest, slug, base) {
   const problems = [];
   if (latest.android && latest.android.key !== apkKey(slug, latest.android.version, latest.android.code)) problems.push('android.key does not name this release\'s APK');
   if (latest.ios?.key && latest.ios.key !== ipaKey(slug, latest.ios.version, latest.ios.build)) problems.push('ios.key does not name this release\'s IPA');
+  if (app && latest.android) {
+    if (!app.android) problems.push('the policy pins no Android package for this app');
+    else {
+      if (latest.android.package !== app.android.package) problems.push(`android.package ${latest.android.package} is not the policy's ${app.android.package}`);
+      if (latest.android.signer_sha256 !== app.android.signer_sha256) problems.push('android.signer_sha256 is not the policy\'s signer');
+    }
+  }
+  if (app && latest.ios) {
+    if (!app.ios) problems.push('the policy pins no iOS bundle for this app');
+    else if (latest.ios.bundle !== app.ios.bundle) problems.push(`ios.bundle ${latest.ios.bundle} is not the policy's ${app.ios.bundle}`);
+  }
   return problems;
 }
 
@@ -175,7 +197,18 @@ export function createJournal({ env = process.env, home = homedir(), now = () =>
     put(slug, platform, block) {
       const document = read();
       document.installs = { ...document.installs, [`${slug}/${platform}`]: { version: block.version, build: buildOf(block, platform), sha256: block.sha256, at: stamp(now()) } };
+      if (document.busy) delete document.busy[`${slug}/${platform}`];
       writeAtomic(path, `${JSON.stringify(document, null, 2)}\n`);
+    },
+    // When this build was first found in use on the device (kept until it is installed), in milliseconds.
+    busySince(slug, platform, block) {
+      const document = read();
+      const key = `${slug}/${platform}`;
+      const entry = document.busy?.[key];
+      if (entry && entry.version === block.version && entry.build === buildOf(block, platform) && Number.isFinite(Date.parse(entry.since))) return Date.parse(entry.since);
+      document.busy = { ...document.busy, [key]: { version: block.version, build: buildOf(block, platform), since: stamp(now()) } };
+      writeAtomic(path, `${JSON.stringify(document, null, 2)}\n`);
+      return now().getTime();
     },
   };
 }
@@ -263,7 +296,7 @@ async function readApps(ctx, platform) {
       continue;
     }
     if (!latest) { quiet.push(`${app.slug} unpublished`); continue; }
-    const problems = latestProblems(latest, app.slug, ctx.settings.publicRoot);
+    const problems = latestProblems(latest, app.slug, ctx.settings.publicRoot, app);
     if (problems.length > 0) {
       errors += 1;
       ctx.log(`HUB_CATCHUP_ERROR ${app.slug}: latest.json refused (${problems.join('; ')})`);
@@ -303,9 +336,13 @@ async function androidApp(ctx, item, id) {
       reinstall = true;
     }
     const over = reinstall ? `${plan.was} (other bytes of the same code, replaced in place)` : plan.was;
+    // adb install -r closes a running app: a kid playing (the app on top, the screen on) waits for the next pass.
+    let playing = false;
+    try { playing = typeof ctx.adb.inUse === 'function' && ctx.adb.inUse(id, pkg) === true; } catch { playing = false; }
+    if (playing) return outcome(item, 'android', 'idle', { message: `${pkg} is on screen on the S26; the install waits for a pass when it is not in use` });
     if (ctx.mode !== 'live') return outcome(item, 'android', 'would-install', { message: `${describe(block.version, block.code)} over ${over} from ${ctx.store.url(block.key)} (${block.bytes} bytes), after sha256 and signer checks` });
     const apk = await ctx.fetchApk(item.app.slug, block);
-    ctx.checkApk(apk, block);
+    ctx.checkApk(apk, block, item.app);
     try { ctx.adb.install(id, apk); } catch (error) { throw stageError('install', error.message); }
     const after = ctx.adb.installed(id, pkg);
     if (!after || after.versionCode !== block.code || after.versionName !== block.version) throw stageError('verify', `readback: the S26 reports ${after ? describe(after.versionName, after.versionCode) : 'no package'}, expected ${describe(block.version, block.code)}`);
@@ -318,19 +355,23 @@ async function androidApp(ctx, item, id) {
   }
 }
 
-// A deploy that is publishing this very version (between its plan and its deliver) owns it. An inflight file left by
-// a deploy that died more than six hours ago no longer holds the device back.
-function inflightHolds(inflight, block, now) {
-  if (!inflight || inflight.version !== block.version) return false;
+// A deploy between its plan and its deliver owns the app's device on the platforms it builds: every pending build at or
+// below its version waits (an older build is never installed minutes before the deploy installs the newer one). An
+// inflight file left by a deploy that died more than six hours ago no longer holds the device back.
+export function inflightHolds(inflight, block, now, platform) {
+  if (!inflight || !semver.test(inflight.version ?? '')) return false;
+  if (Array.isArray(inflight.platforms) && platform && !inflight.platforms.includes(platform)) return false;
+  let atOrBelow = false;
+  try { atOrBelow = compareSemver(block.version, inflight.version) <= 0; } catch { return false; }
+  if (!atOrBelow) return false;
   const since = Date.parse(inflight.started_at ?? inflight.lastModified ?? '');
   return !Number.isFinite(since) || now.getTime() - since < inflightStaleMs;
 }
 
-export async function androidPass(ctx) {
-  const { work: listed, quiet, errors: readErrors, resend } = await readApps(ctx, 'android');
-  let errors = readErrors;
-  for (const { app, platform } of resend) if (!await resendEvent(ctx, app, platform)) errors += 1;
+// The pending builds no deploy is publishing right now; the others are logged and left for a later pass.
+async function notInFlight(ctx, listed, platform) {
   const work = [];
+  let errors = 0;
   for (const item of listed) {
     let inflight;
     try {
@@ -340,12 +381,22 @@ export async function androidPass(ctx) {
       ctx.log(`HUB_CATCHUP_ERROR ${item.app.slug}: cannot read inflight.json (${oneLine(error)}); not touching it this pass`);
       continue;
     }
-    if (inflightHolds(inflight, item.block, ctx.now())) {
-      ctx.log(`HUB_CATCHUP_IDLE ${item.app.slug} android ${describe(item.block.version, item.block.code)}: deploy run ${inflight.run?.id ?? inflight.run ?? '?'} is publishing that version`);
+    if (inflightHolds(inflight, item.block, ctx.now(), platform)) {
+      ctx.log(`HUB_CATCHUP_IDLE ${item.app.slug} ${platform} ${describe(item.block.version, buildOf(item.block, platform))}: deploy run ${inflight.run?.id ?? inflight.run ?? '?'} is publishing ${inflight.version}`);
       continue;
     }
     work.push(item);
   }
+  return { work, errors };
+}
+
+export async function androidPass(ctx) {
+  const { work: listed, quiet, errors: readErrors, resend } = await readApps(ctx, 'android');
+  let errors = readErrors;
+  for (const { app, platform } of resend) if (!await resendEvent(ctx, app, platform)) errors += 1;
+  const held = await notInFlight(ctx, listed, 'android');
+  const { work } = held;
+  errors += held.errors;
   if (work.length === 0) {
     if (listed.length === 0) ctx.log(`HUB_CATCHUP_IDLE android ${ctx.mode}: nothing pending (${quiet.join(', ') || 'no apps'})`);
     return { errors, results: [] };
@@ -406,7 +457,16 @@ async function iosApp(ctx, item) {
       if (ctx.mode !== 'live') return outcome(item, 'ios', 'would-install', { message: `${describe(block.version, block.build)} over ${plan.was}, after downloading ${from} (${block.bytes ?? '?'} bytes)` });
       ipa = await ctx.fetchIpa(app.slug, block);
     }
-    if (ctx.mode !== 'live') return outcome(item, 'ios', 'would-install', { message: `${describe(block.version, block.build)} over ${plan.was} from ${from} (sha256 matches)` });
+    // devicectl install closes a running app, and devicectl cannot tell a game on screen from a suspended one: while the
+    // app runs, wait (up to iosBusyCapMs from the first sighting, so a suspended app cannot hold the iPad forever).
+    let running = false;
+    try { running = typeof ctx.ipad.running === 'function' && ctx.ipad.running(block.bundle) === true; } catch { running = false; }
+    if (running && ctx.mode === 'live') {
+      const waited = ctx.now().getTime() - ctx.journal.busySince(app.slug, 'ios', block);
+      if (waited < iosBusyCapMs) return outcome(item, 'ios', 'idle', { message: `${block.bundle} is running on the iPad; the install waits for a pass when it is closed (${Math.floor(waited / 60_000)} of ${iosBusyCapMs / 60_000} minutes)` });
+      ctx.log(`HUB_CATCHUP_BUSY ${app.slug} ios: ${block.bundle} has been running for ${Math.floor(waited / 60_000)} minutes; installing now`);
+    }
+    if (ctx.mode !== 'live') return outcome(item, 'ios', 'would-install', { message: `${describe(block.version, block.build)} over ${plan.was} from ${from} (sha256 matches)${running ? '; it would wait while the app runs' : ''}` });
     const unpacked = ctx.unpackIpa(ipa);
     try {
       if (unpacked.bundle !== block.bundle || unpacked.version !== block.version || unpacked.build !== block.build) throw stageError('install', `the IPA is ${unpacked.bundle} ${describe(unpacked.version, unpacked.build)}, latest.json names ${block.bundle} ${describe(block.version, block.build)}`);
@@ -427,12 +487,16 @@ async function iosApp(ctx, item) {
 }
 
 export async function iosPass(ctx) {
-  const { work, quiet, errors: readErrors } = await readApps(ctx, 'ios');
+  const { work: listed, quiet, errors: readErrors } = await readApps(ctx, 'ios');
   let errors = readErrors;
-  if (work.length === 0) {
+  if (listed.length === 0) {
     ctx.log(`HUB_CATCHUP_IDLE ios ${ctx.mode}: nothing pending (${quiet.join(', ') || 'no apps'})`);
     return { errors, results: [] };
   }
+  const held = await notInFlight(ctx, listed, 'ios');
+  const { work } = held;
+  errors += held.errors;
+  if (work.length === 0) return { errors, results: [] };
   const pending = work.map(item => `${item.app.slug} ${describe(item.block.version, item.block.build)}`).join(', ');
   let results = null;
   try {
@@ -514,7 +578,7 @@ export async function record(ctx, facts) {
     const where = `${facts.slug} ${facts.platform} ${describe(facts.version, facts.build)}`;
     const latest = await ctx.store.latest(facts.slug, { fresh: true });
     if (!latest) throw new Error(`builds/${latestKey(facts.slug)} is gone`);
-    const problems = latestProblems(latest, facts.slug, ctx.settings.publicRoot);
+    const problems = latestProblems(latest, facts.slug, ctx.settings.publicRoot, app);
     if (problems.length > 0) throw new Error(`builds/${latestKey(facts.slug)} refused (${problems.join('; ')})`);
     const block = latest[facts.platform];
     const sameRelease = Boolean(block) && block.version === facts.version && buildOf(block, facts.platform) === String(facts.build);
@@ -576,7 +640,7 @@ async function resendEvent(ctx, app, platform) {
   try {
     return await ctx.lock(`s3-${app.slug}`, async () => {
       const latest = await ctx.store.latest(app.slug, { fresh: true });
-      if (!latest?.[platform]?.device?.event_pending || latestProblems(latest, app.slug, ctx.settings.publicRoot).length > 0) return true;
+      if (!latest?.[platform]?.device?.event_pending || latestProblems(latest, app.slug, ctx.settings.publicRoot, app).length > 0) return true;
       return flushEvent(ctx, app.slug, latest, platform);
     }, { timeoutMs: 60_000, pollMs: 250 });
   } catch (error) {
@@ -763,14 +827,19 @@ export function linuxContext({
       if (got.downloaded > 0) log(`HUB_CATCHUP_FETCHED ${slug} android ${basename(dest)} ${got.downloaded} bytes over loopback, sha256 matches`);
       return got.path;
     },
-    checkApk: (apk, block) => {
+    // The signer and the package are the policy's pins, never latest.json's alone: whoever can write latest.json cannot
+    // point the S26 at an APK signed with another key.
+    checkApk: (apk, block, app) => {
+      const pin = app?.android ?? settings.apps.find(entry => entry.package === block.package)?.android ?? null;
+      if (!pin) throw stageError('install', `the policy pins no Android package and signer for ${block.package}`);
+      if (block.package !== pin.package || block.signer_sha256 !== pin.signer_sha256) throw stageError('install', `latest.json names ${block.package} and a signer that are not the policy's pins`);
       try {
-        verifySigner({ apk, expected: block.signer_sha256, env, home });
+        verifySigner({ apk, expected: pin.signer_sha256, env, home });
       } catch (error) {
         throw stageError('install', error.message);
       }
       const identity = apkIdentity({ apk, env, home });
-      if (identity.package !== block.package || identity.versionCode !== block.code || identity.versionName !== block.version) throw stageError('install', `the APK is ${identity.package} ${describe(identity.versionName, identity.versionCode)}, latest.json names ${block.package} ${describe(block.version, block.code)}`);
+      if (identity.package !== pin.package || identity.versionCode !== block.code || identity.versionName !== block.version) throw stageError('install', `the APK is ${identity.package} ${describe(identity.versionName, identity.versionCode)}, the policy and latest.json name ${pin.package} ${describe(block.version, block.code)}`);
     },
     emit,
   };
@@ -809,6 +878,31 @@ export function unpackIpa(ipa, { run = runBounded, env = process.env } = {}) {
   }
 }
 
+// A pointer read over ssh from big-chungus: `curl` of its loopback MinIO, with the HTTP status on the last line. null for
+// a missing object, as the https read gives.
+export function readOverSsh({ host, url, run = runBounded, env = process.env }) {
+  if (!/^[A-Za-z0-9.-]+$/.test(host ?? '') || !/^http:\/\/127\.0\.0\.1:\d+\/[a-z0-9.-]+\/[a-z0-9][a-z0-9-]*\/(latest|inflight)\.json$/.test(url)) throw new Error(`refusing to read ${url} over ssh`);
+  const out = run('/usr/bin/ssh', ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20', host, `curl -s --max-time 20 -w '\\n%{http_code}' '${url}'`], { env, timeout: 60_000, label: `ssh ${host} curl` });
+  const lines = String(out).replace(/\n+$/, '').split('\n');
+  const code = lines.pop();
+  if (code === '404') return null;
+  if (code !== '200') throw new Error(`${host} read ${url}: HTTP ${code}`);
+  return JSON.parse(lines.join('\n'));
+}
+
+// The store's pointer reads, with a second path when the first one fails (not when it answers 404).
+export function withFallback(store, { read, log, host }) {
+  const fallback = async (key, error) => {
+    log(`HUB_CATCHUP_FALLBACK ${key}: ${oneLine(error).slice(0, 120)}; reading it over ssh from ${host}`);
+    return read(key);
+  };
+  return {
+    ...store,
+    latest: async (slug, options) => { try { return await store.latest(slug, options); } catch (error) { return fallback(latestKey(slug), error); } },
+    inflight: async slug => { try { return await store.inflight(slug); } catch (error) { return fallback(inflightKey(slug), error); } },
+  };
+}
+
 // The Mac: the iPad pass. It reads through https://s3.delo.sh, installs from the outbox the ios job filled, and
 // reports to big-chungus over ssh (only big-chungus writes latest.json and talks to the bus).
 export function macContext({
@@ -828,8 +922,14 @@ export function macContext({
 } = {}) {
   const cache = join(home, 'Library/Caches/mobile-deploy-hub/catchup');
   const outbox = join(home, devices.mac?.outbox ?? 'Library/Caches/mobile-deploy-hub/outbox');
-  const store = createStore({ root: settings.publicRoot, fetchImpl, cacheDir: cache });
   const linuxHost = devices.linux?.host ?? 'big-chungus';
+  // When https://s3.delo.sh does not answer (Cloudflare or the home WAN down, both devices at home), the same pointer
+  // is read over ssh from big-chungus's loopback port.
+  const store = withFallback(createStore({ root: settings.publicRoot, fetchImpl, cacheDir: cache }), {
+    read: key => readOverSsh({ host: linuxHost, url: `${settings.loopbackRoot}/${key}`, run, env }),
+    log,
+    host: linuxHost,
+  });
   return {
     ...base({ env, home, log, now, settings, devices, lockWaitMs }),
     store,

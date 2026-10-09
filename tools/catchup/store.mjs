@@ -13,12 +13,18 @@ const maxJsonBytes = 1_000_000;
 
 // GET a small JSON object. null when it does not exist (nothing published yet). With a cache file, the request
 // carries If-None-Match and a 304 reuses the cached body, so a pass over a metered link costs headers only.
+//
+// The tag must be the strong one: Cloudflare compresses a response for a client that accepts br or gzip and then
+// answers with a weak W/"..." tag, and MinIO never matches a weak tag, so every pass downloaded the file again. The
+// pointers are asked for uncompressed (they are a few KB), and any W/ left is stripped before it is sent back.
+export const strongTag = tag => (typeof tag === 'string' && tag ? tag.replace(/^W\//, '') : null);
+
 export async function readJson(url, { fetchImpl = globalThis.fetch, timeoutMs = 20_000, cacheFile } = {}) {
   let cached = null;
   if (cacheFile) {
     try { cached = JSON.parse(readFileSync(cacheFile, 'utf8')); } catch { cached = null; }
   }
-  const headers = cached?.etag ? { 'if-none-match': cached.etag } : {};
+  const headers = { 'accept-encoding': 'identity', ...(strongTag(cached?.etag) ? { 'if-none-match': strongTag(cached.etag) } : {}) };
   const response = await fetchImpl(url, { headers, redirect: 'error', signal: AbortSignal.timeout(timeoutMs) });
   if (response.status === 304 && cached) return { value: cached.value, etag: cached.etag, lastModified: cached.lastModified ?? null, cached: true };
   if (response.status === 404) {
@@ -34,7 +40,7 @@ export async function readJson(url, { fetchImpl = globalThis.fetch, timeoutMs = 
   if (text.length > maxJsonBytes) throw new Error(`GET ${url}: ${text.length} bytes is not a pointer file`);
   let value;
   try { value = JSON.parse(text); } catch { throw new Error(`GET ${url}: not JSON`); }
-  const result = { value, etag: response.headers.get('etag'), lastModified: response.headers.get('last-modified'), cached: false };
+  const result = { value, etag: strongTag(response.headers.get('etag')), lastModified: response.headers.get('last-modified'), cached: false };
   if (cacheFile && result.etag) {
     mkdirSync(dirname(cacheFile), { recursive: true });
     writeFileSync(cacheFile, JSON.stringify({ etag: result.etag, lastModified: result.lastModified, value }));
@@ -78,7 +84,7 @@ export function createStore({ root, writer = null, fetchImpl = globalThis.fetch,
     url,
     latest: async (slug, { fresh = false } = {}) => (await readJson(url(latestKey(slug)), { fetchImpl, cacheFile: !fresh && cacheDir ? join(cacheDir, `${slug}-latest.json`) : undefined }))?.value ?? null,
     inflight: async slug => {
-      const found = await readJson(url(inflightKey(slug)), { fetchImpl });
+      const found = await readJson(url(inflightKey(slug)), { fetchImpl, cacheFile: cacheDir ? join(cacheDir, `${slug}-inflight.json`) : undefined });
       return found ? { ...found.value, lastModified: found.lastModified } : null;
     },
     writeLatest: async (slug, latest) => {

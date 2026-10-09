@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "android": { "name": "S26", "model": "SM-S948U", "serial": "R5GL43A7PCH" },
+  "android": { "name": "S26", "model": "SM-S948U", "serial": "R5GL43A7PCH", "syncthing": "E4JJGC4-5F27HSO-6BHIVSC-D2Y3VMK-3EARAUC-CUI7I7Z-IH4IFKC-27QEFQQ" },
   "ios": { "name": "iPad", "model": "iPad14,5", "udid": "00008112-000138390CFB401E" },
   "apple": { "team": "YJ7W7Z36FP", "dev_signer_sha1": "FA11A63DB5E856366C0F8723577CFE8FC4479478", "profile_min_days": 30 },
   "mac": {
@@ -9,7 +9,12 @@
     "handoff_dir": "Library/Caches/mobile-deploy-hub/handoff",
     "handoff_cache": "Library/Caches/mobile-deploy-hub/handoff-cache",
     "outbox": "Library/Caches/mobile-deploy-hub/outbox",
-    "min_free_gib": 15
+    "min_free_gib": 15,
+    "runners": {
+      "delorenj/pile-of-dumb-things": { "name": "carries-macbook-air", "dir": "actions-runner" },
+      "delorenj/green-in-between": { "name": "delonet-gib-mac-r1", "dir": "actions-runner/gib" },
+      "delorenj/gruvato": { "name": "mommymac-gruvato", "dir": "actions-runner/gruvato" }
+    }
   },
   "linux": { "host": "big-chungus", "staging_dir": ".cache/mobile-deploy-hub/staging" }
 }

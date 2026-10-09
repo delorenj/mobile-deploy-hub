@@ -2,6 +2,11 @@
 // preflight still fails on signing, profile or disk; an unreachable iPad is ipad_version=unreachable. The plan waits
 // for the S26 (android_wait_s), then goes ahead without it; it refuses a planned Android code at or below the phone's
 // or the newest published one (latest.json), and an iPad that already runs something newer, before any bump.
+// v1.1.3: inside a job it hashes the caller again (it spends the version), refuses a manifest that changed on main
+// since the dispatched commit (the bump lands on main's newest tip, which the gate never saw), and probes the Mac once
+// more right before the iPad lane: a Mac that went away after the gate turns the lane into skip-lost instead of a job
+// that waits 24 hours for its runner.
+import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { createAdb, findPhone } from '../lib/adb.mjs';
@@ -18,7 +23,9 @@ import { loadManifest } from '../lib/manifest.mjs';
 import { buildReceipt, setOutputs, writeReceipt } from '../lib/receipt.mjs';
 import { jobWriter, readObject } from '../lib/s3.mjs';
 import { parseVersionInfo } from '../lib/version.mjs';
-import { checkDisk, checkSecrets, firstLine, guarded, isoNow, policyBanner, reachIpad, runOf, short } from './common.mjs';
+import { checkCaller, refusal } from '../lib/caller.mjs';
+import { checkDisk, checkSecrets, firstLine, guarded, isoNow, policyBanner, reachIpad, readMacLink, runOf, short } from './common.mjs';
+import { callerReader, checkPins } from './gate.mjs';
 
 // ---------------------------------------------------------------------------------------------------- preflight-ios
 
@@ -60,8 +67,8 @@ export async function preflightIos(config, { env = process.env, home = homedir()
       }
     }
     if (state === 'unreachable') {
-      log(`HUB_IPAD_PENDING ${reach.reason}; the run goes on and the iPad delivery will be pending`);
-      notes.push(`iPad ${devices.ios.model}: unreachable (${reach.reason}); pending`);
+      log(`HUB_IPAD_PENDING ${reach.detail ?? reach.reason}; the run goes on and the iPad delivery will be pending`);
+      notes.push(`iPad ${devices.ios.model}: unreachable (${reach.detail ?? reach.reason}); pending`);
     } else {
       notes.push(`iPad ${devices.ios.model} (iOS ${reach.found.os ?? '?'}, ${reach.found.transport ?? '?'}): ${installed ? `${config.bundle} ${installed.version} (${installed.build})` : `${config.bundle} not installed`}`);
     }
@@ -124,11 +131,24 @@ async function eventPreflight({ config, manifest, devices, version, androidCode,
 
 const notOnAdb = error => /is not on this host's adb server/.test(error.message);
 
-export async function plan(config, { env = process.env, home = homedir(), fetchImpl = fetch, s3Factory = null, log = console.log } = {}) {
+export async function plan(config, { env = process.env, home = homedir(), fetchImpl = fetch, s3Factory = null, log = console.log, macLinkNow = null } = {}) {
   const { policy } = policyBanner(log);
   const manifest = await loadManifest(config.cwd, config.manifest);
+  // The manifest as dispatched (github.sha): the bump must land on a main whose manifest the gate checked.
+  const dispatchedManifest = readFileSync(join(config.cwd, config.manifest), 'utf8');
   return guarded('plan', join(config.out, 'plan'), config, env, async track => {
     const devices = loadDevices(env);
+    const app = policy.apps[env.GITHUB_REPOSITORY ?? ''] ?? null;
+    if (env.GITHUB_ACTIONS === 'true') {
+      // The plan spends the version, so it holds the run to the template caller again (a deploy.yml that skipped the
+      // gate, or one that is not the template, stops here).
+      checkCaller({ policy, env, read: callerReader(config, env) });
+      if (!app) throw refusal('repo', `${env.GITHUB_REPOSITORY || 'this repository'} is not listed in the hub policy`);
+    }
+    if (app) {
+      if (manifest.project.slug !== app.slug) throw refusal('slug', `the manifest's project.slug is ${manifest.project.slug}; the policy lists this repository as ${app.slug}`);
+      checkPins({ app, manifest });
+    }
     if (!policy.bump.levels.includes(config.bump)) throw new Error(`HUB_GATE_REFUSED bump: ${config.bump} is not one of ${policy.bump.levels.join(', ')}`);
     const declared = scopeOf({ platform: config.platform, manifest });
     // The iPad lane runs only when the gate said so (the Mac online and within its data budget).
@@ -203,6 +223,12 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
       runBump: level => parseVersionInfo(hookOutput('version.bump', manifest.version.bump, { cwd: config.cwd, env: hooks, args: [level] }), { hook: 'version.bump', needAndroid: scope.android, needFiles: true }),
       beforeCommit: ({ bumped }) => {
         track.stage = 'preflight';
+        // The bump lands on main's newest tip. Its manifest must be the one the gate checked at the dispatched commit:
+        // lanes and deliver read the manifest at the bump commit, and a renamed slug or a new lane would publish under
+        // rules nobody checked.
+        let base = null;
+        try { base = readFileSync(join(config.cwd, config.manifest), 'utf8'); } catch { /* reported below */ }
+        if (base !== dispatchedManifest) throw refusal('manifest', `${config.manifest} changed on main since the dispatched commit ${short(env.GITHUB_SHA ?? '')}; dispatch the deploy again so the gate checks it. Nothing was bumped`);
         if (phone && bumped.android_code !== undefined && bumped.android_code <= phone.versionCode) {
           throw new Error(`the S26 already has ${manifest.android.package} versionCode ${phone.versionCode}, at or above the planned ${bumped.android_code}; Android would refuse the update. Bump past it (--bump minor) or find out what installed that build`);
         }
@@ -224,12 +250,29 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
     });
     const next = result.next;
 
-    // A real run is now between plan and deliver: the catch-up leaves this version alone until deliver clears it.
+    // The Mac once more, right before the iPad lane: the S26 wait and the bump can take minutes, and a Mac that left in
+    // between (a closed lid, a dropped hotspot) would hold the iPad job, and announce, in GitHub's queue for 24 hours.
+    let laneNow = iosLane;
+    if (scope.ios && (macLinkNow || env.GITHUB_ACTIONS === 'true')) {
+      const link = macLinkNow ? macLinkNow() : readMacLink({ policy, devices, env });
+      if (link.link === 'offline') {
+        laneNow = 'skip-lost';
+        scope.ios = false;
+        log(`HUB_IOS_SKIPPED lost: the Mac went offline after the gate (${link.reason}); the iPad delivery is skipped, the S26 lane goes on`);
+        notes.push(`iPad lane skipped: the Mac went offline after the gate (${link.reason})`);
+      } else {
+        log(`HUB_MAC_LINK ${link.link} (again, before the iPad lane: ${link.reason})`);
+      }
+    }
+
+    // A real run is now between plan and deliver: the catch-up leaves this version alone on the platforms this run
+    // builds, until each deliver clears its own.
     if (result.committed) {
       try {
         const s3 = s3Factory ? await s3Factory() : await jobWriter(policy, env);
-        s3.putText(`${JSON.stringify({ version: next.version, run: runOf(env), started_at: isoNow() })}\n`, inflightKey(manifest.project.slug));
-        notes.push(`inflight.json names ${next.version}`);
+        const platforms = ['android', 'ios'].filter(platform => scope[platform]);
+        s3.putText(`${JSON.stringify({ version: next.version, run: runOf(env), started_at: isoNow(), platforms })}\n`, inflightKey(manifest.project.slug));
+        notes.push(`inflight.json names ${next.version} (${platforms.join(', ')})`);
       } catch (error) {
         log(`::warning::could not write ${inflightKey(manifest.project.slug)} (${firstLine(error.message)}); deliver still publishes`);
       }
@@ -246,6 +289,10 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
       bump_patch: config.dryRun && result.patch ? Buffer.from(result.patch).toString('base64') : '',
       bumped: result.committed,
       s26,
+      // The last word on the iPad lane (the later value of a key wins in GITHUB_OUTPUT).
+      ios_lane: laneNow,
+      run_ios: scope.ios,
+      run_ios_export: scope.ios && Boolean(manifest.ios?.export),
     };
     await setOutputs(outputs, env);
     track.receipt = { version: next.version, androidCode: next.android_code };
@@ -253,11 +300,11 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
     notes.push(result.committed ? `bumped ${result.current.version} -> ${next.version}, pushed ${result.tag} at ${short(result.sha)}` : `dry run: would bump ${result.current.version} -> ${next.version} (${result.files.join(', ')}); commit, tag and git push --dry-run rehearsed, then rewound: nothing reached the remote`);
     await writeReceipt(join(config.out, 'plan'), buildReceipt({
       lane: 'plan', config: { ...config, buildSha: result.sha }, env, version: next.version, androidCode: next.android_code, build: next.ios_build, notes,
-      bump, devices: { s26: phone, s26_state: s26, ipad: scope.ios ? { version: config.ipadVersion, build: config.ipadBuild || null } : null, ios_lane: iosLane },
+      bump, devices: { s26: phone, s26_state: s26, ipad: declared.ios && iosLane === 'run' ? { version: config.ipadVersion, build: config.ipadBuild || null } : null, ios_lane: laneNow },
       published: latest ? { android: latest.android ? { version: latest.android.version, code: latest.android.code } : null, ios: latest.ios ? { version: latest.ios.version, build: latest.ios.build } : null } : null,
       bloodbank: { commit: tree.commit, clean: tree.dirty ? tree.dirty.length === 0 : null },
     }), env);
-    log(`HUB_PLAN version=${result.current.version} next=${next.version} android_code=${next.android_code ?? '-'} platform=${config.platform} bump=${config.bump} dry_run=${config.dryRun} s26=${s26} ios_lane=${iosLane} build_sha=${short(result.sha)}`);
+    log(`HUB_PLAN version=${result.current.version} next=${next.version} android_code=${next.android_code ?? '-'} platform=${config.platform} bump=${config.bump} dry_run=${config.dryRun} s26=${s26} ios_lane=${laneNow} build_sha=${short(result.sha)}`);
     return { ...outputs, schema: 2, run_android: scope.android, run_ios: scope.ios };
   });
 }

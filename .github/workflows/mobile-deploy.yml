@@ -4,12 +4,19 @@ name: Mobile Deploy
 # the jobs run on the caller's repo-scoped runners; this repo owns only the job graph, the policy and tools/ci.
 #
 # gate (Linux: the policy, the caller, the Mac's link, the S26, the build directory) -> preflight-ios (Mac, no
-# checkout) -> plan (the bump) -> android | ios-export -> ios -> deliver (the S3 build directory) -> announce (one
-# Bloodbank event). An absent device is pending, not a stop: the run still bumps, builds, publishes and goes green.
+# checkout) -> plan (the bump) -> android -> deliver-android, and ios-export -> ios -> deliver-ios (the S3 build
+# directory) -> announce (one Bloodbank event). An absent device is pending, not a stop: the run still bumps, builds,
+# publishes and goes green. The APK half never waits for the Mac: deliver-android needs only the plan and the android
+# lane, so the APK, its latest.json block, the pages and the S26's catch-up go live when the android job ends.
 #
-# A skipped job skips everything that needs it unless the dependent says otherwise, so plan, ios, deliver and announce
-# carry explicit conditions: the gate skips preflight-ios when the Mac is offline or over its data budget, apps
-# without a Linux iOS export skip ios-export, deliver runs whenever the plan succeeded, and announce always runs.
+# A skipped job skips everything that needs it unless the dependent says otherwise, so plan, ios, the deliver jobs and
+# announce carry explicit conditions: the gate skips preflight-ios when the Mac is offline or over its data budget, the
+# plan skips the iPad lane when the Mac went offline after the gate, apps without a Linux iOS export skip ios-export,
+# each deliver job runs when its lane ran, and announce always runs. A Mac job that no runner takes is cancelled by the
+# host watchdog on big-chungus (tools/ci/macwatch.mjs, policy mac.queue_limit_min) instead of waiting 24 hours.
+#
+# runs-on is the policy's self-hosted labels, written here: a caller's linux_runner or mac_runner input can never put
+# a job on a billed hosted runner (the gate still refuses any non-default value).
 #
 # `uses:` takes no expressions, so every `delorenj/mobile-deploy-hub/actions/hub@<tag>` below names one exact hub
 # version: a run and its reruns use one version, whatever `v1` points at later. `mise run release` flips them all in
@@ -92,7 +99,7 @@ permissions:
 
 jobs:
   gate:
-    runs-on: ${{ fromJSON(inputs.linux_runner) }}
+    runs-on: [self-hosted, Linux]
     timeout-minutes: 15
     permissions:
       contents: read
@@ -142,7 +149,7 @@ jobs:
   preflight-ios:
     needs: gate
     if: ${{ needs.gate.outputs.ios_lane == 'run' }}
-    runs-on: ${{ fromJSON(inputs.mac_runner) }}
+    runs-on: [self-hosted, macOS]
     timeout-minutes: 10
     permissions:
       contents: read
@@ -168,7 +175,7 @@ jobs:
   plan:
     needs: [gate, preflight-ios]
     if: ${{ !cancelled() && needs.gate.result == 'success' && (needs.preflight-ios.result == 'success' || needs.preflight-ios.result == 'skipped') }}
-    runs-on: ${{ fromJSON(inputs.linux_runner) }}
+    runs-on: [self-hosted, Linux]
     timeout-minutes: 20
     concurrency:
       group: mobile-deploy-plan-${{ github.repository }}
@@ -187,6 +194,7 @@ jobs:
       run_ios_export: ${{ steps.hub.outputs.run_ios_export }}
       play_lane: ${{ steps.hub.outputs.play_lane }}
       release_lane: ${{ steps.hub.outputs.release_lane }}
+      ios_lane: ${{ steps.hub.outputs.ios_lane }}
     steps:
       # Full history and tags: the bump is a real commit and the machine's pre-push guard refuses a shallow push.
       - uses: actions/checkout@v4
@@ -228,7 +236,7 @@ jobs:
   android:
     needs: plan
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run_android == 'true' }}
-    runs-on: ${{ fromJSON(inputs.linux_runner) }}
+    runs-on: [self-hosted, Linux]
     timeout-minutes: 45
     concurrency:
       group: mobile-deploy-android-${{ github.repository }}
@@ -302,7 +310,7 @@ jobs:
   ios-export:
     needs: [gate, plan]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run_ios_export == 'true' }}
-    runs-on: ${{ fromJSON(inputs.linux_runner) }}
+    runs-on: [self-hosted, Linux]
     timeout-minutes: 30
     concurrency:
       group: mobile-deploy-ios-export-${{ github.repository }}
@@ -339,7 +347,7 @@ jobs:
   ios:
     needs: [gate, plan, ios-export]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run_ios == 'true' && (needs.ios-export.result == 'success' || needs.ios-export.result == 'skipped') }}
-    runs-on: ${{ fromJSON(inputs.mac_runner) }}
+    runs-on: [self-hosted, macOS]
     timeout-minutes: 120
     concurrency:
       group: mobile-deploy-ios-${{ github.repository }}
@@ -382,13 +390,58 @@ jobs:
           overwrite: true
           retention-days: ${{ inputs.dry_run && 1 || 7 }}
 
-  deliver:
-    needs: [gate, plan, android, ios-export, ios]
-    if: ${{ !cancelled() && needs.plan.result == 'success' }}
-    runs-on: ${{ fromJSON(inputs.linux_runner) }}
+  # The APK half of the build directory: never waits for the Mac.
+  deliver-android:
+    needs: [gate, plan, android]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.android.result == 'success' || needs.android.result == 'failure') }}
+    runs-on: [self-hosted, Linux]
     timeout-minutes: 45
     concurrency:
-      group: mobile-deploy-deliver-${{ github.repository }}
+      group: mobile-deploy-deliver-android-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      # The manifest at the commit the lanes built.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.build_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: '{gate-out,plan-out,android-out}'
+          path: ${{ runner.temp }}/hub-out/receipts
+      - name: Publish the APK to the build directory (a dry run only checks)
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.1.2
+        with:
+          command: deliver
+          scope: android
+          manifest: ${{ inputs.manifest }}
+          platform: ${{ inputs.platform }}
+          dry_run: ${{ inputs.dry_run }}
+          version: ${{ needs.plan.outputs.version }}
+          android_code: ${{ needs.plan.outputs.android_code }}
+          ios_build: ${{ needs.plan.outputs.ios_build }}
+          build_sha: ${{ needs.plan.outputs.build_sha }}
+          needs: ${{ toJSON(needs) }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: deliver-android-out
+          path: ${{ runner.temp }}/hub-out/deliver/*.json
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: ${{ inputs.dry_run && 1 || 7 }}
+
+  # The IPA half: when the ios job ended, installed, pending or failed (a refused install still publishes the IPA).
+  deliver-ios:
+    needs: [gate, plan, ios-export, ios]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.ios.result == 'success' || needs.ios.result == 'failure') }}
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 45
+    concurrency:
+      group: mobile-deploy-deliver-ios-${{ github.repository }}
       cancel-in-progress: false
     permissions:
       contents: read
@@ -401,12 +454,13 @@ jobs:
       - uses: actions/download-artifact@v4
         continue-on-error: true
         with:
-          pattern: '{plan-out,android-out,ios-receipt,ios-out}'
+          pattern: '{gate-out,plan-out,ios-receipt,ios-out}'
           path: ${{ runner.temp }}/hub-out/receipts
-      - name: Publish to the build directory (a dry run only checks)
+      - name: Publish the IPA to the build directory (a dry run only checks)
         uses: delorenj/mobile-deploy-hub/actions/hub@v1.1.2
         with:
           command: deliver
+          scope: ios
           manifest: ${{ inputs.manifest }}
           platform: ${{ inputs.platform }}
           dry_run: ${{ inputs.dry_run }}
@@ -419,16 +473,16 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: ${{ always() }}
         with:
-          name: deliver-out
+          name: deliver-ios-out
           path: ${{ runner.temp }}/hub-out/deliver/*.json
           if-no-files-found: ignore
           overwrite: true
           retention-days: ${{ inputs.dry_run && 1 || 7 }}
 
   announce:
-    needs: [gate, preflight-ios, plan, android, ios-export, ios, deliver]
+    needs: [gate, preflight-ios, plan, android, ios-export, ios, deliver-android, deliver-ios]
     if: ${{ always() }}
-    runs-on: ${{ fromJSON(inputs.linux_runner) }}
+    runs-on: [self-hosted, Linux]
     timeout-minutes: 10
     permissions:
       contents: read
@@ -440,7 +494,7 @@ jobs:
       - uses: actions/download-artifact@v4
         continue-on-error: true
         with:
-          pattern: '{gate-out,plan-out,android-out,ios-receipt,ios-out,deliver-out}'
+          pattern: '{gate-out,plan-out,android-out,ios-receipt,ios-out,deliver-android-out,deliver-ios-out}'
           path: ${{ runner.temp }}/hub-out/receipts
       - name: One Bloodbank event (a dry run only checks it)
         uses: delorenj/mobile-deploy-hub/actions/hub@v1.1.2

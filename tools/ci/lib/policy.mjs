@@ -45,11 +45,23 @@ export function parsePolicy(source) {
   const slugs = new Set();
   for (const [repo, app] of Object.entries(policy.apps)) {
     if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) fail(`apps key "${repo}" must be owner/repo`);
-    exact(`apps.${repo}`, app, ['slug', 'lanes']);
+    if (!isObject(app) || !Array.isArray(app.lanes)) fail(`apps.${repo} must be an object with lanes`);
+    if (app.lanes.length === 0 || app.lanes.some(lane => !['android', 'ios'].includes(lane)) || new Set(app.lanes).size !== app.lanes.length) fail(`apps.${repo}.lanes must list android and/or ios`);
+    // Each lane pins what a device may receive (v1.1.3): the package and the signer on Android, the bundle on iOS. The
+    // gate, deliver and the catch-up hold every build to these, never to a manifest or latest.json alone.
+    exact(`apps.${repo}`, app, ['slug', 'lanes', ...app.lanes]);
     if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(app.slug ?? '')) fail(`apps.${repo}.slug must be a pjangler slug`);
     if (slugs.has(app.slug)) fail(`apps: slug ${app.slug} is used twice`);
     slugs.add(app.slug);
-    if (!Array.isArray(app.lanes) || app.lanes.length === 0 || app.lanes.some(lane => !['android', 'ios'].includes(lane)) || new Set(app.lanes).size !== app.lanes.length) fail(`apps.${repo}.lanes must list android and/or ios`);
+    if (app.lanes.includes('android')) {
+      exact(`apps.${repo}.android`, app.android, ['package', 'signer_sha256']);
+      if (!/^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/.test(app.android.package ?? '')) fail(`apps.${repo}.android.package must be an Android package name`);
+      if (!/^[0-9a-f]{64}$/.test(app.android.signer_sha256 ?? '')) fail(`apps.${repo}.android.signer_sha256 must be the lowercase sha256 of the signing certificate`);
+    }
+    if (app.lanes.includes('ios')) {
+      exact(`apps.${repo}.ios`, app.ios, ['bundle']);
+      if (!/^[A-Za-z][A-Za-z0-9-]*(\.[A-Za-z][A-Za-z0-9-]*)+$/.test(app.ios.bundle ?? '')) fail(`apps.${repo}.ios.bundle must be a reverse-DNS bundle id`);
+    }
   }
 
   exact('callers', policy.callers, ['workflow', 'manifest', 'accept']);
@@ -79,9 +91,12 @@ export function parsePolicy(source) {
   positive('delivery.quickdrop.keep', policy.delivery.quickdrop.keep);
   if (typeof policy.delivery.release !== 'boolean') fail('delivery.release must be true or false');
 
-  exact('mac', policy.mac, ['lan_cidr', 'metered_budget_mib']);
+  exact('mac', policy.mac, ['lan_cidr', 'metered_budget_mib', 'queue_limit_min']);
   if (!/^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/.test(policy.mac.lan_cidr ?? '')) fail('mac.lan_cidr must be an IPv4 CIDR');
   positive('mac.metered_budget_mib', policy.mac.metered_budget_mib);
+  // How long a Mac job may sit queued for its runner before the host watchdog (tools/ci/macwatch.mjs) gives the
+  // iPad up for that run: GitHub keeps a self-hosted job queued for 24 hours otherwise.
+  positive('mac.queue_limit_min', policy.mac.queue_limit_min);
 
   exact('catch_up', policy.catch_up, ['android_every_s', 'ios_every_s', 'max_failures']);
   positive('catch_up.android_every_s', policy.catch_up.android_every_s);

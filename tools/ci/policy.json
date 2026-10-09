@@ -4,9 +4,21 @@
   "event": { "per": "run-attempt", "strict": true, "catch_up": true, "types": ["bloodbank.project.deployment.completed", "bloodbank.project.deployment.failed"] },
   "manifest_schema": [2],
   "apps": {
-    "delorenj/pile-of-dumb-things": { "slug": "tower-of-dumb-things", "lanes": ["android", "ios"] },
-    "delorenj/green-in-between": { "slug": "green-in-between", "lanes": ["android", "ios"] },
-    "delorenj/gruvato": { "slug": "gruvato", "lanes": ["android", "ios"] }
+    "delorenj/pile-of-dumb-things": {
+      "slug": "tower-of-dumb-things", "lanes": ["android", "ios"],
+      "android": { "package": "io.automaticai.towerofdumbthings", "signer_sha256": "2d4954863dabb5da86d69ce4b60b3e400e73669b50a80658b0941440a7941a97" },
+      "ios": { "bundle": "io.automaticai.towerofdumbthings" }
+    },
+    "delorenj/green-in-between": {
+      "slug": "green-in-between", "lanes": ["android", "ios"],
+      "android": { "package": "io.lasertoast.greeninbetween.spike", "signer_sha256": "d9d0253a4ce5bfb8a18d01efddc042e8828c3f73b04da41b4c3358e125c5222a" },
+      "ios": { "bundle": "io.lasertoast.greeninbetween.spike" }
+    },
+    "delorenj/gruvato": {
+      "slug": "gruvato", "lanes": ["android", "ios"],
+      "android": { "package": "sh.delo.drumjangler", "signer_sha256": "d09a011f872cc3e25f5b6c46e66a5e07c68c1240566bc0d4b66bf41e0fff3a3c" },
+      "ios": { "bundle": "sh.delo.gruvato" }
+    }
   },
   "callers": {
     "workflow": ".github/workflows/deploy.yml",
@@ -20,6 +32,6 @@
     "quickdrop": { "dir": "quickdrop/builds", "max_mb": 120, "keep": 1 },
     "release": true
   },
-  "mac": { "lan_cidr": "192.168.1.0/24", "metered_budget_mib": 150 },
+  "mac": { "lan_cidr": "192.168.1.0/24", "metered_budget_mib": 150, "queue_limit_min": 15 },
   "catch_up": { "android_every_s": 120, "ios_every_s": 300, "max_failures": 3 }
 }

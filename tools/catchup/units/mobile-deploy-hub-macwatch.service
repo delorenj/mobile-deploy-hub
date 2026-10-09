@@ -1,0 +1,15 @@
+# The Mac watchdog (mobile-deploy-hub v1.1.3, tools/ci/macwatch.mjs). units/install.sh copies this into
+# ~/.config/systemd/user/ on big-chungus; mobile-deploy-hub-macwatch.timer starts it every 2 minutes. It cancels a
+# deploy run whose Mac job has waited longer than policy mac.queue_limit_min for its runner (once the run's APK half is
+# done), so announce reports the iPad skipped instead of the run waiting 24 hours. It uses big-chungus's gh login.
+[Unit]
+Description=Mobile Deploy Hub Mac watchdog: give up a deploy's iPad job when the Mac went away
+Documentation=https://github.com/delorenj/mobile-deploy-hub/blob/main/docs/design-hub-v1.1.md
+
+[Service]
+Type=oneshot
+Environment=HOME=%h
+Environment=PATH=%h/.local/share/mise/installs/node/24/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/share/mise/installs/node/24/bin/node %h/.local/share/mobile-deploy-hub/current/tools/ci/macwatch.mjs
+TimeoutStartSec=5min
+Nice=10

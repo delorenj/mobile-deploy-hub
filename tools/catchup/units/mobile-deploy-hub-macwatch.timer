@@ -1,0 +1,12 @@
+# Starts the Mac watchdog every 2 minutes, a minute after the S26 catch-up pass.
+[Unit]
+Description=Mobile Deploy Hub Mac watchdog every 2 minutes
+
+[Timer]
+OnCalendar=*:1/2
+Persistent=false
+AccuracySec=15s
+Unit=mobile-deploy-hub-macwatch.service
+
+[Install]
+WantedBy=timers.target

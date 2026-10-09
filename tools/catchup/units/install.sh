@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Installs the catch-up on THIS host (docs/design-hub-v1.1.md E1), in watch mode unless the host already has a mode:
 #   big-chungus  the hub's tools/ under ~/.local/share/mobile-deploy-hub/releases/<ref>, `current` pointing at it,
-#                and the systemd user timer mobile-deploy-hub-catchup.timer (every 2 minutes)
+#                the systemd user timer mobile-deploy-hub-catchup.timer (every 2 minutes) and the Mac watchdog's
+#                mobile-deploy-hub-macwatch.timer (every 2 minutes, tools/ci/macwatch.mjs)
 #   the Mac      the same tree, and the LaunchAgent sh.delo.mobile-deploy-hub.catchup bootstrapped into the GUI
 #                session gui/<uid> (every 5 minutes)
 # Run it from the tools/ tree it should install: tools/catchup/units/install.sh <ref>. On the Mac, copy tools/ to
@@ -44,9 +45,10 @@ case "$(uname -s)" in
     dest="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     mkdir -p "$dest"
     cp "$units/mobile-deploy-hub-catchup.service" "$units/mobile-deploy-hub-catchup.timer" "$dest/"
+    cp "$units/mobile-deploy-hub-macwatch.service" "$units/mobile-deploy-hub-macwatch.timer" "$dest/"
     systemctl --user daemon-reload
-    systemctl --user enable --now mobile-deploy-hub-catchup.timer
-    systemctl --user list-timers mobile-deploy-hub-catchup.timer --no-pager
+    systemctl --user enable --now mobile-deploy-hub-catchup.timer mobile-deploy-hub-macwatch.timer
+    systemctl --user list-timers mobile-deploy-hub-catchup.timer mobile-deploy-hub-macwatch.timer --no-pager
     ;;
   Darwin)
     label=sh.delo.mobile-deploy-hub.catchup

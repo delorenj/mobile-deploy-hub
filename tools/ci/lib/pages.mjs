@@ -10,20 +10,23 @@ export function megabytes(bytes) {
   return `${(bytes / 1e6).toFixed(bytes >= 1e8 ? 0 : 1)} MB`;
 }
 
-const statusWords = {
-  installed: 'installed',
-  pending: 'pending: installs when it is back',
-  skipped: 'skipped',
-  failed: 'failed',
-};
+// "0.2.2 (4)", or just "0.2.5" when the build is the version itself (Gruvato's iOS build).
+export function releaseLabel(version, build) {
+  return build === undefined || build === null || String(build) === String(version) ? String(version) : `${version} (${build})`;
+}
 
+// One device's line on a phone screen, release first and the reason in plain words:
+//   "S26 0.2.2 (4): pending, installs when it is back (not on big-chungus's adb)"
+//   "iPad 0.2.2 (4): installed by deploy"
+// A pending device whose host's catch-up is off does not promise an automatic install.
 export function deviceLine(platform, block) {
   if (!block) return `${platform === 'android' ? 'S26' : 'iPad'}: no build yet`;
   const device = block.device;
-  const release = `${block.version} (${platform === 'android' ? block.code : block.build})`;
-  const who = device.status === 'installed' && device.by ? ` by ${device.by}` : '';
+  const head = `${device.name} ${releaseLabel(block.version, platform === 'android' ? block.code : block.build)}`;
   const why = device.reason ? ` (${device.reason})` : '';
-  return `${device.name}: ${statusWords[device.status] ?? device.status} ${release}${who}${why}`;
+  if (device.status === 'installed') return `${head}: installed${device.by ? ` by ${device.by}` : ''}`;
+  if (device.status === 'pending') return `${head}: pending${/catch-up off/.test(device.reason ?? '') ? '' : ', installs when it is back'}${why}`;
+  return `${head}: ${device.status}${why}`;
 }
 
 const style = `
@@ -84,15 +87,14 @@ function deviceItems(latest) {
 
 const short = sha => String(sha ?? '').slice(0, 7);
 
-export function appPage({ latest, history = [], deliveries = [] }) {
+// The device states come from latest.json, which deliver and the catch-up both keep current; the page never carries
+// a per-run list that a catch-up re-render would lose.
+export function appPage({ latest, history = [] }) {
   const runLink = latest.run?.url ? `<a href="${attr(latest.run.url)}">run ${html(latest.run.id)}</a>` : `run ${html(latest.run?.id ?? '-')}`;
   const sizes = [
     latest.android ? `APK ${megabytes(latest.android.bytes)}` : null,
     latest.ios?.bytes ? `IPA ${megabytes(latest.ios.bytes)}` : null,
   ].filter(Boolean).join(', ');
-  const last = deliveries.length > 0
-    ? `<h2>Last deploy</h2>\n<ul>\n${deliveries.map(item => `<li class="status-${html(item.status)}">${html(item.device ?? item.target)}: ${html(item.status)}${item.reason ? ` (${html(item.reason)})` : ''}</li>`).join('\n')}\n</ul>`
-    : '';
   const older = history.length > 0
     ? `<h2>Android history</h2>\n<ul>\n${history.map(item => `<li><a href="${attr(item.url)}">${html(item.version)} (${html(item.code)})</a>${item.bytes ? ` <span class="muted">${megabytes(item.bytes)}</span>` : ''}</li>`).join('\n')}\n</ul>`
     : '';
@@ -105,7 +107,6 @@ ${deviceItems(latest)}
 </ul>
 ${sizes ? `<p class="muted">${html(sizes)}</p>` : ''}
 </div>
-${last}
 ${older}
 <p class="muted">Updated ${html(latest.updated_at)}. Builds older than the newest five APKs, and every IPA but the newest, are removed.</p>`;
   return page(`${latest.name} builds`, body);

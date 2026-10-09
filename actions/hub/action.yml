@@ -3,7 +3,7 @@ description: Runs tools/ci/hub.mjs from the hub repo against the checked-out app
 
 inputs:
   command:
-    description: gate, preflight-ios, plan, android, play, release, ios-export, ios, deliver, announce
+    description: gate, preflight-ios, plan, android, play, release, ios-export, ios, deliver, announce. Inside a job every command runs only for the app's own .github/workflows/deploy.yml
     required: true
   manifest:
     description: Path of the app manifest inside the checkout
@@ -81,6 +81,9 @@ inputs:
   needs:
     description: toJSON(needs), deliver and announce only
     default: ''
+  scope:
+    description: deliver only, the half of the build directory it publishes (android, ios; both for a local run)
+    default: both
   wif_provider:
     default: ''
   play_sa:
@@ -194,6 +197,7 @@ runs:
         HUB_IPAD_VERSION: ${{ inputs.ipad_version }}
         HUB_IPAD_BUILD: ${{ inputs.ipad_build }}
         HUB_NEEDS: ${{ inputs.needs }}
+        HUB_SCOPE: ${{ inputs.scope }}
         HUB_WIF_PROVIDER: ${{ inputs.wif_provider }}
         HUB_PLAY_SA: ${{ inputs.play_sa }}
         PLAY_TOKEN: ${{ inputs.play_token }}

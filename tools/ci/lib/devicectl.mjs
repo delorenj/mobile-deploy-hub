@@ -42,10 +42,20 @@ export function pickApp(document, bundle) {
   return app ? { version: app.version ?? null, build: app.bundleVersion === undefined ? null : String(app.bundleVersion), developer: app.builtByDeveloper === true } : null;
 }
 
+// Whether the app is running on the iPad: a process whose executable lives in the app's own bundle folder. devicectl
+// cannot tell the foreground from a suspended app, so a caller treats this as "maybe in use".
+export function appRunning(appsDocument, processesDocument, bundle) {
+  const url = (appsDocument?.result?.apps ?? []).find(entry => entry.bundleIdentifier === bundle)?.url;
+  if (typeof url !== 'string' || url.length < 8) return false;
+  const folder = url.endsWith('/') ? url : `${url}/`;
+  return (processesDocument?.result?.runningProcesses ?? []).some(process => String(process.executable ?? '').startsWith(folder));
+}
+
 export function createIpad({ devicectl, udid, model }) {
   return {
     find: () => pickIpad(devicectl(['list', 'devices'], 30), { udid, model }),
     installed: bundle => pickApp(devicectl(['device', 'info', 'apps', '--device', udid, '--bundle-id', bundle], 60), bundle),
+    running: bundle => appRunning(devicectl(['device', 'info', 'apps', '--device', udid, '--bundle-id', bundle], 60), devicectl(['device', 'info', 'processes', '--device', udid], 60), bundle),
     // An .app bundle path: in place over the installed build, data kept.
     install: app => devicectl(['device', 'install', 'app', '--device', udid, app], 300),
   };
