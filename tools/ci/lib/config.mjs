@@ -113,7 +113,8 @@ function iosStore(value) {
   if (typeof store !== 'object' || Array.isArray(store)) throw new Error('ios store must be an object');
   for (const key of Object.keys(store)) if (!['signer_sha1', 'secrets'].includes(key)) throw new Error(`ios store has unknown key "${key}"`);
   if (store.signer_sha1 !== undefined && store.signer_sha1 !== null && !/^[0-9A-F]{40}$/.test(store.signer_sha1)) throw new Error('ios store signer_sha1 must be an uppercase SHA-1');
-  if (!Array.isArray(store.secrets ?? []) || (store.secrets ?? []).some(ref => typeof ref !== 'string' || !/^op:\/\/[^\s]+$/.test(ref))) throw new Error('ios store secrets must be op:// references');
+  // 1Password references may hold spaces (op://DeLoSecrets/App Store Connect API Key/key_id); never a line break.
+  if (!Array.isArray(store.secrets ?? []) || (store.secrets ?? []).some(ref => typeof ref !== 'string' || !/^op:\/\/[^\r\n\0]+$/.test(ref))) throw new Error('ios store secrets must be op:// references');
   return { signer_sha1: store.signer_sha1 ?? null, secrets: store.secrets ?? [] };
 }
 

@@ -114,6 +114,10 @@ test('environment sets the config and flags override it', () => {
   assert.equal(parseConfig(['ios', '--strict', 'false'], {}).strict, false);
   assert.throws(() => parseConfig(['ios'], { HUB_STRICT: 'no' }), /strict must be true or false/);
   assert.deepEqual(parseConfig(['preflight-ios'], { HUB_IOS_STORE: JSON.stringify({ signer_sha1: sha1, secrets: ['op://Vault/Item/x'] }) }).iosStore, { signer_sha1: sha1, secrets: ['op://Vault/Item/x'] });
+  // Tower's real references have spaces in the item name (the v1.1.0 release dry run found this).
+  const tower = ['op://DeLoSecrets/App Store Connect API Key/key_id', 'op://DeLoSecrets/App Store Connect API Key/issuer_id'];
+  assert.deepEqual(parseConfig(['preflight-ios'], { HUB_IOS_STORE: JSON.stringify({ signer_sha1: sha1, secrets: tower }) }).iosStore.secrets, tower);
+  assert.throws(() => parseConfig(['preflight-ios'], { HUB_IOS_STORE: JSON.stringify({ secrets: ['op://a/b\nc'] }) }), /op:\/\/ references/);
   assert.equal(parseConfig(['gate'], { HUB_METERED: 'allow' }).metered, 'allow');
 });
 
