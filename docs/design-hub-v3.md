@@ -1,6 +1,6 @@
 # Mobile Deploy Hub v3: one deploy contract, three apps
 
-Status: hub built 2026-10-09 (`mise run check`: actionlint plus 82 tests, including `tools/ci/v3.test.mjs`); the Bloodbank schema edit landed (bloodbank 79f5e60). Proof steps 1 to 6 are done: tag `v1.0.0` (41ee100) carries the flipped inner refs, all three callers pin it, and one dry run per app at `v1.0.0` is green on both lanes (build log below). Next: Jarad's first real deploy per app. Replaces v2's job graph, manifest and front door.
+Status: superseded by [design-hub-v1.1.md](design-hub-v1.1.md) (one policy and its gate, deploy from anywhere with pending devices, the S3 build directory, links in the push; released as `v1.1.x`, callers pin `@v1`). Everything below still holds unless v1.1 changes it; the iPad proof ledger and the schema 1 path are gone. v1.0 history: hub built 2026-10-09 (`mise run check`: actionlint plus 82 tests, including `tools/ci/v3.test.mjs`); the Bloodbank schema edit landed (bloodbank 79f5e60). Proof steps 1 to 6 are done: tag `v1.0.0` (41ee100) carries the flipped inner refs, all three callers pin it, and one dry run per app at `v1.0.0` is green on both lanes (build log below). Next: Jarad's first real deploy per app. Replaces v2's job graph, manifest and front door.
 
 Every deploy of Tower (`pile-of-dumb-things`), Green In Between (`green-in-between`) and Gruvato: (1) bumps the version, committed and tagged before the build; (2) installs on the S26 and the iPad, verified by reading the version back; (3) sends one Bloodbank event with the outcome.
 
