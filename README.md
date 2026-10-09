@@ -19,6 +19,8 @@ Before you run it:
 2. The iPad is awake and on the home Wi-Fi.
 3. The Mac is on and Jarad is logged in (the runners start at login).
 
+Status (2026-10-09): `v1.0.0` is the current hub. All three apps pin it, and each has a green strict dry run at `v1.0.0` on both lanes (S26 and iPad: `HUB_S26_DRY_RUN`, `HUB_IPA_OK`, `HUB_IPAD_DRY_RUN`, `HUB_EVENT_CHECKED`): Tower 37931518291, Green In Between 37931519842, Gruvato 37931523316. Their iPad proofs are recorded at `v1.0.0`, so `--dry-run false` is unblocked. No real deploy has run yet; the first one per app is Jarad's. Unproven until then: a devicectl install while the iPad is locked, and Gruvato's first (fresh) install on the iPad. Proof log: [docs/design-hub-v3.md](docs/design-hub-v3.md#build-log-2026-10-09).
+
 ## What a run does
 
 | Job | Runs on | Does |

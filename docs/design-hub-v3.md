@@ -1,6 +1,6 @@
 # Mobile Deploy Hub v3: one deploy contract, three apps
 
-Status: hub built 2026-10-09 (`mise run check`: actionlint plus 78 tests, including `tools/ci/v3.test.mjs`); the Bloodbank schema edit landed (bloodbank 79f5e60). App callers and the proof runs are tracked under "Proof" below. Replaces v2's job graph, manifest and front door.
+Status: hub built 2026-10-09 (`mise run check`: actionlint plus 82 tests, including `tools/ci/v3.test.mjs`); the Bloodbank schema edit landed (bloodbank 79f5e60). Proof steps 1 to 6 are done: tag `v1.0.0` (41ee100) carries the flipped inner refs, all three callers pin it, and one dry run per app at `v1.0.0` is green on both lanes (build log below). Next: Jarad's first real deploy per app. Replaces v2's job graph, manifest and front door.
 
 Every deploy of Tower (`pile-of-dumb-things`), Green In Between (`green-in-between`) and Gruvato: (1) bumps the version, committed and tagged before the build; (2) installs on the S26 and the iPad, verified by reading the version back; (3) sends one Bloodbank event with the outcome.
 
@@ -136,18 +136,18 @@ A dry run rehearses the bump's git half too: the plan commits (the machine's pre
 3. After each: no new tag, same `main`, no Release, old versions on both devices, ntfy silent, App Store Connect unchanged.
 4. Negative: Wireless debugging off fails `plan` before any bump; `--bump minor` plans 0.3.0; `--testflight true` refused for gib and Gruvato.
 5. Gruvato Android (0.2.4, code 2004), iOS after the Xcode 27 fix; gib Android (0.0.20, code 20 > 17, signer `d9d0…`), then iOS.
-6. Tag the hub `v1.0.0`, flip inner refs and the three callers; one more dry run per app shows `hub_ref: v1.0.0`.
+6. Tag the hub `v1.0.0`, flip inner refs and the three callers; one more dry run per app shows `hub_ref: v1.0.0`. Done 2026-10-09: Tower 37931518291, Green In Between 37931519842, Gruvato 37931523316.
 
 The first real deploy (`--dry-run false`) is Jarad's, per app, after step 6.
 
 ## Needs Jarad
 
 - Unproven until a real run: devicectl install while the iPad is locked.
-- The first real deploy per app (`mise run deploy --dry-run false`), after the tag below.
+- The first real deploy per app (`mise run deploy --dry-run false`). The tag is in place: all three callers pin `v1.0.0` and each has its iPad proof recorded at `v1.0.0`. Gruvato's is its first install on the iPad.
 
 ## Build log (2026-10-09)
 
-**Landed.** Hub v3 (770199a, then 936c561, 986751f, 10c600f); Bloodbank schema edit (79f5e60: `mobile-app`, `device-set`, `deliveries[]`, `run`, failed stage `version`; `validate:schemas` and `smoketest:schemas` green); Tower caller (2238305, 642680e); Gruvato caller (f7a1f18); Green In Between caller (374088d).
+**Landed.** Hub v3 (770199a, then 936c561, 986751f, 10c600f); Bloodbank schema edit (79f5e60: `mobile-app`, `device-set`, `deliveries[]`, `run`, failed stage `version`; `validate:schemas` and `smoketest:schemas` green); Tower caller (2238305, 642680e); Gruvato caller (f7a1f18) and iPad lane (c941f4e: `scripts/ios/build-device.sh`, `tauri ios build --archive-only --no-sign`, the Xcode 27 link fix); Green In Between caller (374088d) and iPad lane (e3d14c8 `ios-build.py --hub-out`, 87e7e94 manifest; the Preview 19 BASELINE gate is gone). Hub `v1.0.0`: 41ee100 flips the workflow's eight `actions/hub@` refs, and the annotated tag `v1.0.0` sits on that commit, so a caller at `@v1.0.0` gets `actions/hub@v1.0.0` (the tag was created there, never moved). Callers pinned to `@v1.0.0`: Tower f3aadec, Green In Between 2e9b366, Gruvato 137fb17.
 
 **Proof, Tower (strict dry runs, `@main`).**
 - 37924832437, both devices, `--dry-handoff true`: every marker in one run. `HUB_PLAN version=0.2.1 next=0.2.2`, `HUB_PUSH_REHEARSED v0.2.2` (commit, tag and `git push --dry-run --atomic` through the guards), `APK_SIGNER_OK 2d4954...1a97`, `HUB_S26_DRY_RUN would install 0.2.2 (4) over 0.2.1 (3)`, `HUB_HANDOFF_RECEIVED`, `IPAD_ARCHIVED 0.2.2 (4)`, `HUB_IPA_OK ... signer=FA11A63D profile=iOS Team Provisioning Profile: *`, `HUB_IPAD_DRY_RUN would install 0.2.2 (4) over 0.2.1 (4)`, `HUB_EVENT_CHECKED ... installed on SM-S948U + iPad14,5`. Attempt 1's ios-export crashed in Godot's headless import (signal 11 after a threaded font reimport); "Re-run failed jobs" finished it green, which also exercised the recovery path. Tower now retries that import once (642680e).
@@ -159,6 +159,16 @@ The first real deploy (`--dry-run false`) is Jarad's, per app, after step 6.
 - Green In Between 37925894400: `HUB_PLAN version=0.0.19 next=0.0.20 android_code=20`, `HUB_PUSH_REHEARSED v0.0.20`, `APK_SIGNER_OK d9d0253a...222a`, `HUB_S26_DRY_RUN would install 0.0.20 (20) over preview-17 (17)`, `HUB_EVENT_CHECKED`.
 - No `v0.2.5` or `v0.0.20` tag, `main` unchanged in both.
 
+**Proof, the iPad lanes for Gruvato and Green In Between (strict dry runs, both devices, `@main`).**
+- Green In Between 37929895970: `HUB_PREFLIGHT_IOS ok iPad=0.0.19(19)`, `GIB_BAKE_FETCHED f13a80a5d25abd38 from big-chungus`, `IPAD_ARCHIVED 0.0.20 (20)`, `HUB_IPA_OK ... 0.0.20 (20) signer=FA11A63D profile=iOS Team Provisioning Profile: *`, `HUB_IPAD_DRY_RUN would install 0.0.20 (20) over 0.0.19 (19)`, plus the Android markers above.
+- Gruvato 37929418646: `HUB_PREFLIGHT_IOS ok iPad=absent`, `HUB_LOCK_WAIT mac-ios` (gib's run held it), `IPAD_ARCHIVED 0.2.5 (0.2.5)`, `HUB_IPA_OK sh.delo.gruvato 0.2.5 (0.2.5) signer=FA11A63D`, `HUB_IPAD_DRY_RUN would install 0.2.5 (0.2.5) over nothing`, plus the Android markers above.
+
+**Proof, step 6 (strict dry runs at `v1.0.0`, `mise run deploy --dry-handoff true`, all three dispatched together).** Every receipt reads `hub_ref: v1.0.0`, and each app's iPad proof is recorded under `v1.0.0` in `~/.local/state/mobile-deploy-hub/ipad-proofs.json`. The `mac-ios` host lock serialized the three iPad builds (`HUB_LOCK_WAIT` in Tower's and Gruvato's).
+- Tower 37931518291 (f3aadec): `HUB_PREFLIGHT_IOS ok iPad=0.2.1(4)`, `HUB_S26 SM-S948U serial=R5GL43A7PCH`, `HUB_PUSH_REHEARSED v0.2.2`, `HUB_PLAN version=0.2.1 next=0.2.2 android_code=4`, `HUB_BUMP_APPLIED`, `IPAD_EXPORTED`, `HUB_HANDOFF_SENT`, `HUB_IOS_EXPORTED`, `APK_SIGNER_OK 2d4954...1a97`, `HUB_ANDROID_BUILT 0.2.2 (4)`, `HUB_S26_DRY_RUN would install 0.2.2 (4) over 0.2.1 (3)`, `HUB_HANDOFF_RECEIVED`, `IPAD_ARCHIVED 0.2.2 (4)`, `HUB_IPA_OK ... signer=FA11A63D`, `HUB_IPAD_DRY_RUN would install 0.2.2 (4) over 0.2.1 (4)`, `HUB_EVENT_CHECKED`.
+- Green In Between 37931519842 (2e9b366): `HUB_PREFLIGHT_IOS ok iPad=0.0.19(19)`, `HUB_S26`, `HUB_PUSH_REHEARSED v0.0.20`, `HUB_PLAN version=0.0.19 next=0.0.20 android_code=20`, `HUB_BUMP_APPLIED`, `APK_SIGNER_OK d9d0253a...222a`, `HUB_ANDROID_BUILT 0.0.20 (20)`, `HUB_S26_DRY_RUN would install 0.0.20 (20) over preview-17 (17)`, `IPAD_ARCHIVED 0.0.20 (20)`, `HUB_IPA_OK ... signer=FA11A63D`, `HUB_IPAD_DRY_RUN would install 0.0.20 (20) over 0.0.19 (19)`, `HUB_EVENT_CHECKED`.
+- Gruvato 37931523316 (137fb17): `HUB_PREFLIGHT_IOS ok iPad=absent`, `HUB_S26`, `HUB_PUSH_REHEARSED v0.2.5`, `HUB_PLAN version=0.2.4 next=0.2.5 android_code=2005`, `HUB_BUMP_APPLIED`, `APK_SIGNER_OK d09a011f...3a3c`, `HUB_ANDROID_BUILT 0.2.5 (2005)`, `HUB_S26_DRY_RUN would install 0.2.5 (2005) over 0.2.3 (2003)`, `IPAD_ARCHIVED 0.2.5 (0.2.5)`, `HUB_IPA_OK sh.delo.gruvato ... signer=FA11A63D`, `HUB_IPAD_DRY_RUN would install 0.2.5 (0.2.5) over nothing`, `HUB_EVENT_CHECKED`.
+- After all three: no `v0.2.2`, `v0.0.20` or `v0.2.5` tag, no Release, each `main` unchanged; the S26 reads back Tower 0.2.1 (3), gib preview-17 (17), Gruvato 0.2.3 (2003); no event sent.
+
 **Runners.** gib's `delonet-gib-r1` now starts through `runsvc-op.sh` (systemd drop-in `op.conf`, token checked present). Gruvato has `big-chungus-gruvato` (systemd, `runsvc-op.sh`, `.env` with `MISE_TRUSTED_CONFIG_PATHS`, `ANDROID_HOME`, `JAVA_HOME`) and `mommymac-gruvato` (LaunchAgent through the keychain `runsvc-op.sh`, SessionCreate removed, token present). Registration tokens went through the environment and ssh stdin, never argv.
 
 **Keystores.** Backed up to DeLoSecrets as documents, each verified byte-identical on download and by keytool against its pin: Tower `mkvok3flnoqtvwdwe4yeyw65yq` (2d4954...1a97), Green In Between spike `zmyhzpejj5hgy4krilvwdqbsha` (d9d0253a...222a), Gruvato `66votsjmeurzmgu3brlk5552zi` (d09a011f...3a3c). gib's prepare hook fetches its keystore from there when the host has none.
@@ -166,6 +176,6 @@ The first real deploy (`--dry-run false`) is Jarad's, per app, after step 6.
 **Mac token file.** `~/.config/op/service-account-token` on the Mac was byte-identical to big-chungus's copy and to the DeLoSecrets item "Service Account Auth Token: DeLoSecrets": the token every agent and every big-chungus runner uses. It is deleted from the Mac (nothing read it; the runners read the keychain item). It was not revoked: revoking it would cut off every agent and runner on big-chungus.
 
 **Not done yet.**
-- iPad lanes for Gruvato and Green In Between: their manifests declare Android only, so a deploy covers the S26 until each has an `ios.device` hook (Gruvato: `scripts/ios/build-device.sh` and the Xcode 27 UIKit fix; gib: `ios-build.py --hub-out`, which also drops its Preview 19 BASELINE gate).
-- Tag `v1.0.0` and flip the refs: after both of those lanes are proven, so the tag carries the whole contract.
+- The first real deploy per app (Jarad's; see "Needs Jarad").
+- Known limits the app docs record: gib's `ios-build.py` manual mode still manual-signs (exit 65 against the managed profile; the hub path is unaffected); a gib `--platform ios` run after a bake-input change waits on big-chungus's bake (the Mac waits up to 15 min); Gruvato keeps its Xcode 27 workaround until swift-rs fixes #79/#81; Gruvato's Xcode pre-build script does not yet run pnpm through mise (GUI builds only; the hub uses `mise exec`); a Gruvato iOS run leaves about 3.6 GB in the Mac runner's `_work` until the next checkout (24 GiB free on the Mac).
 - Declined: retiring Gruvato's `emit-deploy-event.py` and `announce-deploy.sh` (they still announce the site, split-service and simulator deploys); a DeLoSecrets item for the spike keystore password (it is Android's public debug value, `android`).
