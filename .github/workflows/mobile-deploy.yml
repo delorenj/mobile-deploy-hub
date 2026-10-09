@@ -11,8 +11,8 @@ name: Mobile Deploy
 # explicit conditions: an Android-only deploy skips the Mac preflight, apps without a Linux iOS export skip
 # ios-export, and announce always runs.
 #
-# `uses:` takes no expressions, so the ref in every `delorenj/mobile-deploy-hub/actions/hub@main` below must match
-# the ref the caller used for this file. After the proof, tag the hub and flip all of them in one commit.
+# `uses:` takes no expressions, so the ref in every `delorenj/mobile-deploy-hub/actions/hub@v1.0.0` below must match
+# the ref the caller used for this file. A new hub version flips all of them in one commit, then tags that commit.
 on:
   workflow_call:
     inputs:
@@ -101,7 +101,7 @@ jobs:
           persist-credentials: false
       - id: hub
         name: iPad, signing, profile, disk
-        uses: delorenj/mobile-deploy-hub/actions/hub@main
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.0.0
         with:
           command: preflight-ios
           manifest: ${{ inputs.manifest }}
@@ -150,7 +150,7 @@ jobs:
           persist-credentials: false
       - id: hub
         name: S26, event contract, version bump
-        uses: delorenj/mobile-deploy-hub/actions/hub@main
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.0.0
         with:
           command: plan
           manifest: ${{ inputs.manifest }}
@@ -196,7 +196,7 @@ jobs:
           ref: ${{ needs.plan.outputs.build_sha }}
           persist-credentials: false
       - name: Build, check, install on the S26 and read it back
-        uses: delorenj/mobile-deploy-hub/actions/hub@main
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.0.0
         with:
           command: android
           manifest: ${{ inputs.manifest }}
@@ -221,7 +221,7 @@ jobs:
           create_credentials_file: false
       - name: Upload to Play
         if: ${{ !inputs.dry_run && needs.plan.outputs.play_lane == 'true' }}
-        uses: delorenj/mobile-deploy-hub/actions/hub@main
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.0.0
         with:
           command: play
           manifest: ${{ inputs.manifest }}
@@ -234,7 +234,7 @@ jobs:
           play_token: ${{ steps.auth.outputs.access_token }}
       - name: Publish the APK to a private Release
         if: ${{ !inputs.dry_run && needs.plan.outputs.release_lane == 'true' }}
-        uses: delorenj/mobile-deploy-hub/actions/hub@main
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.0.0
         with:
           command: release
           manifest: ${{ inputs.manifest }}
@@ -271,7 +271,7 @@ jobs:
           ref: ${{ needs.plan.outputs.build_sha }}
           persist-credentials: false
       - name: Export the Xcode projects and hand them to the Mac
-        uses: delorenj/mobile-deploy-hub/actions/hub@main
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.0.0
         with:
           command: ios-export
           manifest: ${{ inputs.manifest }}
@@ -327,7 +327,7 @@ jobs:
           name: xcode-project
           path: ${{ runner.temp }}/hub-out/ios
       - name: Build, check, install on the iPad and read it back
-        uses: delorenj/mobile-deploy-hub/actions/hub@main
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.0.0
         with:
           command: ios
           manifest: ${{ inputs.manifest }}
@@ -370,7 +370,7 @@ jobs:
           pattern: '{preflight-ios-out,plan-out,android-out,ios-receipt,ios-out}'
           path: ${{ runner.temp }}/hub-out/receipts
       - name: One Bloodbank event (a dry run only checks it)
-        uses: delorenj/mobile-deploy-hub/actions/hub@main
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.0.0
         with:
           command: announce
           manifest: ${{ inputs.manifest }}

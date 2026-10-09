@@ -55,7 +55,7 @@ permissions:
   id-token: write   # keyless Play
 jobs:
   deploy:
-    uses: delorenj/mobile-deploy-hub/.github/workflows/mobile-deploy.yml@main
+    uses: delorenj/mobile-deploy-hub/.github/workflows/mobile-deploy.yml@v1.0.0
     with:
       manifest: tools/ci/mobile-deploy.json
       dry_run: ${{ inputs.dry_run }}
@@ -66,7 +66,7 @@ jobs:
       dry_handoff: ${{ inputs.dry_handoff }}
 ```
 
-The `REAL` in a real run's title is how `mise run deploy` finds the last real run (it offers `gh run rerun --failed` when that run is red). The caller's ref and the `actions/hub@REF` refs inside the workflow must match (a test asserts one ref); pin them to a tag before the first real deploy.
+The `REAL` in a real run's title is how `mise run deploy` finds the last real run (it offers `gh run rerun --failed` when that run is red). The caller's ref and the `actions/hub@REF` refs inside the workflow must match (a test asserts one ref). All three apps pin `v1.0.0`. A new hub version flips the inner refs in one commit, tags that commit, then flips each caller; a real iPad deploy needs a green `--dry-handoff true` dry run at that ref first (the proof ledger `~/.local/state/mobile-deploy-hub/ipad-proofs.json`).
 
 ## The manifest (schema 2)
 
