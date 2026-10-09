@@ -4,11 +4,20 @@ import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { appendFile, mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export async function sha256File(path) {
   const hash = createHash('sha256');
   for await (const chunk of createReadStream(path)) hash.update(chunk);
   return hash.digest('hex');
+}
+
+// The ref the runner fetched the hub at, so a Release or a TestFlight build traces back to the code that made it.
+// The composite action passes github.action_ref as HUB_REF; the runner's own layout names it too
+// (_actions/<owner>/<repo>/<ref>/tools/ci/lib/receipt.mjs). `main` is bring-up only, a tag is what a real run should show.
+export function hubRef(env = process.env, file = fileURLToPath(import.meta.url)) {
+  if (env.HUB_REF) return env.HUB_REF;
+  return /[\\/]_actions[\\/][^\\/]+[\\/][^\\/]+[\\/]([^\\/]+)[\\/]tools[\\/]ci[\\/]lib[\\/]receipt\.mjs$/.exec(file)?.[1] ?? null;
 }
 
 export function buildReceipt({ lane, config, env = process.env, version, androidCode, build, artifacts = [], signer, notes = [] }) {
@@ -22,6 +31,7 @@ export function buildReceipt({ lane, config, env = process.env, version, android
     run_attempt: env.GITHUB_RUN_ATTEMPT ?? null,
     dry_run: config.dryRun,
     channel: config.channel,
+    hub_ref: hubRef(env),
     version: version ?? null,
     android_code: androidCode ?? null,
     build: build ?? null,
@@ -34,7 +44,7 @@ export function buildReceipt({ lane, config, env = process.env, version, android
 
 export function summaryMarkdown(receipt) {
   const rows = [
-    ['lane', receipt.lane], ['dry run', receipt.dry_run], ['version', receipt.version], ['android code', receipt.android_code],
+    ['lane', receipt.lane], ['dry run', receipt.dry_run], ['hub ref', receipt.hub_ref], ['version', receipt.version], ['android code', receipt.android_code],
     ['build', receipt.build], ['sha', receipt.sha], ['run', receipt.run_id], ['signer', receipt.signer],
   ].filter(([, value]) => value !== null && value !== undefined && value !== '');
   const lines = [`### Hub receipt: ${receipt.lane}`, '', '| field | value |', '|---|---|', ...rows.map(([key, value]) => `| ${key} | \`${value}\` |`)];

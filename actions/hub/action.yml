@@ -24,6 +24,9 @@ inputs:
     default: 'true'
   dry_handoff:
     default: 'false'
+  strict:
+    description: A dry run fails, as a real run does, when a check could not be made (a locked Mac leaves the 1Password references unread)
+    default: 'true'
   version:
     description: Version announced by the plan job
     default: ''
@@ -71,6 +74,8 @@ runs:
         HUB_BUILD: ${{ inputs.build }}
         HUB_DRY_RUN: ${{ inputs.dry_run }}
         HUB_DRY_HANDOFF: ${{ inputs.dry_handoff }}
+        HUB_STRICT: ${{ inputs.strict }}
+        HUB_REF: ${{ github.action_ref }}
         HUB_VERSION: ${{ inputs.version }}
         HUB_ANDROID_CODE: ${{ inputs.android_code }}
         HUB_WIF_PROVIDER: ${{ inputs.wif_provider }}

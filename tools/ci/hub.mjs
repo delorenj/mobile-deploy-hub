@@ -234,10 +234,11 @@ async function iosPreflight(config, spec, { env }) {
   for (const ref of secrets) {
     const read = readSecretRef(ref, { env, timeout: opTimeout });
     if (read.timedOut) {
-      const why = `op did not answer within ${opTimeout / 1000}s reading ${ref}: 1Password is waiting for a person on the Mac (screen locked, or the app wants approval). Unlock the Mac and run again.`;
-      // A real run must stop before anything is uploaded. A dry run proves the pipeline, and a locked screen is a
-      // condition of the Mac, not a defect of the pipeline, so it warns, records the gap and does not claim the check passed.
-      if (!config.dryRun) throw new Error(why);
+      const why = `op did not answer within ${opTimeout / 1000}s reading ${ref}: 1Password is waiting for a person on the Mac (screen locked, or the app wants approval). Unlock the Mac, approve 1Password and run again.`;
+      // A real run must stop before anything is uploaded. A strict dry run (the default) stops too: it is the gate
+      // before a real upload, and a green gate that never read the secret references proves nothing about the Mac.
+      // Only an explicit strict=false dry run warns, records the gap and does not claim the check passed.
+      if (!config.dryRun || config.strict) throw new Error(why);
       console.log(`::warning::${why}`);
       notes.push(`UNVERIFIED: ${secrets.length - verified} secret references were not checked (${why})`);
       return { receipt, notes };

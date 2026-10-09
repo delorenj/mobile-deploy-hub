@@ -41,6 +41,10 @@ on:
         description: On a dry run also ship the Xcode archive to the Mac and verify it (about 100 MB of artifact quota)
         type: boolean
         default: false
+      strict:
+        description: A dry run fails, as a real run does, when a check could not be made (a locked Mac leaves the 1Password references unread)
+        type: boolean
+        default: true
       linux_runner:
         description: JSON array of runner labels for Linux jobs
         type: string
@@ -150,12 +154,16 @@ jobs:
           version: ${{ needs.plan.outputs.version }}
           android_code: ${{ needs.plan.outputs.android_code }}
           github_token: ${{ github.token }}
+      # Receipts only. The APK is delivered by the private Release (and the AAB by Play), so the 68 MB build never
+      # spends artifact quota; the receipts carry its sha256 and signer. overwrite lets "Re-run failed jobs" replace
+      # the artifact a failed attempt left behind.
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
           name: android-out
-          path: ${{ runner.temp }}/hub-out/android/
+          path: ${{ runner.temp }}/hub-out/android/*.json
           if-no-files-found: ignore
+          overwrite: true
           retention-days: ${{ inputs.dry_run && 1 || 7 }}
 
   ios-export:
@@ -187,12 +195,14 @@ jobs:
           name: ios-receipt
           path: ${{ runner.temp }}/hub-out/ios/*.json
           if-no-files-found: ignore
+          overwrite: true
           retention-days: ${{ inputs.dry_run && 1 || 7 }}
       - uses: actions/upload-artifact@v4
         if: ${{ !inputs.dry_run || inputs.dry_handoff }}
         with:
           name: xcode-project
           path: ${{ runner.temp }}/hub-out/ios/*.tgz
+          overwrite: true
           retention-days: ${{ inputs.dry_run && 1 || 7 }}
 
   ios-upload:
@@ -228,6 +238,7 @@ jobs:
           build: ${{ inputs.build }}
           dry_run: ${{ inputs.dry_run }}
           dry_handoff: ${{ inputs.dry_handoff }}
+          strict: ${{ inputs.strict }}
           version: ${{ needs.plan.outputs.version }}
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
@@ -235,4 +246,5 @@ jobs:
           name: ios-upload-receipt
           path: ${{ runner.temp }}/hub-out/ios/hub-receipt-ios-upload.json
           if-no-files-found: ignore
+          overwrite: true
           retention-days: ${{ inputs.dry_run && 1 || 7 }}

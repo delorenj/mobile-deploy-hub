@@ -18,6 +18,7 @@ const flags = Object.freeze({
   '--build': 'build',
   '--dry-run': 'dryRun',
   '--dry-handoff': 'dryHandoff',
+  '--strict': 'strict',
   '--out': 'out',
   '--version': 'version',
   '--android-code': 'androidCode',
@@ -32,6 +33,7 @@ const environment = Object.freeze({
   build: 'HUB_BUILD',
   dryRun: 'HUB_DRY_RUN',
   dryHandoff: 'HUB_DRY_HANDOFF',
+  strict: 'HUB_STRICT',
   out: 'HUB_OUT',
   version: 'HUB_VERSION',
   androidCode: 'HUB_ANDROID_CODE',
@@ -78,6 +80,7 @@ export function parseConfig(argv, env = process.env) {
     build,
     dryRun: bool('dry_run', raw.dryRun, true),
     dryHandoff: bool('dry_handoff', raw.dryHandoff, false),
+    strict: bool('strict', raw.strict, true),
     out: raw.out || join(env.RUNNER_TEMP || tmpdir(), 'hub-out'),
     version: raw.version ?? '',
     androidCode,
@@ -85,10 +88,19 @@ export function parseConfig(argv, env = process.env) {
   };
 }
 
+// Every variable that can mint or carry a credential. The runner puts the OIDC pair in each step's environment
+// whenever the job holds id-token: write (the android job always does, dry runs included), and they can mint a
+// federated Google token, so they stop here with the store and GitHub tokens.
+export const credentialVariables = Object.freeze([
+  'PLAY_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN',
+  'ACTIONS_ID_TOKEN_REQUEST_URL', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN', 'ACTIONS_RUNTIME_TOKEN',
+]);
+
 // The environment every hook sees. Nothing from an event payload; only values validated above.
-// Store and GitHub tokens never reach a hook.
+// Store, GitHub and OIDC tokens never reach a hook.
 export function hookEnvironment(config, base = process.env) {
-  const { PLAY_TOKEN, GH_TOKEN, ...rest } = base;
+  const rest = { ...base };
+  for (const name of credentialVariables) delete rest[name];
   return {
     ...rest,
     HUB_OUT: config.out,

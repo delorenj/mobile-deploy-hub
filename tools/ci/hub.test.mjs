@@ -6,11 +6,11 @@ import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { commands, hookEnvironment, parseConfig } from './lib/config.mjs';
+import { commands, credentialVariables, hookEnvironment, parseConfig } from './lib/config.mjs';
 import { parseManifest } from './lib/manifest.mjs';
 import { findApksigner, parseSigners, signerEnvironment, verifySigner } from './lib/android.mjs';
 import { highestVersionCode, uploadBundle } from './lib/play.mjs';
-import { buildReceipt, setOutputs, summaryMarkdown, writeReceipt } from './lib/receipt.mjs';
+import { buildReceipt, hubRef, setOutputs, summaryMarkdown, writeReceipt } from './lib/receipt.mjs';
 import { exportGodot, scriptErrors } from './lib/godot.mjs';
 import { android, iosExport, iosUpload, parseVersion, plan, play, release, releaseArguments, tagVersion } from './hub.mjs';
 
@@ -92,6 +92,7 @@ test('defaults are the safe ones: dry run, sideload, both platforms, no build ov
   const config = parseConfig(['plan'], {});
   assert.equal(config.dryRun, true);
   assert.equal(config.dryHandoff, false);
+  assert.equal(config.strict, true, 'a dry run is strict unless asked otherwise');
   assert.equal(config.platform, 'both');
   assert.equal(config.channel, 'sideload');
   assert.equal(config.track, 'internal');
@@ -106,6 +107,9 @@ test('environment sets the config and flags override it', () => {
   assert.deepEqual([config.platform, config.dryRun, config.build, config.channel, config.track, config.out], ['ios', false, '12', 'play', 'beta', '/tmp/x']);
   const flagged = parseConfig(['android', '--platform', 'android', '--dry-run', 'true', '--build', '13', '--out', '/tmp/y'], env);
   assert.deepEqual([flagged.platform, flagged.dryRun, flagged.build, flagged.out], ['android', true, '13', '/tmp/y']);
+  assert.equal(parseConfig(['ios-upload'], { HUB_STRICT: 'false' }).strict, false);
+  assert.equal(parseConfig(['ios-upload', '--strict', 'false'], {}).strict, false);
+  assert.throws(() => parseConfig(['ios-upload'], { HUB_STRICT: 'no' }), /strict must be true or false/);
 });
 
 test('the output folder defaults under RUNNER_TEMP', () => {
@@ -129,12 +133,17 @@ test('every documented command parses', () => {
   for (const command of commands) assert.equal(parseConfig([command], {}).command, command);
 });
 
-test('hooks see the HUB_ variables and never a store or GitHub token', () => {
+test('hooks see the HUB_ variables and never a store, GitHub or OIDC token', () => {
   const config = parseConfig(['android', '--build', '9', '--dry-run', 'false', '--channel', 'play', '--out', '/o'], {});
-  const env = hookEnvironment(config, { PATH: '/bin', PLAY_TOKEN: 'secret-a', GH_TOKEN: 'secret-b', KEEP: '1' });
+  const env = hookEnvironment(config, {
+    PATH: '/bin', KEEP: '1', PLAY_TOKEN: 'secret-a', GH_TOKEN: 'secret-b', GITHUB_TOKEN: 'secret-c',
+    // The runner sets these in every step of a job that holds id-token: write, and they mint a federated Google token.
+    ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example/token', ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'secret-d', ACTIONS_RUNTIME_TOKEN: 'secret-e',
+  });
   assert.deepEqual([env.HUB_OUT, env.HUB_BUILD, env.HUB_DRY_RUN, env.HUB_CHANNEL, env.KEEP, env.PATH], ['/o', '9', 'false', 'play', '1', '/bin']);
-  assert.equal(env.PLAY_TOKEN, undefined);
-  assert.equal(env.GH_TOKEN, undefined);
+  for (const name of credentialVariables) assert.equal(env[name], undefined, name);
+  assert.deepEqual([...credentialVariables].sort(), ['ACTIONS_ID_TOKEN_REQUEST_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_URL', 'ACTIONS_RUNTIME_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN', 'PLAY_TOKEN']);
+  assert.ok(!JSON.stringify(env).includes('secret-'), 'no credential value survives anywhere in the hook environment');
 });
 
 // ---- manifest ----
@@ -463,7 +472,7 @@ test('a failed secret reference stops the preflight without printing the value',
   } finally { await f.cleanup(); }
 });
 
-test('a 1Password that never answers fails a real run fast and only warns on a dry run', async () => {
+test('a 1Password that never answers fails a real run and a strict dry run fast, and only an explicit non-strict dry run warns', async () => {
   const f = await fixture();
   try {
     await handoff(f);
@@ -471,13 +480,26 @@ test('a 1Password that never answers fails a real run fast and only warns on a d
     await script(join(f.root, 'bin/op'), 'echo "$@" >> "' + join(f.root, 'op-calls.txt') + '"\n(sleep 30) &\nsleep 30');
     const env = { ...f.env, HUB_OP_TIMEOUT_MS: '300' };
     const started = Date.now();
-    const dry = await iosUpload(f.configure('ios-upload', ['--dry-handoff', 'true']), { env });
-    assert.ok(Date.now() - started < 10_000, 'the dry run did not wait for the hung op');
+    // The gate before a real upload: a dry run that never read the references must not go green.
+    await assert.rejects(iosUpload(f.configure('ios-upload', ['--dry-handoff', 'true']), { env }), /op did not answer within 0\.3s reading op:\/\/Vault\/Item\/key_id.*Unlock the Mac, approve 1Password/);
+    assert.ok(Date.now() - started < 10_000, 'the strict dry run did not wait for the hung op');
+    const dry = await iosUpload(f.configure('ios-upload', ['--dry-handoff', 'true', '--strict', 'false']), { env });
     assert.ok(dry.notes.some(note => /UNVERIFIED: 2 secret references were not checked/.test(note)));
     assert.ok(dry.notes.some(note => /dry run: upload and assign were not called/.test(note)));
-    assert.equal((await readFile(join(f.root, 'op-calls.txt'), 'utf8')).trim().split('\n').length, 1, 'one hung read, not one per reference');
-    await assert.rejects(iosUpload(f.configure('ios-upload', ['--dry-run', 'false']), { env }), /op did not answer within 0\.3s reading op:\/\/Vault\/Item\/key_id.*Unlock the Mac/);
+    assert.ok(!dry.notes.some(note => /secret references resolve/.test(note)), 'a warned dry run never claims the references resolve');
+    assert.equal((await readFile(join(f.root, 'op-calls.txt'), 'utf8')).trim().split('\n').length, 2, 'one hung read per attempt, not one per reference');
+    await assert.rejects(iosUpload(f.configure('ios-upload', ['--dry-run', 'false', '--strict', 'false']), { env }), /op did not answer within 0\.3s reading op:\/\/Vault\/Item\/key_id.*Unlock the Mac/);
     assert.equal(existsSync(join(f.out, 'marker.txt')), false, 'a real run stopped before upload and assign');
+  } finally { await f.cleanup(); }
+});
+
+test('a dry run that read every reference says so, which is the receipt a green gate must show', async () => {
+  const f = await fixture();
+  try {
+    await handoff(f);
+    const result = await iosUpload(f.configure('ios-upload', ['--dry-handoff', 'true']), { env: f.env });
+    assert.ok(result.notes.some(note => /2 secret references resolve/.test(note)));
+    assert.ok(!result.notes.some(note => /UNVERIFIED/.test(note)));
   } finally { await f.cleanup(); }
 });
 
@@ -593,6 +615,9 @@ test('receipts hold identity and checksums and no credentials', async () => {
   try {
     const receipt = buildReceipt({ lane: 'android', config: f.configure('android'), env: f.env, version: '0.3.0', artifacts: [{ name: 'a.apk', sha256: 'f'.repeat(64) }], signer });
     assert.deepEqual(Object.keys(receipt).filter(key => /token|key|secret|password/i.test(key)), []);
+    assert.equal(receipt.hub_ref, null, 'unknown outside a runner');
+    assert.equal(buildReceipt({ lane: 'android', config: f.configure('android'), env: { ...f.env, HUB_REF: 'v1.0.0' } }).hub_ref, 'v1.0.0');
+    assert.match(summaryMarkdown({ ...receipt, hub_ref: 'v1.0.0' }), /\| hub ref \| `v1\.0\.0` \|/);
     const summary = join(f.root, 'summary.md');
     const file = await writeReceipt(join(f.root, 'r'), receipt, { GITHUB_STEP_SUMMARY: summary });
     assert.ok(existsSync(file));
@@ -600,6 +625,14 @@ test('receipts hold identity and checksums and no credentials', async () => {
     assert.match(summaryMarkdown(receipt), /a\.apk/);
     await assert.rejects(setOutputs({ evil: 'a\nb=c' }, f.env), /line break/);
   } finally { await f.cleanup(); }
+});
+
+test('the hub ref comes from the action, or from where the runner put the tool', () => {
+  const runner = '/home/x/_work/_actions/delorenj/mobile-deploy-hub';
+  assert.equal(hubRef({ HUB_REF: 'v1.2.3' }, `${runner}/main/tools/ci/lib/receipt.mjs`), 'v1.2.3');
+  assert.equal(hubRef({ HUB_REF: '' }, `${runner}/main/tools/ci/lib/receipt.mjs`), 'main');
+  assert.equal(hubRef({}, `${runner}/v1.0.0/tools/ci/lib/receipt.mjs`), 'v1.0.0');
+  assert.equal(hubRef({}, `/home/delorenj/code/mobile-deploy-hub/tools/ci/lib/receipt.mjs`), null, 'a local checkout has no ref');
 });
 
 test('the godot fallback exports with GODOT_BIN and fails on script errors', async () => {
@@ -637,6 +670,16 @@ test('the reusable workflow is hardened: no hosted runners, no shell interpolati
   assert.match(workflow, /retention-days: \$\{\{ inputs\.dry_run && 1 \|\| 7 \}\}/);
   assert.match(workflow, /if: \$\{\{ !inputs\.dry_run \|\| inputs\.dry_handoff \}\}/);
   assert.match(workflow, /needs: \[plan, ios-export\]/);
+  // Every upload can be redone by "Re-run failed jobs" after a failed first attempt (a locked Mac, a Release clash).
+  const uploads = [...workflow.matchAll(/uses: actions\/upload-artifact@v4\n\s+(?:if: [^\n]+\n\s+)?with:\n((?:\s+[\w-]+: [^\n]+\n?)+)/g)].map(match => match[1]);
+  assert.deepEqual(uploads.map(block => /name: (\S+)/.exec(block)[1]), ['android-out', 'ios-receipt', 'xcode-project', 'ios-upload-receipt']);
+  for (const block of uploads) assert.match(block, /^\s+overwrite: true$/m, block);
+  // The build itself never takes quota twice: the Release (or Play) holds the APK, the artifact holds receipts.
+  assert.match(workflow, /name: android-out\n\s+path: \$\{\{ runner\.temp \}\}\/hub-out\/android\/\*\.json\n/);
+  assert.doesNotMatch(workflow, /hub-out\/android\/\n/);
+  // A dry run is the gate before a real upload, so it is strict by default and the Mac step receives the input.
+  assert.match(workflow, /strict:\n\s+description: [^\n]+\n\s+type: boolean\n\s+default: true\n/);
+  assert.match(workflow, /dry_handoff: \$\{\{ inputs\.dry_handoff \}\}\n\s+strict: \$\{\{ inputs\.strict \}\}\n/);
 });
 
 test('the composite action gives every run step a shell and reads inputs only', async () => {
@@ -649,6 +692,9 @@ test('the composite action gives every run step a shell and reads inputs only', 
   assert.match(action, /\$\{\{ github\.action_path \}\}\/\.\.\/\.\.\/tools\/ci\/hub\.mjs/);
   assert.doesNotMatch(action.replace(/^\s+[A-Z_]+: \$\{\{[^}]+\}\}$/gm, ''), /\$\{\{ inputs\./, 'inputs only reach the shell through env');
   assert.match(action, /run: node "\$HUB_TOOL" "\$HUB_COMMAND"/);
+  assert.match(action, /^\s+HUB_REF: \$\{\{ github\.action_ref \}\}$/m, 'receipts record the ref the hub was fetched at');
+  assert.match(action, /^\s+HUB_STRICT: \$\{\{ inputs\.strict \}\}$/m);
+  assert.match(action, /strict:\n\s+description: [^\n]+\n\s+default: 'true'\n/);
 });
 
 test('the old relay is gone', () => {

@@ -33,15 +33,17 @@ The caller's ref and the `uses: delorenj/mobile-deploy-hub/actions/hub@main` ref
 | Job | Runs on | Does |
 |---|---|---|
 | `plan` | Linux | reads the manifest and the `version` hook, validates inputs, checks a `vX.Y.Z` tag against the version |
-| `android` | Linux | `prepare`, `export` (or `bundle` for Play), checks the APK signer, writes receipts; on a real run publishes a private GitHub Release (sideload) or uploads to Play |
+| `android` | Linux | `prepare`, `export` (or `bundle` for Play), checks the APK signer, writes receipts; on a real run publishes a private GitHub Release (sideload) or uploads to Play. The `android-out` artifact holds the receipts only |
 | `ios-export` | Linux | the app's export hook; checks the archive against the app's receipt |
-| `ios-upload` | Mac | verifies the handoff, Xcode, the signing identity and the secret references; on a real run runs the app's `upload` and `assign` hooks |
+| `ios-upload` | Mac | verifies the handoff, Xcode, the signing identity and the secret references; on a real run runs the app's `upload` and `assign` hooks. The Mac must be unlocked with 1Password approved, because `op read` waits for a person otherwise |
 
 `dry_run` is the default everywhere. A dry run builds and verifies; it never releases, uploads, assigns or contacts Play. `tools/ci/hub.mjs` refuses `play` and `release` on a dry run even if the workflow were miswired.
 
+A dry run is also `strict` by default: it fails, as a real run does, when a check could not be made (a locked Mac leaves the 1Password references unread), so a green dry run is a valid gate. A pass shows "N secret references resolve" in `hub-receipt-ios-upload.json` and no `UNVERIFIED` note. Receipts record `hub_ref`, the ref the runner fetched the hub at; pin the refs to a tag before the first real run (design doc, "Versioning").
+
 ## The manifest
 
-`mobile-deploy.json` in the app, read from the committed file at the built ref. Hooks are shell commands run from the app root with `HUB_OUT`, `HUB_BUILD`, `HUB_DRY_RUN` and `HUB_CHANNEL` set; store and GitHub tokens are stripped.
+`mobile-deploy.json` in the app, read from the committed file at the built ref. Hooks are shell commands run from the app root with `HUB_OUT`, `HUB_BUILD`, `HUB_DRY_RUN` and `HUB_CHANNEL` set; store, GitHub and OIDC tokens are stripped.
 
 | Key | Meaning |
 |---|---|
