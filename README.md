@@ -21,6 +21,31 @@ Before you run it:
 
 Status (2026-10-09): `v1.0.0` is the current hub. All three apps pin it, and each has a green strict dry run at `v1.0.0` on both lanes (S26 and iPad: `HUB_S26_DRY_RUN`, `HUB_IPA_OK`, `HUB_IPAD_DRY_RUN`, `HUB_EVENT_CHECKED`): Tower 37931518291, Green In Between 37931519842, Gruvato 37931523316. Their iPad proofs are recorded at `v1.0.0`, so `--dry-run false` is unblocked. No real deploy has run yet; the first one per app is Jarad's. Unproven until then: a devicectl install while the iPad is locked, and Gruvato's first (fresh) install on the iPad. Proof log: [docs/design-hub-v3.md](docs/design-hub-v3.md#build-log-2026-10-09).
 
+## Deploy policy
+
+The rules every deploy obeys live in one file in this repo: [`tools/ci/policy.json`](tools/ci/policy.json). The `gate` job reads it from the exact tag the run pins — never from a workflow input, an environment variable, an app manifest or a hook — so the front door, `gh workflow run`, the GitHub mobile app and every rerun all run the same rules. Only the hub can change a rule; apps inherit it through the `@v1` pin and never carry deploy policy of their own.
+
+What it pins: bump levels (patch by default, never "none"), one Bloodbank event per run attempt, manifest schema 2, the caller allowlist (`callers.accept`, the hashes of accepted `templates/deploy.yml` versions), pinned self-hosted runner labels, absent-device handling (`pending`, never a stop), the downgrade refusals, the delivery targets (S3, Quickdrop, the private Release) and the Mac's metered data budget.
+
+**Changing a rule, once, for every app:**
+
+1. Edit `tools/ci/policy.json` and its test in this repo.
+2. `mise run release`: it checks a clean tree, runs `mise run check` and `mise run conformance` (every app's caller hash, manifest and out-of-hub drift), tags `vX.Y.Z`, moves `v1`, and proves the release with one strict dry run per app (Tower, Green In Between, Gruvato) — moving `v1` back if any is red.
+
+Apps need no edit for a policy change: their callers pin `@v1`. A caller changes only when the template itself changes, and the new template's hash joins `callers.accept` in the same release, so moving `v1` never refuses a caller that has not been updated yet.
+
+**Adopting the policy in a new app:**
+
+1. Copy `templates/deploy.yml` verbatim into `.github/workflows/deploy.yml`; it pins `@v1`, and the gate hashes the caller, so never edit it.
+2. Write `tools/ci/mobile-deploy.json` (schema 2) and register the app's own repo-scoped runners (Linux on big-chungus, macOS on the Mac).
+3. Add the `mise run deploy` task that fetches this repo's [`tools/deploy.mjs`](tools/deploy.mjs) at the pinned ref.
+4. One hub release adds the app to `apps` and its caller hash to `callers.accept`.
+5. Put the deploy sentence in the app's `AGENTS.md` (see the skillex `mobile-devex` skill) so its agents follow the same rule.
+
+Everything out-of-hub is refused or retired: no app path may bump a version, mint a tag, `gh release create`, upload to TestFlight or install a release build on a device.
+
+*Status: the policy file and the gate land with `v1.1.0` ([design](docs/design-hub-v1.1.md)); until that release, `v1.0.0` behaviour applies.*
+
 ## What a run does
 
 | Job | Runs on | Does |
