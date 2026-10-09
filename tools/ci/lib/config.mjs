@@ -1,10 +1,11 @@
 // Argument handling. Inputs arrive as HUB_* environment variables (the composite action maps its inputs
 // there, so no workflow expression is ever spliced into a shell line) and flags override them for local use.
-// Every default is the safe one: dry run, sideload, no build override.
+// Every default is the safe one: dry run, sideload, no build override, no store lanes.
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { levels } from './version.mjs';
 
-export const commands = Object.freeze(['plan', 'android', 'play', 'release', 'ios-export', 'ios-upload']);
+export const commands = Object.freeze(['plan', 'android', 'play', 'release', 'ios-export', 'ios-upload', 'preflight-ios', 'ios', 'announce']);
 export const platforms = Object.freeze(['both', 'android', 'ios']);
 export const channels = Object.freeze(['sideload', 'play']);
 export const playStatuses = Object.freeze(['draft', 'completed', 'inProgress', 'halted']);
@@ -22,6 +23,14 @@ const flags = Object.freeze({
   '--out': 'out',
   '--version': 'version',
   '--android-code': 'androidCode',
+  '--ios-build': 'iosBuild',
+  '--bump': 'bump',
+  '--testflight': 'testflight',
+  '--play': 'play',
+  '--build-sha': 'buildSha',
+  '--bump-patch': 'bumpPatch',
+  '--ipad-version': 'ipadVersion',
+  '--ipad-build': 'ipadBuild',
 });
 
 const environment = Object.freeze({
@@ -37,6 +46,14 @@ const environment = Object.freeze({
   out: 'HUB_OUT',
   version: 'HUB_VERSION',
   androidCode: 'HUB_ANDROID_CODE',
+  iosBuild: 'HUB_IOS_BUILD',
+  bump: 'HUB_BUMP',
+  testflight: 'HUB_TESTFLIGHT',
+  play: 'HUB_PLAY',
+  buildSha: 'HUB_BUILD_SHA',
+  bumpPatch: 'HUB_BUMP_PATCH',
+  ipadVersion: 'HUB_IPAD_VERSION',
+  ipadBuild: 'HUB_IPAD_BUILD',
 });
 
 function bool(name, value, fallback) {
@@ -49,6 +66,12 @@ function bool(name, value, fallback) {
 function oneOf(name, value, allowed) {
   if (!allowed.includes(value)) throw new Error(`${name} must be one of ${allowed.join(', ')}, got "${value}"`);
   return value;
+}
+
+function matching(name, value, pattern, what) {
+  const found = value ?? '';
+  if (found !== '' && !pattern.test(found)) throw new Error(`${name} must be ${what}, got "${String(found).slice(0, 40)}"`);
+  return found;
 }
 
 export function parseConfig(argv, env = process.env) {
@@ -70,6 +93,7 @@ export function parseConfig(argv, env = process.env) {
   if (manifest.startsWith('/') || manifest.split('/').includes('..')) throw new Error('manifest must be a path inside the app checkout');
   const androidCode = raw.androidCode ?? '';
   if (androidCode !== '' && !/^[1-9]\d{0,9}$/.test(androidCode)) throw new Error(`android code must be a positive integer, got "${androidCode}"`);
+  const bumpPatch = matching('bump_patch', raw.bumpPatch, /^[A-Za-z0-9+/=]{0,700000}$/, 'base64');
   return {
     command,
     manifest,
@@ -81,9 +105,17 @@ export function parseConfig(argv, env = process.env) {
     dryRun: bool('dry_run', raw.dryRun, true),
     dryHandoff: bool('dry_handoff', raw.dryHandoff, false),
     strict: bool('strict', raw.strict, true),
+    bump: oneOf('bump', raw.bump || 'patch', levels),
+    testflight: bool('testflight', raw.testflight, false),
+    play: bool('play', raw.play, false),
     out: raw.out || join(env.RUNNER_TEMP || tmpdir(), 'hub-out'),
-    version: raw.version ?? '',
+    version: matching('version', raw.version, /^\d+\.\d+\.\d+$/, 'X.Y.Z'),
     androidCode,
+    iosBuild: matching('ios build', raw.iosBuild, /^[1-9]\d{0,8}$|^\d+\.\d+(\.\d+)?$/, 'a build number'),
+    buildSha: matching('build sha', raw.buildSha, /^[0-9a-f]{40}$/, 'a 40-character commit sha'),
+    bumpPatch,
+    ipadVersion: matching('ipad version', raw.ipadVersion, /^[0-9A-Za-z.+-]{1,40}$/, 'a version'),
+    ipadBuild: matching('ipad build', raw.ipadBuild, /^[0-9A-Za-z.+-]{1,40}$/, 'a build'),
     cwd: process.cwd(),
   };
 }
@@ -98,14 +130,20 @@ export const credentialVariables = Object.freeze([
 
 // The environment every hook sees. Nothing from an event payload; only values validated above.
 // Store, GitHub and OIDC tokens never reach a hook.
-export function hookEnvironment(config, base = process.env) {
+export function hookEnvironment(config, base = process.env, extra = {}) {
   const rest = { ...base };
   for (const name of credentialVariables) delete rest[name];
+  for (const name of Object.keys(rest)) if (/^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/.test(name)) delete rest[name];
   return {
     ...rest,
     HUB_OUT: config.out,
     HUB_BUILD: config.build,
     HUB_DRY_RUN: String(config.dryRun),
     HUB_CHANNEL: config.channel,
+    HUB_VERSION: config.version ?? '',
+    HUB_ANDROID_CODE: config.androidCode ?? '',
+    HUB_IOS_BUILD: config.iosBuild ?? '',
+    HUB_TESTFLIGHT: String(config.testflight ?? false),
+    ...extra,
   };
 }

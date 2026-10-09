@@ -1,11 +1,18 @@
 name: Mobile Deploy
 
-# Reusable workflow. The app is the caller and the jobs run on the caller's repo-scoped runners; this repo
-# owns only the job graph and tools/ci. The caller must grant `contents: write` (GitHub Release for the
-# sideload APK) and `id-token: write` (keyless Play auth); a called job can only narrow what the caller grants.
+# Reusable workflow (hub v3). The app is the caller and the jobs run on the caller's repo-scoped runners; this repo
+# owns only the job graph and tools/ci. The caller grants `contents: write` (the bump commit and tag, the sideload
+# Release) and `id-token: write` (keyless Play); a called job can only narrow what the caller grants.
+#
+# A v3 deploy (manifest schema 2): preflight-ios (Mac) -> plan (bump) -> android (S26) | ios-export -> ios (iPad)
+# -> announce (one Bloodbank event). A schema 1 manifest still runs the v2 way (no bump, no installs, no event).
+#
+# A skipped job skips everything that needs it unless the dependent says otherwise, so plan, ios and announce carry
+# explicit conditions: an Android-only deploy skips the Mac preflight, apps without a Linux iOS export skip
+# ios-export, and announce always runs.
 #
 # `uses:` takes no expressions, so the ref in every `delorenj/mobile-deploy-hub/actions/hub@main` below must match
-# the ref the caller used for this file. After the proof, tag v1 and flip all of them in one commit.
+# the ref the caller used for this file. After the proof, tag the hub and flip all of them in one commit.
 on:
   workflow_call:
     inputs:
@@ -14,31 +21,27 @@ on:
         type: string
         default: mobile-deploy.json
       platform:
-        description: android, ios or both
+        description: both, android or ios (narrows the devices too)
         type: string
         default: both
-      android_channel:
-        description: sideload (family APK) or play (AAB to Play)
+      bump:
+        description: patch, minor or major. Every deploy bumps; a failed one is finished with Re-run failed jobs
         type: string
-        default: sideload
-      track:
-        description: Play track for android_channel=play
-        type: string
-        default: internal
-      play_status:
-        description: Play release status, draft until the app has shipped once
-        type: string
-        default: draft
-      build:
-        description: iOS build number override, blank for the next after App Store Connect
-        type: string
-        default: ''
+        default: patch
+      testflight:
+        description: Also upload to TestFlight Owner Testing (apps with ios.store)
+        type: boolean
+        default: false
+      play:
+        description: Also upload the AAB to Play (apps with android.bundle)
+        type: boolean
+        default: false
       dry_run:
-        description: Build and verify only; upload, assign, release and Play are skipped
+        description: Build and verify only; no commit, tag, push, install, Release, TestFlight, Play or event
         type: boolean
         default: true
       dry_handoff:
-        description: On a dry run also ship the Xcode archive to the Mac and verify it (about 100 MB of artifact quota)
+        description: On a dry run also hand the Linux Xcode export to the Mac and build and check the iPad IPA
         type: boolean
         default: false
       strict:
@@ -48,11 +51,11 @@ on:
       linux_runner:
         description: JSON array of runner labels for Linux jobs
         type: string
-        default: '["self-hosted","linux","godot"]'
+        default: '["self-hosted","Linux"]'
       mac_runner:
-        description: JSON array of runner labels for the Mac job
+        description: JSON array of runner labels for the Mac jobs
         type: string
-        default: '["self-hosted","macOS","ios-signing"]'
+        default: '["self-hosted","macOS"]'
       wif_provider:
         description: Workload Identity Federation provider, real Play runs only
         type: string
@@ -61,46 +64,126 @@ on:
         description: Service account the Play upload impersonates, real Play runs only
         type: string
         default: ''
+      android_channel:
+        description: v2 callers (manifest schema 1) only, sideload or play
+        type: string
+        default: sideload
+      track:
+        description: Play track
+        type: string
+        default: internal
+      play_status:
+        description: Play release status, draft until the app has shipped once
+        type: string
+        default: draft
+      build:
+        description: v2 callers (manifest schema 1) only, iOS build number override
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 jobs:
-  plan:
-    runs-on: ${{ fromJSON(inputs.linux_runner) }}
+  preflight-ios:
+    if: ${{ inputs.platform != 'android' }}
+    runs-on: ${{ fromJSON(inputs.mac_runner) }}
     timeout-minutes: 10
     permissions:
       contents: read
     outputs:
-      version: ${{ steps.hub.outputs.version }}
-      android_code: ${{ steps.hub.outputs.android_code }}
-      run_android: ${{ steps.hub.outputs.run_android }}
-      run_ios: ${{ steps.hub.outputs.run_ios }}
+      ipad_version: ${{ steps.hub.outputs.ipad_version }}
+      ipad_build: ${{ steps.hub.outputs.ipad_build }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
       - id: hub
+        name: iPad, signing, profile, disk
+        uses: delorenj/mobile-deploy-hub/actions/hub@main
+        with:
+          command: preflight-ios
+          manifest: ${{ inputs.manifest }}
+          platform: ${{ inputs.platform }}
+          testflight: ${{ inputs.testflight }}
+          dry_run: ${{ inputs.dry_run }}
+          strict: ${{ inputs.strict }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: preflight-ios-out
+          path: ${{ runner.temp }}/hub-out/preflight/*.json
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: ${{ inputs.dry_run && 1 || 7 }}
+
+  plan:
+    needs: preflight-ios
+    if: ${{ !cancelled() && (needs.preflight-ios.result == 'success' || needs.preflight-ios.result == 'skipped') }}
+    runs-on: ${{ fromJSON(inputs.linux_runner) }}
+    timeout-minutes: 15
+    concurrency:
+      group: mobile-deploy-plan-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    outputs:
+      schema: ${{ steps.hub.outputs.schema }}
+      version: ${{ steps.hub.outputs.version }}
+      android_code: ${{ steps.hub.outputs.android_code }}
+      ios_build: ${{ steps.hub.outputs.ios_build }}
+      build_sha: ${{ steps.hub.outputs.build_sha }}
+      bump_patch: ${{ steps.hub.outputs.bump_patch }}
+      run_android: ${{ steps.hub.outputs.run_android }}
+      run_ios: ${{ steps.hub.outputs.run_ios }}
+      run_ios_export: ${{ steps.hub.outputs.run_ios_export }}
+      play_lane: ${{ steps.hub.outputs.play_lane }}
+      release_lane: ${{ steps.hub.outputs.release_lane }}
+    steps:
+      # Full history and tags: the bump is a real commit and the machine's pre-push guard refuses a shallow push.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - id: hub
+        name: S26, event contract, version bump
         uses: delorenj/mobile-deploy-hub/actions/hub@main
         with:
           command: plan
           manifest: ${{ inputs.manifest }}
           platform: ${{ inputs.platform }}
+          bump: ${{ inputs.bump }}
+          testflight: ${{ inputs.testflight }}
+          play: ${{ inputs.play }}
           channel: ${{ inputs.android_channel }}
           track: ${{ inputs.track }}
           play_status: ${{ inputs.play_status }}
           build: ${{ inputs.build }}
           dry_run: ${{ inputs.dry_run }}
           dry_handoff: ${{ inputs.dry_handoff }}
+          strict: ${{ inputs.strict }}
+          ipad_version: ${{ needs.preflight-ios.outputs.ipad_version }}
+          ipad_build: ${{ needs.preflight-ios.outputs.ipad_build }}
           wif_provider: ${{ inputs.wif_provider }}
           play_sa: ${{ inputs.play_sa }}
+          github_token: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: plan-out
+          path: ${{ runner.temp }}/hub-out/plan/*.json
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: ${{ inputs.dry_run && 1 || 7 }}
 
   android:
     needs: plan
-    if: ${{ needs.plan.outputs.run_android == 'true' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run_android == 'true' }}
     runs-on: ${{ fromJSON(inputs.linux_runner) }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     concurrency:
       group: mobile-deploy-android-${{ github.repository }}
       cancel-in-progress: false
@@ -110,19 +193,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.plan.outputs.build_sha }}
           persist-credentials: false
-      - name: Export and verify
+      - name: Build, check, install on the S26 and read it back
         uses: delorenj/mobile-deploy-hub/actions/hub@main
         with:
           command: android
           manifest: ${{ inputs.manifest }}
+          platform: ${{ inputs.platform }}
+          bump: ${{ inputs.bump }}
+          play: ${{ inputs.play }}
           channel: ${{ inputs.android_channel }}
           dry_run: ${{ inputs.dry_run }}
           version: ${{ needs.plan.outputs.version }}
           android_code: ${{ needs.plan.outputs.android_code }}
+          build_sha: ${{ needs.plan.outputs.build_sha }}
+          bump_patch: ${{ needs.plan.outputs.bump_patch }}
       - name: Authenticate to Google Cloud (keyless)
-        if: ${{ !inputs.dry_run && inputs.android_channel == 'play' }}
+        if: ${{ !inputs.dry_run && needs.plan.outputs.play_lane == 'true' }}
         id: auth
         uses: google-github-actions/auth@v3
         with:
@@ -132,33 +220,34 @@ jobs:
           access_token_scopes: https://www.googleapis.com/auth/androidpublisher
           create_credentials_file: false
       - name: Upload to Play
-        if: ${{ !inputs.dry_run && inputs.android_channel == 'play' }}
+        if: ${{ !inputs.dry_run && needs.plan.outputs.play_lane == 'true' }}
         uses: delorenj/mobile-deploy-hub/actions/hub@main
         with:
           command: play
           manifest: ${{ inputs.manifest }}
+          play: ${{ inputs.play }}
           channel: ${{ inputs.android_channel }}
           track: ${{ inputs.track }}
           play_status: ${{ inputs.play_status }}
           dry_run: ${{ inputs.dry_run }}
           android_code: ${{ needs.plan.outputs.android_code }}
           play_token: ${{ steps.auth.outputs.access_token }}
-      - name: Publish APK to a private Release
-        if: ${{ !inputs.dry_run && inputs.android_channel == 'sideload' }}
+      - name: Publish the APK to a private Release
+        if: ${{ !inputs.dry_run && needs.plan.outputs.release_lane == 'true' }}
         uses: delorenj/mobile-deploy-hub/actions/hub@main
         with:
           command: release
           manifest: ${{ inputs.manifest }}
+          bump: ${{ inputs.bump }}
           channel: ${{ inputs.android_channel }}
           dry_run: ${{ inputs.dry_run }}
           version: ${{ needs.plan.outputs.version }}
           android_code: ${{ needs.plan.outputs.android_code }}
+          build_sha: ${{ needs.plan.outputs.build_sha }}
           github_token: ${{ github.token }}
-      # Receipts only. The APK is delivered by the private Release (and the AAB by Play), so the 68 MB build never
-      # spends artifact quota; the receipts carry its sha256 and signer. overwrite lets "Re-run failed jobs" replace
-      # the artifact a failed attempt left behind.
+      # Receipts only (the Release holds the APK). always(): a timed-out or cancelled lane still tells announce why.
       - uses: actions/upload-artifact@v4
-        if: ${{ !cancelled() }}
+        if: ${{ always() }}
         with:
           name: android-out
           path: ${{ runner.temp }}/hub-out/android/*.json
@@ -168,7 +257,7 @@ jobs:
 
   ios-export:
     needs: plan
-    if: ${{ needs.plan.outputs.run_ios == 'true' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run_ios_export == 'true' }}
     runs-on: ${{ fromJSON(inputs.linux_runner) }}
     timeout-minutes: 30
     concurrency:
@@ -179,72 +268,112 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.plan.outputs.build_sha }}
           persist-credentials: false
-      - name: Export the Xcode project
+      - name: Export the Xcode projects and hand them to the Mac
         uses: delorenj/mobile-deploy-hub/actions/hub@main
         with:
           command: ios-export
           manifest: ${{ inputs.manifest }}
+          testflight: ${{ inputs.testflight }}
           build: ${{ inputs.build }}
           dry_run: ${{ inputs.dry_run }}
+          dry_handoff: ${{ inputs.dry_handoff }}
           version: ${{ needs.plan.outputs.version }}
+          ios_build: ${{ needs.plan.outputs.ios_build }}
+          build_sha: ${{ needs.plan.outputs.build_sha }}
+          bump_patch: ${{ needs.plan.outputs.bump_patch }}
       - uses: actions/upload-artifact@v4
-        if: ${{ !cancelled() }}
+        if: ${{ always() }}
         with:
           name: ios-receipt
           path: ${{ runner.temp }}/hub-out/ios/*.json
           if-no-files-found: ignore
           overwrite: true
           retention-days: ${{ inputs.dry_run && 1 || 7 }}
+      # v2 callers only: a schema 2 manifest hands the Xcode project to the Mac over the LAN, not through quota.
       - uses: actions/upload-artifact@v4
-        if: ${{ !inputs.dry_run || inputs.dry_handoff }}
+        if: ${{ needs.plan.outputs.schema == '1' && (!inputs.dry_run || inputs.dry_handoff) }}
         with:
           name: xcode-project
           path: ${{ runner.temp }}/hub-out/ios/*.tgz
           overwrite: true
-          retention-days: ${{ inputs.dry_run && 1 || 7 }}
+          retention-days: 1
 
-  ios-upload:
+  ios:
     needs: [plan, ios-export]
-    if: ${{ needs.plan.outputs.run_ios == 'true' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run_ios == 'true' && (needs.ios-export.result == 'success' || needs.ios-export.result == 'skipped') }}
     runs-on: ${{ fromJSON(inputs.mac_runner) }}
-    timeout-minutes: 60
+    timeout-minutes: 120
     concurrency:
-      group: mobile-deploy-ios-upload-${{ github.repository }}
+      group: mobile-deploy-ios-${{ github.repository }}
       cancel-in-progress: false
     permissions:
       contents: read
     steps:
-      # The app tree is needed here too: the manifest's upload and assign hooks are the app's own tools.
+      # The app tree is needed here too: ios.device and the store hooks are the app's own tools.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.plan.outputs.build_sha }}
           persist-credentials: false
       - uses: actions/download-artifact@v4
+        if: ${{ needs.ios-export.result == 'success' }}
         with:
           name: ios-receipt
           path: ${{ runner.temp }}/hub-out/ios
       - uses: actions/download-artifact@v4
-        if: ${{ !inputs.dry_run || inputs.dry_handoff }}
+        if: ${{ needs.plan.outputs.schema == '1' && (!inputs.dry_run || inputs.dry_handoff) }}
         with:
           name: xcode-project
           path: ${{ runner.temp }}/hub-out/ios
-      - name: Verify, then archive, sign, upload and assign on a real run
+      - name: Build, check, install on the iPad and read it back
         uses: delorenj/mobile-deploy-hub/actions/hub@main
         with:
-          command: ios-upload
+          command: ios
           manifest: ${{ inputs.manifest }}
+          bump: ${{ inputs.bump }}
+          testflight: ${{ inputs.testflight }}
           build: ${{ inputs.build }}
           dry_run: ${{ inputs.dry_run }}
           dry_handoff: ${{ inputs.dry_handoff }}
           strict: ${{ inputs.strict }}
           version: ${{ needs.plan.outputs.version }}
+          ios_build: ${{ needs.plan.outputs.ios_build }}
+          build_sha: ${{ needs.plan.outputs.build_sha }}
+          bump_patch: ${{ needs.plan.outputs.bump_patch }}
       - uses: actions/upload-artifact@v4
-        if: ${{ !cancelled() }}
+        if: ${{ always() }}
         with:
-          name: ios-upload-receipt
-          path: ${{ runner.temp }}/hub-out/ios/hub-receipt-ios-upload.json
+          name: ios-out
+          path: |
+            ${{ runner.temp }}/hub-out/ios/hub-receipt-ios.json
+            ${{ runner.temp }}/hub-out/ios/hub-receipt-ios-upload.json
           if-no-files-found: ignore
           overwrite: true
           retention-days: ${{ inputs.dry_run && 1 || 7 }}
+
+  announce:
+    needs: [preflight-ios, plan, android, ios-export, ios]
+    if: ${{ always() }}
+    runs-on: ${{ fromJSON(inputs.linux_runner) }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: '{preflight-ios-out,plan-out,android-out,ios-receipt,ios-out}'
+          path: ${{ runner.temp }}/hub-out/receipts
+      - name: One Bloodbank event (a dry run only checks it)
+        uses: delorenj/mobile-deploy-hub/actions/hub@main
+        with:
+          command: announce
+          manifest: ${{ inputs.manifest }}
+          platform: ${{ inputs.platform }}
+          dry_run: ${{ inputs.dry_run }}
+          needs: ${{ toJSON(needs) }}

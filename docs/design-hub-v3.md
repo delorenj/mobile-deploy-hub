@@ -1,0 +1,147 @@
+# Mobile Deploy Hub v3: one deploy contract, three apps
+
+Status: hub built 2026-10-09 (`mise run check`: actionlint plus 78 tests, including `tools/ci/v3.test.mjs`); the Bloodbank schema edit landed (bloodbank 79f5e60). App callers and the proof runs are tracked under "Proof" below. Replaces v2's job graph, manifest and front door.
+
+Every deploy of Tower (`pile-of-dumb-things`), Green In Between (`green-in-between`) and Gruvato: (1) bumps the version, committed and tagged before the build; (2) installs on the S26 and the iPad, verified by reading the version back; (3) sends one Bloodbank event with the outcome.
+
+## Decisions
+
+### One front door
+
+`mise run deploy`, same flags in all three repos:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--dry-run true\|false` | `true` | `false` deploys |
+| `--bump patch\|minor\|major` | `patch` | no "none": a deploy that failed after its bump is finished with `gh run rerun <id> --failed`; leave the flag blank so a red last real run is offered that rerun |
+| `--platform both\|android\|ios` | `both` | narrows the devices too |
+| `--testflight true\|false` | `false` | also TestFlight Owner Testing (apps with `ios.store`: Tower) |
+| `--play true\|false` | `false` | also Play (apps with `android.bundle`: none yet) |
+| `--dry-handoff true\|false` | `false` | dry run ships the Xcode export to the Mac (Tower only) |
+
+The script is `tools/deploy.mjs`, moved from Tower into the hub: dispatch on `main`, watch only the run it started, then `git pull --ff-only` the bump commit after a green real run. Each app's task is identical: fetch `tools/deploy.mjs` with `gh api` at the ref in the caller's `uses:` line and run it. One copy, one pin.
+
+### The bump runs in the hub
+
+`plan` runs the app's `version.bump <level>` hook, then checks the new version is the exact semver increment, `git status` changed exactly the files the hook listed, and tag `vX.Y.Z` is new. On a real run it commits them (`chore(release): vX.Y.Z`), tags, and runs `git push --atomic origin HEAD:main vX.Y.Z` with `GITHUB_TOKEN` passed through `GIT_CONFIG_*` env vars (never argv or `.git/config`; the hook never sees it). If `main` moved, the push fails before any build. Later jobs check out that commit.
+
+In the hub, because an Actions-tab dispatch must bump too. A `GITHUB_TOKEN` push triggers no workflow; v3 is dispatch-only. The bump follows device preflight, so an unreachable device never costs a version; a build failure after it skips that version.
+
+### S26: `adb install -r` from big-chungus
+
+The `android` job runs as delorenj, using `~/Android/Sdk/platform-tools/adb` and the adb server that holds the wireless pairing. It picks the device whose `ro.serialno` is `R5GL43A7PCH` (the mDNS suffix changes), checks the APK signer against the app's pin (the key on the phone), and refuses a versionCode at or below the installed one. Then `adb -s <serial> install -r` and readback: `dumpsys package` shows the planned versionName and versionCode, and the on-device `sha256sum` of `base.apk` equals the built APK (Gruvato's proven check). Only then does it publish the private Release `vX.Y.Z` (the record, and the file for family phones).
+
+The hub never runs `uninstall`, `pm clear` or `install -d` (a test greps for them). A signer mismatch makes Android refuse the update with data intact.
+
+### iPad: development build, devicectl from the Mac
+
+Not TestFlight:
+- devicectl installs now, and `devicectl device info apps --bundle-id` reads back the short version and build in the same job. TestFlight waits for processing, installs on its own schedule, and has no readback.
+- Green In Between and Gruvato have no App Store Connect app or App Store profile.
+- Every app on the iPad is already a developer build, and the signing exists: Apple Development `FA11A63D` and the Xcode-managed wildcard profile `ff75c3d0` (includes the iPad, expires 2027-10-05).
+
+Recipe, proven by Tower build 4: archive with `CODE_SIGNING_ALLOWED=NO DEVELOPMENT_TEAM=YJ7W7Z36FP`, then `xcodebuild -exportArchive` with method `debugging`, signingStyle `automatic`. Manual signing rejects the managed profile (gib's exit 65). The app's `ios.device` hook leaves an `.xcarchive` (the hub exports it) or an `.ipa` in `$HUB_OUT/ios`. The hub checks the IPA (signer, `get-task-allow`, `application-identifier`, profile lists the iPad), runs `devicectl device install app` (in place, never uninstalls), and reads back. `--testflight` exports the same archive as `app-store-connect` and runs Tower's `upload` and `assign`.
+
+### Event: `bloodbank.project.deployment.completed` / `.failed`
+
+Not `lifecycle.app.deployed`: `lifecycle` is dev-mission status, `app` and `deployed` are off the allowlists (`bb contract` rejects it), and `project.deployment` already means "one install of a project's built artifact on a target". Gruvato emits it today; ntfy-router pushes `data.summary` to Jarad's phone.
+
+One event per deploy, from a final `announce` job on big-chungus (`if: always()`), built from the receipts and sent with `$HOME/.local/bin/bb-emit --strict` (NATS 127.0.0.1:4222). A failed send turns the run red. `--correlation` is a UUIDv5 of repo and run id, so reruns correlate.
+
+Additive edit to `bloodbank/schemas/bloodbank/project/deployment.{completed,failed}.json` (no new type):
+- `artifact.kind` += `mobile-app` (`sha256` null);
+- `target.kind` += `ios-device`, `device-set` (both devices: `device-set` "SM-S948U + iPad14,5");
+- optional `data.deliveries[]`: `{platform, target, version, build, sha256, verified, stage?, reason?}`;
+- optional `data.run`: `{id, url, hub_ref}`;
+- `.failed` `stage` += `version`, `build`.
+
+`verified` means every readback matched. Gruvato's local emitter retires.
+
+### Dry run
+
+No commit, tag, push, install, Release, TestFlight or Play. Each job applies the bump to its own checkout (the hub checks they agree), so the build carries the next version. Both devices are checked and their installed versions read; signer and IPA checks run; `bb-emit --check` validates the would-be event. **The event is not emitted**: the schema has no `dry_run` field, and ntfy or any listener would fire for a deploy that did not happen. Dry runs stay strict.
+
+## Job graph
+
+| Job | Runner | Does |
+|---|---|---|
+| `preflight-ios` | Mac | iPad available by UDID; dev identity and profile valid 30+ days; 15 GiB free; `op://` refs with `--testflight` |
+| `plan` | Linux | after `preflight-ios`: manifest, S26 present and installed code read, bump; real: commit, tag, push |
+| `android` | Linux | prepare, export, signer, install, readback, Release (real); Play with `--play` |
+| `ios-export` | Linux | Tower only: Xcode project handoff |
+| `ios` | Mac | `ios.device` hook, IPA checks, install, readback; TestFlight with `--testflight` |
+| `announce` | Linux | event (real) or `--check` (dry) |
+
+Runner defaults become `["self-hosted","Linux"]` and `["self-hosted","macOS"]` (one runner per OS per app). Every job writes its receipt even on failure (stage, one-line reason); `announce` reads them. "Re-run failed jobs" is the only recovery and is idempotent: it never re-bumps (the plan succeeded), an S26 that already reports the planned name and code is verified by the `base.apk` sha256 (other bytes of the same code reinstall in place with `install -r`), an existing Release `vX.Y.Z` gets the attempt's assets (`gh release upload --clobber`), and the iPad takes the same version again in place.
+
+A dry run rehearses the bump's git half too: the plan commits (the machine's pre-commit guard runs), tags, runs `git push --dry-run --atomic` with the job's token (the pre-push guard runs and GitHub checks write access) and rewinds. So the first real deploy is not the first time the bot commit meets the guards.
+
+## Manifest schema 2 (`tools/ci/mobile-deploy.json`)
+
+```json
+{
+  "schema": 2,
+  "project": { "slug": "tower-of-dumb-things", "name": "Tower of Lost Things" },
+  "version": { "read": "node tools/hub-version.mjs", "bump": "node tools/hub-version.mjs bump" },
+  "android": { "package": "…", "prepare": "…", "export": "…", "artifact": "….apk", "receipt": "…", "signer_sha256": "…" },
+  "ios": { "bundle": "…", "export": "…", "archive": "…", "receipt": "…", "device": "…", "device_artifact": "…",
+           "store": { "upload": "…", "assign": "…", "signer_sha1": "…", "secrets": ["op://…"] } }
+}
+```
+
+`version.read` prints `{version, android_code, ios_build}`; `version.bump <level>` rewrites the authority files (no git) and adds `files`. `ios.export` (Linux) is optional; `ios.device` runs on the Mac and leaves `device_artifact`. Devices live once, in the hub's `tools/ci/devices.json`: S26 (SM-S948U, R5GL43A7PCH), iPad (iPad14,5, 00008112-000138390CFB401E), team YJ7W7Z36FP, dev signer FA11A63DB5E856366C0F8723577CFE8FC4479478.
+
+| App | Version authority | Bump writes | android_code | iOS build |
+|---|---|---|---|---|
+| Tower | `game/export_presets.cfg` | version/name, short_version, version/code+1 | 3 → 4 | next after App Store Connect |
+| Green In Between | `native/godot/export_presets.cfg` | 3 presets: name, short_version, codes+1, iOS version = code | 19 → 20 | = code |
+| Gruvato | `.mise/version-files.conf` + Cargo.lock entry | `versioning.sh bump`, `cargo update --workspace --offline` | M·10⁶+m·10³+p | version string |
+
+## Steps per repo
+
+**mobile-deploy-hub**
+- `tools/ci/hub.mjs` (`preflight-ios`, bump, failure receipts); new `lib/adb.mjs`, `lib/devicectl.mjs`, `lib/ipa.mjs`, `lib/announce.mjs` (ported from Gruvato's emitter); `lib/manifest.mjs` schema 2 only; new `tools/ci/devices.json`, `tools/deploy.mjs`.
+- `.github/workflows/mobile-deploy.yml`: the graph; inputs `bump`, `testflight`, `play`.
+- `tools/ci/hub.test.mjs`: increment rules, files equal the diff, existing tag refused, dry runs never commit, push, install or emit (spies), serialno match, forbidden-command grep, payload passes `bb-emit --check`.
+- README; v2's Mac token item is resolved (strict dry run 37911019368).
+
+**33GOD/bloodbank**: the schema edit; `mise run validate:schemas`, `smoketest:schema-contract-consistency`, `smoketest:schemas`.
+
+**pile-of-dumb-things**
+- `tools/hub-version.mjs bump <level>`.
+- Manifest schema 2: `ios.device` = new `node tools/testflight.mjs device <tgz>` (unsigned Mac-local archive, the Mac form of `tools/ios.mjs`'s private route); `upload` and `assign` move under `ios.store`.
+- `deploy.yml`: add `bump`, `testflight`, `play`; drop `android_channel`, `track`. `mise.toml`: shared `deploy` body.
+- `tests/hub-manifest.test.mjs:99-104`: still no mise-versioning or bump task; assert `bump` rewrites name, short_version and code together, nothing else; drop "bumped by hand".
+- Rewrite `docs/deploy.md` (no Mac-unlock step). Delete `testflight.yml` after the first real `--testflight` run.
+
+**green-in-between**
+- Presets to semver 0.0.19, code and build 19. Replace the `preview-19` literals (`ios-build.py:27-28` plus 8, `ui/practice.gd:1862`, `practice_test.gd:500`, `shot_replay_test.gd:336`, `test_ios_build.py:374`) with reads of the preset. Delete the BASELINE/ALLOWED_CHANGES gate, the mise-versioning block and `.mise/version-files.conf`.
+- New `native/tools/ci/hub-version.mjs`, `hub-android-prepare.sh` (both `.so` builds, `bake.sh`); `ios-build.py --hub-out` (Mac only: Rust iOS lib, gib's own pinned Godot, unsigned archive).
+- Android export with the spike keystore, password from a new `op://DeLoSecrets` item; gib1 runner moves to `runsvc-op.sh`. Signer pin `d9d0253a…222a`.
+- Manifest, `deploy.yml`, `mise run deploy`.
+- Delete `deploy-android.yml`, `deploy-ios.yml`, `deploy-hub.yml`, `tools/ci/deploy-hub.mjs`, secret `DEPLOY_HUB_PAT`; cancel run 37784570383. Keep `play-auth-check.yml`.
+
+**gruvato**
+- Repo-scoped runners: `big-chungus-gruvato` (systemd as delorenj via `runsvc-op.sh`; `.env` sets `MISE_TRUSTED_CONFIG_PATHS`, `ANDROID_HOME`, `JAVA_HOME`) and `mommymac-gruvato` (LaunchAgent via the shared `runsvc-op.sh`, no SessionCreate, Homebrew and mise shims on `.path`).
+- `scripts/release/bump-version.sh <level>` (versioning.sh plus cargo, no git), `scripts/release/hub-version.mjs`.
+- `scripts/android/build.sh` stops bumping; `android:deploy` becomes `android:install` (no event); retire `emit-deploy-event.py`, `announce-deploy.sh`, `tests/deploy-announce.test.mjs`.
+- iOS: commit `src-tauri/gen/apple` (like `gen/android`), `bundle.iOS.developmentTeam` YJ7W7Z36FP, pnpm through mise in the Xcode pre-build script, fix the Xcode 27 UIKit failure, `scripts/ios/build-device.sh` (`tauri ios build`, debugging export).
+- Manifest (Android `sh.delo.drumjangler`, signer `d09a011f…3a3c`; iOS `sh.delo.gruvato`, no `store`), `deploy.yml`, `mise run deploy`.
+- `linux-tauri.yml`, `website.yml`: `runs-on: [self-hosted, Linux]` ($0 rule).
+
+## Proof (dry runs only)
+
+1. Hub `mise run check`; Bloodbank schema checks; `bb-emit --check` on a two-delivery `.completed` and an iOS `.failed` at `install`.
+2. Tower `mise run deploy`, then `--dry-handoff true` at most daily (the Mac needs it to build the dev IPA). Expect `HUB_PLAN version=0.2.1 next=0.2.2 dry_run=true`, S26 at code 3, iPad at 0.2.1 (4), `APK_SIGNER_OK 2d49…1a97`, dev IPA verified, `HUB_EVENT_CHECKED`.
+3. After each: no new tag, same `main`, no Release, old versions on both devices, ntfy silent, App Store Connect unchanged.
+4. Negative: Wireless debugging off fails `plan` before any bump; `--bump minor` plans 0.3.0; `--testflight true` refused for gib and Gruvato.
+5. Gruvato Android (0.2.4, code 2004), iOS after the Xcode 27 fix; gib Android (0.0.20, code 20 > 17, signer `d9d0…`), then iOS.
+6. Tag the hub `v1.0.0`, flip inner refs and the three callers; one more dry run per app shows `hub_ref: v1.0.0`.
+
+The first real deploy (`--dry-run false`) is Jarad's, per app, after step 6.
+
+## Needs Jarad
+
+- Back up the three Android keystores (Tower's Godot debug key, gib's spike key, Gruvato's `~/.android/debug.keystore`) to DeLoSecrets. Each exists only on big-chungus; losing one ends in-place updates on the S26.
+- Delete the Mac's unused plaintext `~/.config/op/service-account-token`.
+- Unproven until a real run: devicectl install while the iPad is locked.

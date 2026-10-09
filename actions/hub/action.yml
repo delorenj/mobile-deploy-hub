@@ -3,22 +3,29 @@ description: Runs tools/ci/hub.mjs from the hub repo against the checked-out app
 
 inputs:
   command:
-    description: plan, android, play, release, ios-export or ios-upload
+    description: preflight-ios, plan, android, play, release, ios-export, ios, announce (v2 also ios-upload)
     required: true
   manifest:
     description: Path of the app manifest inside the checkout
     default: mobile-deploy.json
   platform:
     default: both
+  bump:
+    description: patch, minor or major (every deploy bumps)
+    default: patch
+  testflight:
+    default: 'false'
+  play:
+    default: 'false'
   channel:
-    description: sideload or play
+    description: v2 only, sideload or play
     default: sideload
   track:
     default: internal
   play_status:
     default: draft
   build:
-    description: iOS build override, blank for the next after App Store Connect
+    description: v2 only, iOS build override
     default: ''
   dry_run:
     default: 'true'
@@ -33,6 +40,23 @@ inputs:
   android_code:
     description: Android versionCode announced by the plan job
     default: ''
+  ios_build:
+    description: iOS build announced by the plan job
+    default: ''
+  build_sha:
+    description: The commit the lanes build (the bump commit on a real run)
+    default: ''
+  bump_patch:
+    description: The plan's version bump as a base64 patch, applied by the lanes of a dry run
+    default: ''
+  ipad_version:
+    description: The iPad's installed version from preflight-ios (absent when not installed)
+    default: ''
+  ipad_build:
+    default: ''
+  needs:
+    description: toJSON(needs), announce only
+    default: ''
   wif_provider:
     default: ''
   play_sa:
@@ -41,22 +65,49 @@ inputs:
     description: Play access token from google-github-actions/auth, play step only
     default: ''
   github_token:
-    description: Token with contents write, release step only
+    description: Token with contents write, plan (the bump push) and release steps only
     default: ''
 
 outputs:
+  schema:
+    description: The manifest schema (1 runs the v2 way)
+    value: ${{ steps.hub.outputs.schema }}
   version:
-    description: Version from the app's version hook
+    description: The version this deploy builds (the bumped one)
     value: ${{ steps.hub.outputs.version }}
   android_code:
-    description: Android versionCode from the app's version hook
+    description: Android versionCode this deploy builds
     value: ${{ steps.hub.outputs.android_code }}
+  ios_build:
+    description: iOS build from the version hook
+    value: ${{ steps.hub.outputs.ios_build }}
+  build_sha:
+    description: The commit the lanes check out
+    value: ${{ steps.hub.outputs.build_sha }}
+  bump_patch:
+    description: The bump as a base64 patch (dry runs)
+    value: ${{ steps.hub.outputs.bump_patch }}
   run_android:
     description: true when the Android lane runs
     value: ${{ steps.hub.outputs.run_android }}
   run_ios:
-    description: true when the iOS lanes run
+    description: true when the iOS lane runs
     value: ${{ steps.hub.outputs.run_ios }}
+  run_ios_export:
+    description: true when the Linux iOS export runs
+    value: ${{ steps.hub.outputs.run_ios_export }}
+  play_lane:
+    description: true when Play is in scope
+    value: ${{ steps.hub.outputs.play_lane }}
+  release_lane:
+    description: true when a real run publishes the sideload Release
+    value: ${{ steps.hub.outputs.release_lane }}
+  ipad_version:
+    description: The iPad's installed version (preflight-ios)
+    value: ${{ steps.hub.outputs.ipad_version }}
+  ipad_build:
+    description: The iPad's installed build (preflight-ios)
+    value: ${{ steps.hub.outputs.ipad_build }}
 
 runs:
   using: composite
@@ -68,6 +119,9 @@ runs:
         HUB_COMMAND: ${{ inputs.command }}
         HUB_MANIFEST: ${{ inputs.manifest }}
         HUB_PLATFORM: ${{ inputs.platform }}
+        HUB_BUMP: ${{ inputs.bump }}
+        HUB_TESTFLIGHT: ${{ inputs.testflight }}
+        HUB_PLAY: ${{ inputs.play }}
         HUB_CHANNEL: ${{ inputs.channel }}
         HUB_TRACK: ${{ inputs.track }}
         HUB_PLAY_STATUS: ${{ inputs.play_status }}
@@ -78,6 +132,12 @@ runs:
         HUB_REF: ${{ github.action_ref }}
         HUB_VERSION: ${{ inputs.version }}
         HUB_ANDROID_CODE: ${{ inputs.android_code }}
+        HUB_IOS_BUILD: ${{ inputs.ios_build }}
+        HUB_BUILD_SHA: ${{ inputs.build_sha }}
+        HUB_BUMP_PATCH: ${{ inputs.bump_patch }}
+        HUB_IPAD_VERSION: ${{ inputs.ipad_version }}
+        HUB_IPAD_BUILD: ${{ inputs.ipad_build }}
+        HUB_NEEDS: ${{ inputs.needs }}
         HUB_WIF_PROVIDER: ${{ inputs.wif_provider }}
         HUB_PLAY_SA: ${{ inputs.play_sa }}
         PLAY_TOKEN: ${{ inputs.play_token }}

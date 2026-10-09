@@ -25,13 +25,28 @@ export function javaHome(env = process.env, home = homedir()) {
   return existsSync(join(mise, 'bin/java')) ? mise : undefined;
 }
 
-export function findApksigner(env = process.env, home = homedir()) {
+export function findBuildTool(name, env = process.env, home = homedir()) {
   const tools = join(androidSdk(env, home), 'build-tools');
   let names = [];
   try { names = readdirSync(tools); } catch { /* reported below */ }
-  const found = names.sort(newerFirst).map(name => join(tools, name, 'apksigner')).find(path => existsSync(path));
-  if (!found) throw new Error(`apksigner not found under ${tools}; install Android build-tools or set ANDROID_HOME`);
+  const found = names.sort(newerFirst).map(entry => join(tools, entry, name)).find(path => existsSync(path));
+  if (!found) throw new Error(`${name} not found under ${tools}; install Android build-tools or set ANDROID_HOME`);
   return found;
+}
+
+export const findApksigner = (env = process.env, home = homedir()) => findBuildTool('apksigner', env, home);
+
+// `aapt2 dump badging`: the package line names the id, versionCode and versionName the APK really carries.
+export function parseBadging(output) {
+  const line = output.split('\n').find(entry => entry.startsWith('package: ')) ?? '';
+  const field = name => new RegExp(`\\b${name}='([^']*)'`).exec(line)?.[1];
+  const code = field('versionCode');
+  return { package: field('name') ?? null, versionCode: code === undefined ? null : Number(code), versionName: field('versionName') ?? null };
+}
+
+// The built APK must be the planned version: a bump that did not reach the export would ship the old one.
+export function apkIdentity({ apk, env = process.env, home = homedir() }) {
+  return parseBadging(run(findBuildTool('aapt2', env, home), ['dump', 'badging', apk], { env }));
 }
 
 export function parseSigners(output) {

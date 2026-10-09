@@ -216,12 +216,15 @@ test('a different signer fails the check and says why', async () => {
 
 // ---- plan ----
 
-test('plan announces the version and which lanes run', async () => {
+test('a schema 1 plan announces the version and which lanes run, the v2 way', async () => {
   const f = await fixture();
   try {
     const outputs = await plan(f.configure('plan'), { env: f.env });
-    assert.deepEqual(outputs, { version: '0.3.0', android_code: 4, run_android: true, run_ios: true, dry_run: true, channel: 'sideload' });
-    assert.match(await readFile(f.env.GITHUB_OUTPUT, 'utf8'), /^version=0\.3\.0\nandroid_code=4\nrun_android=true\nrun_ios=true\ndry_run=true\nchannel=sideload\n$/);
+    assert.deepEqual(outputs, {
+      version: '0.3.0', android_code: 4, run_android: true, run_ios: true, dry_run: true, channel: 'sideload',
+      schema: 1, run_ios_export: true, build_sha: 'abc123', bump_patch: '', play_lane: false, release_lane: true,
+    });
+    assert.match(await readFile(f.env.GITHUB_OUTPUT, 'utf8'), /^version=0\.3\.0\nandroid_code=4\nrun_android=true\nrun_ios=true\ndry_run=true\nchannel=sideload\nschema=1\nrun_ios_export=true\nbuild_sha=abc123\nbump_patch=\nplay_lane=false\nrelease_lane=true\n$/);
     const iosOnly = await plan(f.configure('plan', ['--platform', 'ios']), { env: f.env });
     assert.deepEqual([iosOnly.run_android, iosOnly.run_ios], [false, true]);
   } finally { await f.cleanup(); }
@@ -660,26 +663,39 @@ test('the reusable workflow is hardened: no hosted runners, no shell interpolati
   assert.doesNotMatch(workflow, /^\s*run:/m, 'the YAML carries no shell; hub.mjs does the work');
   assert.doesNotMatch(workflow, /github\.job|pull_request_target|secrets\./);
   assert.doesNotMatch(workflow, /client_payload|repository_dispatch/);
+  const jobs = [...workflow.matchAll(/^ {2}([\w-]+):\n/gm)].map(match => match[1]).filter(name => !['workflow_call'].includes(name));
+  assert.deepEqual(jobs.slice(-6), ['preflight-ios', 'plan', 'android', 'ios-export', 'ios', 'announce']);
   const groups = [...workflow.matchAll(/^\s+group: (mobile-deploy-[\w-]+)-\$\{\{ github\.repository \}\}$/gm)].map(match => match[1]);
-  assert.deepEqual(groups, ['mobile-deploy-android', 'mobile-deploy-ios-export', 'mobile-deploy-ios-upload']);
-  assert.equal([...workflow.matchAll(/cancel-in-progress: false/g)].length, 3);
-  const checkouts = [...workflow.matchAll(/uses: actions\/checkout@v4\n\s+with:\n\s+ref: \$\{\{ github\.sha \}\}/g)];
-  assert.equal(checkouts.length, 4, 'every job, the Mac included, checks out the built sha');
+  assert.deepEqual(groups, ['mobile-deploy-plan', 'mobile-deploy-android', 'mobile-deploy-ios-export', 'mobile-deploy-ios']);
+  assert.equal([...workflow.matchAll(/cancel-in-progress: false/g)].length, 4);
+  // preflight-ios, plan and announce check out the dispatched commit; the lanes build the plan's commit (the bump).
+  assert.equal([...workflow.matchAll(/uses: actions\/checkout@v4\n\s+with:\n\s+ref: \$\{\{ github\.sha \}\}/g)].length, 3);
+  assert.equal([...workflow.matchAll(/uses: actions\/checkout@v4\n\s+with:\n\s+ref: \$\{\{ needs\.plan\.outputs\.build_sha \}\}/g)].length, 3);
+  assert.match(workflow, /ref: \$\{\{ github\.sha \}\}\n\s+fetch-depth: 0\n\s+fetch-tags: true\n/, 'the plan bumps on full history');
   const refs = new Set([...workflow.matchAll(/uses: delorenj\/mobile-deploy-hub\/actions\/hub@(\S+)/g)].map(match => match[1]));
   assert.equal(refs.size, 1, 'one hub ref everywhere; flip them together');
   assert.match(workflow, /retention-days: \$\{\{ inputs\.dry_run && 1 \|\| 7 \}\}/);
-  assert.match(workflow, /if: \$\{\{ !inputs\.dry_run \|\| inputs\.dry_handoff \}\}/);
   assert.match(workflow, /needs: \[plan, ios-export\]/);
-  // Every upload can be redone by "Re-run failed jobs" after a failed first attempt (a locked Mac, a Release clash).
-  const uploads = [...workflow.matchAll(/uses: actions\/upload-artifact@v4\n\s+(?:if: [^\n]+\n\s+)?with:\n((?:\s+[\w-]+: [^\n]+\n?)+)/g)].map(match => match[1]);
-  assert.deepEqual(uploads.map(block => /name: (\S+)/.exec(block)[1]), ['android-out', 'ios-receipt', 'xcode-project', 'ios-upload-receipt']);
+  assert.match(workflow, /announce:\n\s+needs: \[preflight-ios, plan, android, ios-export, ios\]\n\s+if: \$\{\{ always\(\) \}\}/, 'one event per deploy, whatever happened');
+  // Every upload can be redone by "Re-run failed jobs", and receipts upload even when the lane failed.
+  const uploads = workflow.split('uses: actions/upload-artifact@v4').slice(1).map(block => block.split(/\n {6}- |\n\n/)[0]);
+  assert.deepEqual(uploads.map(block => /name: (\S+)/.exec(block)[1]), ['preflight-ios-out', 'plan-out', 'android-out', 'ios-receipt', 'xcode-project', 'ios-out']);
   for (const block of uploads) assert.match(block, /^\s+overwrite: true$/m, block);
-  // The build itself never takes quota twice: the Release (or Play) holds the APK, the artifact holds receipts.
+  // The build itself never takes quota: the Release (or Play) holds the APK, the LAN carries the Xcode project.
   assert.match(workflow, /name: android-out\n\s+path: \$\{\{ runner\.temp \}\}\/hub-out\/android\/\*\.json\n/);
   assert.doesNotMatch(workflow, /hub-out\/android\/\n/);
-  // A dry run is the gate before a real upload, so it is strict by default and the Mac step receives the input.
+  // The deploy contract: a bump on every run (no "none"), extra stores off by default, dry run and strict on.
+  assert.match(workflow, /bump:\n\s+description: [^\n]+\n\s+type: string\n\s+default: patch\n/);
+  assert.doesNotMatch(workflow, /\bnone\b/, 'there is no bump level none');
+  for (const name of ['testflight', 'play']) assert.match(workflow, new RegExp(`${name}:\\n\\s+description: [^\\n]+\\n\\s+type: boolean\\n\\s+default: false\\n`), name);
+  assert.match(workflow, /dry_run:\n\s+description: [^\n]+\n\s+type: boolean\n\s+default: true\n/);
   assert.match(workflow, /strict:\n\s+description: [^\n]+\n\s+type: boolean\n\s+default: true\n/);
   assert.match(workflow, /dry_handoff: \$\{\{ inputs\.dry_handoff \}\}\n\s+strict: \$\{\{ inputs\.strict \}\}\n/);
+  // Only the plan (bump push) and android (Release) jobs hold contents: write; only android holds id-token.
+  const bodies = workflow.slice(workflow.indexOf('\njobs:\n')).split(/\n {2}(?=[\w-]+:\n)/).slice(1);
+  const writes = bodies.filter(body => /\n {6}contents: write\n/.test(body)).map(body => body.split(':')[0]);
+  assert.deepEqual(writes, ['plan', 'android']);
+  assert.deepEqual(bodies.filter(body => /\n {6}id-token: write\n/.test(body)).map(body => body.split(":")[0]), ["android"]);
 });
 
 test('the composite action gives every run step a shell and reads inputs only', async () => {
