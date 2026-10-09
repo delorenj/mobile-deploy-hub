@@ -6,6 +6,7 @@ import { createReadStream } from 'node:fs';
 import { appendFile, mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadPolicy } from './policy.mjs';
 
 export async function sha256File(path) {
   const hash = createHash('sha256');
@@ -19,6 +20,13 @@ export async function sha256File(path) {
 export function hubRef(env = process.env, file = fileURLToPath(import.meta.url)) {
   if (env.HUB_REF) return env.HUB_REF;
   return /[\\/]_actions[\\/][^\\/]+[\\/][^\\/]+[\\/]([^\\/]+)[\\/]tools[\\/]ci[\\/]lib[\\/]receipt\.mjs$/.exec(file)?.[1] ?? null;
+}
+
+// The digest of the policy this hub ran with, recorded in every receipt (design v1.1, A1).
+let digest;
+export function policyDigest() {
+  if (digest === undefined) { try { digest = loadPolicy().sha256; } catch { digest = null; } }
+  return digest;
 }
 
 // sha is the commit the lane built: the bump commit on a real v3 run, else the dispatched commit.
@@ -35,6 +43,7 @@ export function buildReceipt({ lane, config, env = process.env, version, android
     dry_run: config.dryRun,
     channel: config.channel,
     hub_ref: hubRef(env),
+    policy: policyDigest(),
     outcome,
     ...(stage ? { stage } : {}),
     ...(reason ? { reason } : {}),

@@ -3,7 +3,7 @@ description: Runs tools/ci/hub.mjs from the hub repo against the checked-out app
 
 inputs:
   command:
-    description: preflight-ios, plan, android, play, release, ios-export, ios, announce (v2 also ios-upload)
+    description: gate, preflight-ios, plan, android, play, release, ios-export, ios, deliver, announce
     required: true
   manifest:
     description: Path of the app manifest inside the checkout
@@ -18,22 +18,46 @@ inputs:
   play:
     default: 'false'
   channel:
-    description: v2 only, sideload or play
+    description: v2 input; the gate refuses anything but sideload
     default: sideload
   track:
     default: internal
   play_status:
     default: draft
   build:
-    description: v2 only, iOS build override
+    description: v2 input; the gate refuses a value
     default: ''
   dry_run:
     default: 'true'
   dry_handoff:
     default: 'false'
   strict:
-    description: A dry run fails, as a real run does, when a check could not be made (a locked Mac leaves the 1Password references unread)
+    description: The gate refuses false (policy)
     default: 'true'
+  metered:
+    description: auto or allow (the iPad lane on a metered Mac link)
+    default: auto
+  linux_runner:
+    description: The Linux runner labels the caller passed, for the gate's policy check
+    default: '["self-hosted","Linux"]'
+  mac_runner:
+    description: The Mac runner labels the caller passed, for the gate's policy check
+    default: '["self-hosted","macOS"]'
+  ios_lane:
+    description: The gate's verdict on the iPad lane (run, skip-offline, skip-metered, skip-platform)
+    default: ''
+  mac_link:
+    description: The gate's reading of the Mac's link (home, metered, offline)
+    default: ''
+  bundle:
+    description: The iOS bundle id from the gate (preflight-ios has no checkout)
+    default: ''
+  slug:
+    description: The app slug from the gate
+    default: ''
+  ios_store:
+    description: The TestFlight signer and op:// references from the gate, as JSON (preflight-ios with --testflight)
+    default: ''
   version:
     description: Version announced by the plan job
     default: ''
@@ -50,12 +74,12 @@ inputs:
     description: The plan's version bump as a base64 patch, applied by the lanes of a dry run
     default: ''
   ipad_version:
-    description: The iPad's installed version from preflight-ios (absent when not installed)
+    description: The iPad's installed version from preflight-ios (absent when not installed, unreachable when away)
     default: ''
   ipad_build:
     default: ''
   needs:
-    description: toJSON(needs), announce only
+    description: toJSON(needs), deliver and announce only
     default: ''
   wif_provider:
     default: ''
@@ -69,8 +93,32 @@ inputs:
     default: ''
 
 outputs:
+  ios_lane:
+    description: The gate's verdict on the iPad lane
+    value: ${{ steps.hub.outputs.ios_lane }}
+  metered:
+    description: true when the Mac is on a metered link
+    value: ${{ steps.hub.outputs.metered }}
+  mac_link:
+    description: home, metered or offline
+    value: ${{ steps.hub.outputs.mac_link }}
+  bundle:
+    description: The iOS bundle id (gate)
+    value: ${{ steps.hub.outputs.bundle }}
+  slug:
+    description: The app slug (gate)
+    value: ${{ steps.hub.outputs.slug }}
+  ios_store:
+    description: The TestFlight signer and references as JSON (gate)
+    value: ${{ steps.hub.outputs.ios_store }}
+  policy:
+    description: The first 8 hex of the policy's sha256 (gate)
+    value: ${{ steps.hub.outputs.policy }}
+  receipt:
+    description: preflight-ios's receipt as base64 JSON (it uploads no artifact)
+    value: ${{ steps.hub.outputs.receipt }}
   schema:
-    description: The manifest schema (1 runs the v2 way)
+    description: The manifest schema (2)
     value: ${{ steps.hub.outputs.schema }}
   version:
     description: The version this deploy builds (the bumped one)
@@ -129,6 +177,14 @@ runs:
         HUB_DRY_RUN: ${{ inputs.dry_run }}
         HUB_DRY_HANDOFF: ${{ inputs.dry_handoff }}
         HUB_STRICT: ${{ inputs.strict }}
+        HUB_METERED: ${{ inputs.metered }}
+        HUB_LINUX_RUNNER: ${{ inputs.linux_runner }}
+        HUB_MAC_RUNNER: ${{ inputs.mac_runner }}
+        HUB_IOS_LANE: ${{ inputs.ios_lane }}
+        HUB_MAC_LINK: ${{ inputs.mac_link }}
+        HUB_BUNDLE: ${{ inputs.bundle }}
+        HUB_SLUG: ${{ inputs.slug }}
+        HUB_IOS_STORE: ${{ inputs.ios_store }}
         HUB_REF: ${{ github.action_ref }}
         HUB_VERSION: ${{ inputs.version }}
         HUB_ANDROID_CODE: ${{ inputs.android_code }}

@@ -5,7 +5,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { credentialVariables } from './config.mjs';
+import { isCredentialVariable } from './config.mjs';
 import { attempt, runBounded } from './exec.mjs';
 import { checkBump, sameFiles } from './version.mjs';
 
@@ -55,8 +55,8 @@ export function parseRemoteTag(output, tag) {
 
 export function createGit({ cwd, env = process.env, token } = {}) {
   // The token lives only in the extraheader variables; the git hooks never see GH_TOKEN or the runner's tokens.
-  const quiet = { ...env };
-  for (const name of credentialVariables) delete quiet[name];
+  const quiet = {};
+  for (const [name, value] of Object.entries(env)) if (!isCredentialVariable(name)) quiet[name] = value;
   const gitEnv = { ...authEnvironment(quiet, token), ...botIdentity };
   const git = (args, timeout = 120_000) => runBounded('git', args, { cwd, env: gitEnv, timeout, label: `git ${args[0]}` });
   return {

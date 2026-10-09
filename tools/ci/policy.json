@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "bump": { "levels": ["patch", "minor", "major"], "default": "patch" },
+  "event": { "per": "run-attempt", "strict": true, "catch_up": true, "types": ["bloodbank.project.deployment.completed", "bloodbank.project.deployment.failed"] },
+  "manifest_schema": [2],
+  "apps": {
+    "delorenj/pile-of-dumb-things": { "slug": "tower-of-dumb-things", "lanes": ["android", "ios"] },
+    "delorenj/green-in-between": { "slug": "green-in-between", "lanes": ["android", "ios"] },
+    "delorenj/gruvato": { "slug": "gruvato", "lanes": ["android", "ios"] }
+  },
+  "callers": {
+    "workflow": ".github/workflows/deploy.yml",
+    "manifest": "tools/ci/mobile-deploy.json",
+    "accept": ["130f1ef2a2f15a3babc52694b86354700e779559a24f97fb84d150936a9b40d2"]
+  },
+  "runners": { "linux": ["self-hosted", "Linux"], "mac": ["self-hosted", "macOS"] },
+  "devices": { "absent": "pending", "android_wait_s": 180, "ipad_wait_s": 60 },
+  "delivery": {
+    "s3": { "bucket": "builds", "public": "https://s3.delo.sh/builds", "write": "http://127.0.0.1:9012", "keep_apk": 5, "keep_ipa": 1 },
+    "quickdrop": { "dir": "quickdrop/builds", "max_mb": 120, "keep": 1 },
+    "release": true
+  },
+  "mac": { "lan_cidr": "192.168.1.0/24", "metered_budget_mib": 150 },
+  "catch_up": { "android_every_s": 120, "ios_every_s": 300, "max_failures": 3 }
+}

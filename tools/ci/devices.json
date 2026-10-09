@@ -3,5 +3,13 @@
   "android": { "name": "S26", "model": "SM-S948U", "serial": "R5GL43A7PCH" },
   "ios": { "name": "iPad", "model": "iPad14,5", "udid": "00008112-000138390CFB401E" },
   "apple": { "team": "YJ7W7Z36FP", "dev_signer_sha1": "FA11A63DB5E856366C0F8723577CFE8FC4479478", "profile_min_days": 30 },
-  "mac": { "host": "mommymac.local", "handoff_dir": "Library/Caches/mobile-deploy-hub/handoff", "min_free_gib": 15 }
+  "mac": {
+    "host": "hub-mac",
+    "peer": "carries-macbook-air",
+    "handoff_dir": "Library/Caches/mobile-deploy-hub/handoff",
+    "handoff_cache": "Library/Caches/mobile-deploy-hub/handoff-cache",
+    "outbox": "Library/Caches/mobile-deploy-hub/outbox",
+    "min_free_gib": 15
+  },
+  "linux": { "host": "big-chungus", "staging_dir": ".cache/mobile-deploy-hub/staging" }
 }

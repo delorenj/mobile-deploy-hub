@@ -6,13 +6,13 @@ import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { commands, credentialVariables, hookEnvironment, parseConfig } from './lib/config.mjs';
+import { commands, credentialVariables, hookEnvironment, isCredentialVariable, jobControlFiles, parseConfig } from './lib/config.mjs';
 import { parseManifest } from './lib/manifest.mjs';
 import { findApksigner, parseSigners, signerEnvironment, verifySigner } from './lib/android.mjs';
 import { highestVersionCode, uploadBundle } from './lib/play.mjs';
 import { buildReceipt, hubRef, setOutputs, summaryMarkdown, writeReceipt } from './lib/receipt.mjs';
 import { exportGodot, scriptErrors } from './lib/godot.mjs';
-import { android, iosExport, iosUpload, parseVersion, plan, play, release, releaseArguments, tagVersion } from './hub.mjs';
+import { play, releaseArguments } from './hub.mjs';
 
 const hub = fileURLToPath(new URL('./hub.mjs', import.meta.url));
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
@@ -21,24 +21,24 @@ const other = 'd09a000000000000000000000000000000000000000000000000000000000000'
 const sha1 = 'F8A5C5309FC1B6C7DD7662A28EA822BE3309C351';
 
 const manifestText = (extra = {}) => JSON.stringify({
-  schema: 1,
-  version: `echo '{"version":"0.3.0","android_code":4}'`,
+  schema: 2,
+  project: { slug: 'example-app', name: 'Example App' },
+  version: { read: 'node tools/version.mjs', bump: 'node tools/version.mjs bump' },
   android: {
     package: 'io.example.app',
-    export: 'mkdir -p artifacts && printf apk > artifacts/App.apk && printf \'{"version":"0.3.0","version_code":4}\' > artifacts/android-receipt.json && env | grep ^HUB_ > "$HUB_OUT/hook-env.txt" || true',
+    export: 'mkdir -p artifacts && printf apk > artifacts/App.apk',
     artifact: 'artifacts/App.apk',
     receipt: 'artifacts/android-receipt.json',
     signer_sha256: signer,
   },
   ios: {
     bundle: 'io.example.app',
-    export: 'mkdir -p "$HUB_OUT/ios" && cd "$HUB_OUT/ios" && mkdir -p App.xcodeproj && printf x > App.xcodeproj/project.pbxproj && tar -czf App-xcode.tgz App.xcodeproj && rm -r App.xcodeproj && printf \'{"version":"0.3.0","build":"7","bundle":"io.example.app"}\' > testflight-export.json',
-    archive: 'App-xcode.tgz',
-    receipt: 'testflight-export.json',
-    upload: 'echo uploaded >> "$HUB_OUT/marker.txt"',
-    assign: 'echo assigned >> "$HUB_OUT/marker.txt"',
-    secrets: ['op://Vault/Item/key_id', 'op://Vault/Item/credential'],
-    signer_sha1: sha1,
+    export: 'node tools/ios.mjs export',
+    archive: 'App-ipad.tgz',
+    receipt: 'ipad-export.json',
+    device: 'node tools/ios.mjs device',
+    device_artifact: 'App.xcarchive',
+    store: { archive: 'App-xcode.tgz', receipt: 'testflight-export.json', upload: 'node tools/ios.mjs upload', assign: 'node tools/ios.mjs assign', secrets: ['op://Vault/Item/key_id'], signer_sha1: sha1 },
   },
   ...extra,
 });
@@ -99,6 +99,9 @@ test('defaults are the safe ones: dry run, sideload, both platforms, no build ov
   assert.equal(config.playStatus, 'draft');
   assert.equal(config.build, '');
   assert.equal(config.manifest, 'mobile-deploy.json');
+  assert.equal(config.metered, 'auto', 'the iPad lane is skipped on a metered link that would go over budget unless asked');
+  assert.deepEqual([config.linuxRunner, config.macRunner], [['self-hosted', 'Linux'], ['self-hosted', 'macOS']]);
+  assert.equal(config.iosLane, '');
 });
 
 test('environment sets the config and flags override it', () => {
@@ -107,9 +110,11 @@ test('environment sets the config and flags override it', () => {
   assert.deepEqual([config.platform, config.dryRun, config.build, config.channel, config.track, config.out], ['ios', false, '12', 'play', 'beta', '/tmp/x']);
   const flagged = parseConfig(['android', '--platform', 'android', '--dry-run', 'true', '--build', '13', '--out', '/tmp/y'], env);
   assert.deepEqual([flagged.platform, flagged.dryRun, flagged.build, flagged.out], ['android', true, '13', '/tmp/y']);
-  assert.equal(parseConfig(['ios-upload'], { HUB_STRICT: 'false' }).strict, false);
-  assert.equal(parseConfig(['ios-upload', '--strict', 'false'], {}).strict, false);
-  assert.throws(() => parseConfig(['ios-upload'], { HUB_STRICT: 'no' }), /strict must be true or false/);
+  assert.equal(parseConfig(['ios'], { HUB_STRICT: 'false' }).strict, false, 'parsed here; the gate refuses it');
+  assert.equal(parseConfig(['ios', '--strict', 'false'], {}).strict, false);
+  assert.throws(() => parseConfig(['ios'], { HUB_STRICT: 'no' }), /strict must be true or false/);
+  assert.deepEqual(parseConfig(['preflight-ios'], { HUB_IOS_STORE: JSON.stringify({ signer_sha1: sha1, secrets: ['op://Vault/Item/x'] }) }).iosStore, { signer_sha1: sha1, secrets: ['op://Vault/Item/x'] });
+  assert.equal(parseConfig(['gate'], { HUB_METERED: 'allow' }).metered, 'allow');
 });
 
 test('the output folder defaults under RUNNER_TEMP', () => {
@@ -125,6 +130,8 @@ test('bad arguments are rejected before anything runs', () => {
     [['plan'], { HUB_MANIFEST: '/etc/passwd' }], [['plan'], { HUB_MANIFEST: '../other.json' }],
     [['plan'], { HUB_PLAY_STATUS: 'live' }], [['plan'], { HUB_ANDROID_CODE: '0' }],
     [['plan', '--bogus', '1'], {}], [['plan', '--platform'], {}],
+    [['ios-upload'], {}], [['plan'], { HUB_METERED: 'always' }], [['plan'], { HUB_IOS_LANE: 'maybe' }], [['plan'], { HUB_LINUX_RUNNER: '["ubuntu latest"]' }],
+    [['plan'], { HUB_LINUX_RUNNER: 'self-hosted' }], [['preflight-ios'], { HUB_IOS_STORE: '{"secrets":["hunter2"]}' }], [['preflight-ios'], { HUB_BUNDLE: 'not a bundle' }],
   ];
   for (const [argv, env] of bad) assert.throws(() => parseConfig(argv, env), undefined, JSON.stringify([argv, env]));
 });
@@ -134,47 +141,71 @@ test('every documented command parses', () => {
 });
 
 test('hooks see the HUB_ variables and never a store, GitHub or OIDC token', () => {
-  const config = parseConfig(['android', '--build', '9', '--dry-run', 'false', '--channel', 'play', '--out', '/o'], {});
+  const out = join(tmpdir(), `hub-hook-env-${process.pid}`);
+  const config = parseConfig(['android', '--build', '9', '--dry-run', 'false', '--channel', 'play', '--out', out], {});
   const env = hookEnvironment(config, {
     PATH: '/bin', KEEP: '1', PLAY_TOKEN: 'secret-a', GH_TOKEN: 'secret-b', GITHUB_TOKEN: 'secret-c',
     // The runner sets these in every step of a job that holds id-token: write, and they mint a federated Google token.
     ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example/token', ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'secret-d', ACTIONS_RUNTIME_TOKEN: 'secret-e',
   });
-  assert.deepEqual([env.HUB_OUT, env.HUB_BUILD, env.HUB_DRY_RUN, env.HUB_CHANNEL, env.KEEP, env.PATH], ['/o', '9', 'false', 'play', '1', '/bin']);
+  assert.deepEqual([env.HUB_OUT, env.HUB_BUILD, env.HUB_DRY_RUN, env.HUB_CHANNEL, env.KEEP, env.PATH], [out, '9', 'false', 'play', '1', '/bin']);
   for (const name of credentialVariables) assert.equal(env[name], undefined, name);
   assert.deepEqual([...credentialVariables].sort(), ['ACTIONS_ID_TOKEN_REQUEST_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_URL', 'ACTIONS_RUNTIME_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN', 'PLAY_TOKEN']);
   assert.ok(!JSON.stringify(env).includes('secret-'), 'no credential value survives anywhere in the hook environment');
 });
 
+test('hooks get throwaway job-control files and never an mc alias with keys', async () => {
+  const out = await mkdtemp(join(tmpdir(), 'hub-sink-'));
+  try {
+    const config = parseConfig(['android', '--out', out], {});
+    const env = hookEnvironment(config, { PATH: '/bin', GITHUB_ENV: '/runner/env', GITHUB_OUTPUT: '/runner/out', GITHUB_PATH: '/runner/path', GITHUB_STATE: '/runner/state', MC_HOST_builds: 'http://a:secret-mc@127.0.0.1:9012', MC_HOST_other: 'x' });
+    for (const name of jobControlFiles) {
+      assert.ok(env[name].startsWith(out), `${name} is a throwaway file under the hub output`);
+      assert.ok(existsSync(env[name]), name);
+    }
+    assert.equal(env.MC_HOST_builds, undefined);
+    assert.equal(env.MC_HOST_other, undefined);
+    assert.ok(isCredentialVariable('MC_HOST_anything') && isCredentialVariable('GH_TOKEN') && !isCredentialVariable('OP_SERVICE_ACCOUNT_TOKEN'), 'hooks keep the 1Password token (gib fetches its keystore), never a MinIO alias');
+  } finally { await rm(out, { recursive: true, force: true }); }
+});
+
 // ---- manifest ----
 
-test('a complete manifest parses', () => {
-  const manifest = parseManifest(manifestText());
+test('a complete manifest parses, project.icon included', () => {
+  const manifest = parseManifest(manifestText({ project: { slug: 'example-app', name: 'Example App', icon: 'art/icon-1024.png' } }));
   assert.equal(manifest.android.package, 'io.example.app');
-  assert.equal(manifest.ios.signer_sha1, sha1);
+  assert.equal(manifest.ios.store.signer_sha1, sha1);
+  assert.equal(manifest.project.icon, 'art/icon-1024.png');
+});
+
+test('schema 1 is gone: the v2 manifest is refused with the way out', () => {
+  assert.throws(() => parseManifest(JSON.stringify({ schema: 1, version: 'echo', android: {} })), /schema 1 \(the v2 contract\) is gone/);
 });
 
 test('the manifest is strict', () => {
   const base = JSON.parse(manifestText());
   const mutate = change => JSON.stringify(change(structuredClone(base)));
   const cases = {
-    'schema 2': mutate(m => { m.schema = 2; }),
+    'schema 3': mutate(m => { m.schema = 3; }),
     'unknown top key': mutate(m => { m.deploy = 'x'; }),
     'unknown android key': mutate(m => { m.android.extra = 'x'; }),
     'hook not a string': mutate(m => { m.android.export = ['node', 'x']; }),
-    'empty hook': mutate(m => { m.ios.upload = '  '; }),
-    'missing version hook': mutate(m => { delete m.version; }),
+    'empty hook': mutate(m => { m.ios.store.upload = '  '; }),
+    'missing version hooks': mutate(m => { delete m.version; }),
     'bad signer digest': mutate(m => { m.android.signer_sha256 = 'ABC'; }),
     'artifact outside the checkout': mutate(m => { m.android.artifact = '../App.apk'; }),
     'artifact absolute': mutate(m => { m.android.artifact = '/tmp/App.apk'; }),
     'artifact not an apk': mutate(m => { m.android.artifact = 'artifacts/App.zip'; }),
     'export and godot': mutate(m => { m.android.godot = { path: 'game', preset: 'Android' }; }),
-    'ios archive with a path': mutate(m => { m.ios.archive = 'out/App-xcode.tgz'; }),
-    'ios secret that is not op://': mutate(m => { m.ios.secrets = ['hunter2']; }),
+    'ios archive with a path': mutate(m => { m.ios.archive = 'out/App-ipad.tgz'; }),
+    'store secret that is not op://': mutate(m => { m.ios.store.secrets = ['hunter2']; }),
     'bad bundle': mutate(m => { m.ios.bundle = 'not a bundle'; }),
-    'bad sha1': mutate(m => { m.ios.signer_sha1 = 'abc'; }),
+    'bad sha1': mutate(m => { m.ios.store.signer_sha1 = 'abc'; }),
     'bundle_artifact without bundle': mutate(m => { m.android.bundle_artifact = 'a.aab'; }),
-    'no platform': JSON.stringify({ schema: 1, version: 'echo' }),
+    'icon outside the checkout': mutate(m => { m.project.icon = '../icon.png'; }),
+    'icon not a png': mutate(m => { m.project.icon = 'icon.svg'; }),
+    'unknown project key': mutate(m => { m.project.color = 'green'; }),
+    'no platform': JSON.stringify({ schema: 2, project: { slug: 'a', name: 'A' }, version: { read: 'x', bump: 'y' } }),
     'not json': '{',
   };
   for (const [name, text] of Object.entries(cases)) assert.throws(() => parseManifest(text), /mobile-deploy\.json/, name);
@@ -211,319 +242,6 @@ test('a different signer fails the check and says why', async () => {
   const f = await fixture();
   try {
     assert.throws(() => verifySigner({ apk: 'x.apk', expected: signer, env: { ...f.env, FAKE_SIGNER: other }, home: '/nonexistent' }), /differs from the pinned.*update in place/);
-  } finally { await f.cleanup(); }
-});
-
-// ---- plan ----
-
-test('a schema 1 plan announces the version and which lanes run, the v2 way', async () => {
-  const f = await fixture();
-  try {
-    const outputs = await plan(f.configure('plan'), { env: f.env });
-    assert.deepEqual(outputs, {
-      version: '0.3.0', android_code: 4, run_android: true, run_ios: true, dry_run: true, channel: 'sideload',
-      schema: 1, run_ios_export: true, build_sha: 'abc123', bump_patch: '', play_lane: false, release_lane: true,
-    });
-    assert.match(await readFile(f.env.GITHUB_OUTPUT, 'utf8'), /^version=0\.3\.0\nandroid_code=4\nrun_android=true\nrun_ios=true\ndry_run=true\nchannel=sideload\nschema=1\nrun_ios_export=true\nbuild_sha=abc123\nbump_patch=\nplay_lane=false\nrelease_lane=true\n$/);
-    const iosOnly = await plan(f.configure('plan', ['--platform', 'ios']), { env: f.env });
-    assert.deepEqual([iosOnly.run_android, iosOnly.run_ios], [false, true]);
-  } finally { await f.cleanup(); }
-});
-
-test('a tag must equal the version in the presets', async () => {
-  const f = await fixture();
-  try {
-    assert.equal(tagVersion({ GITHUB_REF_TYPE: 'branch', GITHUB_REF_NAME: 'main' }), undefined);
-    assert.equal(tagVersion({ GITHUB_REF_TYPE: 'tag', GITHUB_REF_NAME: 'v0.3.0' }), '0.3.0');
-    assert.throws(() => tagVersion({ GITHUB_REF_TYPE: 'tag', GITHUB_REF_NAME: 'ios-v0.3.0' }), /must look like vX\.Y\.Z/);
-    await assert.rejects(plan(f.configure('plan'), { env: { ...f.env, GITHUB_REF_TYPE: 'tag', GITHUB_REF_NAME: 'v0.4.0' } }), /tag v0\.4\.0 differs from the version 0\.3\.0/);
-    await plan(f.configure('plan'), { env: { ...f.env, GITHUB_REF_TYPE: 'tag', GITHUB_REF_NAME: 'v0.3.0' } });
-  } finally { await f.cleanup(); }
-});
-
-test('the version hook must print X.Y.Z JSON, and android_code when Android runs', () => {
-  assert.deepEqual(parseVersion('noise\n{"version":"1.2.3","android_code":9}\n'), { version: '1.2.3', android_code: 9 });
-  assert.throws(() => parseVersion('{"version":"1.2"}'), /expected X\.Y\.Z/);
-  assert.throws(() => parseVersion('not json'), /one line of JSON/);
-  assert.throws(() => parseVersion('{"version":"1.2.3","android_code":0}'), /bad android_code/);
-  assert.throws(() => parseVersion('{"version":"1.2.3"}', { needAndroid: true }), /android_code/);
-});
-
-test('play is refused with a clear message while the app declares no bundle hook', async () => {
-  const f = await fixture();
-  try {
-    await assert.rejects(plan(f.configure('plan', ['--channel', 'play']), { env: f.env }), /needs an android\.bundle hook.*Use android_channel=sideload/);
-  } finally { await f.cleanup(); }
-});
-
-test('a real Play run also needs the keyless-auth inputs', async () => {
-  const manifest = JSON.parse(manifestText());
-  manifest.android.bundle = 'true';
-  manifest.android.bundle_artifact = 'artifacts/App.aab';
-  const f = await fixture(JSON.stringify(manifest));
-  try {
-    await plan(f.configure('plan', ['--channel', 'play']), { env: f.env });
-    await assert.rejects(plan(f.configure('plan', ['--channel', 'play', '--dry-run', 'false']), { env: f.env }), /wif_provider and play_sa/);
-    await plan(f.configure('plan', ['--channel', 'play', '--dry-run', 'false']), { env: { ...f.env, HUB_WIF_PROVIDER: 'projects/1/x', HUB_PLAY_SA: 'sa@x.iam.gserviceaccount.com' } });
-  } finally { await f.cleanup(); }
-});
-
-test('asking for a platform the manifest lacks fails in the plan', async () => {
-  const manifest = JSON.parse(manifestText());
-  delete manifest.ios;
-  const f = await fixture(JSON.stringify(manifest));
-  try {
-    await assert.rejects(plan(f.configure('plan', ['--platform', 'ios']), { env: f.env }), /no ios section/);
-    await plan(f.configure('plan', ['--platform', 'android']), { env: f.env });
-  } finally { await f.cleanup(); }
-});
-
-// ---- android lane ----
-
-test('android dry run exports, checks the signer, copies artifacts and writes a dry-run receipt', async () => {
-  const f = await fixture();
-  try {
-    const result = await android(f.configure('android'), { env: f.env, home: '/nonexistent' });
-    assert.equal(result.signer, signer);
-    const dir = join(f.out, 'android');
-    for (const name of ['App.apk', 'android-receipt.json', 'hub-receipt-android.json']) assert.ok(existsSync(join(dir, name)), name);
-    const receipt = JSON.parse(await readFile(join(dir, 'hub-receipt-android.json'), 'utf8'));
-    assert.equal(receipt.dry_run, true);
-    assert.equal(receipt.signer, signer);
-    assert.equal(receipt.version, '0.3.0');
-    assert.equal(receipt.android_code, '4');
-    assert.equal(receipt.sha, 'abc123');
-    assert.equal(receipt.artifacts[0].name, 'App.apk');
-    const seen = await readFile(join(dir, 'hook-env.txt'), 'utf8').catch(() => '');
-    assert.doesNotMatch(seen, /TOKEN/);
-  } finally { await f.cleanup(); }
-});
-
-test('android fails when the signer is not the pinned one', async () => {
-  const f = await fixture();
-  try {
-    await assert.rejects(android(f.configure('android'), { env: { ...f.env, FAKE_SIGNER: other }, home: '/nonexistent' }), /differs from the pinned/);
-  } finally { await f.cleanup(); }
-});
-
-test('android fails when the app receipt names another version than the plan', async () => {
-  const f = await fixture();
-  try {
-    await assert.rejects(android({ ...f.configure('android'), version: '0.9.9' }, { env: f.env, home: '/nonexistent' }), /says version 0\.3\.0 but the plan says 0\.9\.9/);
-  } finally { await f.cleanup(); }
-});
-
-test('android fails when the hook produces no artifact', async () => {
-  const manifest = JSON.parse(manifestText());
-  manifest.android.export = 'true';
-  const f = await fixture(JSON.stringify(manifest));
-  try {
-    await assert.rejects(android(f.configure('android'), { env: f.env, home: '/nonexistent' }), /did not produce artifacts\/App\.apk/);
-  } finally { await f.cleanup(); }
-});
-
-test('a failing hook fails the lane', async () => {
-  const manifest = JSON.parse(manifestText());
-  manifest.android.prepare = 'exit 3';
-  const f = await fixture(JSON.stringify(manifest));
-  try {
-    await assert.rejects(android(f.configure('android'), { env: f.env, home: '/nonexistent' }), /hook android\.prepare failed \(exit 3\)/);
-  } finally { await f.cleanup(); }
-});
-
-// ---- dry run never publishes ----
-
-test('play and release refuse on a dry run, and the CLI exits non-zero', async () => {
-  const f = await fixture();
-  try {
-    await assert.rejects(play(f.configure('play', ['--channel', 'play']), { env: f.env }), /refusing to contact Play on a dry run/);
-    await assert.rejects(release(f.configure('release'), { env: f.env }), /refusing to publish a release on a dry run/);
-    for (const command of ['play', 'release']) {
-      const run = spawnSync('node', [hub, command, '--manifest', 'mobile-deploy.json', '--out', f.out], { cwd: f.app, env: f.env, encoding: 'utf8' });
-      assert.notEqual(run.status, 0, command);
-      assert.match(run.stderr, /dry run/, command);
-    }
-    assert.equal(existsSync(join(f.root, 'gh-calls.txt')), false, 'gh was never called');
-  } finally { await f.cleanup(); }
-});
-
-test('release publishes the APK and receipts to a private release, and refuses to overwrite one', async () => {
-  const f = await fixture();
-  try {
-    await android(f.configure('android'), { env: f.env, home: '/nonexistent' });
-    const real = f.configure('release', ['--dry-run', 'false']);
-    await assert.rejects(release(real, { env: f.env }), /GH_TOKEN is empty/);
-    const result = await release(real, { env: { ...f.env, GH_TOKEN: 'token' } });
-    assert.equal(result.tag, 'v0.3.0');
-    const calls = (await readFile(join(f.root, 'gh-calls.txt'), 'utf8')).trim().split('\n');
-    assert.match(calls[0], /^release view v0\.3\.0 --repo owner\/app$/);
-    assert.match(calls[1], /^release create v0\.3\.0 .*App\.apk .*android-receipt\.json .*hub-receipt-android\.json --repo owner\/app --target abc123 --title Android 0\.3\.0 --notes /);
-    await rm(join(f.root, 'gh-calls.txt'));
-    await assert.rejects(release(real, { env: { ...f.env, GH_TOKEN: 'token', FAKE_RELEASE_EXISTS: '0' } }), /release v0\.3\.0 already exists/);
-    assert.deepEqual(releaseArguments({ tag: 't', repo: 'r', sha: 's', title: 'T', notes: 'N', assets: ['a'] }), ['release', 'create', 't', 'a', '--repo', 'r', '--target', 's', '--title', 'T', '--notes', 'N']);
-  } finally { await f.cleanup(); }
-});
-
-test('release only runs for the sideload channel', async () => {
-  const f = await fixture();
-  try {
-    await assert.rejects(release(f.configure('release', ['--dry-run', 'false', '--channel', 'play']), { env: { ...f.env, GH_TOKEN: 'token' } }), /only the sideload channel/);
-  } finally { await f.cleanup(); }
-});
-
-// ---- ios lanes ----
-
-test('ios export checks the archive against the app receipt and writes a receipt', async () => {
-  const f = await fixture();
-  try {
-    const result = await iosExport(f.configure('ios-export'), { env: f.env });
-    assert.equal(result.receipt.version, '0.3.0');
-    const receipt = JSON.parse(await readFile(join(f.out, 'ios/hub-receipt-ios-export.json'), 'utf8'));
-    assert.equal(receipt.dry_run, true);
-    assert.equal(receipt.build, '7');
-    assert.equal(receipt.artifacts[0].name, 'App-xcode.tgz');
-  } finally { await f.cleanup(); }
-});
-
-test('ios export rejects a receipt for another bundle', async () => {
-  const manifest = JSON.parse(manifestText());
-  manifest.ios.bundle = 'io.example.other';
-  const f = await fixture(JSON.stringify(manifest));
-  try {
-    await assert.rejects(iosExport(f.configure('ios-export'), { env: f.env }), /names bundle io\.example\.app, the manifest pins io\.example\.other/);
-  } finally { await f.cleanup(); }
-});
-
-// The Linux half's output, as the Mac job receives it. The receipt carries the archive checksum, as the app's tool writes it.
-async function handoff(f) {
-  await iosExport(f.configure('ios-export'), { env: f.env });
-  const { createHash } = await import('node:crypto');
-  const archive = join(f.out, 'ios/App-xcode.tgz');
-  const receiptFile = join(f.out, 'ios/testflight-export.json');
-  const receipt = JSON.parse(await readFile(receiptFile, 'utf8'));
-  receipt.tarball_sha256 = createHash('sha256').update(await readFile(archive)).digest('hex');
-  await writeFile(receiptFile, JSON.stringify(receipt));
-  return { archive, receiptFile };
-}
-
-test('ios dry run verifies the toolchain and handoff, and never calls upload or assign', async () => {
-  const f = await fixture();
-  try {
-    await handoff(f);
-    const result = await iosUpload(f.configure('ios-upload', ['--dry-handoff', 'true']), { env: f.env });
-    assert.ok(result.notes.some(note => /handoff verified/.test(note)));
-    assert.ok(result.notes.some(note => /dry run: upload and assign were not called/.test(note)));
-    assert.equal(existsSync(join(f.out, 'marker.txt')), false, 'neither hook ran');
-    const receipt = JSON.parse(await readFile(join(f.out, 'ios/hub-receipt-ios-upload.json'), 'utf8'));
-    assert.equal(receipt.dry_run, true);
-    const calls = await readFile(join(f.root, 'op-calls.txt'), 'utf8');
-    assert.match(calls, /read --no-newline op:\/\/Vault\/Item\/key_id/);
-    assert.match(calls, /read --no-newline op:\/\/Vault\/Item\/credential/);
-  } finally { await f.cleanup(); }
-});
-
-test('ios dry run without the archive still passes, and says the handoff was not exercised', async () => {
-  const f = await fixture();
-  try {
-    const { archive } = await handoff(f);
-    await rm(archive);
-    const result = await iosUpload(f.configure('ios-upload'), { env: f.env });
-    assert.ok(result.notes.some(note => /handoff not exercised/.test(note)));
-    await assert.rejects(iosUpload(f.configure('ios-upload', ['--dry-handoff', 'true']), { env: f.env }), /App-xcode\.tgz is missing/);
-  } finally { await f.cleanup(); }
-});
-
-test('secret values never reach the log', async () => {
-  const f = await fixture();
-  try {
-    const { archive } = await handoff(f);
-    await rm(archive);
-    const run = spawnSync('node', [hub, 'ios-upload', '--manifest', 'mobile-deploy.json', '--out', f.out, '--version', '0.3.0'], { cwd: f.app, env: f.env, encoding: 'utf8' });
-    assert.equal(run.status, 0, run.stderr);
-    assert.doesNotMatch(run.stdout + run.stderr, /SECRETVALUE/);
-    assert.match(run.stdout, /HUB_IOS_DRY_RUN/);
-  } finally { await f.cleanup(); }
-});
-
-test('ios refuses a missing signing identity, a tampered handoff and an archive without an xcodeproj', async () => {
-  const f = await fixture();
-  try {
-    const { archive, receiptFile } = await handoff(f);
-    const real = f.configure('ios-upload', ['--dry-handoff', 'true', '--dry-run', 'false']);
-    await script(join(f.root, 'bin/security'), 'echo "     0 valid identities found"');
-    await assert.rejects(iosUpload(real, { env: f.env }), /not a valid codesigning identity/);
-    await script(join(f.root, 'bin/security'), `echo '  1) ${sha1} "x"'`);
-    await writeFile(archive, 'tampered');
-    await assert.rejects(iosUpload(real, { env: f.env }), /differs from the receipt/);
-    const { createHash } = await import('node:crypto');
-    await writeFile(join(f.root, 'empty.txt'), 'x');
-    spawnSync('tar', ['-czf', archive, '-C', f.root, 'empty.txt']);
-    const receipt = JSON.parse(await readFile(receiptFile, 'utf8'));
-    receipt.tarball_sha256 = createHash('sha256').update(await readFile(archive)).digest('hex');
-    await writeFile(receiptFile, JSON.stringify(receipt));
-    await assert.rejects(iosUpload(real, { env: f.env }), /holds no \.xcodeproj/);
-    assert.equal(existsSync(join(f.out, 'marker.txt')), false, 'a failed preflight never reaches upload');
-  } finally { await f.cleanup(); }
-});
-
-test('a failed secret reference stops the preflight without printing the value', async () => {
-  const f = await fixture();
-  try {
-    await handoff(f);
-    await script(join(f.root, 'bin/op'), 'echo "[ERROR] not signed in" >&2\nexit 1');
-    await assert.rejects(iosUpload(f.configure('ios-upload', ['--dry-handoff', 'true']), { env: f.env }), /op could not read op:\/\/Vault\/Item\/key_id/);
-  } finally { await f.cleanup(); }
-});
-
-test('a 1Password that never answers fails a real run and a strict dry run fast, and only an explicit non-strict dry run warns', async () => {
-  const f = await fixture();
-  try {
-    await handoff(f);
-    // Like a locked Mac: op sits waiting for a person and leaves a child holding stderr open.
-    await script(join(f.root, 'bin/op'), 'echo "$@" >> "' + join(f.root, 'op-calls.txt') + '"\n(sleep 30) &\nsleep 30');
-    const env = { ...f.env, HUB_OP_TIMEOUT_MS: '300' };
-    const started = Date.now();
-    // The gate before a real upload: a dry run that never read the references must not go green.
-    await assert.rejects(iosUpload(f.configure('ios-upload', ['--dry-handoff', 'true']), { env }), /op did not answer within 0\.3s reading op:\/\/Vault\/Item\/key_id.*Unlock the Mac, approve 1Password/);
-    assert.ok(Date.now() - started < 10_000, 'the strict dry run did not wait for the hung op');
-    const dry = await iosUpload(f.configure('ios-upload', ['--dry-handoff', 'true', '--strict', 'false']), { env });
-    assert.ok(dry.notes.some(note => /UNVERIFIED: 2 secret references were not checked/.test(note)));
-    assert.ok(dry.notes.some(note => /dry run: upload and assign were not called/.test(note)));
-    assert.ok(!dry.notes.some(note => /secret references resolve/.test(note)), 'a warned dry run never claims the references resolve');
-    assert.equal((await readFile(join(f.root, 'op-calls.txt'), 'utf8')).trim().split('\n').length, 2, 'one hung read per attempt, not one per reference');
-    await assert.rejects(iosUpload(f.configure('ios-upload', ['--dry-run', 'false', '--strict', 'false']), { env }), /op did not answer within 0\.3s reading op:\/\/Vault\/Item\/key_id.*Unlock the Mac/);
-    assert.equal(existsSync(join(f.out, 'marker.txt')), false, 'a real run stopped before upload and assign');
-  } finally { await f.cleanup(); }
-});
-
-test('a dry run that read every reference says so, which is the receipt a green gate must show', async () => {
-  const f = await fixture();
-  try {
-    await handoff(f);
-    const result = await iosUpload(f.configure('ios-upload', ['--dry-handoff', 'true']), { env: f.env });
-    assert.ok(result.notes.some(note => /2 secret references resolve/.test(note)));
-    assert.ok(!result.notes.some(note => /UNVERIFIED/.test(note)));
-  } finally { await f.cleanup(); }
-});
-
-test('a real ios run uploads then assigns, in that order', async () => {
-  const f = await fixture();
-  try {
-    await handoff(f);
-    await iosUpload(f.configure('ios-upload', ['--dry-run', 'false']), { env: f.env });
-    assert.equal(await readFile(join(f.out, 'marker.txt'), 'utf8'), 'uploaded\nassigned\n');
-    const receipt = JSON.parse(await readFile(join(f.out, 'ios/hub-receipt-ios-upload.json'), 'utf8'));
-    assert.equal(receipt.dry_run, false);
-  } finally { await f.cleanup(); }
-});
-
-test('a real ios run needs the archive', async () => {
-  const f = await fixture();
-  try {
-    const { archive } = await handoff(f);
-    await rm(archive);
-    await assert.rejects(iosUpload(f.configure('ios-upload', ['--dry-run', 'false']), { env: f.env }), /App-xcode\.tgz is missing/);
-    assert.equal(existsSync(join(f.out, 'marker.txt')), false);
   } finally { await f.cleanup(); }
 });
 
@@ -604,7 +322,7 @@ test('the play command reads its token from PLAY_TOKEN and uses the draft status
     await mkdir(join(f.out, 'android'), { recursive: true });
     await writeFile(join(f.out, 'android/App.aab'), 'aab');
     const api = playApi({ uploadedCode: 4 });
-    const real = f.configure('play', ['--dry-run', 'false', '--channel', 'play', '--track', 'alpha']);
+    const real = f.configure('play', ['--dry-run', 'false', '--play', 'true', '--track', 'alpha']);
     await assert.rejects(play(real, { env: f.env, fetchImpl: api.fetchImpl }), /PLAY_TOKEN is empty/);
     const result = await play(real, { env: { ...f.env, PLAY_TOKEN: 'tok' }, fetchImpl: api.fetchImpl });
     assert.deepEqual([result.track, result.status, result.versionCode], ['alpha', 'draft', 4]);
@@ -664,38 +382,50 @@ test('the reusable workflow is hardened: no hosted runners, no shell interpolati
   assert.doesNotMatch(workflow, /github\.job|pull_request_target|secrets\./);
   assert.doesNotMatch(workflow, /client_payload|repository_dispatch/);
   const jobs = [...workflow.matchAll(/^ {2}([\w-]+):\n/gm)].map(match => match[1]).filter(name => !['workflow_call'].includes(name));
-  assert.deepEqual(jobs.slice(-6), ['preflight-ios', 'plan', 'android', 'ios-export', 'ios', 'announce']);
+  assert.deepEqual(jobs.slice(-8), ['gate', 'preflight-ios', 'plan', 'android', 'ios-export', 'ios', 'deliver', 'announce']);
   const groups = [...workflow.matchAll(/^\s+group: (mobile-deploy-[\w-]+)-\$\{\{ github\.repository \}\}$/gm)].map(match => match[1]);
-  assert.deepEqual(groups, ['mobile-deploy-plan', 'mobile-deploy-android', 'mobile-deploy-ios-export', 'mobile-deploy-ios']);
-  assert.equal([...workflow.matchAll(/cancel-in-progress: false/g)].length, 4);
-  // preflight-ios, plan and announce check out the dispatched commit; the lanes build the plan's commit (the bump).
+  assert.deepEqual(groups, ['mobile-deploy-plan', 'mobile-deploy-android', 'mobile-deploy-ios-export', 'mobile-deploy-ios', 'mobile-deploy-deliver']);
+  assert.equal([...workflow.matchAll(/cancel-in-progress: false/g)].length, 5);
+  // gate, plan and announce check out the dispatched commit; the lanes and deliver the plan's commit (the bump).
   assert.equal([...workflow.matchAll(/uses: actions\/checkout@v4\n\s+with:\n\s+ref: \$\{\{ github\.sha \}\}/g)].length, 3);
-  assert.equal([...workflow.matchAll(/uses: actions\/checkout@v4\n\s+with:\n\s+ref: \$\{\{ needs\.plan\.outputs\.build_sha \}\}/g)].length, 3);
+  assert.equal([...workflow.matchAll(/uses: actions\/checkout@v4\n\s+with:\n\s+ref: \$\{\{ needs\.plan\.outputs\.build_sha \}\}/g)].length, 4);
   assert.match(workflow, /ref: \$\{\{ github\.sha \}\}\n\s+fetch-depth: 0\n\s+fetch-tags: true\n/, 'the plan bumps on full history');
   const refs = new Set([...workflow.matchAll(/uses: delorenj\/mobile-deploy-hub\/actions\/hub@(\S+)/g)].map(match => match[1]));
-  assert.equal(refs.size, 1, 'one hub ref everywhere; flip them together');
+  assert.equal(refs.size, 1, 'one exact hub ref everywhere; mise run release flips them together');
+  assert.match([...refs][0], /^v\d+\.\d+\.\d+$/, 'the inner refs are an exact tag, never v1 or main');
   assert.match(workflow, /retention-days: \$\{\{ inputs\.dry_run && 1 \|\| 7 \}\}/);
-  assert.match(workflow, /needs: \[plan, ios-export\]/);
-  assert.match(workflow, /announce:\n\s+needs: \[preflight-ios, plan, android, ios-export, ios\]\n\s+if: \$\{\{ always\(\) \}\}/, 'one event per deploy, whatever happened');
+  // The Mac preflight: after the gate, only when the gate runs the iPad lane, no checkout and no artifact.
+  const preflight = workflow.slice(workflow.indexOf('\n  preflight-ios:\n'), workflow.indexOf('\n  plan:\n'));
+  assert.match(preflight, /needs: gate\n\s+if: \$\{\{ needs\.gate\.outputs\.ios_lane == 'run' \}\}/);
+  assert.doesNotMatch(preflight, /actions\/checkout|upload-artifact/, 'a metered Mac downloads only the hub action');
+  assert.match(preflight, /receipt: \$\{\{ steps\.hub\.outputs\.receipt \}\}/, 'its receipt goes back as a job output');
+  assert.match(workflow, /plan:\n\s+needs: \[gate, preflight-ios\]\n\s+if: \$\{\{ !cancelled\(\) && needs\.gate\.result == 'success' && \(needs\.preflight-ios\.result == 'success' \|\| needs\.preflight-ios\.result == 'skipped'\) \}\}/);
+  assert.match(workflow, /ios:\n\s+needs: \[gate, plan, ios-export\]/);
+  assert.match(workflow, /deliver:\n\s+needs: \[gate, plan, android, ios-export, ios\]\n\s+if: \$\{\{ !cancelled\(\) && needs\.plan\.result == 'success' \}\}/, 'deliver publishes whatever the lanes staged once the plan spent a version');
+  assert.match(workflow, /announce:\n\s+needs: \[gate, preflight-ios, plan, android, ios-export, ios, deliver\]\n\s+if: \$\{\{ always\(\) \}\}/, 'one event per run attempt, whatever happened');
   // Every upload can be redone by "Re-run failed jobs", and receipts upload even when the lane failed.
   const uploads = workflow.split('uses: actions/upload-artifact@v4').slice(1).map(block => block.split(/\n {6}- |\n\n/)[0]);
-  assert.deepEqual(uploads.map(block => /name: (\S+)/.exec(block)[1]), ['preflight-ios-out', 'plan-out', 'android-out', 'ios-receipt', 'xcode-project', 'ios-out']);
+  assert.deepEqual(uploads.map(block => /name: (\S+)/.exec(block)[1]), ['gate-out', 'plan-out', 'android-out', 'ios-receipt', 'ios-out', 'deliver-out']);
   for (const block of uploads) assert.match(block, /^\s+overwrite: true$/m, block);
-  // The build itself never takes quota: the Release (or Play) holds the APK, the LAN carries the Xcode project.
+  // The build itself never takes artifact quota: staging, the build directory and the Release hold it.
   assert.match(workflow, /name: android-out\n\s+path: \$\{\{ runner\.temp \}\}\/hub-out\/android\/\*\.json\n/);
-  assert.doesNotMatch(workflow, /hub-out\/android\/\n/);
-  // The deploy contract: a bump on every run (no "none"), extra stores off by default, dry run and strict on.
+  assert.doesNotMatch(workflow, /xcode-project|\.tgz/, 'the Xcode handoff never goes through artifacts');
+  // The deploy contract: a bump on every run (no "none"), extra stores off, dry run and strict on, metered auto.
   assert.match(workflow, /bump:\n\s+description: [^\n]+\n\s+type: string\n\s+default: patch\n/);
   assert.doesNotMatch(workflow, /\bnone\b/, 'there is no bump level none');
   for (const name of ['testflight', 'play']) assert.match(workflow, new RegExp(`${name}:\\n\\s+description: [^\\n]+\\n\\s+type: boolean\\n\\s+default: false\\n`), name);
   assert.match(workflow, /dry_run:\n\s+description: [^\n]+\n\s+type: boolean\n\s+default: true\n/);
   assert.match(workflow, /strict:\n\s+description: [^\n]+\n\s+type: boolean\n\s+default: true\n/);
-  assert.match(workflow, /dry_handoff: \$\{\{ inputs\.dry_handoff \}\}\n\s+strict: \$\{\{ inputs\.strict \}\}\n/);
+  assert.match(workflow, /metered:\n\s+description: [^\n]+\n\s+type: string\n\s+default: auto\n/);
+  // The gate sees every input the policy rules on.
+  const gateJob = workflow.slice(workflow.indexOf('\n  gate:\n'), workflow.indexOf('\n  preflight-ios:\n'));
+  for (const input of ['manifest', 'strict', 'metered', 'linux_runner', 'mac_runner', 'bump', 'dry_run']) assert.match(gateJob, new RegExp(`\\n {10}${input}: \\$\\{\\{ inputs\\.${input} \\}\\}`), input);
+  assert.match(gateJob, /channel: \$\{\{ inputs\.android_channel \}\}/);
   // Only the plan (bump push) and android (Release) jobs hold contents: write; only android holds id-token.
   const bodies = workflow.slice(workflow.indexOf('\njobs:\n')).split(/\n {2}(?=[\w-]+:\n)/).slice(1);
   const writes = bodies.filter(body => /\n {6}contents: write\n/.test(body)).map(body => body.split(':')[0]);
   assert.deepEqual(writes, ['plan', 'android']);
-  assert.deepEqual(bodies.filter(body => /\n {6}id-token: write\n/.test(body)).map(body => body.split(":")[0]), ["android"]);
+  assert.deepEqual(bodies.filter(body => /\n {6}id-token: write\n/.test(body)).map(body => body.split(':')[0]), ['android']);
 });
 
 test('the composite action gives every run step a shell and reads inputs only', async () => {
@@ -710,6 +440,7 @@ test('the composite action gives every run step a shell and reads inputs only', 
   assert.match(action, /run: node "\$HUB_TOOL" "\$HUB_COMMAND"/);
   assert.match(action, /^\s+HUB_REF: \$\{\{ github\.action_ref \}\}$/m, 'receipts record the ref the hub was fetched at');
   assert.match(action, /^\s+HUB_STRICT: \$\{\{ inputs\.strict \}\}$/m);
+  for (const name of ['METERED', 'IOS_LANE', 'MAC_LINK', 'BUNDLE', 'SLUG', 'IOS_STORE', 'LINUX_RUNNER', 'MAC_RUNNER']) assert.match(action, new RegExp(`^\\s+HUB_${name}: \\$\\{\\{ inputs\\.${name.toLowerCase()} \\}\\}$`, 'm'), name);
   assert.match(action, /strict:\n\s+description: [^\n]+\n\s+default: 'true'\n/);
 });
 

@@ -400,46 +400,78 @@ test('devicectl app info is read back as version and build', () => {
 
 // ---------------------------------------------------------------------------------------------------- the event
 
-const manifestBoth = { project: { slug: 'tower-of-dumb-things', name: 'Tower of Lost Things' }, android: {}, ios: {} };
-const runEnv = { GITHUB_REPOSITORY: 'delorenj/pile-of-dumb-things', GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '2', HUB_REF: 'v1.0.0' };
+const project = { slug: 'tower-of-dumb-things', name: 'Tower of Lost Things' };
+const both = { android: true, ios: true };
+const runEnv = { GITHUB_REPOSITORY: 'delorenj/pile-of-dumb-things', GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '2', HUB_REF: 'v1.1.0' };
 const ok = { result: 'success' };
-const delivery = (platform, extra = {}) => ({ platform, target: platform === 'android' ? 'SM-S948U' : 'iPad14,5', version: '0.2.2', build: platform === 'android' ? '4' : '5', sha256: 'a'.repeat(64), verified: true, ...extra });
+const delivery = (platform, extra = {}) => ({ platform, target: platform === 'android' ? 'SM-S948U' : 'iPad14,5', version: '0.2.2', build: platform === 'android' ? '4' : '5', sha256: 'a'.repeat(64), verified: true, status: 'installed', ...extra });
+const allOk = { gate: ok, 'preflight-ios': ok, plan: ok, android: ok, 'ios-export': ok, ios: ok, deliver: ok };
+const published = { apk: 'https://s3.delo.sh/builds/tower-of-dumb-things/0.2.2/tower-of-dumb-things-0.2.2-4.apk', ota: 'itms-services://?action=download-manifest&url=https://s3.delo.sh/builds/tower-of-dumb-things/ios/manifest.plist', page: 'https://s3.delo.sh/builds/tower-of-dumb-things/index.html', any: true };
 
-test('a deploy to both devices is one completed event naming each delivery', () => {
+test('a deploy to both devices is one completed event naming each delivery, its status and the links', () => {
   const event = deploymentEvent({
-    manifest: manifestBoth, devices, scope: { android: true, ios: true },
-    needs: { 'preflight-ios': ok, plan: ok, android: ok, 'ios-export': ok, ios: ok },
+    project, declared: both, devices, needs: allOk,
     receipts: { android: { delivery: delivery('android') }, ios: { delivery: delivery('ios') } },
-    version: '0.2.2', androidCode: '4', commit: 'b'.repeat(40), env: runEnv, now: new Date('2026-10-09T12:00:00.123Z'),
+    version: '0.2.2', androidCode: '4', commit: 'b'.repeat(40), published, env: runEnv, now: new Date('2026-10-09T12:00:00.123Z'),
   });
   assert.equal(event.type, 'bloodbank.project.deployment.completed');
   assert.deepEqual(event.data.artifact, { kind: 'mobile-app', name: 'Tower of Lost Things', version: '0.2.2', version_code: 4, commit: 'b'.repeat(40), dirty: false, variant: 'debug', sha256: null });
   assert.deepEqual(event.data.target, { kind: 'device-set', name: 'SM-S948U + iPad14,5', id: null });
-  assert.equal(event.data.deliveries.length, 2);
+  assert.deepEqual(event.data.deliveries.map(item => [item.device, item.status, item.by]), [['S26', 'installed', 'deploy'], ['iPad', 'installed', 'deploy']]);
   assert.equal(event.data.verified, true);
-  assert.deepEqual(event.data.run, { id: '123', attempt: 2, url: 'https://github.com/delorenj/pile-of-dumb-things/actions/runs/123', hub_ref: 'v1.0.0' });
+  assert.equal(event.data.trigger, 'deploy');
+  assert.deepEqual(event.data.run, { id: '123', attempt: 2, url: 'https://github.com/delorenj/pile-of-dumb-things/actions/runs/123', hub_ref: 'v1.1.0' });
   assert.equal(event.data.deployed_at, '2026-10-09T12:00:00Z');
-  assert.equal(event.data.summary, 'Tower of Lost Things v0.2.2 (4) bbbbbbb installed on SM-S948U + iPad14,5, verified');
+  assert.equal(event.data.summary, 'Tower of Lost Things 0.2.2 (4) bbbbbbb: S26 installed, iPad installed, verified=true');
+  assert.deepEqual(event.data.links.map(link => [link.rel, link.label]), [['apk', 'Install APK'], ['page', 'Builds'], ['run', 'Run']], 'no Install on iPad when the iPad has it');
+});
+
+test('an away device is pending, not a failure: the event is .completed, verified false, with Install links', () => {
+  const event = deploymentEvent({
+    project, declared: both, devices, needs: allOk,
+    receipts: { android: { delivery: delivery('android', { verified: false, status: 'pending', reason: "not on big-chungus's adb" }) }, ios: { delivery: delivery('ios', { verified: false, status: 'pending', reason: 'the iPad is listed but unavailable' }) } },
+    version: '0.2.2', androidCode: '4', commit: 'b'.repeat(40), published, env: runEnv,
+  });
+  assert.equal(event.type, 'bloodbank.project.deployment.completed');
+  assert.equal(event.data.verified, false);
+  assert.deepEqual(event.data.deliveries.map(item => [item.status, item.reason]), [['pending', "not on big-chungus's adb"], ['pending', 'the iPad is listed but unavailable']]);
+  assert.match(event.data.summary, /: S26 pending, iPad pending, verified=false$/);
+  assert.deepEqual(event.data.links.map(link => link.rel), ['apk', 'ota', 'page', 'run']);
+});
+
+test('a Mac offline or over its budget leaves the iPad skipped, and --platform narrows to skipped too', () => {
+  for (const [iosLane, reason] of [['skip-offline', /offline/], ['skip-metered', /data budget/]]) {
+    const event = deploymentEvent({ project, declared: both, devices, needs: { ...allOk, 'preflight-ios': { result: 'skipped' }, 'ios-export': { result: 'skipped' }, ios: { result: 'skipped' } }, receipts: { android: { delivery: delivery('android') } }, version: '0.2.2', androidCode: '4', commit: 'b'.repeat(40), iosLane, published: { ...published, ota: null }, env: runEnv });
+    assert.equal(event.type, 'bloodbank.project.deployment.completed', iosLane);
+    const ipad = event.data.deliveries.find(item => item.platform === 'ios');
+    assert.equal(ipad.status, 'skipped');
+    assert.match(ipad.reason, reason);
+    assert.equal(event.data.verified, false, 'an in-scope device that was skipped is not verified');
+  }
+  const narrowed = deploymentEvent({ project, declared: both, platform: 'android', devices, needs: { ...allOk, ios: { result: 'skipped' } }, receipts: { android: { delivery: delivery('android') } }, version: '0.2.2', androidCode: '4', commit: 'b'.repeat(40), iosLane: 'skip-platform', env: runEnv });
+  assert.deepEqual(narrowed.data.deliveries.map(item => [item.platform, item.status, item.reason ?? null]), [['android', 'installed', null], ['ios', 'skipped', '--platform android']]);
+  assert.equal(narrowed.data.verified, true, '--platform takes the iPad out of scope');
+  assert.equal(narrowed.data.artifact.kind, 'android-apk');
 });
 
 test('a failed lane makes the deploy a failed event with its stage and a path-free reason', () => {
   const event = deploymentEvent({
-    manifest: manifestBoth, devices, scope: { android: true, ios: true },
-    needs: { 'preflight-ios': ok, plan: ok, android: ok, 'ios-export': ok, ios: { result: 'failure' } },
+    project, declared: both, devices, needs: { ...allOk, ios: { result: 'failure' } },
     receipts: { android: { delivery: delivery('android') }, ios: { stage: 'install', reason: '::error::devicectl failed (/Users/delorenj/Library/x.app)', delivery: delivery('ios', { verified: false }) } },
-    version: '0.2.2', androidCode: '4', commit: 'b'.repeat(40), env: runEnv,
+    version: '0.2.2', androidCode: '4', commit: 'b'.repeat(40), published, env: runEnv,
   });
   assert.equal(event.type, 'bloodbank.project.deployment.failed');
   assert.equal(event.data.stage, 'install');
   assert.equal(event.data.reason, 'devicectl failed (<path>)');
-  assert.deepEqual(event.data.deliveries.map(item => [item.platform, item.verified, item.stage ?? null]), [['android', true, null], ['ios', false, 'install']]);
-  assert.match(event.data.summary, /deploy to SM-S948U \+ iPad14,5 failed at install: devicectl failed \(<path>\)$/);
+  assert.deepEqual(event.data.deliveries.map(item => [item.platform, item.status, item.stage ?? null]), [['android', 'installed', null], ['ios', 'failed', 'install']]);
+  assert.match(event.data.summary, /^Tower of Lost Things 0\.2\.2 \(4\) deploy failed at install: devicectl failed \(<path>\); S26 installed, iPad failed$/);
+  assert.deepEqual(event.data.links.map(link => [link.rel, link.label]), [['run', 'Open run'], ['page', 'Builds']]);
 });
 
 test('a plan that stopped is the failed event: its stage, and lanes that never ran', () => {
   const event = deploymentEvent({
-    manifest: manifestBoth, devices, scope: { android: true, ios: false },
-    needs: { plan: { result: 'failure' }, android: { result: 'skipped' } },
+    project, declared: { android: true, ios: false }, devices,
+    needs: { gate: ok, plan: { result: 'failure' }, android: { result: 'skipped' }, deliver: { result: 'skipped' } },
     receipts: { plan: { stage: 'version', reason: 'tag v0.2.2 already exists on origin' } },
     version: '0.2.1', androidCode: '3', commit: 'c'.repeat(40), env: runEnv,
   });
@@ -447,9 +479,20 @@ test('a plan that stopped is the failed event: its stage, and lanes that never r
   assert.deepEqual([event.data.stage, event.data.reason], ['version', 'tag v0.2.2 already exists on origin']);
   assert.deepEqual(event.data.target, { kind: 'android-device', name: 'SM-S948U', id: 'R5GL43A7PCH' });
   assert.equal(event.data.artifact.kind, 'android-apk');
-  assert.equal(event.data.deliveries[0].stage, 'version');
+  assert.deepEqual([event.data.deliveries[0].status, event.data.deliveries[0].stage], ['failed', 'version']);
+  assert.deepEqual(event.data.links.map(link => link.rel), ['run'], 'nothing was published');
   assert.equal(sanitizeReason('one\ntwo'), 'one');
   assert.deepEqual(targetOf({ android: false, ios: true }, devices), { kind: 'ios-device', name: 'iPad14,5', id: devices.ios.udid });
+});
+
+test('a refused gate and a failed deliver are failed events at their stage', () => {
+  const refused = deploymentEvent({ project, declared: both, devices, needs: { gate: { result: 'failure' }, 'preflight-ios': { result: 'skipped' }, plan: { result: 'skipped' } }, receipts: { gate: { stage: 'preflight', reason: 'HUB_GATE_REFUSED caller: not an accepted copy of templates/deploy.yml' } }, version: '0.2.1', androidCode: '3', commit: 'c'.repeat(40), env: runEnv });
+  assert.equal(refused.type, 'bloodbank.project.deployment.failed');
+  assert.match(refused.data.reason, /^HUB_GATE_REFUSED caller/);
+  assert.ok(refused.data.deliveries.every(item => item.status === 'failed'));
+  const deliver = deploymentEvent({ project, declared: both, devices, needs: { ...allOk, deliver: { result: 'failure' } }, receipts: { android: { delivery: delivery('android', { status: 'pending', verified: false }) }, ios: { delivery: delivery('ios') }, deliver: { stage: 'deliver', reason: 'mc cp failed' } }, version: '0.2.2', androidCode: '4', commit: 'b'.repeat(40), env: runEnv });
+  assert.equal(deliver.type, 'bloodbank.project.deployment.failed');
+  assert.deepEqual([deliver.data.stage, deliver.data.reason], ['deliver', 'mc cp failed']);
 });
 
 test('reruns correlate: one UUIDv5 per repo and run, a different one for another run', () => {
@@ -458,14 +501,17 @@ test('reruns correlate: one UUIDv5 per repo and run, a different one for another
   assert.notEqual(correlationFor(runEnv), correlationFor({ ...runEnv, GITHUB_RUN_ID: '124' }));
   assert.deepEqual(emitArgs({ type: 't', correlation: 'c', check: true }).slice(-1), ['--check']);
   assert.deepEqual(emitArgs({ type: 't', correlation: 'c', check: false }).slice(-1), ['--strict']);
+  assert.equal(emitArgs({ type: 't', correlation: 'c', check: true, producer: 'mobile-deploy-hub-catchup' })[5], 'mobile-deploy-hub-catchup', 'the catch-up names itself (G3)');
 });
 
 const realBbEmit = bbEmitPath(process.env);
 test('the events the hub sends pass the live Bloodbank contract (bb-emit --check)', { skip: !existsSync(realBbEmit) && 'bb-emit is not installed on this host' }, () => {
   const cases = [
-    deploymentEvent({ manifest: manifestBoth, devices, scope: { android: true, ios: true }, needs: { 'preflight-ios': ok, plan: ok, android: ok, 'ios-export': ok, ios: ok }, receipts: { android: { delivery: delivery('android') }, ios: { delivery: delivery('ios') } }, version: '0.2.2', androidCode: '4', commit: 'b'.repeat(40), env: runEnv }),
-    deploymentEvent({ manifest: manifestBoth, devices, scope: { android: false, ios: true }, needs: { 'preflight-ios': ok, plan: ok, ios: { result: 'failure' } }, receipts: { ios: { stage: 'install', reason: 'devicectl device install app did not succeed', delivery: delivery('ios', { verified: false }) } }, version: '0.2.2', androidCode: '', commit: 'b'.repeat(40), env: runEnv }),
-    deploymentEvent({ manifest: manifestBoth, devices, scope: { android: true, ios: true }, needs: { plan: { result: 'failure' } }, receipts: { plan: { stage: 'version', reason: 'main kept moving' } }, version: '0.2.1', androidCode: '3', commit: 'b'.repeat(40), env: runEnv }),
+    deploymentEvent({ project, declared: both, devices, needs: allOk, receipts: { android: { delivery: delivery('android', { status: 'pending', verified: false, reason: "not on big-chungus's adb" }) }, ios: { delivery: delivery('ios') } }, version: '0.2.2', androidCode: '4', commit: 'b'.repeat(40), published, env: runEnv }),
+    deploymentEvent({ project, declared: both, devices, needs: { ...allOk, ios: { result: 'skipped' }, 'preflight-ios': { result: 'skipped' } }, receipts: { android: { delivery: delivery('android') } }, version: '0.2.2', androidCode: '4', commit: 'b'.repeat(40), iosLane: 'skip-metered', published, env: runEnv }),
+    deploymentEvent({ project, declared: { android: false, ios: true }, devices, needs: { ...allOk, ios: { result: 'failure' } }, receipts: { ios: { stage: 'install', reason: 'devicectl device install app did not succeed', delivery: delivery('ios', { verified: false }) } }, version: '0.2.2', androidCode: '', commit: 'b'.repeat(40), env: runEnv }),
+    deploymentEvent({ project, declared: both, devices, needs: { ...allOk, deliver: { result: 'failure' } }, receipts: { android: { delivery: delivery('android') }, ios: { delivery: delivery('ios') }, deliver: { stage: 'deliver', reason: 'mc cp failed' } }, version: '0.2.2', androidCode: '4', commit: 'b'.repeat(40), published, env: runEnv }),
+    deploymentEvent({ project, declared: both, devices, needs: { gate: ok, plan: { result: 'failure' } }, receipts: { plan: { stage: 'version', reason: 'main kept moving' } }, version: '0.2.1', androidCode: '3', commit: 'b'.repeat(40), env: runEnv }),
   ];
   for (const event of cases) {
     const result = spawnSync(realBbEmit, emitArgs({ type: event.type, correlation: correlationFor(runEnv), check: true }), { input: JSON.stringify(event.data), encoding: 'utf8', timeout: 30_000 });
@@ -512,16 +558,10 @@ test('devices.json names the S26, the iPad, the team and the Mac once, and is va
   assert.throws(() => parseDevices(text.replace('"Library/Caches/mobile-deploy-hub/handoff"', '"../etc"')), /handoff_dir/);
 });
 
-test('an app without an iPad lane passes the Mac preflight, unless ios was asked for by name', async () => {
+test('the Mac preflight has no checkout: it needs the bundle id from the gate', async () => {
   const f = await gitFixture();
   try {
-    const output = join(f.root, 'out.txt');
-    await writeFile(output, '');
-    const env = { ...f.env, GITHUB_OUTPUT: output };
-    const result = await quiet(() => preflightIos({ ...parseConfig(['preflight-ios', '--manifest', 'mobile-deploy.json', '--out', f.out], env), cwd: f.app }, { env }));
-    assert.deepEqual(result, { skipped: true });
-    assert.match(readFileSync(output, 'utf8'), /^ipad_version=\nipad_build=\n$/);
-    await assert.rejects(preflightIos({ ...parseConfig(['preflight-ios', '--manifest', 'mobile-deploy.json', '--platform', 'ios', '--out', f.out], env), cwd: f.app }, { env }), /platform ios but the manifest has no ios section/);
+    await assert.rejects(preflightIos({ ...parseConfig(['preflight-ios', '--out', f.out], f.env), cwd: f.app }, { env: f.env, log: () => {} }), /needs the bundle id from the gate/);
   } finally { await f.cleanup(); }
 });
 
@@ -588,6 +628,7 @@ async function laneHost(f) {
     HUB_BB_EMIT: join(bin, 'bb-emit'),
     HUB_LOCK_DIR: join(f.root, 'locks'),
     HUB_ADB_WAIT_MS: '2000',
+    HUB_ADB_LANE_WAIT_MS: '2000',
     GITHUB_OUTPUT: output,
     GITHUB_REPOSITORY: 'delorenj/example-app',
     GITHUB_RUN_ID: '777',
@@ -600,8 +641,12 @@ async function laneHost(f) {
   const outputs = () => Object.fromEntries(readFileSync(output, 'utf8').trim().split('\n').filter(Boolean).map(line => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
   const configure = (command, extra = [], more = {}) => ({ ...parseConfig([command, '--manifest', 'mobile-deploy.json', '--out', f.out, ...extra], { ...env, ...more }), cwd: f.app });
   const installApk = async text => writeFile(join(state, 'installed.apk'), text);
-  return { env, state, calls, adbCalls, outputs, configure, installApk };
+  const s3 = { writes: [], putText(text, key) { this.writes.push({ key, text }); }, put(file, key) { this.writes.push({ key, file }); }, remove(key) { this.writes.push({ key, removed: true }); }, list: () => [] };
+  return { env, state, calls, adbCalls, outputs, configure, installApk, s3 };
 }
+
+// The build directory as the plan reads it: empty (no latest.json yet) unless a test says otherwise.
+const noLatest = async () => ({ status: 404, ok: false, text: async () => '' });
 
 const quiet = async fn => {
   const log = console.log;
@@ -615,7 +660,7 @@ test('a dry run end to end: the plan bumps nothing on origin, the S26 gets nothi
     const host = await laneHost(f);
     await host.installApk('io.example.app 0.2.1 4');
     const before = f.remote(['rev-parse', 'main']);
-    const planned = await quiet(() => plan(host.configure('plan'), { env: host.env, home: f.root }));
+    const planned = await quiet(() => plan(host.configure('plan'), { env: host.env, home: f.root, fetchImpl: noLatest }));
     assert.deepEqual([planned.version, planned.android_code, planned.build_sha, planned.bumped], ['0.2.2', 5, before, false]);
     const out = host.outputs();
     assert.equal(out.version, '0.2.2');
@@ -633,7 +678,7 @@ test('a dry run end to end: the plan bumps nothing on origin, the S26 gets nothi
     assert.match(readJson(join(f.out, 'android/hub-receipt-android.json')).notes.join('\n'), /dry run: would install 0\.2\.2 \(5\) over 0\.2\.1 \(4\)/);
 
     await rm(join(f.root, 'bb-emit.log'), { force: true });
-    const event = await quiet(() => announce(host.configure('announce', [], { HUB_RECEIPTS: f.out, HUB_NEEDS: JSON.stringify({ plan: { result: 'success', outputs: out }, android: { result: 'success' } }) }), { env: { ...host.env, HUB_RECEIPTS: f.out, HUB_NEEDS: JSON.stringify({ plan: { result: 'success', outputs: out }, android: { result: 'success' } }) }, home: f.root }));
+    const event = await quiet(() => announce(host.configure('announce', [], { HUB_RECEIPTS: f.out }), { env: { ...host.env, HUB_RECEIPTS: f.out, HUB_NEEDS: JSON.stringify({ gate: { result: 'success' }, plan: { result: 'success', outputs: out }, android: { result: 'success' } }) }, home: f.root, fetchImpl: noLatest }));
     assert.equal(event.sent, false);
     assert.equal(event.type, 'bloodbank.project.deployment.completed');
     const emitted = host.calls('bb-emit.log').trim().split('\n');
@@ -648,7 +693,7 @@ test('a real run end to end: bump pushed, APK installed in place and read back, 
   try {
     const host = await laneHost(f);
     await host.installApk('io.example.app 0.2.1 4');
-    const planned = await quiet(() => plan(host.configure('plan', ['--dry-run', 'false']), { env: host.env, home: f.root }));
+    const planned = await quiet(() => plan(host.configure('plan', ['--dry-run', 'false']), { env: host.env, home: f.root, fetchImpl: noLatest, s3Factory: async () => host.s3 }));
     assert.equal(planned.bumped, true);
     assert.equal(f.remote(['rev-parse', 'main']), planned.build_sha);
     assert.equal(f.remote(['rev-parse', 'v0.2.2^{commit}']), planned.build_sha);
@@ -661,9 +706,9 @@ test('a real run end to end: bump pushed, APK installed in place and read back, 
     assert.equal(readFileSync(join(host.state, 'installed.apk'), 'utf8'), 'io.example.app 0.2.2 5 ');
     await quiet(() => release(host.configure('release', ['--dry-run', 'false', '--version', '0.2.2', '--android-code', '5', '--build-sha', planned.build_sha]), { env: { ...host.env, GH_TOKEN: 'token' } }));
     assert.match(host.calls("gh.log"), /gh release create v0\.2\.2 [^\n]* --target [0-9a-f]{40} [\s\S]*--verify-tag\n/);
-    const needs = JSON.stringify({ plan: { result: 'success', outputs: out }, android: { result: 'success' } });
+    const needs = JSON.stringify({ gate: { result: 'success' }, plan: { result: 'success', outputs: out }, android: { result: 'success' }, deliver: { result: 'success' } });
     await rm(join(f.root, 'bb-emit.log'), { force: true });
-    const event = await quiet(() => announce(host.configure('announce', ['--dry-run', 'false']), { env: { ...host.env, HUB_RECEIPTS: f.out, HUB_NEEDS: needs }, home: f.root }));
+    const event = await quiet(() => announce(host.configure('announce', ['--dry-run', 'false']), { env: { ...host.env, HUB_RECEIPTS: f.out, HUB_NEEDS: needs }, home: f.root, fetchImpl: noLatest }));
     assert.equal(event.sent, true);
     assert.deepEqual(host.calls('bb-emit.log').trim().split('\n').map(line => line.split(' ').pop()), ['--check', '--strict']);
     assert.equal(event.data.verified, true);
@@ -675,7 +720,7 @@ test('Re-run failed jobs finishes a deploy: same build verified without reinstal
   const f = await gitFixture();
   try {
     const host = await laneHost(f);
-    const planned = await quiet(() => plan(host.configure('plan', ['--dry-run', 'false']), { env: host.env, home: f.root }));
+    const planned = await quiet(() => plan(host.configure('plan', ['--dry-run', 'false']), { env: host.env, home: f.root, fetchImpl: noLatest, s3Factory: async () => host.s3 }));
     git(f.app, ['checkout', '-q', planned.build_sha], f.env);
     const real = host.configure('android', ['--dry-run', 'false', '--version', '0.2.2', '--android-code', '5', '--build-sha', planned.build_sha]);
     // Attempt 1 installed 0.2.2 (5) and then failed later in the job (a Release clash, a runner restart).
@@ -699,15 +744,23 @@ test('Re-run failed jobs finishes a deploy: same build verified without reinstal
   } finally { await f.cleanup(); }
 });
 
-test('the plan refuses before any bump when the S26 is missing, and writes a failure receipt for the event', async () => {
+test('an away S26 is pending, not a stop: the plan still bumps, and the lane publishes for a later install', async () => {
   const f = await gitFixture();
   try {
     const host = await laneHost(f);
     await script(join(f.root, 'bin/adb'), `echo "$*" >> "${host.state}/calls.log"\n[ "$1" = devices ] && printf 'List of devices attached\\n'\nexit 0`);
-    await assert.rejects(quiet(() => plan(host.configure('plan', ['--dry-run', 'false']), { env: host.env, home: f.root })), /not on this host's adb server.*Turn on Wireless debugging/);
-    assert.equal(f.remote(['tag', '--list']), '');
-    const receipt = readJson(join(f.out, 'plan/hub-receipt-plan.json'));
-    assert.deepEqual([receipt.outcome, receipt.stage], ['failure', 'preflight']);
+    const logs = [];
+    const planned = await plan(host.configure('plan'), { env: host.env, home: f.root, fetchImpl: noLatest, log: line => logs.push(line) });
+    assert.equal(planned.version, '0.2.2');
+    assert.equal(planned.s26, 'away');
+    assert.ok(logs.some(line => /^HUB_S26_PENDING /.test(line)), logs.join('\n'));
+    const out = host.outputs();
+    const lane = await quiet(() => android(host.configure('android', ['--version', out.version, '--android-code', out.android_code, '--build-sha', out.build_sha, '--bump-patch', out.bump_patch]), { env: host.env, home: f.root }));
+    assert.deepEqual([lane.delivery.status, lane.delivery.verified, lane.delivery.reason], ['pending', false, "not on big-chungus's adb"]);
+    assert.equal(lane.staged.name, 'example-app-0.2.2-5.apk');
+    assert.ok(existsSync(join(f.root, '.cache/mobile-deploy-hub/staging/delorenj-example-app/777/android/example-app-0.2.2-5.apk')), 'staged for deliver');
+    assert.equal(lane.quickdrop.status, 'skipped', 'a dry run drops nothing in Quickdrop');
+    assert.doesNotMatch(host.adbCalls(), /\binstall\b/);
   } finally { await f.cleanup(); }
 });
 
@@ -717,7 +770,7 @@ test('the plan holds the event to its contract before it spends a version', asyn
     const host = await laneHost(f);
     await host.installApk('io.example.app 0.2.1 4');
     await script(join(f.root, 'bin/bb-emit'), 'echo "Additional properties are not allowed" >&2\nexit 1');
-    await assert.rejects(quiet(() => plan(host.configure('plan', ['--dry-run', 'false']), { env: host.env, home: f.root })), /fails its contract.*Nothing was bumped/);
+    await assert.rejects(quiet(() => plan(host.configure('plan', ['--dry-run', 'false']), { env: host.env, home: f.root, fetchImpl: noLatest, s3Factory: async () => host.s3 })), /fails its contract.*Nothing was bumped/);
     assert.equal(f.remote(['tag', '--list']), '');
     assert.equal(f.remote(['log', '-1', '--format=%s', 'main']), 'init');
   } finally { await f.cleanup(); }

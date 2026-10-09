@@ -5,7 +5,7 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { androidSdk } from './android.mjs';
-import { credentialVariables } from './config.mjs';
+import { isCredentialVariable } from './config.mjs';
 import { runBounded } from './exec.mjs';
 
 export const adbPath = (env = process.env, home = homedir()) => env.HUB_ADB || join(androidSdk(env, home), 'platform-tools/adb');
@@ -44,8 +44,8 @@ export function parseMdnsEndpoint(output, serial) {
 
 export function createAdb({ env: given = process.env, home = homedir(), runner = runBounded } = {}) {
   // No token reaches adb: its server outlives the job (below), and it must not carry the job's credentials with it.
-  const env = { ...given };
-  for (const name of credentialVariables) delete env[name];
+  const env = {};
+  for (const [name, value] of Object.entries(given)) if (!isCredentialVariable(name)) env[name] = value;
   const adb = adbPath(env, home);
   const call = (args, timeout = 30_000) => runner(adb, args, { env, timeout, label: `adb ${args.filter(arg => !arg.startsWith('/')).slice(0, 4).join(' ')}` });
   return {

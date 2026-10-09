@@ -1,0 +1,66 @@
+name: Deploy
+run-name: ${{ inputs.dry_run && 'Deploy (dry run)' || 'Deploy REAL' }} ${{ inputs.platform }} bump=${{ inputs.bump }}
+
+# The caller template of delorenj/mobile-deploy-hub (templates/deploy.yml). Copy it as .github/workflows/deploy.yml; only
+# comment lines may differ, because the hub's gate refuses a caller whose normalized text is not an accepted template
+# (policy.json callers.accept). Every new app version deploys through the hub: `mise run deploy` for the dry run, then
+# `mise run deploy --dry-run false`. A real deploy bumps the version (the hub commits and tags it on main), builds the
+# APK and the iPad IPA, publishes them (S3 build directory, Quickdrop, a private Release), installs them in place on
+# the S26 and the iPad when they are reachable (pending otherwise: a catch-up installs them later), and sends one
+# Bloodbank event with download links. `REAL` in a real run's title is how `mise run deploy` finds the last real run.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and verify only. No commit, tag, install, publish, Release, TestFlight or event.
+        type: boolean
+        default: true
+      bump:
+        description: Version bump; every deploy bumps
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      platform:
+        description: Which devices
+        type: choice
+        options: [both, android, ios]
+        default: both
+      testflight:
+        description: Also upload to TestFlight Owner Testing (apps with ios.store; the hub refuses the others)
+        type: boolean
+        default: false
+      play:
+        description: Also upload to Play (apps with android.bundle; the hub refuses the others)
+        type: boolean
+        default: false
+      dry_handoff:
+        description: On a dry run, also hand the Linux Xcode export to the Mac (apps with ios.export) and build and check the iPad IPA
+        type: boolean
+        default: false
+      metered:
+        description: The Mac on a metered link (a phone hotspot) skips the iPad lane when the run would go over its data budget; allow builds it anyway
+        type: choice
+        options: [auto, allow]
+        default: auto
+
+# The hub's jobs can only narrow these. contents: write is the bump commit and tag and the private Release (and the
+# checkout of this private repo); id-token: write is keyless Play; actions: read lets a job look up earlier runs.
+permissions:
+  contents: write
+  id-token: write
+  actions: read
+
+jobs:
+  deploy:
+    uses: delorenj/mobile-deploy-hub/.github/workflows/mobile-deploy.yml@v1
+    with:
+      manifest: tools/ci/mobile-deploy.json
+      dry_run: ${{ inputs.dry_run }}
+      bump: ${{ inputs.bump }}
+      platform: ${{ inputs.platform }}
+      testflight: ${{ inputs.testflight }}
+      play: ${{ inputs.play }}
+      dry_handoff: ${{ inputs.dry_handoff }}
+      metered: ${{ inputs.metered }}
+      wif_provider: ${{ vars.GCP_WIF_PROVIDER }}
+      play_sa: ${{ vars.PLAY_SA_EMAIL }}

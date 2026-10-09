@@ -1,14 +1,20 @@
-// Argument handling. Inputs arrive as HUB_* environment variables (the composite action maps its inputs
-// there, so no workflow expression is ever spliced into a shell line) and flags override them for local use.
-// Every default is the safe one: dry run, sideload, no build override, no store lanes.
+// Argument handling. Inputs arrive as HUB_* environment variables (the composite action maps its inputs there, so no
+// workflow expression is ever spliced into a shell line) and flags override them for local use. Every default is the
+// safe one: dry run, strict, no store lanes, the policy's runners and manifest.
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { levels } from './version.mjs';
 
-export const commands = Object.freeze(['plan', 'android', 'play', 'release', 'ios-export', 'ios-upload', 'preflight-ios', 'ios', 'announce']);
+export const commands = Object.freeze(['gate', 'preflight-ios', 'plan', 'android', 'play', 'release', 'ios-export', 'ios', 'deliver', 'announce']);
 export const platforms = Object.freeze(['both', 'android', 'ios']);
 export const channels = Object.freeze(['sideload', 'play']);
 export const playStatuses = Object.freeze(['draft', 'completed', 'inProgress', 'halted']);
+export const meteredModes = Object.freeze(['auto', 'allow']);
+// The gate's verdict on the iPad lane: run it, or skip it because the Mac is offline, over its data budget on a
+// metered link, or out of the platform's scope.
+export const iosLanes = Object.freeze(['run', 'skip-offline', 'skip-metered', 'skip-platform']);
+export const macLinks = Object.freeze(['home', 'metered', 'offline', 'unknown']);
 
 const flags = Object.freeze({
   '--manifest': 'manifest',
@@ -31,6 +37,14 @@ const flags = Object.freeze({
   '--bump-patch': 'bumpPatch',
   '--ipad-version': 'ipadVersion',
   '--ipad-build': 'ipadBuild',
+  '--metered': 'metered',
+  '--ios-lane': 'iosLane',
+  '--mac-link': 'macLink',
+  '--bundle': 'bundle',
+  '--slug': 'slug',
+  '--ios-store': 'iosStore',
+  '--linux-runner': 'linuxRunner',
+  '--mac-runner': 'macRunner',
 });
 
 const environment = Object.freeze({
@@ -54,6 +68,14 @@ const environment = Object.freeze({
   bumpPatch: 'HUB_BUMP_PATCH',
   ipadVersion: 'HUB_IPAD_VERSION',
   ipadBuild: 'HUB_IPAD_BUILD',
+  metered: 'HUB_METERED',
+  iosLane: 'HUB_IOS_LANE',
+  macLink: 'HUB_MAC_LINK',
+  bundle: 'HUB_BUNDLE',
+  slug: 'HUB_SLUG',
+  iosStore: 'HUB_IOS_STORE',
+  linuxRunner: 'HUB_LINUX_RUNNER',
+  macRunner: 'HUB_MAC_RUNNER',
 });
 
 function bool(name, value, fallback) {
@@ -72,6 +94,27 @@ function matching(name, value, pattern, what) {
   const found = value ?? '';
   if (found !== '' && !pattern.test(found)) throw new Error(`${name} must be ${what}, got "${String(found).slice(0, 40)}"`);
   return found;
+}
+
+function labels(name, value, fallback) {
+  const text = value === undefined || value === '' ? fallback : value;
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { throw new Error(`${name} must be a JSON array of runner labels`); }
+  if (!Array.isArray(parsed) || parsed.length === 0 || parsed.some(label => typeof label !== 'string' || !/^[A-Za-z0-9_.-]+$/.test(label))) throw new Error(`${name} must be a JSON array of runner labels`);
+  return parsed;
+}
+
+// The testflight half of the manifest the gate hands preflight-ios (which has no checkout): signer and op:// refs.
+function iosStore(value) {
+  if (value === undefined || value === '') return null;
+  let store;
+  try { store = JSON.parse(value); } catch { throw new Error('ios store must be JSON'); }
+  if (store === null) return null;
+  if (typeof store !== 'object' || Array.isArray(store)) throw new Error('ios store must be an object');
+  for (const key of Object.keys(store)) if (!['signer_sha1', 'secrets'].includes(key)) throw new Error(`ios store has unknown key "${key}"`);
+  if (store.signer_sha1 !== undefined && store.signer_sha1 !== null && !/^[0-9A-F]{40}$/.test(store.signer_sha1)) throw new Error('ios store signer_sha1 must be an uppercase SHA-1');
+  if (!Array.isArray(store.secrets ?? []) || (store.secrets ?? []).some(ref => typeof ref !== 'string' || !/^op:\/\/[^\s]+$/.test(ref))) throw new Error('ios store secrets must be op:// references');
+  return { signer_sha1: store.signer_sha1 ?? null, secrets: store.secrets ?? [] };
 }
 
 export function parseConfig(argv, env = process.env) {
@@ -116,26 +159,55 @@ export function parseConfig(argv, env = process.env) {
     bumpPatch,
     ipadVersion: matching('ipad version', raw.ipadVersion, /^[0-9A-Za-z.+-]{1,40}$/, 'a version'),
     ipadBuild: matching('ipad build', raw.ipadBuild, /^[0-9A-Za-z.+-]{1,40}$/, 'a build'),
+    metered: oneOf('metered', raw.metered || 'auto', meteredModes),
+    iosLane: raw.iosLane ? oneOf('ios lane', raw.iosLane, iosLanes) : '',
+    macLink: raw.macLink ? oneOf('mac link', raw.macLink, macLinks) : '',
+    bundle: matching('bundle', raw.bundle, /^[A-Za-z][A-Za-z0-9-]*(\.[A-Za-z][A-Za-z0-9-]*)+$/, 'a reverse-DNS bundle id'),
+    slug: matching('slug', raw.slug, /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/, 'a pjangler slug'),
+    iosStore: iosStore(raw.iosStore),
+    linuxRunner: labels('linux_runner', raw.linuxRunner, '["self-hosted","Linux"]'),
+    macRunner: labels('mac_runner', raw.macRunner, '["self-hosted","macOS"]'),
     cwd: process.cwd(),
   };
 }
 
 // Every variable that can mint or carry a credential. The runner puts the OIDC pair in each step's environment
 // whenever the job holds id-token: write (the android job always does, dry runs included), and they can mint a
-// federated Google token, so they stop here with the store and GitHub tokens.
+// federated Google token, so they stop here with the store and GitHub tokens. MC_HOST_* (an mc alias with its keys)
+// is a credential wherever it appears: only the hub's own mc child ever gets one.
 export const credentialVariables = Object.freeze([
   'PLAY_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN',
   'ACTIONS_ID_TOKEN_REQUEST_URL', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN', 'ACTIONS_RUNTIME_TOKEN',
 ]);
+export const isCredentialVariable = name => credentialVariables.includes(name) || /^MC_HOST_/.test(name);
 
-// The environment every hook sees. Nothing from an event payload; only values validated above.
-// Store, GitHub and OIDC tokens never reach a hook.
+// Files the runner reads back after a step: an app hook gets throwaway copies, so it cannot set job outputs, add
+// environment variables or change PATH for the hub's own later steps.
+export const jobControlFiles = Object.freeze(['GITHUB_ENV', 'GITHUB_OUTPUT', 'GITHUB_PATH', 'GITHUB_STATE']);
+
+const sinks = new Map();
+function sinkFiles(out) {
+  if (!sinks.has(out)) {
+    const dir = join(out, '.hook-sink', String(process.pid));
+    mkdirSync(dir, { recursive: true });
+    const files = Object.fromEntries(jobControlFiles.map(name => {
+      const file = join(dir, name.toLowerCase());
+      writeFileSync(file, '');
+      return [name, file];
+    }));
+    sinks.set(out, files);
+  }
+  return sinks.get(out);
+}
+
+// The environment every hook sees. Nothing from an event payload; only values validated above. Store, GitHub, OIDC
+// and MinIO credentials never reach a hook, and the job-control files are throwaway copies.
 export function hookEnvironment(config, base = process.env, extra = {}) {
-  const rest = { ...base };
-  for (const name of credentialVariables) delete rest[name];
-  for (const name of Object.keys(rest)) if (/^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/.test(name)) delete rest[name];
+  const rest = {};
+  for (const [name, value] of Object.entries(base)) if (!isCredentialVariable(name) && !/^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/.test(name)) rest[name] = value;
   return {
     ...rest,
+    ...sinkFiles(config.out),
     HUB_OUT: config.out,
     HUB_BUILD: config.build,
     HUB_DRY_RUN: String(config.dryRun),
