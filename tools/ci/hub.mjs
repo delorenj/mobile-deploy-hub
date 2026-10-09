@@ -11,8 +11,10 @@
 //
 // Hooks come from the app's committed manifest and run under bash in the app root. Nothing here reads a
 // hook, a ref or a command from an event payload.
+import { closeSync, mkdtempSync, openSync, readFileSync, rmSync } from 'node:fs';
 import { copyFile, mkdir, readFile, stat } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { verifySigner } from './lib/android.mjs';
@@ -184,6 +186,21 @@ export async function iosExport(config, { env = process.env } = {}) {
   return { out, sha256: digest, receipt };
 }
 
+// Reads one reference and discards the value. stderr goes to a file, not a pipe: `op read` leaves an `op daemon`
+// behind that keeps a pipe open, and spawnSync would wait on it even after the timeout killed `op read`.
+function readSecretRef(ref, { env, timeout }) {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-op-'));
+  const file = join(dir, 'stderr');
+  const fd = openSync(file, 'w');
+  try {
+    const read = spawnSync('op', ['read', '--no-newline', ref], { env, stdio: ['ignore', 'ignore', fd], timeout, killSignal: 'SIGKILL' });
+    closeSync(fd);
+    const stderr = readFileSync(file, 'utf8');
+    if (read.error?.code === 'ETIMEDOUT') return { ok: false, timedOut: true, stderr };
+    return { ok: !read.error && read.status === 0, timedOut: false, stderr: stderr || read.error?.message || '' };
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
 // Mac preflight. Reads only: checks the handoff, the toolchain, the signing identity and that each secret reference
 // resolves. Values are discarded unread; only the reference names are printed.
 async function iosPreflight(config, spec, { env }) {
@@ -209,11 +226,26 @@ async function iosPreflight(config, spec, { env }) {
   const identities = run('security', ['find-identity', '-v', '-p', 'codesigning'], { env });
   if (spec.signer_sha1 && !identities.toUpperCase().includes(spec.signer_sha1)) throw new Error(`the pinned signing identity ${spec.signer_sha1} is not a valid codesigning identity in this keychain`);
   notes.push(`signing identity ${spec.signer_sha1 ?? 'present'} is valid in the keychain`);
-  for (const ref of spec.secrets ?? []) {
-    const read = spawnSync('op', ['read', '--no-newline', ref], { env, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8' });
-    if (read.error || read.status !== 0) throw new Error(`op could not read ${ref}: ${(read.stderr ?? read.error?.message ?? '').trim().slice(0, 300)}`);
+  // The desktop-app integration waits for a human when the Mac's screen is locked or the app wants approval, and
+  // an unbounded `op read` then holds the runner until the job timeout. Bound it and say what is wrong.
+  const opTimeout = Number(env.HUB_OP_TIMEOUT_MS) > 0 ? Number(env.HUB_OP_TIMEOUT_MS) : 45_000;
+  const secrets = spec.secrets ?? [];
+  let verified = 0;
+  for (const ref of secrets) {
+    const read = readSecretRef(ref, { env, timeout: opTimeout });
+    if (read.timedOut) {
+      const why = `op did not answer within ${opTimeout / 1000}s reading ${ref}: 1Password is waiting for a person on the Mac (screen locked, or the app wants approval). Unlock the Mac and run again.`;
+      // A real run must stop before anything is uploaded. A dry run proves the pipeline, and a locked screen is a
+      // condition of the Mac, not a defect of the pipeline, so it warns, records the gap and does not claim the check passed.
+      if (!config.dryRun) throw new Error(why);
+      console.log(`::warning::${why}`);
+      notes.push(`UNVERIFIED: ${secrets.length - verified} secret references were not checked (${why})`);
+      return { receipt, notes };
+    }
+    if (!read.ok) throw new Error(`op could not read ${ref}: ${read.stderr.trim().slice(0, 300)}`);
+    verified += 1;
   }
-  if ((spec.secrets ?? []).length > 0) notes.push(`${spec.secrets.length} secret references resolve (values not read into the log)`);
+  if (secrets.length > 0) notes.push(`${secrets.length} secret references resolve (values not read into the log)`);
   return { receipt, notes };
 }
 

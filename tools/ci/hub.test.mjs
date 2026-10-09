@@ -463,6 +463,24 @@ test('a failed secret reference stops the preflight without printing the value',
   } finally { await f.cleanup(); }
 });
 
+test('a 1Password that never answers fails a real run fast and only warns on a dry run', async () => {
+  const f = await fixture();
+  try {
+    await handoff(f);
+    // Like a locked Mac: op sits waiting for a person and leaves a child holding stderr open.
+    await script(join(f.root, 'bin/op'), 'echo "$@" >> "' + join(f.root, 'op-calls.txt') + '"\n(sleep 30) &\nsleep 30');
+    const env = { ...f.env, HUB_OP_TIMEOUT_MS: '300' };
+    const started = Date.now();
+    const dry = await iosUpload(f.configure('ios-upload', ['--dry-handoff', 'true']), { env });
+    assert.ok(Date.now() - started < 10_000, 'the dry run did not wait for the hung op');
+    assert.ok(dry.notes.some(note => /UNVERIFIED: 2 secret references were not checked/.test(note)));
+    assert.ok(dry.notes.some(note => /dry run: upload and assign were not called/.test(note)));
+    assert.equal((await readFile(join(f.root, 'op-calls.txt'), 'utf8')).trim().split('\n').length, 1, 'one hung read, not one per reference');
+    await assert.rejects(iosUpload(f.configure('ios-upload', ['--dry-run', 'false']), { env }), /op did not answer within 0\.3s reading op:\/\/Vault\/Item\/key_id.*Unlock the Mac/);
+    assert.equal(existsSync(join(f.out, 'marker.txt')), false, 'a real run stopped before upload and assign');
+  } finally { await f.cleanup(); }
+});
+
 test('a real ios run uploads then assigns, in that order', async () => {
   const f = await fixture();
   try {
