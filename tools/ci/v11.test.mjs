@@ -436,3 +436,55 @@ test('the train dispatches Tower, then Green In Between, then Gruvato, and stops
   assert.equal(result.status, 1);
   assert.ok(logged.some(line => /^DEPLOY_TRAIN stopped at delorenj\/green-in-between/.test(line)));
 });
+
+// ---------------------------------------------------------------------------------------------------- conformance and release
+
+import { checkApp, miseTasks, scriptsOf } from '../conformance.mjs';
+import { flipInnerRefs } from '../release.mjs';
+
+test('conformance: the template caller and a clean app pass; uploads, bumps, tags and announcements outside the hub fail', () => {
+  const app = { slug: 'gruvato', lanes: ['android', 'ios'] };
+  const manifest = JSON.stringify(towerManifest({ project: { slug: 'gruvato', name: 'Gruvato' } }));
+  const files = {
+    '.github/workflows/deploy.yml': template,
+    'tools/ci/mobile-deploy.json': manifest,
+    '.github/workflows/website.yml': 'jobs:\n  site:\n    runs-on: [self-hosted, Linux]\n',
+    'mise.toml': '[tasks."android:build"]\nrun = "scripts/android/build.sh"\n[tasks."version"]\nrun = "\'{{config_root}}/.mise/scripts/versioning.sh\' current"\n[tasks."deploy:check"]\nrun = "node --test tools/ci/mobile-deploy.test.mjs"\n',
+    'scripts/android/build.sh': 'pnpm tauri android build\n',
+    'tools/ci/mobile-deploy.test.mjs': "assert.doesNotMatch(mise, /version:bump|bb-emit/)\n",
+  };
+  const open = extra => ({ read: path => { const all = { ...files, ...extra }; if (!(path in all)) throw Object.assign(new Error('404'), { code: 'ENOENT' }); return all[path]; }, list: () => Object.keys({ ...files, ...extra }).filter(path => path.startsWith('.github/workflows/')) });
+  assert.deepEqual(checkApp({ repo: 'delorenj/gruvato', app, policy, ...open({}) }), []);
+  const bad = checkApp({ repo: 'delorenj/gruvato', app, policy, ...open({
+    '.github/workflows/deploy.yml': template.replace('@v1', '@main'),
+    '.github/workflows/sideload.yml': 'steps:\n  - run: gh release create v1 app.apk\n',
+    'mise.toml': `${files['mise.toml']}[tasks.build]\nrun = "scripts/release/bump-build-version.sh && pnpm build"\n[tasks.ship]\nrun = "bb-emit --type x"\n[tasks.tag]\nrun = "git tag -a v1.2.3 -m x"\n`,
+    'scripts/release/bump-build-version.sh': 'git tag -a "$v"\n',
+  }) });
+  for (const expected of [/deploy\.yml: not an accepted copy/, /sideload\.yml: gh release create\/upload outside the hub/, /task build: the task would bump/, /task ship: the task would announce/, /task tag: the task would tag/]) {
+    assert.ok(bad.some(problem => expected.test(problem)), `${expected}\n${bad.join('\n')}`);
+  }
+  assert.deepEqual(miseTasks('[tasks."a:b"]\nrun = "x"\n[env]\nX = 1\n[tasks.c]\nrun = "y"\n').map(task => task.name), ['a:b', 'c']);
+  assert.deepEqual(scriptsOf('run = "scripts/a.sh && node tools/b.mjs && \'{{config_root}}/.mise/scripts/v.sh\' x"'), ['scripts/a.sh', 'tools/b.mjs', '.mise/scripts/v.sh']);
+});
+
+test('release flips every inner actions/hub ref to the exact tag in one edit', () => {
+  const text = readFileSync(join(repoRoot, '.github/workflows/mobile-deploy.yml'), 'utf8');
+  const flipped = flipInnerRefs(text, 'v1.2.3');
+  assert.deepEqual([...new Set([...flipped.matchAll(/uses: delorenj\/mobile-deploy-hub\/actions\/hub@(\S+)/g)].map(match => match[1]))], ['v1.2.3']);
+  assert.equal(flipped.split('\n').length, text.split('\n').length);
+});
+
+// v1.x never removes or retypes a caller input: callers pinned @v1 must keep working when v1 moves (D1).
+test('the v1 caller surface is frozen: every workflow_call input keeps its name, type and default', () => {
+  const workflow = readFileSync(join(repoRoot, '.github/workflows/mobile-deploy.yml'), 'utf8');
+  const block = workflow.slice(workflow.indexOf('    inputs:\n'), workflow.indexOf('\npermissions:'));
+  const inputs = [...block.matchAll(/^ {6}([\w]+):\n(?: {8}description: [^\n]*\n)? {8}type: (\w+)\n {8}default: ([^\n]*)$/gm)].map(match => `${match[1]}:${match[2]}=${match[3]}`);
+  assert.deepEqual(inputs, [
+    'manifest:string=mobile-deploy.json', 'platform:string=both', 'bump:string=patch', 'testflight:boolean=false', 'play:boolean=false',
+    'dry_run:boolean=true', 'dry_handoff:boolean=false', 'strict:boolean=true', 'metered:string=auto', "linux_runner:string='[\"self-hosted\",\"Linux\"]'",
+    "mac_runner:string='[\"self-hosted\",\"macOS\"]'", "wif_provider:string=''", "play_sa:string=''", 'android_channel:string=sideload', 'track:string=internal',
+    'play_status:string=draft', "build:string=''",
+  ]);
+  for (const name of ['dry_run', 'bump', 'platform', 'testflight', 'play', 'dry_handoff', 'metered']) assert.match(template, new RegExp(`^ {6}${name}: \\$\\{\\{ inputs\\.${name} \\}\\}$`, 'm'), `the template passes ${name}`);
+});

@@ -80,3 +80,46 @@ description = "Lint the reusable workflow with actionlint, then run the tool tes
 tools = { actionlint = "1.7.12", node = "24" }
 # The glob is node's own (quoted), so tools/catchup/*.test.mjs runs here too.
 run = ["actionlint .github/workflows/*.yml", "node --test 'tools/**/*.test.mjs'"]
+
+# ---- mobile-deploy-hub v1.1 (docs/design-hub-v1.1.md) ----
+# The usage specs own --dry-run and friends, so `mise run deploy:train --dry-run false` reaches the front door
+# instead of mise's own --dry-run.
+[tasks."deploy"]
+description = "Deploy one app from here, with the front door the apps run: mise run deploy --repo delorenj/gruvato [--dry-run false]"
+usage = '''
+flag "--repo <repo>"
+flag "--dry-run <dry_run>" default="true"
+flag "--bump <bump>" default=""
+flag "--platform <platform>" default="both"
+flag "--testflight <testflight>" default="false"
+flag "--play <play>" default="false"
+flag "--dry-handoff <dry_handoff>" default="false"
+flag "--metered <metered>" default="auto"
+'''
+run = 'node tools/deploy.mjs --repo "$usage_repo" --dry-run "$usage_dry_run" --bump "$usage_bump" --platform "$usage_platform" --testflight "$usage_testflight" --play "$usage_play" --dry-handoff "$usage_dry_handoff" --metered "$usage_metered"'
+
+[tasks."deploy:train"]
+description = "Deploy Tower, then Green In Between, then Gruvato, one at a time; stops at the first red run"
+usage = '''
+flag "--dry-run <dry_run>" default="true"
+flag "--bump <bump>" default=""
+flag "--platform <platform>" default="both"
+flag "--dry-handoff <dry_handoff>" default="false"
+flag "--metered <metered>" default="auto"
+'''
+run = 'node tools/deploy.mjs train --dry-run "$usage_dry_run" --bump "$usage_bump" --platform "$usage_platform" --dry-handoff "$usage_dry_handoff" --metered "$usage_metered"'
+
+[tasks.conformance]
+description = "Check through gh api that Tower, Green In Between and Gruvato deploy only through the hub (caller hash, manifest, no other uploads, no bump/tag/announce tasks)"
+tools = { node = "24" }
+run = "node tools/conformance.mjs"
+
+[tasks.release]
+description = "Release the hub: mise run release -- X.Y.Z (check, conformance, tag, move v1, one strict dry run per app, v1 back if red)"
+tools = { node = "24", actionlint = "1.7.12" }
+run = "node tools/release.mjs"
+
+[tasks."hosts:install"]
+description = "The hosts' half: build directory index, hub-mac, the Mac's quickdrop .stignore and handoff cache, the catch-up units on both hosts"
+tools = { node = "24" }
+run = "node tools/hosts.mjs"
