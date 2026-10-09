@@ -91,6 +91,18 @@ export function newRuns(runs, { after, sha }) {
 
 export const newestId = runs => runs.reduce((newest, run) => Math.max(newest, run.databaseId), 0);
 
+// The lanes the app declares (its manifest, at the path deploy.yml passes): an app without an ios section has no iPad
+// lane, so `both` means the S26 alone and no Mac runner or iPad proof is needed. Unreadable means assume both.
+export function lanesFrom(workflowText, read) {
+  const path = /^\s+manifest:\s*(\S+)\s*$/m.exec(workflowText ?? '')?.[1] ?? 'mobile-deploy.json';
+  try {
+    const manifest = JSON.parse(read(path));
+    return { android: Boolean(manifest.android), ios: Boolean(manifest.ios), manifest: path };
+  } catch {
+    return { android: true, ios: true, manifest: null };
+  }
+}
+
 // The hub ref an app pins, read from its caller's `uses:` line.
 export function hubRefFrom(workflowText) {
   return /uses:\s*delorenj\/mobile-deploy-hub\/\.github\/workflows\/mobile-deploy\.yml@([\w./-]+)/.exec(workflowText ?? '')?.[1] ?? null;
@@ -154,7 +166,13 @@ export async function deploy(options, {
   try { head = git(['rev-parse', 'HEAD']).trim(); } catch { /* not a checkout */ }
   if (head !== sha) log(`DEPLOY_WARNING local HEAD ${head.slice(0, 8) || '-'} is not main on GitHub (${sha.slice(0, 8)}); the deploy builds main, not this checkout`);
 
-  const ios = options.platform !== 'android';
+  let workflowText = '';
+  try { workflowText = readFileSync(join(cwd, '.github/workflows', options.workflow), 'utf8'); } catch { /* checked below where it matters */ }
+  const lanes = lanesFrom(workflowText, path => readFileSync(join(cwd, path), 'utf8'));
+  if (options.platform === 'ios' && !lanes.ios) throw new Error(`${lanes.manifest} declares no ios section, so there is no iPad lane to deploy`);
+  if (options.platform === 'android' && !lanes.android) throw new Error(`${lanes.manifest} declares no android section, so there is no S26 lane to deploy`);
+  const ios = options.platform !== 'android' && lanes.ios;
+  const android = options.platform !== 'ios' && lanes.android;
   if (ios) {
     let macs = null;
     try {
@@ -167,7 +185,7 @@ export async function deploy(options, {
     if (macs && !macs.some(runner => runner.status === 'online')) throw new Error(`the Mac runner of ${repo} (${macs.map(runner => runner.name).join(', ')}) is offline: log in on the Mac (runners start at login), or deploy with --platform android`);
   }
 
-  if (options.platform !== 'ios' && adb && host === phone.host) {
+  if (android && adb && host === phone.host) {
     const seen = await checkPhone({ adb, log, sleep });
     if (!seen.found) {
       if (!options.dryRun) throw new Error(`${seen.why}. ${wirelessHint}`);
@@ -193,10 +211,7 @@ export async function deploy(options, {
     }
   }
 
-  let hubRef = options.hubRef;
-  if (!hubRef) {
-    try { hubRef = hubRefFrom(readFileSync(join(cwd, '.github/workflows', options.workflow), 'utf8')); } catch { hubRef = null; }
-  }
+  const hubRef = options.hubRef || hubRefFrom(workflowText);
   const ledger = ledgerPath(home);
   if (!options.dryRun && ios) {
     if (!hubRef) throw new Error(`cannot find the mobile-deploy-hub ref in .github/workflows/${options.workflow}`);

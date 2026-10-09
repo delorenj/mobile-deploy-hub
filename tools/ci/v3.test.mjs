@@ -19,7 +19,7 @@ import { bbEmitPath, correlationFor, deploymentEvent, emitArgs, sanitizeReason, 
 import { loadDevices, parseDevices } from './lib/devices.mjs';
 import { parseManifest } from './lib/manifest.mjs';
 import { android, announce, plan, release } from './hub.mjs';
-import { checkPhone, parseArguments, phone } from '../deploy.mjs';
+import { checkPhone, lanesFrom, parseArguments, phone } from '../deploy.mjs';
 
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 const signer = '2d4954863dabb5da86d69ce4b60b3e400e73669b50a80658b0941440a7941a97';
@@ -324,6 +324,14 @@ test('the front door looks for the S26 on big-chungus before it dispatches', asy
   const none = await checkPhone({ adb: args => (args[0] === 'devices' ? 'List of devices attached\n' : ''), log: () => {}, sleep: async ms => { clock += ms; }, now: () => clock, waitMs: 4000 });
   assert.equal(none.found, false);
   assert.match(none.why, /SM-S948U \(serial R5GL43A7PCH\) is not on this host's adb server/);
+});
+
+test('the front door reads the lanes the app declares: no ios section, no iPad lane', () => {
+  const workflow = 'jobs:\n  deploy:\n    with:\n      manifest: tools/ci/mobile-deploy.json\n';
+  const files = { 'tools/ci/mobile-deploy.json': JSON.stringify({ schema: 2, android: {} }) };
+  assert.deepEqual(lanesFrom(workflow, path => files[path]), { android: true, ios: false, manifest: 'tools/ci/mobile-deploy.json' });
+  assert.deepEqual(lanesFrom(workflow, () => { throw new Error('missing'); }), { android: true, ios: true, manifest: null }, 'unreadable: assume both');
+  assert.equal(lanesFrom('', path => JSON.stringify({ ios: {}, path }))?.ios, true);
 });
 
 // ---------------------------------------------------------------------------------------------------- iPad
