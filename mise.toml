@@ -73,3 +73,9 @@ run = "'{{config_root}}/.mise/scripts/versioning.sh' check"
 description = "Force every versioned file up to the highest version"
 run = "'{{config_root}}/.mise/scripts/versioning.sh' sync"
 # <<< mise-versioning <<<
+
+# The hub has no runners and no CI (private-repo hosted minutes are billed), so its checks run here.
+[tasks.check]
+description = "Lint the reusable workflow with actionlint, then run the tool tests"
+tools = { actionlint = "1.7.12", node = "24" }
+run = ["actionlint .github/workflows/*.yml", "node --test tools/ci/*.test.mjs"]

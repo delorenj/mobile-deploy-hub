@@ -1,0 +1,80 @@
+name: Mobile Deploy Hub tool
+description: Runs tools/ci/hub.mjs from the hub repo against the checked-out app. Inputs only; a composite action cannot read secrets or vars.
+
+inputs:
+  command:
+    description: plan, android, play, release, ios-export or ios-upload
+    required: true
+  manifest:
+    description: Path of the app manifest inside the checkout
+    default: mobile-deploy.json
+  platform:
+    default: both
+  channel:
+    description: sideload or play
+    default: sideload
+  track:
+    default: internal
+  play_status:
+    default: draft
+  build:
+    description: iOS build override, blank for the next after App Store Connect
+    default: ''
+  dry_run:
+    default: 'true'
+  dry_handoff:
+    default: 'false'
+  version:
+    description: Version announced by the plan job
+    default: ''
+  android_code:
+    description: Android versionCode announced by the plan job
+    default: ''
+  wif_provider:
+    default: ''
+  play_sa:
+    default: ''
+  play_token:
+    description: Play access token from google-github-actions/auth, play step only
+    default: ''
+  github_token:
+    description: Token with contents write, release step only
+    default: ''
+
+outputs:
+  version:
+    description: Version from the app's version hook
+    value: ${{ steps.hub.outputs.version }}
+  android_code:
+    description: Android versionCode from the app's version hook
+    value: ${{ steps.hub.outputs.android_code }}
+  run_android:
+    description: true when the Android lane runs
+    value: ${{ steps.hub.outputs.run_android }}
+  run_ios:
+    description: true when the iOS lanes run
+    value: ${{ steps.hub.outputs.run_ios }}
+
+runs:
+  using: composite
+  steps:
+    - id: hub
+      shell: bash
+      env:
+        HUB_TOOL: ${{ github.action_path }}/../../tools/ci/hub.mjs
+        HUB_COMMAND: ${{ inputs.command }}
+        HUB_MANIFEST: ${{ inputs.manifest }}
+        HUB_PLATFORM: ${{ inputs.platform }}
+        HUB_CHANNEL: ${{ inputs.channel }}
+        HUB_TRACK: ${{ inputs.track }}
+        HUB_PLAY_STATUS: ${{ inputs.play_status }}
+        HUB_BUILD: ${{ inputs.build }}
+        HUB_DRY_RUN: ${{ inputs.dry_run }}
+        HUB_DRY_HANDOFF: ${{ inputs.dry_handoff }}
+        HUB_VERSION: ${{ inputs.version }}
+        HUB_ANDROID_CODE: ${{ inputs.android_code }}
+        HUB_WIF_PROVIDER: ${{ inputs.wif_provider }}
+        HUB_PLAY_SA: ${{ inputs.play_sa }}
+        PLAY_TOKEN: ${{ inputs.play_token }}
+        GH_TOKEN: ${{ inputs.github_token }}
+      run: node "$HUB_TOOL" "$HUB_COMMAND"

@@ -1,0 +1,238 @@
+name: Mobile Deploy
+
+# Reusable workflow. The app is the caller and the jobs run on the caller's repo-scoped runners; this repo
+# owns only the job graph and tools/ci. The caller must grant `contents: write` (GitHub Release for the
+# sideload APK) and `id-token: write` (keyless Play auth); a called job can only narrow what the caller grants.
+#
+# `uses:` takes no expressions, so the ref in every `delorenj/mobile-deploy-hub/actions/hub@main` below must match
+# the ref the caller used for this file. After the proof, tag v1 and flip all of them in one commit.
+on:
+  workflow_call:
+    inputs:
+      manifest:
+        description: Path of the app manifest inside the checkout
+        type: string
+        default: mobile-deploy.json
+      platform:
+        description: android, ios or both
+        type: string
+        default: both
+      android_channel:
+        description: sideload (family APK) or play (AAB to Play)
+        type: string
+        default: sideload
+      track:
+        description: Play track for android_channel=play
+        type: string
+        default: internal
+      play_status:
+        description: Play release status, draft until the app has shipped once
+        type: string
+        default: draft
+      build:
+        description: iOS build number override, blank for the next after App Store Connect
+        type: string
+        default: ''
+      dry_run:
+        description: Build and verify only; upload, assign, release and Play are skipped
+        type: boolean
+        default: true
+      dry_handoff:
+        description: On a dry run also ship the Xcode archive to the Mac and verify it (about 100 MB of artifact quota)
+        type: boolean
+        default: false
+      linux_runner:
+        description: JSON array of runner labels for Linux jobs
+        type: string
+        default: '["self-hosted","linux","godot"]'
+      mac_runner:
+        description: JSON array of runner labels for the Mac job
+        type: string
+        default: '["self-hosted","macOS","ios-signing"]'
+      wif_provider:
+        description: Workload Identity Federation provider, real Play runs only
+        type: string
+        default: ''
+      play_sa:
+        description: Service account the Play upload impersonates, real Play runs only
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ${{ fromJSON(inputs.linux_runner) }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.hub.outputs.version }}
+      android_code: ${{ steps.hub.outputs.android_code }}
+      run_android: ${{ steps.hub.outputs.run_android }}
+      run_ios: ${{ steps.hub.outputs.run_ios }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: hub
+        uses: delorenj/mobile-deploy-hub/actions/hub@main
+        with:
+          command: plan
+          manifest: ${{ inputs.manifest }}
+          platform: ${{ inputs.platform }}
+          channel: ${{ inputs.android_channel }}
+          track: ${{ inputs.track }}
+          play_status: ${{ inputs.play_status }}
+          build: ${{ inputs.build }}
+          dry_run: ${{ inputs.dry_run }}
+          dry_handoff: ${{ inputs.dry_handoff }}
+          wif_provider: ${{ inputs.wif_provider }}
+          play_sa: ${{ inputs.play_sa }}
+
+  android:
+    needs: plan
+    if: ${{ needs.plan.outputs.run_android == 'true' }}
+    runs-on: ${{ fromJSON(inputs.linux_runner) }}
+    timeout-minutes: 30
+    concurrency:
+      group: mobile-deploy-android-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Export and verify
+        uses: delorenj/mobile-deploy-hub/actions/hub@main
+        with:
+          command: android
+          manifest: ${{ inputs.manifest }}
+          channel: ${{ inputs.android_channel }}
+          dry_run: ${{ inputs.dry_run }}
+          version: ${{ needs.plan.outputs.version }}
+          android_code: ${{ needs.plan.outputs.android_code }}
+      - name: Authenticate to Google Cloud (keyless)
+        if: ${{ !inputs.dry_run && inputs.android_channel == 'play' }}
+        id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ inputs.wif_provider }}
+          service_account: ${{ inputs.play_sa }}
+          token_format: access_token
+          access_token_scopes: https://www.googleapis.com/auth/androidpublisher
+          create_credentials_file: false
+      - name: Upload to Play
+        if: ${{ !inputs.dry_run && inputs.android_channel == 'play' }}
+        uses: delorenj/mobile-deploy-hub/actions/hub@main
+        with:
+          command: play
+          manifest: ${{ inputs.manifest }}
+          channel: ${{ inputs.android_channel }}
+          track: ${{ inputs.track }}
+          play_status: ${{ inputs.play_status }}
+          dry_run: ${{ inputs.dry_run }}
+          android_code: ${{ needs.plan.outputs.android_code }}
+          play_token: ${{ steps.auth.outputs.access_token }}
+      - name: Publish APK to a private Release
+        if: ${{ !inputs.dry_run && inputs.android_channel == 'sideload' }}
+        uses: delorenj/mobile-deploy-hub/actions/hub@main
+        with:
+          command: release
+          manifest: ${{ inputs.manifest }}
+          channel: ${{ inputs.android_channel }}
+          dry_run: ${{ inputs.dry_run }}
+          version: ${{ needs.plan.outputs.version }}
+          android_code: ${{ needs.plan.outputs.android_code }}
+          github_token: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: android-out
+          path: ${{ runner.temp }}/hub-out/android/
+          if-no-files-found: ignore
+          retention-days: ${{ inputs.dry_run && 1 || 7 }}
+
+  ios-export:
+    needs: plan
+    if: ${{ needs.plan.outputs.run_ios == 'true' }}
+    runs-on: ${{ fromJSON(inputs.linux_runner) }}
+    timeout-minutes: 30
+    concurrency:
+      group: mobile-deploy-ios-export-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Export the Xcode project
+        uses: delorenj/mobile-deploy-hub/actions/hub@main
+        with:
+          command: ios-export
+          manifest: ${{ inputs.manifest }}
+          build: ${{ inputs.build }}
+          dry_run: ${{ inputs.dry_run }}
+          version: ${{ needs.plan.outputs.version }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: ios-receipt
+          path: ${{ runner.temp }}/hub-out/ios/*.json
+          if-no-files-found: ignore
+          retention-days: ${{ inputs.dry_run && 1 || 7 }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ !inputs.dry_run || inputs.dry_handoff }}
+        with:
+          name: xcode-project
+          path: ${{ runner.temp }}/hub-out/ios/*.tgz
+          retention-days: ${{ inputs.dry_run && 1 || 7 }}
+
+  ios-upload:
+    needs: [plan, ios-export]
+    if: ${{ needs.plan.outputs.run_ios == 'true' }}
+    runs-on: ${{ fromJSON(inputs.mac_runner) }}
+    timeout-minutes: 60
+    concurrency:
+      group: mobile-deploy-ios-upload-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      # The app tree is needed here too: the manifest's upload and assign hooks are the app's own tools.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-receipt
+          path: ${{ runner.temp }}/hub-out/ios
+      - uses: actions/download-artifact@v4
+        if: ${{ !inputs.dry_run || inputs.dry_handoff }}
+        with:
+          name: xcode-project
+          path: ${{ runner.temp }}/hub-out/ios
+      - name: Verify, then archive, sign, upload and assign on a real run
+        uses: delorenj/mobile-deploy-hub/actions/hub@main
+        with:
+          command: ios-upload
+          manifest: ${{ inputs.manifest }}
+          build: ${{ inputs.build }}
+          dry_run: ${{ inputs.dry_run }}
+          dry_handoff: ${{ inputs.dry_handoff }}
+          version: ${{ needs.plan.outputs.version }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: ios-upload-receipt
+          path: ${{ runner.temp }}/hub-out/ios/hub-receipt-ios-upload.json
+          if-no-files-found: ignore
+          retention-days: ${{ inputs.dry_run && 1 || 7 }}
