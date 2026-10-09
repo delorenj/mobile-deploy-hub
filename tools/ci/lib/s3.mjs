@@ -168,8 +168,14 @@ export async function publishPages({ s3, policy, slug, latest, deliveries = [], 
   await withLock('s3-index', async () => {
     const apps = [];
     for (const app of Object.values(policy.apps)) {
-      const text = app.slug === slug ? serializeLatest(latest) : await readObject(policy, latestKey(app.slug), { fetchImpl });
-      if (text) apps.push(parseLatest(text, { slug: app.slug }));
+      // Another app's unreadable pointer leaves that app off the index; it never stops this app's publish.
+      try {
+        const text = app.slug === slug ? serializeLatest(latest) : await readObject(policy, latestKey(app.slug), { fetchImpl });
+        if (text) apps.push(parseLatest(text, { slug: app.slug }));
+      } catch (error) {
+        if (app.slug === slug) throw error;
+        console.log(`::warning::${latestKey(app.slug)} is left off the index (${error.message.split('\n')[0]})`);
+      }
     }
     s3.putText(`${JSON.stringify(indexData(apps), null, 2)}\n`, 'index.json');
     s3.putText(indexPage(apps), 'index.html');

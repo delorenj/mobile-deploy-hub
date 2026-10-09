@@ -775,3 +775,57 @@ test('the plan holds the event to its contract before it spends a version', asyn
     assert.equal(f.remote(['log', '-1', '--format=%s', 'main']), 'init');
   } finally { await f.cleanup(); }
 });
+
+// ---------------------------------------------------------------------------------------------------- v1.1 downgrade guards
+
+import { apkKey as keyOfApk, publicUrl as urlOf } from './lib/latest.mjs';
+import { sampleLatest } from './test-fixtures.mjs';
+
+function publishedFor(slug, version, code) {
+  const doc = sampleLatest({ slug, version });
+  const key = keyOfApk(slug, version, code);
+  doc.android = { ...doc.android, version, code, key, url: urlOf('https://s3.delo.sh/builds', key), quickdrop: null };
+  doc.ios = null;
+  return JSON.stringify(doc);
+}
+
+test('the plan refuses a planned Android code at or below the newest published one, before any bump', async () => {
+  const f = await gitFixture();
+  try {
+    const host = await laneHost(f);
+    await host.installApk('io.example.app 0.2.1 4');
+    const latest = publishedFor('example-app', '0.2.9', 9);
+    const fetchImpl = async url => (String(url).endsWith('/builds/example-app/latest.json') ? { status: 200, ok: true, text: async () => latest } : { status: 404, ok: false, text: async () => '' });
+    await assert.rejects(quiet(() => plan(host.configure('plan', ['--dry-run', 'false']), { env: host.env, home: f.root, fetchImpl, s3Factory: async () => host.s3 })), /HUB_PLAN_REFUSED .*0\.2\.9 \(9\), at or above the planned 5/);
+    assert.equal(f.remote(['tag', '--list']), '', 'no version was spent');
+    assert.equal(host.s3.writes.length, 0, 'no inflight.json for a refused plan');
+  } finally { await f.cleanup(); }
+});
+
+test('the plan refuses an iPad that already runs a newer build, before any bump (HUB_IPAD_NEWER)', async () => {
+  const f = await gitFixture({ manifest: v3Manifest({ ios: { bundle: 'io.example.app', device: 'true', device_artifact: 'App.xcarchive' } }) });
+  try {
+    const host = await laneHost(f);
+    await host.installApk('io.example.app 0.2.1 4');
+    const run = flags => quiet(() => plan(host.configure('plan', ['--ios-lane', 'run', ...flags]), { env: host.env, home: f.root, fetchImpl: noLatest }));
+    await assert.rejects(run(['--ipad-version', '0.9.0', '--ipad-build', '9']), /HUB_IPAD_NEWER .*0\.9\.0 \(9\)/);
+    assert.equal(f.remote(['tag', '--list']), '');
+    const planned = await run(['--ipad-version', 'unreachable', '--ipad-build', 'unreachable']);
+    assert.equal(planned.version, '0.2.2', 'an unreachable iPad is pending, not a stop');
+    const skipped = await quiet(() => plan(host.configure('plan', ['--ios-lane', 'skip-metered']), { env: host.env, home: f.root, fetchImpl: noLatest }));
+    assert.deepEqual([skipped.run_ios, skipped.run_android], [false, true], 'the gate\'s skip keeps the iPad lane out of the run');
+  } finally { await f.cleanup(); }
+});
+
+test('a real plan names its version in inflight.json once the bump is pushed', async () => {
+  const f = await gitFixture();
+  try {
+    const host = await laneHost(f);
+    await host.installApk('io.example.app 0.2.1 4');
+    await quiet(() => plan(host.configure('plan', ['--dry-run', 'false']), { env: host.env, home: f.root, fetchImpl: noLatest, s3Factory: async () => host.s3 }));
+    const inflight = host.s3.writes.find(write => write.key === 'example-app/inflight.json');
+    assert.ok(inflight, 'inflight.json written');
+    assert.deepEqual(JSON.parse(inflight.text).version, '0.2.2');
+    assert.equal(JSON.parse(inflight.text).run.id, '777');
+  } finally { await f.cleanup(); }
+});
