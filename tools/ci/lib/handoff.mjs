@@ -65,7 +65,20 @@ export async function treeDigest(dir) {
   return { sha256: createHash('sha256').update(text).digest('hex'), files: entries.length, bytes };
 }
 
-const sshOptions = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4'];
+const sshOptions = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=30', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4'];
+
+// A Mac on a hotspot behind a DERP relay sometimes drops the first ssh banner exchange while tailscale finds a path:
+// a connection step is tried three times before it counts as a failure.
+export function retried(fn, { attempts = 3, log = () => {}, label = 'ssh' } = {}) {
+  let last;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try { return fn(); } catch (error) {
+      last = error;
+      if (attempt < attempts) log(`HUB_MAC_RETRY ${label} (${attempt}/${attempts}): ${error.message.split('\n')[0].slice(0, 160)}`);
+    }
+  }
+  throw last;
+}
 const sshCommand = `ssh ${sshOptions.join(' ')}`;
 
 function check({ host, base, cache }) {
@@ -90,7 +103,7 @@ export async function sendHandoffDelta({ host, base, cache, archives, receipts =
   const add = stats => { total.in += stats.sent ?? 0; total.out += stats.received ?? 0; };
   try {
     // Every value here is validated (host, fixed bases, owner/repo/run id), so the remote shell sees no input.
-    runner('ssh', [...sshOptions, host, `find '${base}' -mindepth 2 -maxdepth 2 -type d -mtime +3 -exec rm -rf {} + 2>/dev/null; mkdir -p '${remoteRun}' '${remoteCache}'`], { env, timeout: 90_000, label: `ssh ${host}` });
+    retried(() => runner('ssh', [...sshOptions, host, `find '${base}' -mindepth 2 -maxdepth 2 -type d -mtime +3 -exec rm -rf {} + 2>/dev/null; mkdir -p '${remoteRun}' '${remoteCache}'`], { env, timeout: 90_000, label: `ssh ${host}` }), { log, label: `ssh ${host}` });
   } catch (error) {
     throw new Error(`could not reach ${host} for the Xcode handoff (ssh as the runner user, BatchMode): ${error.message.split('\n')[0]}`);
   }
@@ -109,7 +122,7 @@ export async function sendHandoffDelta({ host, base, cache, archives, receipts =
     };
     let mode = 'tree';
     try {
-      attempt(null);
+      retried(() => attempt(null), { attempts: 2, log, label: `rsync ${stem}` });
     } catch (first) {
       log(`HUB_HANDOFF_FALLBACK ${stem}: the tree delta failed (${first.message.split('\n')[0].slice(0, 160)})`);
       if (homebrew === null) {
@@ -129,7 +142,7 @@ export async function sendHandoffDelta({ host, base, cache, archives, receipts =
     results.push({ name, mode, tree_sha256: digest.sha256, files: digest.files, bytes: digest.bytes });
     rmSync(tree, { recursive: true, force: true });
   }
-  if (receipts.length > 0) add(rsync(['-t', ...receipts, `${host}:${remoteRun}/`], { env, runner, label: `rsync receipts to ${host}` }));
+  if (receipts.length > 0) add(retried(() => rsync(['-t', ...receipts, `${host}:${remoteRun}/`], { env, runner, label: `rsync receipts to ${host}` }), { log, label: 'rsync receipts' }));
   log(`HUB_MAC_BYTES in=${total.in} out=${total.out} (Xcode handoff to ${host})`);
   log(`HUB_HANDOFF_DELTA bytes=${total.in + total.out} ${results.map(item => `${item.name}=${item.mode}`).join(' ')} -> ${host}:${remoteRun}`);
   return { host, folder: remoteRun, archives: results, receipts: receipts.map(file => basename(file)), mac_bytes: total };

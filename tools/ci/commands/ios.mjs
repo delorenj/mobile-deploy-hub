@@ -10,7 +10,7 @@ import { hookEnvironment } from '../lib/config.mjs';
 import { createDevicectl, createIpad } from '../lib/devicectl.mjs';
 import { loadDevices } from '../lib/devices.mjs';
 import { hook, runBounded } from '../lib/exec.mjs';
-import { handoffFolder, receiveHandoff, repoFolder, sendHandoffDelta } from '../lib/handoff.mjs';
+import { handoffFolder, receiveHandoff, repoFolder, retried, sendHandoffDelta } from '../lib/handoff.mjs';
 import { compareBuild, compareSemver, ipaName } from '../lib/latest.mjs';
 import { withLock } from '../lib/lock.mjs';
 import { loadManifest } from '../lib/manifest.mjs';
@@ -73,7 +73,7 @@ export async function iosExport(config, { env = process.env, log = console.log, 
 
 // ---------------------------------------------------------------------------------------------------- ios (Mac)
 
-const sshOptions = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4'];
+const sshOptions = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=30', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4'];
 
 export function newerOnDevice(before, facts) {
   try {
@@ -100,10 +100,10 @@ export function keepInOutbox({ ipa, home, devices, slug, version, build, keep = 
 }
 
 // The IPA back to big-chungus's staging for deliver, over ssh from the Mac (openrsync as the sender).
-function sendIpa({ ipa, name, devices, env, runner }) {
+function sendIpa({ ipa, name, devices, env, runner, log }) {
   const folder = `${devices.linux.staging_dir}/${repoFolder(env)}/${handoffFolder(env).split('/')[1]}/ios`;
-  runner('ssh', [...sshOptions, devices.linux.host, `mkdir -p '${folder}'`], { env, timeout: 90_000, label: `ssh ${devices.linux.host}` });
-  const out = runner('rsync', ['--stats', '-t', '-e', `ssh ${sshOptions.join(' ')}`, ipa, `${devices.linux.host}:${folder}/${name}`], { env, timeout: 30 * 60_000, label: `rsync IPA to ${devices.linux.host}` });
+  retried(() => runner('ssh', [...sshOptions, devices.linux.host, `mkdir -p '${folder}'`], { env, timeout: 90_000, label: `ssh ${devices.linux.host}` }), { log, label: `ssh ${devices.linux.host}` });
+  const out = retried(() => runner('rsync', ['--stats', '-t', '-e', `ssh ${sshOptions.join(' ')}`, ipa, `${devices.linux.host}:${folder}/${name}`], { env, timeout: 30 * 60_000, label: `rsync IPA to ${devices.linux.host}` }), { attempts: 2, log, label: 'rsync IPA' });
   const stats = parseRsyncStats(out);
   return { out: stats.sent ?? statSync(ipa).size, in: stats.received ?? 0 };
 }
@@ -208,7 +208,7 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
       if ((needsOta || home_) && !(config.dryRun && !home_)) {
         track.stage = 'build';
         const name = ipaName(manifest.project.slug, config.version, ipa.build);
-        const sent = sendIpa({ ipa: ipa.path, name, devices, env, runner });
+        const sent = sendIpa({ ipa: ipa.path, name, devices, env, runner, log });
         macBytes.out += sent.out;
         macBytes.in += sent.in;
         Object.assign(ipa, { sent: true, staged_name: name });

@@ -488,3 +488,51 @@ test('the v1 caller surface is frozen: every workflow_call input keeps its name,
   ]);
   for (const name of ['dry_run', 'bump', 'platform', 'testflight', 'play', 'dry_handoff', 'metered']) assert.match(template, new RegExp(`^ {6}${name}: \\$\\{\\{ inputs\\.${name} \\}\\}$`, 'm'), `the template passes ${name}`);
 });
+
+// ---------------------------------------------------------------------------------------------------- the delta handoff
+
+import { receiveHandoff, retried, sendHandoffDelta, treeDigest } from './lib/handoff.mjs';
+
+test('the Xcode handoff is a tree delta into the Mac cache, cloned per run, checked by tree_sha256 and packed back for the hook', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'hub-handoff-'));
+  try {
+    const src = join(root, 'src');
+    await mkdir(join(src, 'A.xcodeproj'), { recursive: true });
+    await writeFile(join(src, 'A.xcodeproj/project.pbxproj'), 'pbx');
+    await writeFile(join(src, 'A.pck'), 'pck bytes');
+    const tgz = join(root, 'A-ipad.tgz');
+    execFileSync('tar', ['-C', src, '-czf', tgz, '.']);
+    const calls = [];
+    const runner = (command, args) => {
+      calls.push(`${command} ${args.join(' ')}`);
+      if (command === 'tar') execFileSync('tar', args);
+      return command === 'rsync' ? 'Total bytes sent: 1,234\nTotal bytes received: 56\n' : '';
+    };
+    const env = { GITHUB_REPOSITORY: 'delorenj/pile-of-dumb-things', GITHUB_RUN_ID: '42' };
+    const logs = [];
+    const sent = await sendHandoffDelta({ host: 'hub-mac', base: 'Library/Caches/mobile-deploy-hub/handoff', cache: 'Library/Caches/mobile-deploy-hub/handoff-cache', archives: [{ name: 'A-ipad.tgz', tgz }], receipts: [], unpackInto: join(root, 'trees'), env, runner, log: line => logs.push(line) });
+    assert.deepEqual(sent.mac_bytes, { in: 1234, out: 56 });
+    assert.equal(sent.archives[0].mode, 'tree');
+    assert.equal(sent.archives[0].tree_sha256, (await treeDigest(src)).sha256);
+    assert.ok(calls.some(call => /^rsync --stats -e ssh .* -rlpt -z --checksum --delete .*\/A-ipad\.tree\/ hub-mac:Library\/Caches\/mobile-deploy-hub\/handoff-cache\/delorenj-pile-of-dumb-things\/A-ipad\/$/.test(call)), calls.join('\n'));
+    assert.ok(calls.some(call => /cp -cR 'Library\/Caches\/mobile-deploy-hub\/handoff-cache\/delorenj-pile-of-dumb-things\/A-ipad' 'Library\/Caches\/mobile-deploy-hub\/handoff\/delorenj-pile-of-dumb-things\/42\/A-ipad\.tree'/.test(call)), 'the run gets its own clone');
+    assert.ok(logs.some(line => /^HUB_MAC_BYTES in=1234 out=56/.test(line)) && logs.some(line => /^HUB_HANDOFF_DELTA bytes=1290 A-ipad\.tgz=tree/.test(line)));
+
+    // The Mac side: the run's clone checked against tree_sha256 and packed into the tarball the hook reads.
+    const home = join(root, 'mac');
+    const clone = join(home, 'Library/Caches/mobile-deploy-hub/handoff/delorenj-pile-of-dumb-things/42/A-ipad.tree');
+    await mkdir(clone, { recursive: true });
+    execFileSync('cp', ['-R', `${src}/.`, clone]);
+    const into = join(root, 'into');
+    await receiveHandoff({ names: ['A-ipad.tgz'], expected: {}, archives: sent.archives, base: 'Library/Caches/mobile-deploy-hub/handoff', into, env, home, log: () => {} });
+    assert.match(execFileSync('tar', ['-tzf', join(into, 'A-ipad.tgz')]).toString(), /A\.xcodeproj\/project\.pbxproj/);
+    await writeFile(join(clone, 'A.pck'), 'other bytes');
+    await assert.rejects(receiveHandoff({ names: ['A-ipad.tgz'], expected: {}, archives: sent.archives, base: 'Library/Caches/mobile-deploy-hub/handoff', into, env, home, log: () => {} }), /tree_sha256 .* the ios-export receipt says/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('a connection step to the Mac is retried before it counts as a failure', () => {
+  let tries = 0;
+  assert.equal(retried(() => { tries += 1; if (tries < 3) throw new Error('Connection timed out during banner exchange'); return 'ok'; }), 'ok');
+  assert.throws(() => retried(() => { throw new Error('down'); }, { attempts: 2 }), /down/);
+});
