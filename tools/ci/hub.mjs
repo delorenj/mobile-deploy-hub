@@ -183,7 +183,7 @@ async function planV3(config, manifest, { env, home, track }) {
   if (scope.android) {
     phone = await withLock('adb', async () => {
       const adb = createAdb({ env, home });
-      const id = await findPhone(adb, { serial: devices.android.serial, model: devices.android.model, waitMs: Number(env.HUB_ADB_WAIT_MS) || 90_000 });
+      const id = await findPhone(adb, { serial: devices.android.serial, model: devices.android.model, waitMs: Number(env.HUB_ADB_WAIT_MS) || 180_000 });
       return adb.installed(id, manifest.android.package);
     }, { env, timeoutMs: 20 * 60_000 });
     notes.push(`S26 ${devices.android.model}: ${phone ? `${manifest.android.package} ${phone.versionName} (${phone.versionCode}) installed` : `${manifest.android.package} not installed`}`);
@@ -352,7 +352,7 @@ async function androidV3(config, manifest, { env, home, track }) {
   track.stage = 'preflight';
   await withLock('adb', async () => {
     const adb = createAdb({ env, home });
-    const id = await findPhone(adb, { serial: devices.android.serial, model: devices.android.model, waitMs: Number(env.HUB_ADB_WAIT_MS) || 90_000 });
+    const id = await findPhone(adb, { serial: devices.android.serial, model: devices.android.model, waitMs: Number(env.HUB_ADB_WAIT_MS) || 180_000 });
     const before = adb.installed(id, spec.package);
     const was = before ? `${before.versionName} (${before.versionCode})` : 'nothing';
     if (before && before.versionCode > planned) throw new Error(`the S26 has versionCode ${before.versionCode}, above the planned ${planned}; Android would refuse the update (the hub never downgrades)`);

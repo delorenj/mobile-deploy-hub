@@ -5,6 +5,7 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { androidSdk } from './android.mjs';
+import { credentialVariables } from './config.mjs';
 import { runBounded } from './exec.mjs';
 
 export const adbPath = (env = process.env, home = homedir()) => env.HUB_ADB || join(androidSdk(env, home), 'platform-tools/adb');
@@ -32,11 +33,28 @@ export function parseBaseApk(output) {
 
 export const parseSha256 = output => /\b([0-9a-f]{64})\b/.exec(output)?.[1] ?? null;
 
-export function createAdb({ env = process.env, home = homedir(), runner = runBounded } = {}) {
+// `adb mdns services`: the phone's wireless debugging endpoint, by the serial in its service name.
+export function parseMdnsEndpoint(output, serial) {
+  for (const line of output.split('\n')) {
+    const [name, type, endpoint] = line.trim().split(/\s+/);
+    if (name?.startsWith(`adb-${serial}-`) && type?.startsWith('_adb-tls-connect') && /^[\d.]+:\d+$/.test(endpoint ?? '')) return endpoint;
+  }
+  return null;
+}
+
+export function createAdb({ env: given = process.env, home = homedir(), runner = runBounded } = {}) {
+  // No token reaches adb: its server outlives the job (below), and it must not carry the job's credentials with it.
+  const env = { ...given };
+  for (const name of credentialVariables) delete env[name];
   const adb = adbPath(env, home);
   const call = (args, timeout = 30_000) => runner(adb, args, { env, timeout, label: `adb ${args.filter(arg => !arg.startsWith('/')).slice(0, 4).join(' ')}` });
   return {
-    startServer: () => call(['start-server'], 60_000),
+    // The server must outlive the job: the runner kills a job's leftover processes by their RUNNER_TRACKING_ID, and a
+    // server that dies with every job makes the next one wait for the phone's wireless reconnect. Without the id the
+    // server stays up on big-chungus between jobs and runs, holding the connection like a person's adb would.
+    startServer: () => runner(adb, ['start-server'], { env: { ...env, RUNNER_TRACKING_ID: '' }, timeout: 60_000, label: 'adb start-server' }),
+    mdnsEndpoint: serial => parseMdnsEndpoint(call(['mdns', 'services'], 15_000), serial),
+    connect: endpoint => call(['connect', endpoint], 30_000),
     devices: () => parseDeviceList(call(['devices'])),
     prop: (id, name) => call(['-s', id, 'shell', 'getprop', name]).trim(),
     installed: (id, pkg) => parsePackage(call(['-s', id, 'shell', 'dumpsys', 'package', pkg], 60_000), pkg),
@@ -48,12 +66,13 @@ export function createAdb({ env = process.env, home = homedir(), runner = runBou
 }
 
 // Starts the adb server if it is down (a dead server is what an idle big-chungus looks like) and waits for the
-// phone, which reconnects over Wireless debugging within seconds once the server is up.
-export async function findPhone(adb, { serial, model, waitMs = 90_000, pollMs = 3000, sleep = ms => new Promise(done => setTimeout(done, ms)), now = Date.now, log = console.log }) {
+// phone, which usually reconnects over Wireless debugging within seconds once the server is up. When mDNS auto-connect
+// is slow, every few polls it looks the phone up in `adb mdns services` and connects to that endpoint itself.
+export async function findPhone(adb, { serial, model, waitMs = 180_000, pollMs = 3000, nudgeEvery = 5, sleep = ms => new Promise(done => setTimeout(done, ms)), now = Date.now, log = console.log }) {
   adb.startServer();
   const deadline = now() + waitMs;
   let seen = [];
-  for (;;) {
+  for (let poll = 1; ; poll += 1) {
     seen = adb.devices();
     for (const device of seen.filter(entry => entry.state === 'device')) {
       let found;
@@ -65,6 +84,12 @@ export async function findPhone(adb, { serial, model, waitMs = 90_000, pollMs = 
       return device.id;
     }
     if (now() >= deadline) break;
+    if (poll % nudgeEvery === 0 && adb.mdnsEndpoint && adb.connect) {
+      try {
+        const endpoint = adb.mdnsEndpoint(serial);
+        if (endpoint) { log(`HUB_S26_CONNECT ${endpoint} (mDNS lists it; auto-connect had not)`); adb.connect(endpoint); }
+      } catch { /* the next poll tries again */ }
+    }
     await sleep(pollMs);
   }
   const listed = seen.map(entry => `${entry.id} (${entry.state})`).join(', ') || 'none';

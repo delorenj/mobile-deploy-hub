@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { parseConfig } from './lib/config.mjs';
 import { checkBump, levels, nextVersion, parseVersionInfo } from './lib/version.mjs';
 import { bumpTransaction, createGit, parseRemoteTag, parseStatus } from './lib/git.mjs';
-import { findPhone, parseBaseApk, parseDeviceList, parsePackage, parseSha256 } from './lib/adb.mjs';
+import { createAdb, findPhone, parseBaseApk, parseDeviceList, parseMdnsEndpoint, parsePackage, parseSha256 } from './lib/adb.mjs';
 import { createIpad, pickApp, pickIpad } from './lib/devicectl.mjs';
 import { bbEmitPath, correlationFor, deploymentEvent, emitArgs, sanitizeReason, targetOf, uuidv5 } from './lib/announce.mjs';
 import { loadDevices, parseDevices } from './lib/devices.mjs';
@@ -308,6 +308,32 @@ test('findPhone waits for the phone to reconnect, refuses a wrong model, and nam
   clock = 0;
   const other = fakeAdbApi({ listed: [{ id: 'adb-R5CX31AEJDA-x', state: 'device' }], props: { 'adb-R5CX31AEJDA-x': { 'ro.serialno': 'R5CX31AEJDA' } } });
   await assert.rejects(findPhone(other, { serial: 'R5GL43A7PCH', model: 'SM-S948U', waitMs: 10_000, pollMs: 1000, ...timing }), /SM-S948U \(serial R5GL43A7PCH\) is not on this host's adb server after 10s \(devices: adb-R5CX31AEJDA-x \(device\)\)\. Turn on Wireless debugging/);
+});
+
+test('a slow mDNS auto-connect is nudged: the phone is looked up in adb mdns services and connected', async () => {
+  assert.equal(parseMdnsEndpoint('List of discovered mdns services\nadb-R5CX31AEJDA-YYVl71\t_adb-tls-connect._tcp\t192.168.1.34:34995\nadb-R5GL43A7PCH-NGdiLU\t_adb-tls-connect._tcp\t192.168.1.50:41234\n', 'R5GL43A7PCH'), '192.168.1.50:41234');
+  assert.equal(parseMdnsEndpoint('adb-R5GL43A7PCH-x\t_adb-tls-pairing._tcp\t192.168.1.50:5555\n', 'R5GL43A7PCH'), null, 'a pairing endpoint is not a connect endpoint');
+  let clock = 0;
+  let connected = false;
+  const adb = {
+    startServer() {},
+    devices: () => (connected ? [{ id: '192.168.1.50:41234', state: 'device' }] : []),
+    prop: (_id, name) => ({ 'ro.serialno': 'R5GL43A7PCH', 'ro.product.model': 'SM-S948U' })[name],
+    mdnsEndpoint: serial => (serial === 'R5GL43A7PCH' ? '192.168.1.50:41234' : null),
+    connect: endpoint => { connected = endpoint === '192.168.1.50:41234'; },
+  };
+  const logs = [];
+  assert.equal(await findPhone(adb, { serial: 'R5GL43A7PCH', model: 'SM-S948U', nudgeEvery: 2, sleep: async ms => { clock += ms; }, now: () => clock, log: line => logs.push(line) }), '192.168.1.50:41234');
+  assert.ok(logs.some(line => /HUB_S26_CONNECT 192\.168\.1\.50:41234/.test(line)));
+});
+
+test('the adb server is started outside the job, so it keeps the phone between jobs', () => {
+  const calls = [];
+  const adb = createAdb({ env: { RUNNER_TRACKING_ID: 'github_123', HUB_ADB: '/x/adb', GH_TOKEN: 'secret-a', ACTIONS_RUNTIME_TOKEN: 'secret-b' }, runner: (command, args, options) => { calls.push({ command, args, tracking: options.env.RUNNER_TRACKING_ID, env: options.env }); return ''; } });
+  adb.startServer();
+  adb.devices();
+  assert.deepEqual(calls.map(call => [call.args[0], call.tracking]), [['start-server', ''], ['devices', 'github_123']]);
+  assert.ok(calls.every(call => !JSON.stringify(call.env).includes('secret-')), 'no token reaches the long-lived adb server');
 });
 
 test('the front door looks for the S26 on big-chungus before it dispatches', async () => {
