@@ -203,8 +203,8 @@ One sentence goes everywhere: **"Mobile app versions ship only through mobile-de
 - **Deploy from the Mac or big-chungus:**
   - `mise run deploy --dry-run false` in the app;
   - or, in the hub, `mise run deploy:train --dry-run false`. It runs Tower, then Green In Between, then Gruvato, one at a time, and stops at the first red run.
-- **Update the S26:** tap **Install APK** in the ntfy notification, then Update. Or open Files → Quickdrop → builds, tap the APK, then Update.
-- **Update the iPad:** tap **Install on iPad** in the ntfy notification. Or open the bookmarked `https://s3.delo.sh/builds/index.html` in Safari and tap Install.
+- **Update the S26:** tap **Install APK (NN MB)** in the ntfy notification, then Download (Chrome warns the file type can harm the device), Open, Update; the first time, also allow the browser to install unknown apps. On Wi-Fi: Files → Quickdrop → builds, tap the APK, then Update. *(Corrected in v1.1.3: the original "Install APK, then Update" left out Chrome's steps.)*
+- **Update the iPad:** tap **Install on iPad** in the ntfy notification (ntfy-ios subscribed to `deploys`, the topic the upstream gate forwards). Or open the bookmarked `https://s3.delo.sh/builds/index.html` in Safari and tap Install.
 - **Back home:** nothing to do. Catch-up installs or confirms each pending build within 2 minutes on the S26 and 5 on the iPad, then sends one notification per device.
 
 ### B2. Job graph
@@ -383,6 +383,7 @@ How the fields are used:
 - **Peers:** the folder syncs to phoneballs, PottyBarron (the S26), tiny-chungus, Tom and mommymac.
   - The Mac's quickdrop `.stignore` gains `/builds`, so APKs never cross its hotspot.
   - On the S26, Syncthing pulls each new APK automatically. On cellular that costs phone data. Jarad sets Syncthing on the S26 to sync on Wi-Fi only (the hub cannot), so Quickdrop is the "already on the phone when back on Wi-Fi" channel and the ntfy button is the "now" channel.
+  - *v1.1.3:* the S26 was seen syncing over Verizon, so the setting is not to be relied on: `android` writes Quickdrop only while big-chungus's Syncthing sees the S26 connected from inside `lan_cidr` (`HUB_QUICKDROP_DEFERRED` otherwise), and never over a newer hub APK of the app.
 - **Who writes:** `android` (real runs only). Dry runs write nothing.
 
 ## E. Catch-up installers
@@ -914,3 +915,41 @@ ssh hub-mac '~/.local/share/mise/installs/node/24/bin/node ~/.local/share/mobile
   - Green In Between 37977334285 and Gruvato 37979031860 (the Mac home on the LAN, `mac=home`): full lanes — `HUB_S26_DRY_RUN would install 0.0.20 (20) over preview-17 (17)` and `0.2.5 (2005) over 0.2.3 (2003)`, `HUB_IPA_OK` both, and on the free link `HUB_OUTBOX_SENT` (31,270,940 and 7,782,589 bytes, so `deliver` re-checks a staged IPA, not just an APK). Their `ios-export` job is `skipped` (no `ios.export`: the Mac builds straight from source), and `HUB_PUBLISH_DRY_RUN` named both the APK and the IPA per app.
   - Afterwards, per app: no version tag, no Release, `main` unchanged, the bucket still holds only `index.html`/`index.json`, no Quickdrop file, staging empty. The real first deploys are left to Jarad (`mise run deploy --dry-run false`).
   - After the tag: `eb9270d` (the deploy jobs write the real bucket only inside a workflow job, `jobWriter`) is on `main` past `v1.1.2`; it rides the next release.
+
+## Build log: review fixes (v1.1.3, 2026-10-09)
+
+A review of v1.1.2 found ways around the policy, waits on a lost Mac, wrong device states on reruns, a catch-up left in watch mode, and a leaked root password. Fixed on `main` (hub `315e7ca` and the docs commit after it); they reach callers with the next `mise run release -- 1.1.3`, as `eb9270d` does.
+
+**Only the template caller runs the hub.**
+- Every command, inside a job, refuses a run whose `GITHUB_WORKFLOW_REF` is not the app's `deploy.yml` (`checkCallerRef`); the plan also hashes the caller at `GITHUB_WORKFLOW_SHA`, so a `deploy.yml` that skips the gate stops before the bump.
+- Conformance fails any other workflow that names `delorenj/mobile-deploy-hub` at any ref, and every gate runs the same check on its own checkout (`HUB_GATE_REFUSED conformance`). Tower's `testflight.yml` exception holds only while `workflow_dispatch` is its one trigger (Tower `5892304` removed the `ios-v*` tag trigger).
+- `_guard.sh` (agents `66633eb`) refuses a staged hub `uses:` outside `deploy.yml` or not `@v1`, and, in a hub app, a staged workflow line that uploads a build. Conformance on a timer was not added: the gate runs it on every deploy, dry runs included, and the guard catches it at commit.
+- The pre-gate tag `v1.0.0` (at `41ee100`; only dry runs used it) is deleted from origin.
+- `runs-on` is `[self-hosted, Linux]` / `[self-hosted, macOS]` in the workflow itself; the inputs stay for the v1 interface and the gate still refuses other values.
+- The policy pins each app's Android package and signer and iOS bundle (`apps.<repo>.android`, `.ios`); the gate, the plan and deliver hold the manifest and the APK to them, and the catch-up refuses a `latest.json` that disagrees and checks an APK's signer against the pin, never against `latest.json` alone (design M's residual risk).
+
+**The Mac cannot hold the deploy.**
+- `deliver` is two jobs: `deliver-android` needs only the plan and the android lane, so the APK, its block, the pages and the S26 catch-up never wait for the Mac; `deliver-ios` runs when the ios job ran (success or failure). `inflight.json` names the run's platforms and each deliver clears its own.
+- The gate checks this app's own Mac runner (`pgrep` of its folder from `devices.json` `mac.runners`, and GitHub's status through big-chungus's `gh`); off the LAN an ssh with no answer is offline. The plan probes once more right before the iPad lane: `skip-lost`.
+- Each app has one Linux runner, so the queue limit cannot be a job of the run: `tools/ci/macwatch.mjs`, a systemd user timer on big-chungus every 2 minutes, cancels a run whose Mac job waited past `mac.queue_limit_min` (15) while its runner is not busy, once `deliver-android` is done (a lost `preflight-ios` at once: nothing was bumped). announce asks GitHub which Mac job no runner took and reports the iPad `skipped` ("the Mac went offline after the gate").
+- The ios job reads the link again on the Mac (its gateway) before it sends the IPA; a dry run never sends on a link it cannot confirm.
+
+**Device states.**
+- A device's state comes from its lane's receipt. The Release and Play steps write their own receipts (`android-release`, `android-play`) and TestFlight runs at stage `deliver`, so a failed upload makes the run `.failed` at `deliver` while the S26 or the iPad keeps `pending` or `installed`.
+- A rerun of the same release keeps only an install it did not see; a fresh `pending` replaces an earlier `failed` (failures reset), so the catch-up retries.
+- A lane that succeeded but whose receipt deliver or announce cannot read fails at `deliver` ("receipt missing") instead of a green `pending`; deliver moves the top level of `latest.json` only with a block. The front door offers `gh run rerun --failed` only within the 7-day window of receipts and staging.
+- A present iPad that refuses the install or the readback still has its checked IPA published (device `failed`), as Android does; the verified IPA is in the receipt as soon as it is checked.
+- The plan refuses a manifest that changed on `main` since the dispatched commit; deliver and announce use the policy's slug.
+- `installCurrent` moves `current` only forward (`HUB_CURRENT kept`).
+
+**The catch-up.** Both hosts were switched to live on 2026-10-09 (nothing was published, so nothing could install before the Deploy phase), after `mise run hosts:install` put `main-315e7ca` on both (220 KB to the Mac) with the new watchdog units. The gate logs `HUB_CATCHUP_MODE big-chungus=... mac=...`, and a pending device on a host in watch mode reads "catch-up off". A deploy in flight holds every pending build at or below its version on both passes; the S26 waits while the app is on top with the screen on, the iPad while the app runs (up to 45 minutes from the first sighting); the Mac revalidates its pointers with the strong ETag (`accept-encoding: identity`, any `W/` stripped: 304s now) and reads over ssh from big-chungus when `s3.delo.sh` does not answer.
+
+**Data on the hotspot.** Mac transfers keep a broken file's partial (`--partial-dir`, which openrsync takes; proven both ways with a 20 KB probe), and the bytes of failed attempts count into `HUB_MAC_BYTES` (GNU rsync's progress on the handoff, the partial's size for the IPA). Quickdrop: see D.
+
+**Notification.** The router also publishes every deploy event to `deploys`, which the upstream gate now forwards (bloodbank `6526fb7`, monitoring `8b1ebeb`); the install buttons carry the size ("Install APK (74.7 MB)"), and the router then skips its HEAD. The device lines read "S26 0.2.2 (4): pending, installs when it is back (not on big-chungus's adb)" and "iPad: pending (asleep or away)".
+
+**Secrets.** The MinIO root password (also the public `delorenj/skills` Piwigo example, and printed by a tracked `setup.sh`) is rotated: DeLoSecrets `hwatizsoschtnq5oleume6kdpu` generated a new one, the stack starts with `op run --env-file .env.op` and refuses to start without the keys (DeLoContainers `3210d88`), the plaintext `.env` is gone, and the `mc` aliases `delo`, `delodrive` (now `127.0.0.1:9012`) and `deloroot` use the new key. The builds writer's key was rotated as well (a fragment reached a review transcript); the writer probe passes. The skill reads Piwigo from DeLoSecrets `56shztqigvr5pe4znrmurutevy` (skills `e20bcba`); the old pair stays in that public repo's history and still opens Piwigo and the other services that share it.
+
+**s3.delo.sh/builds** in a browser now redirects to `builds/index.html` (and `/builds/<app>` to its page); S3 clients are untouched.
+
+**Left for Jarad.** Release it (`mise run release -- 1.1.3`). On the devices: subscribe ntfy-ios on the iPad to `deploys`, set Syncthing on the S26 to Wi-Fi only, then the first real deploy and the L3 button proof. Rotate the shared default password where it still opens something reachable from outside (Piwigo at media.delo.sh first).

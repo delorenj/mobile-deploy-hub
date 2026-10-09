@@ -12,9 +12,19 @@ mise run deploy --dry-run false    # real: patch bump, publish, install where th
 mise run deploy:train --dry-run false   # in the hub: Tower, then Green In Between, then Gruvato; stops at a red run
 ```
 
-A real deploy bumps the patch version (`--bump minor` or `--bump major` for more), commits and tags it on `main`, builds the APK and the iPad IPA, and publishes them to the build directory ([https://s3.delo.sh/builds/index.html](https://s3.delo.sh/builds/index.html): Install APK, Install on iPad), Quickdrop (`~/quickdrop/builds`, APKs up to 120 MB) and the private Release `vX.Y.Z`. It installs in place on the S26 and the iPad when they are reachable and reads the version back. **An away device is `pending`, not a stop**: the run goes green, the ntfy notification carries the install links, and a catch-up installs the build when the device is back (2 minutes on the S26, 5 on the iPad; `tools/catchup/`). One `bloodbank.project.deployment.completed` (or `.failed`) event names each device's status (`installed`, `pending`, `skipped`, `failed`) and carries the links. `--platform android|ios` narrows it; `--metered allow` builds the iPad lane even when the Mac's metered link would go over its data budget. A deploy that failed after its bump is finished with `gh run rerun <run-id> --failed` (same version, same commit); the front door offers it.
+A real deploy bumps the patch version (`--bump minor` or `--bump major` for more), commits and tags it on `main`, builds the APK and the iPad IPA, and publishes them to the build directory ([https://s3.delo.sh/builds/index.html](https://s3.delo.sh/builds/index.html), or just `s3.delo.sh/builds` in a browser: Install APK, Install on iPad), Quickdrop (`~/quickdrop/builds`, APKs up to 120 MB, only while the S26 syncs from the LAN) and the private Release `vX.Y.Z`. It installs in place on the S26 and the iPad when they are reachable and reads the version back. **An away device is `pending`, not a stop**: the run goes green, the ntfy notification carries the install links (with the download's size), and a catch-up installs the build when the device is back (2 minutes on the S26, 5 on the iPad; `tools/catchup/`), never while the app is on screen. One `bloodbank.project.deployment.completed` (or `.failed`) event names each device's status (`installed`, `pending`, `skipped`, `failed`) and carries the links. `--platform android|ios` narrows it; `--metered allow` builds the iPad lane even when the Mac's metered link would go over its data budget. A deploy that failed after its bump is finished with `gh run rerun <run-id> --failed` (same version, same commit); the front door offers it for 7 days (the window of its receipts and staging), and after that a new version is the way.
 
-Nothing has to be at home first: the `gate` job reads the Mac's link (home, metered or offline, from tailscale) and the S26 itself, and skips the iPad lane when the Mac is offline or a metered link would go over budget.
+Nothing has to be at home first: the `gate` job reads the Mac's link (home, metered or offline, from tailscale, this app's own Mac runner and GitHub's view of it) and the S26 itself, and skips the iPad lane when the Mac is offline or a metered link would go over budget. The APK half never waits for the Mac (`deliver-android`), and a Mac that goes away after the gate costs the iPad lane, not the deploy: the plan probes the Mac again (`skip-lost`), and the host watchdog gives up an iPad job no runner takes within `mac.queue_limit_min` (15 minutes) instead of letting GitHub hold it for 24 hours.
+
+**One-time setup on the devices:**
+- **S26:** subscribe the ntfy app to `bloodbank` on `https://ntfy.delo.sh` (it already is). In Syncthing on the S26, set the run conditions to Wi-Fi only (Settings > Run conditions, at least for the `quickdrop` folder); the hub also writes Quickdrop only while the S26 syncs from the LAN, but the phone decides when it pulls. The first Install APK asks once to let the browser install unknown apps.
+- **iPad (and an iPhone):** subscribe ntfy-ios to **`deploys`** on `https://ntfy.delo.sh`. iOS wakes only for topics the ntfy upstream gate forwards, never for the `bloodbank` firehose; the router copies every deploy event there. Bookmark `https://s3.delo.sh/builds/index.html` in Safari as the fallback.
+- **GitHub app:** bookmark each app's Deploy workflow (Run workflow, untick `dry_run`).
+
+**The taps:**
+- **S26 away:** Install APK in the notification, then Download (Chrome warns that the file type can harm the device), Open, Update. On Wi-Fi at home it is shorter: Files > Quickdrop > builds > the APK > Update, or nothing at all, since the catch-up installs it within 2 minutes once the S26 is on big-chungus's adb.
+- **iPad away:** Install on iPad in the notification (or Install on the build page in Safari), then Install in the iPadOS prompt.
+- **Back home:** nothing. The catch-up installs or confirms each pending build and sends one notification per device; it waits while the app is on screen.
 
 ## Deploy policy
 
@@ -39,7 +49,7 @@ Apps need no edit for a policy change: their callers pin `@v1`. A caller changes
 
 Everything out-of-hub is refused or retired: no app path may bump a version, mint a tag, `gh release create`, upload to TestFlight or install a release build on a device.
 
-*Status (2026-10-09): v1.1 is out. `v1.1.2` (commit `9bee7ff`) is what `v1` points at; its release dry runs are green in all three apps — Tower 37975743662 (the Mac on a metered hotspot: 37 KB handoff delta, 24 KB out), Green In Between 37977334285 and Gruvato 37979031860 (the Mac home on the LAN). `v1.1.0` and `v1.1.1` were burned by their own release dry runs (1Password references with spaces; the Mac dropping off the tailnet mid-handoff). Design and build log: [docs/design-hub-v1.1.md](docs/design-hub-v1.1.md).*
+*Status (2026-10-09): v1.1 is out, and `main` carries the v1.1.3 review fixes (design doc, "Build log: review fixes"), ready for `mise run release -- 1.1.3`. `v1.1.2` (commit `9bee7ff`) is what `v1` points at; its release dry runs are green in all three apps — Tower 37975743662 (the Mac on a metered hotspot: 37 KB handoff delta, 24 KB out), Green In Between 37977334285 and Gruvato 37979031860 (the Mac home on the LAN). `v1.1.0` and `v1.1.1` were burned by their own release dry runs (1Password references with spaces; the Mac dropping off the tailnet mid-handoff). Design and build log: [docs/design-hub-v1.1.md](docs/design-hub-v1.1.md).*
 
 ## What a run does
 
@@ -48,11 +58,14 @@ Everything out-of-hub is refused or retired: no app path may bump a version, min
 | `gate` | Linux | the policy on this run: the repo is listed, the manifest is schema 2 with every lane, the caller is the template (normalized hash in `callers.accept`), strict, runners and manifest are the policy's, a real run uses a released hub on `main`; then the Mac's link, the S26, and an S3 write probe. Decides the iPad lane: `run`, `skip-offline`, `skip-metered` |
 | `preflight-ios` | Mac | no checkout: the development identity signs, a profile covers the iPad for 30+ days, 15 GiB free; the iPad's installed version, or `unreachable` (pending) |
 | `plan` | Linux | the S26 (away after 180 s is pending), the event contract, the downgrade guards (the S26, the published `latest.json`, a newer iPad), then the bump. Real: commit, tag, `git push --atomic` to `main`, `inflight.json`. Dry: the same commit, tag and `git push --dry-run --atomic`, then rewound |
-| `android` | Linux | build, signer pin, APK identity, staging for deliver, Quickdrop (real), then `adb install -r` and readback on the S26, or pending; the private Release `vX.Y.Z` |
-| `ios-export` | Linux | Tower only: Godot's Xcode project, handed to the Mac as an rsync delta into a cache there (`HUB_HANDOFF_DELTA`, `HUB_MAC_BYTES`) |
-| `ios` | Mac | the app's `ios.device` hook, export with method `debugging`, IPA checks, the Mac outbox, `devicectl device install app` and readback, or pending; the IPA goes back to big-chungus only when the iPad needs it over the air or the link is free |
-| `deliver` | Linux | the build directory, under a host lock: versioned objects, `manifest.plist`, `latest.json`, the pages, retention (5 APKs, the newest IPA), forward-only pointers. A dry run checks and renders, and writes nothing |
-| `announce` | Linux | one event per run attempt from the job results and receipts (`bb-emit --strict`), with statuses and links; a dry run only checks it |
+| `android` | Linux | build, signer pin, APK identity, staging for deliver, `adb install -r` and readback on the S26, or pending; Quickdrop (real, only while the S26 syncs from the LAN, never over a newer APK); the private Release `vX.Y.Z` (its own receipt: a failed upload is stage `deliver`, the S26 keeps its status) |
+| `ios-export` | Linux | Tower only: Godot's Xcode project, handed to the Mac as an rsync delta into a cache there (`HUB_HANDOFF_DELTA`, `HUB_MAC_BYTES`; a broken transfer resumes from its partial file) |
+| `ios` | Mac | the app's `ios.device` hook, export with method `debugging`, IPA checks, the Mac outbox, `devicectl device install app` and readback, or pending; the IPA goes back to big-chungus when the iPad needs it over the air (a refused install too) or the link, read again on the Mac, is free |
+| `deliver-android` | Linux | the APK half of the build directory, under a host lock, as soon as the android job ends (it never waits for the Mac): the APK, `latest.json`'s android block, the pages, retention (5 APKs), forward-only pointers |
+| `deliver-ios` | Linux | the IPA half when the ios job ends: the IPA, `manifest.plist`, `latest.json`'s ios block, the pages (the newest IPA only). A dry run of either checks and renders, and writes nothing |
+| `announce` | Linux | one event per run attempt from the job results and receipts (`bb-emit --strict`), with statuses and sized links; a dry run only checks it |
+
+Inside a job every hub command first checks that the run was started by the app's own `.github/workflows/deploy.yml` (`GITHUB_WORKFLOW_REF`); the gate and the plan also hash that caller. A second workflow that `uses:` the hub's action or reusable workflow, at any ref, does nothing, and conformance, every gate (on its own checkout) and the global pre-commit guard refuse one. Each job pins its runner labels itself (`[self-hosted, Linux]`, `[self-hosted, macOS]`).
 
 A dry run never commits to the remote, tags, installs, publishes, uploads or emits. Each lane applies the plan's bump to its own checkout, so the dry run builds and checks the next version. The hub only installs in place (`adb install -r`, `devicectl device install app`) and never removes an app, clears its data or downgrades it; a test greps `tools/` (the catch-up too) for those commands.
 
@@ -66,8 +79,10 @@ builds/<slug>/index.html                         Install APK, Install on iPad, d
 builds/<slug>/latest.json                        the delivery contract (tools/ci/lib/latest.mjs), read by the catch-up
 builds/<slug>/inflight.json                      a real run between plan and deliver
 builds/<slug>/ios/manifest.plist                 the one OTA manifest, always the newest IPA
-builds/<slug>/<X.Y.Z>/<slug>-<X.Y.Z>-<code>.apk, <slug>-<X.Y.Z>-<build>.ipa, icon-57.png, icon-512.png, receipt.json
+builds/<slug>/<X.Y.Z>/<slug>-<X.Y.Z>-<code>.apk, <slug>-<X.Y.Z>-<build>.ipa, icon-57.png, icon-512.png, receipt-android.json, receipt-ios.json
 ```
+
+`inflight.json` names the platforms a real run builds; each deliver job clears its own, and the catch-up holds every older pending build of those platforms until then. A device block's package, signer and bundle must be the policy's pins (`tools/ci/policy.json` `apps`), or the catch-up refuses the file.
 
 ## Use it from an app
 
@@ -97,6 +112,15 @@ Hooks are shell commands from the committed manifest, run under `bash -eo pipefa
 
 ```sh
 mise run check          # actionlint on the workflow, then node --test 'tools/**/*.test.mjs' (the catch-up included)
-mise run conformance    # every app still deploys only through the hub (gh api)
-mise run hosts:install  # the bucket index, hub-mac, the Mac's quickdrop .stignore and handoff cache, the catch-up units
+mise run conformance    # every app still deploys only through the hub (gh api); every deploy's gate runs it on its own checkout too
+mise run hosts:install  # the bucket index, hub-mac, the Mac's quickdrop .stignore and handoff cache, the catch-up units and the Mac watchdog
 ```
+
+The catch-up installs only on a host in live mode, and both are live since 2026-10-09 (`catchup.mjs mode` prints it; every gate logs `HUB_CATCHUP_MODE`, and a pending device on a host in watch mode reads "catch-up off" in the event and on the page):
+
+```sh
+node ~/.local/share/mobile-deploy-hub/current/tools/catchup/catchup.mjs mode live          # big-chungus
+ssh hub-mac '~/.local/share/mise/installs/node/24/bin/node ~/.local/share/mobile-deploy-hub/current/tools/catchup/catchup.mjs mode live'
+```
+
+The Mac watchdog (`tools/ci/macwatch.mjs`, systemd timer `mobile-deploy-hub-macwatch.timer` on big-chungus, every 2 minutes) cancels a deploy run whose Mac job has waited longer than `mac.queue_limit_min` for its runner, once the run's APK half is done; it uses big-chungus's `gh` login. `HUB_MACWATCH_*` lines in its journal say what it did.
