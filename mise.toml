@@ -78,4 +78,5 @@ run = "'{{config_root}}/.mise/scripts/versioning.sh' sync"
 [tasks.check]
 description = "Lint the reusable workflow with actionlint, then run the tool tests"
 tools = { actionlint = "1.7.12", node = "24" }
-run = ["actionlint .github/workflows/*.yml", "node --test tools/ci/*.test.mjs"]
+# The glob is node's own (quoted), so tools/catchup/*.test.mjs runs here too.
+run = ["actionlint .github/workflows/*.yml", "node --test 'tools/**/*.test.mjs'"]
