@@ -845,16 +845,15 @@ ssh hub-mac '~/.local/share/mise/installs/node/24/bin/node ~/.local/share/mobile
 
 **Hosts.**
 - **big-chungus:**
-  - The code is at `~/.local/share/mobile-deploy-hub/current -> releases/bootstrap-20261009T1740`, the working tree's `tools/` until a real run's `deliver` replaces it.
+  - The code is at `~/.local/share/mobile-deploy-hub/current -> releases/main-42f3f4c` (`git archive 42f3f4c tools`), until a real run's `deliver` points it at `releases/v1.1.x`.
   - The timer is enabled and the mode is watch. Every 2 minutes the pass logs `HUB_CATCHUP_IDLE android watch: nothing pending (tower-of-dumb-things unpublished, green-in-between unpublished, gruvato unpublished)`.
   - A proof against the real adb server, with a fixture `latest.json` that has Tower 0.2.2 (4) pending, logged `HUB_LOCK adb`, searched 20 s by serial, then `HUB_CATCHUP_IDLE android watch: tower-of-dumb-things 0.2.2 (4) pending; the S26 is away`. It wrote nothing and sent no event.
-- **The Mac:** not installed yet. It left the tailnet at 17:40Z, before the copy; at 17:20Z it was reachable on a hotspot (gateway 172.30.235.16, so metered). The iPad shows `tunnelState: unavailable`. Once it is back:
-  ```
-  rsync -az tools/ hub-mac:.local/share/mobile-deploy-hub/releases/<ref>/tools/
-  ssh hub-mac bash .local/share/mobile-deploy-hub/releases/<ref>/tools/catchup/units/install.sh <ref>
-  ssh hub-mac launchctl print gui/502/sh.delo.mobile-deploy-hub.catchup
-  ```
-  The pass logs to `~/Library/Logs/mobile-deploy-hub/catchup.log`.
+- **The Mac:**
+  - Installed at 17:50Z over `hub-mac`. `rsync` sent the `main-42f3f4c` tree in 162 KB and received 1 KB, over the hotspot (gateway 172.30.235.16, so metered).
+  - `install.sh` bootstrapped the LaunchAgent into `gui/502` from ssh: `run interval = 300 seconds`, node 24, mode watch.
+  - The first pass, on load, logged `HUB_CATCHUP_IDLE ios watch: nothing pending (tower-of-dumb-things unpublished, ...)`, with `last exit code = 0`.
+  - A proof with a fixture `latest.json` (Tower iOS 0.2.2 (4) pending) and the real devicectl logged `HUB_LOCK mac-ios`, then `HUB_CATCHUP_IDLE ios watch: ... pending; the iPad is unavailable to devicectl`, with `metered=true`.
+  - The real `record` call from the Mac to big-chungus over ssh, with no ssh agent, took `s3-tower-of-dumb-things` and refused cleanly: `latest.json is gone`, because nothing is published yet.
 
 **For HUB.**
 - `mise run hosts:install`:
