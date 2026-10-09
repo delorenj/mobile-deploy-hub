@@ -142,6 +142,30 @@ The first real deploy (`--dry-run false`) is Jarad's, per app, after step 6.
 
 ## Needs Jarad
 
-- Back up the three Android keystores (Tower's Godot debug key, gib's spike key, Gruvato's `~/.android/debug.keystore`) to DeLoSecrets. Each exists only on big-chungus; losing one ends in-place updates on the S26.
-- Delete the Mac's unused plaintext `~/.config/op/service-account-token`.
 - Unproven until a real run: devicectl install while the iPad is locked.
+- The first real deploy per app (`mise run deploy --dry-run false`), after the tag below.
+
+## Build log (2026-10-09)
+
+**Landed.** Hub v3 (770199a, then 936c561, 986751f, 10c600f); Bloodbank schema edit (79f5e60: `mobile-app`, `device-set`, `deliveries[]`, `run`, failed stage `version`; `validate:schemas` and `smoketest:schemas` green); Tower caller (2238305, 642680e); Gruvato caller (f7a1f18); Green In Between caller (374088d).
+
+**Proof, Tower (strict dry runs, `@main`).**
+- 37924832437, both devices, `--dry-handoff true`: every marker in one run. `HUB_PLAN version=0.2.1 next=0.2.2`, `HUB_PUSH_REHEARSED v0.2.2` (commit, tag and `git push --dry-run --atomic` through the guards), `APK_SIGNER_OK 2d4954...1a97`, `HUB_S26_DRY_RUN would install 0.2.2 (4) over 0.2.1 (3)`, `HUB_HANDOFF_RECEIVED`, `IPAD_ARCHIVED 0.2.2 (4)`, `HUB_IPA_OK ... signer=FA11A63D profile=iOS Team Provisioning Profile: *`, `HUB_IPAD_DRY_RUN would install 0.2.2 (4) over 0.2.1 (4)`, `HUB_EVENT_CHECKED ... installed on SM-S948U + iPad14,5`. Attempt 1's ios-export crashed in Godot's headless import (signal 11 after a threaded font reimport); "Re-run failed jobs" finished it green, which also exercised the recovery path. Tower now retries that import once (642680e).
+- 37923646167 (iOS only) and 37923899195 (Android only): the same markers per lane. 37924102293 (both) lost the S26 between the plan and android jobs (a fresh adb server waited 90 s): fixed in 986751f (the adb server is started outside the job's tracking id, findPhone waits 180 s and nudges `adb connect` from `adb mdns services`).
+- After each: no `v0.2.2` tag, no Release, `main` unchanged, the S26 still on 0.2.1 (3), the iPad on 0.2.1 (4), no event sent.
+
+**Proof, Gruvato and Green In Between (strict dry runs, Android lane; their manifests declare no iPad lane yet, so preflight-ios logs `HUB_PREFLIGHT_IOS skipped`).**
+- Gruvato 37925894185: `HUB_PLAN version=0.2.4 next=0.2.5 android_code=2005`, `HUB_PUSH_REHEARSED v0.2.5`, `APK_SIGNER_OK d09a011f...3a3c`, `HUB_S26_DRY_RUN would install 0.2.5 (2005) over 0.2.3 (2003)`, `HUB_EVENT_CHECKED`.
+- Green In Between 37925894400: `HUB_PLAN version=0.0.19 next=0.0.20 android_code=20`, `HUB_PUSH_REHEARSED v0.0.20`, `APK_SIGNER_OK d9d0253a...222a`, `HUB_S26_DRY_RUN would install 0.0.20 (20) over preview-17 (17)`, `HUB_EVENT_CHECKED`.
+- No `v0.2.5` or `v0.0.20` tag, `main` unchanged in both.
+
+**Runners.** gib's `delonet-gib-r1` now starts through `runsvc-op.sh` (systemd drop-in `op.conf`, token checked present). Gruvato has `big-chungus-gruvato` (systemd, `runsvc-op.sh`, `.env` with `MISE_TRUSTED_CONFIG_PATHS`, `ANDROID_HOME`, `JAVA_HOME`) and `mommymac-gruvato` (LaunchAgent through the keychain `runsvc-op.sh`, SessionCreate removed, token present). Registration tokens went through the environment and ssh stdin, never argv.
+
+**Keystores.** Backed up to DeLoSecrets as documents, each verified byte-identical on download and by keytool against its pin: Tower `mkvok3flnoqtvwdwe4yeyw65yq` (2d4954...1a97), Green In Between spike `zmyhzpejj5hgy4krilvwdqbsha` (d9d0253a...222a), Gruvato `66votsjmeurzmgu3brlk5552zi` (d09a011f...3a3c). gib's prepare hook fetches its keystore from there when the host has none.
+
+**Mac token file.** `~/.config/op/service-account-token` on the Mac was byte-identical to big-chungus's copy and to the DeLoSecrets item "Service Account Auth Token: DeLoSecrets": the token every agent and every big-chungus runner uses. It is deleted from the Mac (nothing read it; the runners read the keychain item). It was not revoked: revoking it would cut off every agent and runner on big-chungus.
+
+**Not done yet.**
+- iPad lanes for Gruvato and Green In Between: their manifests declare Android only, so a deploy covers the S26 until each has an `ios.device` hook (Gruvato: `scripts/ios/build-device.sh` and the Xcode 27 UIKit fix; gib: `ios-build.py --hub-out`, which also drops its Preview 19 BASELINE gate).
+- Tag `v1.0.0` and flip the refs: after both of those lanes are proven, so the tag carries the whole contract.
+- Declined: retiring Gruvato's `emit-deploy-event.py` and `announce-deploy.sh` (they still announce the site, split-service and simulator deploys); a DeLoSecrets item for the spike keystore password (it is Android's public debug value, `android`).
