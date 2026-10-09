@@ -53,6 +53,28 @@ export function parseRemoteTag(output, tag) {
   return object ? { object, commit: commit ?? object } : null;
 }
 
+// The Mac's checkout persists between runs, but actions/checkout leaves HEAD detached and keeps no ref on it, so the
+// next run's `git fetch --depth=1 origin <sha>` has nothing to negotiate with and downloads the app's whole tree again
+// over the Mac's link: Tower 21.7 MB, Gruvato 25.4 MB, Green In Between 144 MB per new commit (measured 2026-10-09,
+// never counted in HUB_MAC_BYTES). A ref on this checkout survives actions/checkout (it deletes only refs/heads/* and
+// conflicting refs/remotes/origin/*), so the next fetch sends only what changed: 16 KB for Tower's next commit.
+export const checkoutRef = 'refs/hub/last';
+
+export function rememberCheckout({ cwd, env = process.env, runner = runBounded, log = console.log } = {}) {
+  const quiet = {};
+  for (const [name, value] of Object.entries(env)) if (!isCredentialVariable(name)) quiet[name] = value;
+  try {
+    const sha = String(runner('git', ['rev-parse', '--verify', 'HEAD^{commit}'], { cwd, env: quiet, timeout: 30_000, label: 'git rev-parse HEAD' })).trim();
+    if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error(`HEAD is "${sha.slice(0, 40)}", not a commit`);
+    runner('git', ['update-ref', checkoutRef, sha], { cwd, env: quiet, timeout: 30_000, label: 'git update-ref' });
+    log(`HUB_CHECKOUT_KEPT ${checkoutRef} ${sha.slice(0, 8)}: the next run's fetch on this host downloads only what changed`);
+    return sha;
+  } catch (error) {
+    log(`::warning::could not keep ${checkoutRef} on this checkout (${String(error.message).split('\n')[0]}); the next run's fetch downloads the whole tree again`);
+    return null;
+  }
+}
+
 export function createGit({ cwd, env = process.env, token } = {}) {
   // The token lives only in the extraheader variables; the git hooks never see GH_TOKEN or the runner's tokens.
   const quiet = {};

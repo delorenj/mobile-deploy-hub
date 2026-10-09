@@ -454,3 +454,68 @@ test('device lines read plainly on a phone: the release first, plain reasons, no
   assert.equal(releaseLabel('0.2.5', '0.2.5'), '0.2.5');
   assert.equal(releaseLabel('0.2.2', 4), '0.2.2 (4)');
 });
+
+// ---------------------------------------------------------------------------------------------------- the Mac's checkout
+
+import { randomBytes } from 'node:crypto';
+import { checkoutRef, rememberCheckout } from './lib/git.mjs';
+
+// actions/checkout leaves the Mac's persistent workspace on a detached HEAD with no ref, so a depth-1 fetch of the next
+// commit has nothing to negotiate with and re-downloads the whole tree (Tower 21.7 MB per run on the hotspot,
+// 2026-10-09). The ios job keeps refs/hub/last on its checkout; the next fetch then sends only what changed.
+test('the ios job keeps a ref on its checkout, so the next depth-1 fetch on the Mac is a delta, not the whole tree', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'hub-checkout-ref-'));
+  try {
+    const git = (cwd, ...args) => execFileSync('git', ['-c', 'protocol.file.allow=always', '-c', 'core.hooksPath=/dev/null', ...args], { cwd, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } }).trim();
+    const origin = join(root, 'origin');
+    await mkdir(origin);
+    git(origin, 'init', '-q', '-b', 'main');
+    // An asset that never changes (incompressible, like the app's art) and a file each commit changes.
+    writeFileSync(join(origin, 'asset.bin'), randomBytes(300_000));
+    writeFileSync(join(origin, 'version.txt'), '0.2.1\n');
+    git(origin, 'add', '.');
+    git(origin, 'commit', '-q', '-m', 'a');
+    const first = git(origin, 'rev-parse', 'HEAD');
+    writeFileSync(join(origin, 'version.txt'), '0.2.2\n');
+    git(origin, 'commit', '-q', '-am', 'b');
+    const second = git(origin, 'rev-parse', 'HEAD');
+    const url = `file://${origin}`;
+    // What actions/checkout does in a persistent workspace: a depth-1 fetch of the sha, then a detached checkout.
+    const workspace = async (name, keep) => {
+      const dir = join(root, name);
+      await mkdir(dir);
+      git(dir, 'init', '-q');
+      git(dir, 'remote', 'add', 'origin', url);
+      git(dir, 'fetch', '-q', '--no-tags', '--depth=1', 'origin', first);
+      git(dir, 'checkout', '-q', '--force', first);
+      const logs = [];
+      if (keep) assert.equal(rememberCheckout({ cwd: dir, log: line => logs.push(line) }), first);
+      const packs = () => readdirSync(join(dir, '.git/objects/pack')).filter(file => file.endsWith('.pack'));
+      const before = new Set(packs());
+      git(dir, '-c', 'fetch.unpackLimit=1', 'fetch', '-q', '--no-tags', '--prune', '--no-recurse-submodules', '--depth=1', 'origin', second);
+      const fresh = packs().filter(file => !before.has(file));
+      assert.equal(fresh.length, 1);
+      return { bytes: lstatSync(join(dir, '.git/objects/pack', fresh[0])).size, logs, dir };
+    };
+    const detached = await workspace('detached', false);
+    const kept = await workspace('kept', true);
+    assert.ok(detached.bytes > 250_000, `without the ref the fetch re-sends the unchanged asset (${detached.bytes} bytes)`);
+    assert.ok(kept.bytes < 20_000, `with the ref the fetch sends only the change (${kept.bytes} bytes)`);
+    assert.match(kept.logs[0], new RegExp(`^HUB_CHECKOUT_KEPT ${checkoutRef} ${first.slice(0, 8)}: `));
+    assert.equal(git(kept.dir, 'rev-parse', checkoutRef), first);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('keeping the checkout ref never fails the ios job, never hands git a credential, and runs before the build', () => {
+  const logs = [];
+  const seen = [];
+  const runner = (command, args, options) => { seen.push(options.env); if (args[0] === 'update-ref') throw new Error('cannot lock ref'); return `${'a'.repeat(40)}\n`; };
+  assert.equal(rememberCheckout({ cwd: '/nowhere', env: { PATH: '/bin', GH_TOKEN: 'x', MC_HOST_builds: 'y' }, runner, log: line => logs.push(line) }), null);
+  assert.match(logs[0], /^::warning::could not keep refs\/hub\/last on this checkout \(cannot lock ref\)/);
+  for (const env of seen) assert.deepEqual(Object.keys(env), ['PATH']);
+  const source = readFileSync(join(repoRoot, 'tools/ci/commands/ios.mjs'), 'utf8');
+  const body = source.slice(source.indexOf('export async function ios('));
+  assert.ok(body.indexOf('rememberCheckout({ cwd: config.cwd') > 0 && body.indexOf('rememberCheckout({ cwd: config.cwd') < body.indexOf('applyBump(config, env)'), 'the ref is kept before the bump and the build');
+});

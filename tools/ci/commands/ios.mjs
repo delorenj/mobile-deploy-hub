@@ -14,6 +14,7 @@ import { hookEnvironment } from '../lib/config.mjs';
 import { createDevicectl, createIpad } from '../lib/devicectl.mjs';
 import { loadDevices } from '../lib/devices.mjs';
 import { hook, runBounded } from '../lib/exec.mjs';
+import { rememberCheckout } from '../lib/git.mjs';
 import { handoffFolder, receiveHandoff, repoFolder, retried, sendHandoffDelta } from '../lib/handoff.mjs';
 import { compareBuild, compareSemver, ipaName } from '../lib/latest.mjs';
 import { withLock } from '../lib/lock.mjs';
@@ -138,6 +139,8 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
     const spec = manifest.ios ?? (() => { throw new Error('the manifest has no ios section'); })();
     const devices = loadDevices(env);
     requirePlan(config);
+    // Before anything can fail: the next run's checkout on this Mac fetches a delta, not the whole tree (lib/git.mjs).
+    rememberCheckout({ cwd: config.cwd, env, log });
     const out = join(config.out, 'ios');
     await mkdir(out, { recursive: true });
     track.receipt = { version: config.version };
