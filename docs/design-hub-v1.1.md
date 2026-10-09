@@ -955,3 +955,23 @@ A review of v1.1.2 found ways around the policy, waits on a lost Mac, wrong devi
 **s3.delo.sh/builds** in a browser now redirects to `builds/index.html` (and `/builds/<app>` to its page); S3 clients are untouched.
 
 **Left for Jarad.** Release it (`mise run release -- 1.1.3`). On the devices: subscribe ntfy-ios on the iPad to `deploys`, set Syncthing on the S26 to Wi-Fi only, then the first real deploy and the L3 button proof. Rotate the shared default password where it still opens something reachable from outside (Piwigo at media.delo.sh first).
+
+## Proof at v1.1.2 (2026-10-09, 21:45 to 22:43Z, devices away)
+
+The three apps call `@v1` = `v1.1.2`. Each dry run went from its repo root on big-chungus with `mise run deploy --dry-handoff true`, with the S26 off adb, the iPad `unavailable` and the Mac metered (gateway 10.0.0.1, tailnet address 68.83.79.146). All three are green, with `HUB_GATE ok ... mac=metered s26=away s3=ok ios_lane=run`, `HUB_S26_PENDING`, `HUB_IPAD_PENDING`, `HUB_IPA_OK`, `HUB_OUTBOX_SKIPPED dry run on a metered link`, `HUB_PUBLISH_DRY_RUN` and `HUB_EVENT_CHECKED ... S26 pending, iPad pending, verified=false (4 links)`.
+
+| App | Run | Plan | Hub Mac bytes | Mac checkout | Mac total |
+|---|---|---|---|---|---|
+| Tower | 37995314752 | 0.2.1 -> 0.2.2 (4) | 36,988 (`HUB_HANDOFF_DELTA`, a 401 MB tree) | 21,334,888 | about 25.7 MB |
+| Green In Between | 37999347543 | 0.0.20 -> 0.0.21 (21) | 0 | 0 (the commit was already on the Mac) | about 4.3 MB |
+| Gruvato | 37996337872 | 0.2.4 -> 0.2.5 (2005) | 0 | 25,355,462 | about 29.7 MB |
+
+Each run also downloads about 4.3 MB of actions to the Mac.
+
+- **The notifications** were rebuilt from each run's receipts with the `v1.1.2` announce code and rendered with the live router's `main.py --render`. Each is a JSON publish to the ntfy root, titled "<app> <version> deployed", priority 5, with Click on the app page. Its buttons are Install APK (the APK's URL), Install on iPad (`itms-services://...ios/manifest.plist`) and Builds (the app page). The fourth link, Run, gives way.
+- **The catch-up** ran in watch mode with each host's real device and the would-be `latest.json` of each run, served in memory. Both passes reported `HUB_CATCHUP_IDLE ... pending; the S26 is away` and `... the iPad is unavailable`. With a simulated present device they reported `HUB_CATCHUP_WATCH ... would install` over the versions the plans last saw. The host mode stayed live.
+- **Afterwards:** no tag, Release, S3 object or Quickdrop file from these runs, and each `main` was unchanged by them.
+- **Another agent's real deploy.** At 22:13Z an opencode agent in Green In Between ran a REAL deploy, 37998023596, which published 0.0.20.
+  - Its Mac checkout fetched 144,209,175 bytes and it sent the 29,946,806-byte IPA over the metered link. The gate had estimated 29.9 MB, the IPA alone.
+  - Its `installCurrent`, which is not forward-only in `v1.1.2`, flipped `current` on both hosts to `releases/v1.1.2`. The macwatch unit then failed with "Cannot find module", so `current` was pointed back at `releases/main-315e7ca` on both hosts.
+  - Every real run at `v1.1.2` does both of these until `v1.1.3` ships.
