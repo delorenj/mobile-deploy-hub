@@ -130,6 +130,19 @@ export function createS3({ policy, credentials, env = process.env, runner = atte
   return api;
 }
 
+// The deploy jobs' writer. They write the real bucket only from a workflow job (or on purpose with HUB_S3_LOCAL=1): a
+// test or a local hub command that forgot its fake must not reach 1Password and MinIO just because this host can.
+// The catch-up reporter (a systemd unit, not a job) builds its own writer with writerCredentials and createS3.
+export function assertJobContext(env = process.env) {
+  if (env.GITHUB_ACTIONS === 'true' || env.HUB_S3_LOCAL === '1') return;
+  throw new Error('the deploy jobs write the build directory only inside a workflow job; set HUB_S3_LOCAL=1 to do it from this shell on purpose');
+}
+
+export async function jobWriter(policy, env = process.env) {
+  assertJobContext(env);
+  return createS3({ policy, credentials: await writerCredentials({ env }), env });
+}
+
 // Anonymous reads over the loopback port (the bucket is public-read). A missing object is null.
 export async function readObject(policy, key, { fetchImpl = fetch, base = policy.delivery.s3.write, timeoutMs = 20_000 } = {}) {
   const url = `${base.replace(/\/+$/, '')}/${policy.delivery.s3.bucket}/${key}`;

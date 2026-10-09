@@ -14,7 +14,7 @@ import { loadManifest } from '../lib/manifest.mjs';
 import { manifestPlist, resizeIcon } from '../lib/ota.mjs';
 import { appPage, indexPage } from '../lib/pages.mjs';
 import { buildReceipt, sha256File, writeReceipt } from '../lib/receipt.mjs';
-import { createS3, publishPages, pruneVersions, readObject, writerCredentials } from '../lib/s3.mjs';
+import { jobWriter, publishPages, pruneVersions, readObject } from '../lib/s3.mjs';
 import { firstLine, guarded, installCurrent, isoNow, parseNeeds, policyBanner, publicCopy, pruneStaging, readReceipts, requirePlan, runOf, stagingDir } from './common.mjs';
 
 function deviceOf(device, delivery, { stamp, failed, reason }) {
@@ -164,7 +164,7 @@ export async function deliver(config, { env = process.env, home = homedir(), fet
       return { published, pointer: merged.pointer, dryRun: true };
     }
 
-    const s3 = s3Factory ? await s3Factory() : createS3({ policy, credentials: await writerCredentials({ env }), env });
+    const s3 = s3Factory ? await s3Factory() : await jobWriter(policy, env);
     let pointer = {};
     await withLock(`s3-${slug}`, async () => {
       const currentText = await readObject(policy, latestKey(slug), { fetchImpl });

@@ -1,6 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -12,9 +11,8 @@ import { findApksigner, parseSigners, signerEnvironment, verifySigner } from './
 import { highestVersionCode, uploadBundle } from './lib/play.mjs';
 import { buildReceipt, hubRef, setOutputs, summaryMarkdown, writeReceipt } from './lib/receipt.mjs';
 import { exportGodot, scriptErrors } from './lib/godot.mjs';
-import { play, releaseArguments } from './hub.mjs';
+import { play } from './hub.mjs';
 
-const hub = fileURLToPath(new URL('./hub.mjs', import.meta.url));
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 const signer = '2d4954863dabb5da86d69ce4b60b3e400e73669b50a80658b0941440a7941a97';
 const other = 'd09a000000000000000000000000000000000000000000000000000000000000';

@@ -16,7 +16,7 @@ import { compareBuild, compareSemver, inflightKey, latestKey, parseLatest } from
 import { withLock } from '../lib/lock.mjs';
 import { loadManifest } from '../lib/manifest.mjs';
 import { buildReceipt, setOutputs, writeReceipt } from '../lib/receipt.mjs';
-import { createS3, readObject, writerCredentials } from '../lib/s3.mjs';
+import { jobWriter, readObject } from '../lib/s3.mjs';
 import { parseVersionInfo } from '../lib/version.mjs';
 import { checkDisk, checkSecrets, firstLine, guarded, isoNow, policyBanner, reachIpad, runOf, short } from './common.mjs';
 
@@ -227,7 +227,7 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
     // A real run is now between plan and deliver: the catch-up leaves this version alone until deliver clears it.
     if (result.committed) {
       try {
-        const s3 = s3Factory ? await s3Factory() : createS3({ policy, credentials: await writerCredentials({ env }), env });
+        const s3 = s3Factory ? await s3Factory() : await jobWriter(policy, env);
         s3.putText(`${JSON.stringify({ version: next.version, run: runOf(env), started_at: isoNow() })}\n`, inflightKey(manifest.project.slug));
         notes.push(`inflight.json names ${next.version}`);
       } catch (error) {

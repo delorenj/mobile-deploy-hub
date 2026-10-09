@@ -4,8 +4,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, lstatSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs';
+import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,12 +14,11 @@ import { parseConfig } from './lib/config.mjs';
 import { loadPolicy, parsePolicy, policyFile } from './lib/policy.mjs';
 import * as hub from './hub.mjs';
 import { sampleLatest } from './test-fixtures.mjs';
-import { gate, plan } from './hub.mjs';
+import { gate } from './hub.mjs';
 
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 const template = readFileSync(templateFile, 'utf8');
 const { policy } = loadPolicy();
-const quiet = () => {};
 
 async function script(path, body) {
   await writeFile(path, `#!/bin/sh\n${body}\n`);
@@ -201,7 +200,7 @@ test('the v2 path is gone: no ios-upload command, no v2 exports, no schema 1 lan
 
 // ---------------------------------------------------------------------------------------------------- the build directory
 
-import { createS3, mcEnvironment, pruneVersions } from './lib/s3.mjs';
+import { createS3, jobWriter, mcEnvironment, pruneVersions } from './lib/s3.mjs';
 import { dropApk } from './lib/quickdrop.mjs';
 import { apkKey, ipaKey, parseLatest } from './lib/latest.mjs';
 import { deliver, mergeLatest } from './hub.mjs';
@@ -560,4 +559,9 @@ test('a Mac that stays unreachable fails the handoff without falling back to sen
     await assert.rejects(sendHandoffDelta({ host: 'hub-mac', base: 'b', cache: 'c', archives: [{ name: 'A-ipad.tgz', tgz }], unpackInto: join(root, 'trees'), env: { GITHUB_REPOSITORY: 'o/r', GITHUB_RUN_ID: '1' }, runner, log: () => {}, retryOptions: { sleep: () => {} } }), /stayed unreachable during the Xcode handoff.*Re-run failed jobs/);
     assert.equal(calls.filter(command => command === 'rsync').length, 4, 'four tries of the tree delta, no tarball fallback');
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('the deploy jobs write the real bucket only inside a workflow job, or on purpose with HUB_S3_LOCAL=1', async () => {
+  await assert.rejects(jobWriter(policy, {}), /only inside a workflow job/);
+  await assert.rejects(gate(...await (async () => { const f = await gateFixture(); return [f.configure(), { ...f.deps(), s3Factory: null, env: { ...f.env, GITHUB_ACTIONS: '' } }]; })()), /HUB_GATE_REFUSED s3: .*only inside a workflow job/);
 });

@@ -15,7 +15,7 @@ import { loadManifest } from '../lib/manifest.mjs';
 import { macEstimate, macLink, runnerAliveOver, tailscaleStatus } from '../lib/metered.mjs';
 import { appFor } from '../lib/policy.mjs';
 import { buildReceipt, setOutputs, writeReceipt } from '../lib/receipt.mjs';
-import { createS3, probe, readObject, writerCredentials } from '../lib/s3.mjs';
+import { jobWriter, probe, readObject } from '../lib/s3.mjs';
 import { guarded, policyBanner, releaseRef } from './common.mjs';
 
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
@@ -85,7 +85,7 @@ export async function gate(config, {
 } = {}) {
   const loaded = policyBanner(log);
   const { policy } = loaded;
-  const makeS3 = s3Factory ?? (async () => createS3({ policy, credentials: await writerCredentials({ env }), env }));
+  const makeS3 = s3Factory ?? (() => jobWriter(policy, env));
   const out = join(config.out, 'gate');
   return guarded('gate', out, config, env, async track => {
     track.stage = 'preflight';
