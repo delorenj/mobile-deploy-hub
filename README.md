@@ -39,7 +39,7 @@ Apps need no edit for a policy change: their callers pin `@v1`. A caller changes
 
 Everything out-of-hub is refused or retired: no app path may bump a version, mint a tag, `gh release create`, upload to TestFlight or install a release build on a device.
 
-*Status (2026-10-09): v1.1 is built ([design and build log](docs/design-hub-v1.1.md)). `v1.1.0` was burned by its own release dry run (Tower 37972648770: preflight-ios refused 1Password references with spaces), and `v1` was removed again. `v1.1.1` is tagged and its release dry runs are running; until they are green, `v1` may be missing and the callers (which pin `@v1`) cannot start a run.*
+*Status (2026-10-09): v1.1 is out. `v1.1.2` (commit `9bee7ff`) is what `v1` points at; its release dry runs are green in all three apps — Tower 37975743662 (the Mac on a metered hotspot: 37 KB handoff delta, 24 KB out), Green In Between 37977334285 and Gruvato 37979031860 (the Mac home on the LAN). `v1.1.0` and `v1.1.1` were burned by their own release dry runs (1Password references with spaces; the Mac dropping off the tailnet mid-handoff). Design and build log: [docs/design-hub-v1.1.md](docs/design-hub-v1.1.md).*
 
 ## What a run does
 
