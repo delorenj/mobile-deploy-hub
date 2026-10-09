@@ -795,3 +795,84 @@ Residual risks:
   - **Keeping ten APKs:** five is enough.
 - From the brief:
   - **An `Attach` header:** ntfy-android cannot open APK attachments (H1).
+
+## Build log: catch-up (CATCHUP, 2026-10-09)
+
+**Landed** in `tools/catchup/`:
+- `catchup.mjs`: `android` (the S26 pass, E2), `ios` (the iPad pass, E3), `record` (E4), `retry <slug> <platform>`, and `mode [watch|live]`.
+- `report.mjs`: the G3 event, sent through the hub's `bbEmit` with `producer: mobile-deploy-hub-catchup`.
+- `store.mjs`: anonymous reads of the pointers, and downloads kept only when their size and sha256 match `latest.json`. On the Mac every read carries `If-None-Match`, so a pass with nothing new costs headers only.
+- `units/`: `mobile-deploy-hub-catchup.service` and `.timer` (big-chungus), `sh.delo.mobile-deploy-hub.catchup.plist` (the Mac), and `install.sh`, which installs the code and the unit on the host it runs on.
+- `catchup.test.mjs`: 26 tests. They cover K's catch-up list:
+  - pending only, and the inflight version skipped;
+  - idle with no event when the S26 or the iPad is away;
+  - AHEAD, CONFIRMED, INSTALLED and the equal-code reinstall;
+  - the sha256 and signer checks before an install;
+  - one event per status change, and none for a device the deploy installed;
+  - the third failure's `.failed`, then silence, then `retry`;
+  - `record` leaving a newer pointer alone;
+  - the `adb` and `s3-<slug>` locks shared with the deploy jobs.
+
+  They also cover:
+  - watch mode;
+  - a dead bus (the event is sent once on the next pass);
+  - `policy.event.catch_up: false`;
+  - the event naming the block's own run;
+  - the iPad branches: the outbox, the metered wait, the download at home and foreign outbox bytes;
+  - the `record` arguments over ssh;
+  - the hub writer's credential handling;
+  - `record` through the hub's `createS3` and `publishPages` (with a fake `mc`);
+  - the units, and the CLI through the `current` symlink;
+  - `bb-emit --check` on the three event shapes.
+
+  They pass on node 24 and on the system node 20.
+
+**The contract as built.**
+- `latest.json` goes through `tools/ci/lib/latest.mjs`: `validateLatest`, `updateDevice`, `compareRelease` and the key helpers. A file that fails it is refused and logged (`HUB_CATCHUP_ERROR`), never acted on. The download URL is built from the block's `key`, never taken from `url`.
+- The policy comes from `loadPolicy` (`tools/ci/policy.json` at the code that runs); `event.catch_up: false` turns the catch-up events off.
+- Writes go through `s3.mjs` (`writerCredentials`, `createS3`). The keys come from the DeLoSecrets item by UUID, read with the runners' service account (`~/.config/op/service-account-token`), and reach only the `mc` child's `MC_HOST_builds`.
+- After each change `record` calls the hub's `publishPages` with the same writer, as `deliver` does, so the app page and the index show the new device state.
+- The event names the `run`, `correlation` and `commit` of the block it reports. A deploy that skipped a platform kept that platform's older block, so the block's run can be older than the top level's. `run.hub_ref` is set only when the block came from the newest run.
+- Only `device` fields change. `event_pending: true` marks an event the bus refused. The next S26 pass sends it and clears the mark; this includes iPad events, because only big-chungus has the bus.
+- A failed attempt leaves the device `pending`, adds one to `failures` and sets the reason to "catch-up attempt N of 3 failed at <stage>: ...". The third failure records `failed` and sends one `.failed` (`HUB_CATCHUP_FAILED`). `retry` sets `pending` with 0 failures.
+- The iPad counts as away when devicectl lists it with `tunnelState: unavailable`. That is what it reports today.
+
+**Modes.** A host without `~/.config/mobile-deploy-hub/catchup.json` is in watch mode. A pass then reads `latest.json`, finds the device and its installed version, and logs `HUB_CATCHUP_WATCH <slug> <platform> <release>: would ...`. It downloads, installs, writes and sends nothing. `install.sh` writes `watch` only when the file is missing and never writes `live`. `record` and `retry` are explicit commands, so they ignore the mode. The Deploy phase makes both hosts live:
+```
+node ~/.local/share/mobile-deploy-hub/current/tools/catchup/catchup.mjs mode live                                   # big-chungus
+ssh hub-mac '~/.local/share/mise/installs/node/24/bin/node ~/.local/share/mobile-deploy-hub/current/tools/catchup/catchup.mjs mode live'
+```
+
+**Hosts.**
+- **big-chungus:**
+  - The code is at `~/.local/share/mobile-deploy-hub/current -> releases/bootstrap-20261009T1740`, the working tree's `tools/` until a real run's `deliver` replaces it.
+  - The timer is enabled and the mode is watch. Every 2 minutes the pass logs `HUB_CATCHUP_IDLE android watch: nothing pending (tower-of-dumb-things unpublished, green-in-between unpublished, gruvato unpublished)`.
+  - A proof against the real adb server, with a fixture `latest.json` that has Tower 0.2.2 (4) pending, logged `HUB_LOCK adb`, searched 20 s by serial, then `HUB_CATCHUP_IDLE android watch: tower-of-dumb-things 0.2.2 (4) pending; the S26 is away`. It wrote nothing and sent no event.
+- **The Mac:** not installed yet. It left the tailnet at 17:40Z, before the copy; at 17:20Z it was reachable on a hotspot (gateway 172.30.235.16, so metered). The iPad shows `tunnelState: unavailable`. Once it is back:
+  ```
+  rsync -az tools/ hub-mac:.local/share/mobile-deploy-hub/releases/<ref>/tools/
+  ssh hub-mac bash .local/share/mobile-deploy-hub/releases/<ref>/tools/catchup/units/install.sh <ref>
+  ssh hub-mac launchctl print gui/502/sh.delo.mobile-deploy-hub.catchup
+  ```
+  The pass logs to `~/Library/Logs/mobile-deploy-hub/catchup.log`.
+
+**For HUB.**
+- `mise run hosts:install`:
+  - on big-chungus, runs `tools/catchup/units/install.sh <ref>`;
+  - on the Mac, runs `rsync -az tools/ hub-mac:.local/share/mobile-deploy-hub/releases/<ref>/tools/` (about 600 KB, sent once), then `ssh hub-mac bash .local/share/mobile-deploy-hub/releases/<ref>/tools/catchup/units/install.sh <ref>`.
+- The code refresh in `deliver` and the `ios` job copies `tools/` to `releases/<hub_ref>` and points `current` at it. The mode file lives outside that folder, so it survives.
+
+**Differences from the text above.**
+- `ExecStart` runs mise's node 24 by absolute path, because a bare `node` in a systemd unit is the system node 20. The code also runs on node 20. The Mac reaches `record` through ssh, whose PATH has only the system node, so the remote command prefers node 24 when it exists.
+- The timer is `OnCalendar=*:0/2`, so `Persistent=true` has an effect; it does nothing on a monotonic timer.
+- `KillMode=process` keeps alive an adb server that the pass started, for the deploys and the next pass.
+- `record` takes more than E3's `--slug --platform --version --build --by`: also `--status installed|skipped|failure`, `--reason`, `--stage`, `--sha256`, `--commit`, `--run-id` and `--run-attempt`. Each value must match a pattern and is single-quoted on the ssh line. The reason travels as plain words.
+- A local journal (`~/.local/state/mobile-deploy-hub/catchup-journal.json`) remembers what this host installed. An install whose report was lost is then recorded as `catch-up`, not `manual`.
+- An `inflight.json` older than 6 hours (by `started_at`, else its Last-Modified) no longer holds a build back.
+- The iPad pass downloads an IPA only off a metered link, and only into its own cache, never into the deploy's outbox.
+- Extra markers:
+  - `HUB_CATCHUP_WATCH`;
+  - `HUB_CATCHUP_PENDING` (an attempt failed; still pending);
+  - `HUB_CATCHUP_FETCHED`;
+  - `HUB_CATCHUP_PAGES` (the pages were re-rendered, or why not);
+  - `HUB_CATCHUP_ERROR`.

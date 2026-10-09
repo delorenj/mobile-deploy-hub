@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The iPad catch-up pass (mobile-deploy-hub, docs/design-hub-v1.1.md E1 and E3), every 5 minutes (policy
+  catch_up.ios_every_s). units/install.sh fills in @HOME@ and bootstraps it into gui/<uid>: devicectl and the
+  keychain work only in the logged-in GUI session, never over plain ssh. The pass installs nothing until the Mac's
+  mode is live: `catchup.mjs mode live`.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>sh.delo.mobile-deploy-hub.catchup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@HOME@/.local/share/mise/installs/node/24/bin/node</string>
+    <string>@HOME@/.local/share/mobile-deploy-hub/current/tools/catchup/catchup.mjs</string>
+    <string>ios</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>@HOME@</string>
+    <key>PATH</key>
+    <string>@HOME@/.local/share/mise/installs/node/24/bin:@HOME@/.local/share/mise/shims:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>WorkingDirectory</key>
+  <string>@HOME@</string>
+  <key>StandardOutPath</key>
+  <string>@HOME@/Library/Logs/mobile-deploy-hub/catchup.log</string>
+  <key>StandardErrorPath</key>
+  <string>@HOME@/Library/Logs/mobile-deploy-hub/catchup.log</string>
+</dict>
+</plist>

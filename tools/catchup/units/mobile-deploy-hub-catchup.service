@@ -1,0 +1,18 @@
+# The S26 catch-up pass (mobile-deploy-hub, docs/design-hub-v1.1.md E1 and E2). units/install.sh copies this into
+# ~/.config/systemd/user/ on big-chungus; mobile-deploy-hub-catchup.timer starts it every 2 minutes. The pass
+# installs nothing until the host's mode is live: `catchup.mjs mode live` (see the build log in the design doc).
+[Unit]
+Description=Mobile Deploy Hub catch-up: install pending builds on the S26
+Documentation=https://github.com/delorenj/mobile-deploy-hub/blob/main/docs/design-hub-v1.1.md
+
+[Service]
+Type=oneshot
+Environment=HOME=%h
+Environment=PATH=%h/.local/share/mise/installs/node/24/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# The hub runs on node 24 (mise); a bare `node` here would be the system node.
+ExecStart=%h/.local/share/mise/installs/node/24/bin/node %h/.local/share/mobile-deploy-hub/current/tools/catchup/catchup.mjs android
+# An adb server the pass starts must outlive it, as a person's adb would: the deploy jobs and the next pass reuse it,
+# and the phone's wireless connection with it.
+KillMode=process
+TimeoutStartSec=50min
+Nice=10

@@ -1,0 +1,13 @@
+# Starts the S26 catch-up pass every 2 minutes (policy catch_up.android_every_s). Persistent: a pass missed while
+# big-chungus was down runs once at boot. A pass still running when the next one is due is not started twice.
+[Unit]
+Description=Mobile Deploy Hub catch-up every 2 minutes (the S26)
+
+[Timer]
+OnCalendar=*:0/2
+Persistent=true
+AccuracySec=15s
+Unit=mobile-deploy-hub-catchup.service
+
+[Install]
+WantedBy=timers.target
