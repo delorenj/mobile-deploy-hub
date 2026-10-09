@@ -66,20 +66,26 @@ export async function treeDigest(dir) {
 }
 
 const sshOptions = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=30', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4'];
+const sshCommand = `ssh ${sshOptions.join(' ')}`;
 
-// A Mac on a hotspot behind a DERP relay sometimes drops the first ssh banner exchange while tailscale finds a path:
-// a connection step is tried three times before it counts as a failure.
-export function retried(fn, { attempts = 3, log = () => {}, label = 'ssh' } = {}) {
+// A Mac on a hotspot behind a DERP relay drops off for a minute or two at a time (the v1.1.1 release dry run lost it
+// for about 90 s mid-handoff). A connection step is retried with growing waits before it counts as a failure; only a
+// connection error is retried, anything else fails at once.
+export const connectionError = error => /exit 255|connection unexpectedly closed|Connection closed|timed out|banner exchange|Connection refused|No route to host|Network is unreachable|Could not resolve/i.test(String(error?.message ?? error));
+const pause = ms => { if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+export function retried(fn, { attempts = 4, delaysMs = [15_000, 45_000, 90_000], log = () => {}, label = 'ssh', sleep = pause, retry = connectionError } = {}) {
   let last;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try { return fn(); } catch (error) {
       last = error;
-      if (attempt < attempts) log(`HUB_MAC_RETRY ${label} (${attempt}/${attempts}): ${error.message.split('\n')[0].slice(0, 160)}`);
+      if (attempt >= attempts || !retry(error)) break;
+      const wait = delaysMs[Math.min(attempt - 1, delaysMs.length - 1)] ?? 0;
+      log(`HUB_MAC_RETRY ${label} (${attempt}/${attempts}) in ${Math.round(wait / 1000)}s: ${error.message.split('\n')[0].slice(0, 160)}`);
+      sleep(wait);
     }
   }
   throw last;
 }
-const sshCommand = `ssh ${sshOptions.join(' ')}`;
 
 function check({ host, base, cache }) {
   if (!safe.test(host)) throw new Error(`bad Mac host "${host}"`);
@@ -92,7 +98,7 @@ function rsync(args, { env, runner, timeout = 30 * 60_000, label }) {
 }
 
 // Linux side. archives: [{ name, tgz }] (the export's tarballs); receipts: small JSON files sent alongside.
-export async function sendHandoffDelta({ host, base, cache, archives, receipts = [], unpackInto, env = process.env, runner = runBounded, log = console.log }) {
+export async function sendHandoffDelta({ host, base, cache, archives, receipts = [], unpackInto, env = process.env, runner = runBounded, log = console.log, retryOptions = {} }) {
   check({ host, base, cache });
   for (const file of [...archives.map(item => item.tgz), ...receipts]) if (!safe.test(basename(file))) throw new Error(`bad handoff file name ${basename(file)}`);
   const folder = handoffFolder(env);
@@ -103,7 +109,7 @@ export async function sendHandoffDelta({ host, base, cache, archives, receipts =
   const add = stats => { total.in += stats.sent ?? 0; total.out += stats.received ?? 0; };
   try {
     // Every value here is validated (host, fixed bases, owner/repo/run id), so the remote shell sees no input.
-    retried(() => runner('ssh', [...sshOptions, host, `find '${base}' -mindepth 2 -maxdepth 2 -type d -mtime +3 -exec rm -rf {} + 2>/dev/null; mkdir -p '${remoteRun}' '${remoteCache}'`], { env, timeout: 90_000, label: `ssh ${host}` }), { log, label: `ssh ${host}` });
+    retried(() => runner('ssh', [...sshOptions, host, `find '${base}' -mindepth 2 -maxdepth 2 -type d -mtime +3 -exec rm -rf {} + 2>/dev/null; mkdir -p '${remoteRun}' '${remoteCache}'`], { env, timeout: 90_000, label: `ssh ${host}` }), { log, label: `ssh ${host}`, ...retryOptions });
   } catch (error) {
     throw new Error(`could not reach ${host} for the Xcode handoff (ssh as the runner user, BatchMode): ${error.message.split('\n')[0]}`);
   }
@@ -122,8 +128,10 @@ export async function sendHandoffDelta({ host, base, cache, archives, receipts =
     };
     let mode = 'tree';
     try {
-      retried(() => attempt(null), { attempts: 2, log, label: `rsync ${stem}` });
+      retried(() => attempt(null), { log, label: `rsync ${stem}`, ...retryOptions });
     } catch (first) {
+      // A Mac that stays unreachable is not a reason to send more bytes: only a delta the Mac's rsync cannot take is.
+      if (connectionError(first)) throw new Error(`the Mac (${host}) stayed unreachable during the Xcode handoff: ${first.message.split('\n')[0]}; Re-run failed jobs when it is back`);
       log(`HUB_HANDOFF_FALLBACK ${stem}: the tree delta failed (${first.message.split('\n')[0].slice(0, 160)})`);
       if (homebrew === null) {
         try { homebrew = /yes/.test(runner('ssh', [...sshOptions, host, 'test -x /opt/homebrew/bin/rsync && echo yes || echo no'], { env, timeout: 60_000, label: `ssh ${host}` })); } catch { homebrew = false; }
@@ -134,15 +142,15 @@ export async function sendHandoffDelta({ host, base, cache, archives, receipts =
         mode = 'tree';
       } catch {
         // The tarball against the previous one: the app writes it sorted, mtime-pinned and gzip --rsyncable.
-        add(rsync(['-t', '-z', tgz, `${host}:${remoteCache}/${name}`], { env, runner, label: `rsync ${name} to ${host}` }));
-        runner('ssh', [...sshOptions, host, `rm -f '${remoteRun}/${name}' && (cp -c '${remoteCache}/${name}' '${remoteRun}/${name}' 2>/dev/null || cp '${remoteCache}/${name}' '${remoteRun}/${name}')`], { env, timeout: 10 * 60_000, label: `ssh ${host} clone ${name}` });
+        retried(() => add(rsync(['-t', '-z', tgz, `${host}:${remoteCache}/${name}`], { env, runner, label: `rsync ${name} to ${host}` })), { log, label: `rsync ${name}`, ...retryOptions });
+        retried(() => runner('ssh', [...sshOptions, host, `rm -f '${remoteRun}/${name}' && (cp -c '${remoteCache}/${name}' '${remoteRun}/${name}' 2>/dev/null || cp '${remoteCache}/${name}' '${remoteRun}/${name}')`], { env, timeout: 10 * 60_000, label: `ssh ${host} clone ${name}` }), { log, label: `ssh ${host}`, ...retryOptions });
         mode = 'tgz';
       }
     }
     results.push({ name, mode, tree_sha256: digest.sha256, files: digest.files, bytes: digest.bytes });
     rmSync(tree, { recursive: true, force: true });
   }
-  if (receipts.length > 0) add(retried(() => rsync(['-t', ...receipts, `${host}:${remoteRun}/`], { env, runner, label: `rsync receipts to ${host}` }), { log, label: 'rsync receipts' }));
+  if (receipts.length > 0) add(retried(() => rsync(['-t', ...receipts, `${host}:${remoteRun}/`], { env, runner, label: `rsync receipts to ${host}` }), { log, label: 'rsync receipts', ...retryOptions }));
   log(`HUB_MAC_BYTES in=${total.in} out=${total.out} (Xcode handoff to ${host})`);
   log(`HUB_HANDOFF_DELTA bytes=${total.in + total.out} ${results.map(item => `${item.name}=${item.mode}`).join(' ')} -> ${host}:${remoteRun}`);
   return { host, folder: remoteRun, archives: results, receipts: receipts.map(file => basename(file)), mac_bytes: total };

@@ -103,7 +103,7 @@ export function keepInOutbox({ ipa, home, devices, slug, version, build, keep = 
 function sendIpa({ ipa, name, devices, env, runner, log }) {
   const folder = `${devices.linux.staging_dir}/${repoFolder(env)}/${handoffFolder(env).split('/')[1]}/ios`;
   retried(() => runner('ssh', [...sshOptions, devices.linux.host, `mkdir -p '${folder}'`], { env, timeout: 90_000, label: `ssh ${devices.linux.host}` }), { log, label: `ssh ${devices.linux.host}` });
-  const out = retried(() => runner('rsync', ['--stats', '-t', '-e', `ssh ${sshOptions.join(' ')}`, ipa, `${devices.linux.host}:${folder}/${name}`], { env, timeout: 30 * 60_000, label: `rsync IPA to ${devices.linux.host}` }), { attempts: 2, log, label: 'rsync IPA' });
+  const out = retried(() => runner('rsync', ['--stats', '-t', '-e', `ssh ${sshOptions.join(' ')}`, ipa, `${devices.linux.host}:${folder}/${name}`], { env, timeout: 30 * 60_000, label: `rsync IPA to ${devices.linux.host}` }), { log, label: 'rsync IPA' });
   const stats = parseRsyncStats(out);
   return { out: stats.sent ?? statSync(ipa).size, in: stats.received ?? 0 };
 }

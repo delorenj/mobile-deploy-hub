@@ -531,8 +531,33 @@ test('the Xcode handoff is a tree delta into the Mac cache, cloned per run, chec
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test('a connection step to the Mac is retried before it counts as a failure', () => {
+test('a connection step to the Mac is retried with growing waits; other errors fail at once', () => {
   let tries = 0;
-  assert.equal(retried(() => { tries += 1; if (tries < 3) throw new Error('Connection timed out during banner exchange'); return 'ok'; }), 'ok');
-  assert.throws(() => retried(() => { throw new Error('down'); }, { attempts: 2 }), /down/);
+  const waits = [];
+  const sleep = ms => waits.push(ms);
+  assert.equal(retried(() => { tries += 1; if (tries < 3) throw new Error('Connection timed out during banner exchange'); return 'ok'; }, { sleep }), 'ok');
+  assert.deepEqual(waits, [15_000, 45_000]);
+  let other = 0;
+  assert.throws(() => retried(() => { other += 1; throw new Error('rsync: protocol mismatch'); }, { sleep }), /protocol mismatch/);
+  assert.equal(other, 1, 'not a connection error: no retry');
+  assert.throws(() => retried(() => { throw new Error('rsync to hub-mac failed (exit 255)'); }, { attempts: 2, sleep }), /exit 255/);
+});
+
+test('a Mac that stays unreachable fails the handoff without falling back to sending the tarball', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'hub-handoff-down-'));
+  try {
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(join(root, 'src/a'), 'a');
+    const tgz = join(root, 'A-ipad.tgz');
+    execFileSync('tar', ['-C', join(root, 'src'), '-czf', tgz, '.']);
+    const calls = [];
+    const runner = (command, args) => {
+      calls.push(command);
+      if (command === 'tar') { execFileSync('tar', args); return ''; }
+      if (command === 'rsync') throw new Error('rsync A-ipad to hub-mac failed (exit 255)\nConnection closed by UNKNOWN port 65535');
+      return '';
+    };
+    await assert.rejects(sendHandoffDelta({ host: 'hub-mac', base: 'b', cache: 'c', archives: [{ name: 'A-ipad.tgz', tgz }], unpackInto: join(root, 'trees'), env: { GITHUB_REPOSITORY: 'o/r', GITHUB_RUN_ID: '1' }, runner, log: () => {}, retryOptions: { sleep: () => {} } }), /stayed unreachable during the Xcode handoff.*Re-run failed jobs/);
+    assert.equal(calls.filter(command => command === 'rsync').length, 4, 'four tries of the tree delta, no tarball fallback');
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
