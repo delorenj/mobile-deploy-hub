@@ -1,6 +1,6 @@
 # Mobile Deploy Hub v1.1.0: one policy, deploy from anywhere, links in the push
 
-Status: design, 2026-10-09. Nothing here is built yet. It answers Jarad's four asks:
+Status: built 2026-10-09 (HUB, NOTIFY and CATCHUP build logs at the end); released as `v1.1.x` through `mise run release`, callers pin `@v1`. It answers Jarad's four asks:
 1. one deploy rule for every mobile deployer (patch bump, one Bloodbank event, and the rest);
 2. deploy while away, and still get every device updated, through S3, Quickdrop or a later automatic install;
 3. deploy Tower, then Green In Between, then Gruvato;
@@ -875,3 +875,38 @@ ssh hub-mac '~/.local/share/mise/installs/node/24/bin/node ~/.local/share/mobile
   - `HUB_CATCHUP_FETCHED`;
   - `HUB_CATCHUP_PAGES` (the pages were re-rendered, or why not);
   - `HUB_CATCHUP_ERROR`.
+
+## Build log: hub (HUB, 2026-10-09)
+
+**Landed** (hub, in order): `7bd6e80` `lib/latest.mjs` and the `tools/**/*.test.mjs` check glob; `d25b37d` the core (policy, gate, pending devices, staging, delta handoff, deliver, statuses and links); `16139a2` the v1.1 tests; `ec00b6c` `mise run release`, `deploy`, `deploy:train`, `conformance`, `hosts:install`; `ee0c6ad` ssh retries to a relayed Mac; `ab9b9b1` 1Password references with spaces; `53addac` patient retries when the Mac drops off mid-handoff. Bloodbank `e1981a2`: the additive schema edits (G). Apps: Tower `8b1fb29`, Green In Between `de53c71`, Gruvato `bea0fda` (callers from the template at `@v1`, `--metered`, `project.icon`; Tower's rsyncable export tarball; Gruvato's `build`, `tauri-build` and `ios:simulator` no longer bump or tag, `bump-build-version.sh` and the hand bump tasks are gone). DeLoContainers `642f17e`: MinIO publishes `127.0.0.1:9012`.
+
+**Code layout.** `tools/ci/hub.mjs` is the CLI; each command lives in `tools/ci/commands/` (`gate`, `plan` with `preflight-ios`, `android` with `play` and `release`, `ios` with `ios-export`, `deliver`, `announce`, and `common`). The libraries the design names are in `tools/ci/lib/`: `policy`, `caller`, `latest`, `s3` (also `publishPages`, `pruneVersions`, `historyOf`, used by the catch-up reporter), `quickdrop`, `ota`, `pages`, `metered`; `handoff`, `announce`, `config`, `manifest`, `devices`, `receipt` changed. The frozen exports for the catch-up (E) are unchanged; `bbEmit` gained an optional `producer` (`mobile-deploy-hub-catchup`).
+
+**Hosts (done 2026-10-09).**
+- MinIO: bucket `builds`, `mc anonymous set download`; user `mobile-deploy-hub` with policy `mobile-deploy-hub-builds` (`s3:ListBucket` on `builds`, `s3:PutObject`, `GetObject`, `DeleteObject` on `builds/*`); keys in DeLoSecrets item `dfch6zwvscl3ootrcbkwbfelka` ("MinIO builds writer (mobile-deploy-hub)", fields `username` and `credential`), created through stdin only. A write as that user to another bucket is refused.
+- `mc --attr` splits on `;`: Content-Type values are double-quoted (`Content-Type="text/html; charset=utf-8"`), which MinIO stores exactly.
+- `hub-mac` in big-chungus's `~/.ssh/config` (`ProxyCommand tailscale nc carries-macbook-air %p`, `HostKeyAlias` the ts.net name). The first banner exchange over a DERP relay sometimes times out, so every connection step to the Mac retries (`HUB_MAC_RETRY`).
+- The Mac's `~/quickdrop/.stignore` holds `/builds`. The handoff cache is seeded from run 37931518291's tarball: `handoff-cache/delorenj-pile-of-dumb-things/TowerOfDumbThings-ipad/` (383 MB), 0 bytes over the link.
+- `mise run hosts:install` rendered the empty index (`curl -I https://s3.delo.sh/builds/index.html` from big-chungus and from the Mac: 200, `text/html; charset=utf-8`, `no-cache`) and installed CATCHUP's units on both hosts (the Mac: 183,577 bytes sent; `launchctl` shows the agent active, interval 300 s; the big-chungus timer fires every 2 minutes).
+
+**Proofs before the release.**
+- The real gate against live hosts from Tower's checkout: `HUB_MAC_LINK metered ... (relayed through DERP nyc)`, `HUB_MAC_BUDGET estimate 157286400 bytes (no history: the whole budget) within 150 MiB`, `HUB_GATE ok policy=7a14e2c4 mac=metered s26=away s3=ok ios_lane=run`; the probe object was gone afterwards.
+- The delta handoff to the Mac on the hotspot: a 200 KB tree, then a one-file change for 421 bytes; the per-run APFS clone; `treeDigest` equal on both hosts. openrsync (protocol 29) takes GNU rsync's delta and `--checksum`, so Homebrew's rsync is not needed today.
+- `bb-emit --check` on the plan's sample event (one device pending, one installed, links) and on the five event shapes in `v3.test.mjs`.
+
+**Differences from the text above.**
+- `latest.json` blocks carry their own `run`, `correlation` and `commit`: a deploy that skipped a platform keeps that platform's older block. A platform not built keeps its block unchanged (or `null`); the run's own `skipped` statuses are in the event and in the version folder's `receipt.json`.
+- A rerun of the same release replaces a block when its `run.id` matches even if the bytes differ (Godot exports are not reproducible), and keeps a device state the rerun did not observe (a catch-up install).
+- `--platform android` lists the iPad as `skipped` with reason `--platform android`; `verified` leaves such a device out.
+- The handoff: Linux rsyncs the unpacked tree into the cache, clones it on the Mac into the run's folder inside the same job (one ios-export per repo at a time, so a later run cannot change it), and the Mac's `ios` job checks `tree_sha256` and packs the tarball the app's hook expects. Fallbacks: Homebrew's rsync, then the tarball against the previous one (`HUB_HANDOFF_FALLBACK`).
+- A dry run stages the APK too, so `deliver` re-checks it (sha256, signer, identity) and renders `latest.json`, `manifest.plist` and the pages before it removes the staging; it asks for no keys and writes nothing.
+- `deliver` uploads the bytes of a block only when its pointer moves; `manifest.plist` is removed when the newest iPad build has no over-the-air copy, so OTA can never offer an older IPA.
+- `publishPages` leaves another app's unreadable `latest.json` off the index instead of failing this app's deliver.
+- The gate also refuses non-default v2 inputs (`android_channel`, `build`) and a `latest.json` it cannot parse, and outputs `skip-platform` for `--platform android`.
+- `mise run release` removes `v1` when the release that created it is red (there was no previous target).
+- Conformance skips the scaffold's `.mise/scripts/` and test files when it follows a task's scripts; documented exceptions: Tower's `testflight.yml` and `mise run testflight` (until the first hub `--testflight`), Gruvato's `ios:simulator` simulator event.
+
+**The release dry runs (L4, L5), with the devices away and the Mac on hotspots and borrowed Wi-Fi.**
+- `v1.1.0` (37972648770, Tower): the gate passed in the real workflow (`HUB_GATE ok policy=7a14e2c4 mac=metered s26=away s3=ok ios_lane=run`, which also proves `GITHUB_WORKFLOW_REF` names the caller inside a reusable workflow); `preflight-ios` then refused Tower's 1Password references because they hold spaces. `v1` was removed again (it was new) and the tag annotation says RED. The `.failed` event passed `bb-emit --check`.
+- `v1.1.1` (37973357683, Tower): gate, `preflight-ios` (`HUB_IPAD_PENDING the iPad is listed but unavailable`, `HUB_PREFLIGHT_IOS ok iPad=unreachable`), plan (`HUB_S26_PENDING` after 180 s, `HUB_PUSH_REHEARSED v0.2.2`, `HUB_PLAN version=0.2.1 next=0.2.2 ... s26=away ios_lane=run`), android (`APK_SIGNER_OK 2d4954...1a97`, `HUB_STAGED tower-of-dumb-things-0.2.2-4.apk 74660647 bytes`, `HUB_S26_PENDING`) and the dry-run deliver (`HUB_PUBLISH_DRY_RUN would publish ... nothing was written`) were green. The Mac left the tailnet for about 90 s in the middle of the Xcode handoff, and the quick retries and the tarball fallback all failed (exit 255): fixed in `53addac`. The Mac's link changed networks four times in the afternoon (Verizon 174.230.182.34, Comcast 76.98.73.87, 50.174.114.26, DERP relays), and once its runner showed offline on GitHub for 3 minutes while `preflight-ios` sat queued.
+- RELEASE_RESULTS
