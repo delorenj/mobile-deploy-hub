@@ -28,11 +28,11 @@ const hubRoot = fileURLToPath(new URL('../../', import.meta.url));
 const devices = loadDevices({});
 const signer = '2d4954863dabb5da86d69ce4b60b3e400e73669b50a80658b0941440a7941a97';
 const sha = text => createHash('sha256').update(text).digest('hex');
-const slug = 'tower-of-dumb-things';
+const slug = 'tower-of-lost-things';
 const pkg = 'io.automaticai.towerofdumbthings';
 const commit = '1a2b3c4d'.repeat(5);
 const runId = '37940000000';
-const repo = 'delorenj/pile-of-dumb-things';
+const repo = 'delorenj/tower-of-lost-things';
 const now = () => new Date('2026-10-10T12:00:00Z');
 const policy = loadPolicy().policy;
 const runOf = id => ({ repo, id, attempt: 1, url: `https://github.com/${repo}/actions/runs/${id}` });
@@ -221,7 +221,7 @@ test('latest.json is held to the contract before anything acts on it', () => {
   };
   for (const [name, latest] of Object.entries(bad)) assert.notDeepEqual(latestProblems(latest, slug, 'https://s3.delo.sh/builds'), [], name);
   const settings = loadSettings();
-  assert.deepEqual(settings.apps.map(app => app.slug), ['tower-of-dumb-things', 'green-in-between', 'gruvato']);
+  assert.deepEqual(settings.apps.map(app => app.slug), ['tower-of-lost-things', 'green-in-between', 'gruvato']);
   assert.deepEqual([settings.loopbackRoot, settings.publicRoot, settings.maxFailures, settings.lanCidr], ['http://127.0.0.1:9012/builds', 'https://s3.delo.sh/builds', 3, '192.168.1.0/24']);
   assert.match(settings.digest, /^[0-9a-f]{8}$/, 'read from tools/ci/policy.json through the hub\'s strict parser');
 });
@@ -236,13 +236,13 @@ test('only pending builds are acted on; a build the deploy installed is never to
     await androidPass(host.ctx);
     assert.equal(host.phone.calls(), '', 'no adb call at all');
     assert.deepEqual([host.events.length, host.s3.writer.writes.length], [0, 0], 'no event, no write for a device the run installed');
-    assert.match(host.lines(/HUB_CATCHUP_IDLE android live/)[0], /tower-of-dumb-things 0\.2\.2 \(4\) installed, green-in-between unpublished, gruvato unpublished/);
+    assert.match(host.lines(/HUB_CATCHUP_IDLE android live/)[0], /tower-of-lost-things 0\.2\.2 \(4\) installed, green-in-between unpublished, gruvato unpublished/);
 
     publish(host.s3, { latest: latestDoc(), apk: apkText() });
     host.s3.put(`${slug}/inflight.json`, { version: '0.2.2', run: runId, started_at: '2026-10-10T11:50:00Z' });
     await androidPass(host.ctx);
     assert.equal(host.phone.calls(), '', 'a deploy is publishing this version: hands off');
-    assert.equal(host.lines(/HUB_CATCHUP_IDLE tower-of-dumb-things android 0\.2\.2 \(4\): deploy run 37940000000 is publishing 0\.2\.2/).length, 1);
+    assert.equal(host.lines(/HUB_CATCHUP_IDLE tower-of-lost-things android 0\.2\.2 \(4\): deploy run 37940000000 is publishing 0\.2\.2/).length, 1);
 
     // A newer deploy in flight holds the older pending build too: it would be replaced minutes later (v1.1.3).
     host.s3.put(`${slug}/inflight.json`, { version: '0.2.3', run: '37950000000', started_at: '2026-10-10T11:50:00Z', platforms: ['android', 'ios'] });
@@ -265,7 +265,7 @@ test('an absent S26 is idle: no event, no write, no failure counted', async () =
     await androidPass(host.ctx);
     assert.doesNotMatch(host.phone.calls(), /install/);
     assert.deepEqual([host.events.length, host.s3.writer.writes.length], [0, 0]);
-    assert.match(host.lines(/HUB_CATCHUP_IDLE/)[0], /tower-of-dumb-things 0\.2\.2 \(4\) pending; the S26 is away/);
+    assert.match(host.lines(/HUB_CATCHUP_IDLE/)[0], /tower-of-lost-things 0\.2\.2 \(4\) pending; the S26 is away/);
     assert.equal(host.s3.requests.filter(request => request.key.endsWith('.apk')).length, 0, 'nothing downloaded for an absent phone');
   } finally { host.cleanup(); }
 });
@@ -277,9 +277,9 @@ test('INSTALLED: fetched over loopback, sha256 and signer checked, installed in 
     host.phone.install(apkText({ version: '0.2.1', code: 3 }));
     const result = await androidPass(host.ctx);
     assert.equal(result.errors, 0);
-    assert.match(host.phone.calls(), /install -r \S+\/\.cache\/mobile-deploy-hub\/catchup\/tower-of-dumb-things\/tower-of-dumb-things-0\.2\.2-4\.apk/);
+    assert.match(host.phone.calls(), /install -r \S+\/\.cache\/mobile-deploy-hub\/catchup\/tower-of-lost-things\/tower-of-lost-things-0\.2\.2-4\.apk/);
     assert.equal(host.phone.installed(), apkText());
-    assert.equal(host.lines(/^HUB_CATCHUP_INSTALLED tower-of-dumb-things android 0\.2\.2 \(4\): installed over 0\.2\.1 \(3\); readback 0\.2\.2 \(4\), base\.apk sha256 matches/).length, 1);
+    assert.equal(host.lines(/^HUB_CATCHUP_INSTALLED tower-of-lost-things android 0\.2\.2 \(4\): installed over 0\.2\.1 \(3\); readback 0\.2\.2 \(4\), base\.apk sha256 matches/).length, 1);
     const device = latestOf(host.s3).android.device;
     assert.deepEqual([device.status, device.by, device.reason, device.event_pending], ['installed', 'catch-up', null, undefined]);
     assert.equal(host.events.length, 1);
@@ -347,7 +347,7 @@ test('equal code with other bytes is replaced in place; a newer S26 is never tou
       await androidPass(ahead.ctx);
       assert.doesNotMatch(ahead.phone.calls(), /\binstall -r\b/);
       assert.equal(ahead.phone.installed(), apkText({ version: '0.2.9', code: 9 }));
-      assert.equal(ahead.lines(/^HUB_CATCHUP_AHEAD tower-of-dumb-things android 0\.2\.2 \(4\): the S26 runs 0\.2\.9 \(9\); not touched/).length, 1);
+      assert.equal(ahead.lines(/^HUB_CATCHUP_AHEAD tower-of-lost-things android 0\.2\.2 \(4\): the S26 runs 0\.2\.9 \(9\); not touched/).length, 1);
       const device = latestOf(ahead.s3).android.device;
       assert.deepEqual([device.status, device.reason], ['skipped', 'the S26 runs 0.2.9 (9), ahead of this build']);
       assert.equal(ahead.events.length, 0, 'AHEAD sends no event');
@@ -363,7 +363,7 @@ test('the bytes are checked before any install: a wrong sha256 or a wrong signer
     host.phone.install(apkText({ version: '0.2.1', code: 3 }));
     await androidPass(host.ctx);
     assert.doesNotMatch(host.phone.calls(), /\binstall -r\b/);
-    assert.equal(host.lines(/HUB_CATCHUP_PENDING .*tower-of-dumb-things-0\.2\.2-4\.apk has sha256 [0-9a-f]{12}\.\.\., latest\.json says [0-9a-f]{12}\.\.\./).length, 1);
+    assert.equal(host.lines(/HUB_CATCHUP_PENDING .*tower-of-lost-things-0\.2\.2-4\.apk has sha256 [0-9a-f]{12}\.\.\., latest\.json says [0-9a-f]{12}\.\.\./).length, 1);
     assert.deepEqual([latestOf(host.s3).android.device.status, latestOf(host.s3).android.device.failures], ['pending', 1]);
     assert.equal(readdirSync(join(host.root, '.cache/mobile-deploy-hub/catchup', slug)).length, 0, 'the bad download is not kept');
     assert.equal(host.events.length, 0);
@@ -396,7 +396,7 @@ test('the third failure gives up with one .failed event, then silence; retry sta
     await androidPass(host.ctx);
     const failed = latestOf(host.s3).android.device;
     assert.deepEqual([failed.status, failed.failures, failed.event_pending], ['failed', 3, undefined]);
-    assert.equal(host.lines(/^HUB_CATCHUP_FAILED tower-of-dumb-things android 0\.2\.2 \(4\): catch-up failed 3 times at install/).length, 1);
+    assert.equal(host.lines(/^HUB_CATCHUP_FAILED tower-of-lost-things android 0\.2\.2 \(4\): catch-up failed 3 times at install/).length, 1);
     assert.equal(host.events.length, 1);
     const [event] = host.events;
     assert.equal(event.type, 'bloodbank.project.deployment.failed');
@@ -492,7 +492,7 @@ test('the locks are the deploy jobs\' locks: a held adb lock idles the pass, rec
     setTimeout(() => releaseS3(), 300);
     await androidPass(host.ctx);
     await deliver;
-    assert.ok(host.lines(/HUB_LOCK_WAIT s3-tower-of-dumb-things/).length >= 1, 'record waited for deliver');
+    assert.ok(host.lines(/HUB_LOCK_WAIT s3-tower-of-lost-things/).length >= 1, 'record waited for deliver');
     assert.equal(latestOf(host.s3).android.device.status, 'installed');
     assert.equal(existsSync(join(host.env.HUB_LOCK_DIR, 'adb.lock')), false, 'every lock is released');
   } finally { host.cleanup(); }
@@ -505,7 +505,7 @@ test('watch mode reads and logs what it would do: no download, no install, no wr
     publish(host.s3, { latest: latestDoc(), apk: apkText() });
     host.phone.install(apkText({ version: '0.2.1', code: 3 }));
     await androidPass(host.ctx);
-    assert.match(host.lines(/^HUB_CATCHUP_WATCH /)[0], /tower-of-dumb-things android 0\.2\.2 \(4\): would install: 0\.2\.2 \(4\) over 0\.2\.1 \(3\) from http:\/\/127\.0\.0\.1:9012\/builds\/tower-of-dumb-things\/0\.2\.2\/tower-of-dumb-things-0\.2\.2-4\.apk/);
+    assert.match(host.lines(/^HUB_CATCHUP_WATCH /)[0], /tower-of-lost-things android 0\.2\.2 \(4\): would install: 0\.2\.2 \(4\) over 0\.2\.1 \(3\) from http:\/\/127\.0\.0\.1:9012\/builds\/tower-of-lost-things\/0\.2\.2\/tower-of-lost-things-0\.2\.2-4\.apk/);
     assert.doesNotMatch(host.phone.calls(), /\binstall\b/);
     assert.equal(host.s3.requests.filter(request => request.key.endsWith('.apk')).length, 0);
     assert.deepEqual([host.s3.writer.writes.length, host.events.length], [0, 0]);
@@ -579,7 +579,7 @@ test('iPad: unavailable is idle; an older build is installed from the outbox, re
     await iosPass(mac.ctx);
     assert.ok(mac.ipadState.calls.some(call => call.startsWith('install ')), 'installed in place with devicectl');
     assert.deepEqual(mac.ipadState.installed, { version: '0.2.2', build: '4', developer: true });
-    assert.equal(mac.lines(/^HUB_CATCHUP_INSTALLED tower-of-dumb-things ios 0\.2\.2 \(4\): installed over 0\.2\.1 \(4\) from the outbox; readback 0\.2\.2 \(4\)/).length, 1);
+    assert.equal(mac.lines(/^HUB_CATCHUP_INSTALLED tower-of-lost-things ios 0\.2\.2 \(4\): installed over 0\.2\.1 \(4\) from the outbox; readback 0\.2\.2 \(4\)/).length, 1);
     assert.deepEqual(mac.reports[0].slice(0, 12), ['--slug', slug, '--platform', 'ios', '--version', '0.2.2', '--build', '4', '--status', 'installed', '--by', 'catch-up']);
     assert.equal(mac.linux.s3.requests.filter(request => request.key.endsWith('.ipa')).length, 0, 'the outbox cost no network bytes');
     const device = latestOf(mac.linux.s3).ios.device;
@@ -595,7 +595,7 @@ test('iPad: an equal build is confirmed, a newer one is never touched, and a met
     publish(mac.linux.s3, { latest: latestDoc({ android: null, ios: iosBlock() }), ipa: ipaText() });
     mac.ipadState.installed = { version: '0.2.2', build: '4' };
     await iosPass(mac.ctx);
-    assert.equal(mac.lines(/^HUB_CATCHUP_CONFIRMED tower-of-dumb-things ios 0\.2\.2 \(4\): the iPad already runs 0\.2\.2 \(4\) \(installed over the air\)/).length, 1);
+    assert.equal(mac.lines(/^HUB_CATCHUP_CONFIRMED tower-of-lost-things ios 0\.2\.2 \(4\): the iPad already runs 0\.2\.2 \(4\) \(installed over the air\)/).length, 1);
     assert.deepEqual([latestOf(mac.linux.s3).ios.device.status, latestOf(mac.linux.s3).ios.device.by], ['installed', 'manual']);
     assert.equal(mac.linux.events[0].data.deliveries[0].by, 'manual');
   } finally { mac.cleanup(); }
@@ -607,7 +607,7 @@ test('iPad: an equal build is confirmed, a newer one is never touched, and a met
     newer.outbox(ipaText());
     await iosPass(newer.ctx);
     assert.ok(!newer.ipadState.calls.some(call => call.startsWith('install ')));
-    assert.equal(newer.lines(/^HUB_IPAD_NEWER tower-of-dumb-things ios 0\.2\.2 \(4\): the iPad runs 0\.3\.0 \(1\); not touched/).length, 1);
+    assert.equal(newer.lines(/^HUB_IPAD_NEWER tower-of-lost-things ios 0\.2\.2 \(4\): the iPad runs 0\.3\.0 \(1\); not touched/).length, 1);
     assert.equal(latestOf(newer.linux.s3).ios.device.status, 'skipped');
     assert.equal(newer.linux.events.length, 0);
   } finally { newer.cleanup(); }
@@ -670,7 +670,7 @@ test('record arguments are patterns, not shell: the ssh command quotes each one 
   const command = sshRecordCommand(facts, 'big-chungus');
   assert.deepEqual(command.slice(0, 7), ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=15']);
   assert.equal(command[7], 'big-chungus');
-  assert.match(command[8], /tools\/catchup\/catchup\.mjs" record '--slug' 'tower-of-dumb-things' '--platform' 'ios' /);
+  assert.match(command[8], /tools\/catchup\/catchup\.mjs" record '--slug' 'tower-of-lost-things' '--platform' 'ios' /);
   assert.throws(() => sshRecordCommand(facts, 'big-chungus; rm -rf ~'), /not a host name/);
   for (const bad of [{ slug: 'Tower;rm' }, { version: '0.2' }, { build: '4 4' }, { status: 'deleted' }, { sha256: 'abc' }]) assert.throws(() => recordArgs({ ...facts, ...bad }), /does not match its pattern/);
   assert.throws(() => parseRecordArgs(['--slug', slug, '--evil', 'x']), /unknown option/);
@@ -789,7 +789,7 @@ test('record writes through the hub\'s builds writer and re-renders the app page
     assert.ok(mcCalls.includes(`cp builds/builds/${slug}/index.html`) && mcCalls.includes('cp builds/builds/index.json') && mcCalls.includes('cp builds/builds/index.html'), mcCalls.join(', '));
     assert.equal(s3.json('index.json').apps[0].android.device, 'installed', 'the index shows the catch-up');
     assert.match(s3.objects.get(`${slug}/index.html`).body, /installed/);
-    assert.equal(host.lines(/^HUB_CATCHUP_PAGES tower-of-dumb-things: app page and index re-rendered$/).length, 1);
+    assert.equal(host.lines(/^HUB_CATCHUP_PAGES tower-of-lost-things: app page and index re-rendered$/).length, 1);
     assert.equal(host.events.length, 1);
   } finally { host.cleanup(); }
 });
@@ -852,7 +852,7 @@ test('pins: a latest.json whose package, signer or bundle is not the policy\'s i
     publish(host.s3, { latest: latestDoc({ android: foreign }), apk: apkText({ signerSha: 'f'.repeat(64) }) });
     host.phone.install(apkText({ version: '0.2.1', code: 3 }));
     await androidPass(host.ctx);
-    assert.equal(host.lines(/^HUB_CATCHUP_ERROR tower-of-dumb-things: latest\.json refused \(android\.signer_sha256 is not the policy's signer\)/).length, 1, host.logs.join('\n'));
+    assert.equal(host.lines(/^HUB_CATCHUP_ERROR tower-of-lost-things: latest\.json refused \(android\.signer_sha256 is not the policy's signer\)/).length, 1, host.logs.join('\n'));
     assert.doesNotMatch(host.phone.calls(), /\binstall\b/);
     assert.equal(host.s3.requests.filter(request => request.key.endsWith('.apk')).length, 0, 'nothing fetched');
     const app = settingsFrom(policy).apps.find(entry => entry.slug === slug);
@@ -870,7 +870,7 @@ test('the S26 is not updated under a kid: the app on top with the screen on wait
     host.phone.install(apkText({ version: '0.2.1', code: 3 }));
     host.phone.playing(pkg);
     await androidPass(host.ctx);
-    assert.equal(host.lines(/^HUB_CATCHUP_IDLE tower-of-dumb-things android 0\.2\.2 \(4\): io\.automaticai\.towerofdumbthings is on screen on the S26/).length, 1, host.logs.join('\n'));
+    assert.equal(host.lines(/^HUB_CATCHUP_IDLE tower-of-lost-things android 0\.2\.2 \(4\): io\.automaticai\.towerofdumbthings is on screen on the S26/).length, 1, host.logs.join('\n'));
     assert.doesNotMatch(host.phone.calls(), /\binstall\b/);
     assert.deepEqual([host.events.length, host.s3.writer.writes.length], [0, 0], 'waiting is not a failed attempt');
     host.phone.asleep(true);
@@ -888,7 +888,7 @@ test('iPad: while the app runs the install waits, up to 45 minutes from the firs
     mac.ipadState.running = true;
     await iosPass(mac.ctx);
     assert.ok(!mac.ipadState.calls.some(call => call.startsWith('install ')), 'not under a kid');
-    assert.match(mac.lines(/^HUB_CATCHUP_IDLE tower-of-dumb-things ios/)[0], /is running on the iPad; the install waits .* \(0 of 45 minutes\)/);
+    assert.match(mac.lines(/^HUB_CATCHUP_IDLE tower-of-lost-things ios/)[0], /is running on the iPad; the install waits .* \(0 of 45 minutes\)/);
     // An app that stays suspended in the background must not hold the iPad forever.
     const journal = join(mac.env.XDG_STATE_HOME, 'mobile-deploy-hub/catchup-journal.json');
     const document = JSON.parse(readFileSync(journal, 'utf8'));
@@ -896,7 +896,7 @@ test('iPad: while the app runs the install waits, up to 45 minutes from the firs
     writeFileSync(journal, JSON.stringify(document));
     await iosPass(mac.ctx);
     assert.ok(mac.ipadState.calls.some(call => call.startsWith('install ')));
-    assert.equal(mac.lines(/^HUB_CATCHUP_BUSY tower-of-dumb-things ios: .* running for 60 minutes; installing now/).length, 1);
+    assert.equal(mac.lines(/^HUB_CATCHUP_BUSY tower-of-lost-things ios: .* running for 60 minutes; installing now/).length, 1);
   } finally { mac.cleanup(); }
 });
 
@@ -909,7 +909,7 @@ test('iPad: a deploy in flight holds the older pending build too (both passes re
     mac.linux.s3.put(`${slug}/inflight.json`, { version: '0.2.3', run: { id: '37950000000' }, started_at: '2026-10-10T11:50:00Z', platforms: ['android', 'ios'] });
     await iosPass(mac.ctx);
     assert.deepEqual(mac.ipadState.calls, [], 'not even devicectl: the deploy owns the iPad');
-    assert.equal(mac.lines(/^HUB_CATCHUP_IDLE tower-of-dumb-things ios 0\.2\.2 \(4\): deploy run 37950000000 is publishing 0\.2\.3/).length, 1);
+    assert.equal(mac.lines(/^HUB_CATCHUP_IDLE tower-of-lost-things ios 0\.2\.2 \(4\): deploy run 37950000000 is publishing 0\.2\.3/).length, 1);
   } finally { mac.cleanup(); }
 });
 
@@ -932,7 +932,7 @@ test('the Mac revalidates its pointers with the strong tag, uncompressed, and re
 
   const reads = [];
   const store = withFallback({ latest: async () => { throw new Error('GET https://s3.delo.sh/builds/x/latest.json: HTTP 522'); }, inflight: async () => null }, { read: key => { reads.push(key); return { ok: true }; }, log: () => {}, host: 'big-chungus' });
-  assert.deepEqual(await store.latest('tower-of-dumb-things'), { ok: true });
-  assert.deepEqual(reads, ['tower-of-dumb-things/latest.json']);
-  assert.equal(await store.inflight('tower-of-dumb-things'), null, 'a missing object is not a failure: no fallback');
+  assert.deepEqual(await store.latest('tower-of-lost-things'), { ok: true });
+  assert.deepEqual(reads, ['tower-of-lost-things/latest.json']);
+  assert.equal(await store.inflight('tower-of-lost-things'), null, 'a missing object is not a failure: no fallback');
 });

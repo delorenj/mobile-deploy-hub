@@ -11,7 +11,7 @@
     "outbox": "Library/Caches/mobile-deploy-hub/outbox",
     "min_free_gib": 15,
     "runners": {
-      "delorenj/pile-of-dumb-things": { "name": "carries-macbook-air", "dir": "actions-runner" },
+      "delorenj/tower-of-lost-things": { "name": "carries-macbook-air", "dir": "actions-runner" },
       "delorenj/green-in-between": { "name": "delonet-gib-mac-r1", "dir": "actions-runner/gib" },
       "delorenj/gruvato": { "name": "mommymac-gruvato", "dir": "actions-runner/gruvato" }
     }

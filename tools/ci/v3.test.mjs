@@ -399,13 +399,13 @@ test('devicectl app info is read back as version and build', () => {
 
 // ---------------------------------------------------------------------------------------------------- the event
 
-const project = { slug: 'tower-of-dumb-things', name: 'Tower of Lost Things' };
+const project = { slug: 'tower-of-lost-things', name: 'Tower of Lost Things' };
 const both = { android: true, ios: true };
-const runEnv = { GITHUB_REPOSITORY: 'delorenj/pile-of-dumb-things', GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '2', HUB_REF: 'v1.1.0' };
+const runEnv = { GITHUB_REPOSITORY: 'delorenj/tower-of-lost-things', GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '2', HUB_REF: 'v1.1.0' };
 const ok = { result: 'success' };
 const delivery = (platform, extra = {}) => ({ platform, target: platform === 'android' ? 'SM-S948U' : 'iPad14,5', version: '0.2.2', build: platform === 'android' ? '4' : '5', sha256: 'a'.repeat(64), verified: true, status: 'installed', ...extra });
 const allOk = { gate: ok, 'preflight-ios': ok, plan: ok, android: ok, 'ios-export': ok, ios: ok, deliver: ok };
-const published = { apk: 'https://s3.delo.sh/builds/tower-of-dumb-things/0.2.2/tower-of-dumb-things-0.2.2-4.apk', ota: 'itms-services://?action=download-manifest&url=https://s3.delo.sh/builds/tower-of-dumb-things/ios/manifest.plist', page: 'https://s3.delo.sh/builds/tower-of-dumb-things/index.html', any: true };
+const published = { apk: 'https://s3.delo.sh/builds/tower-of-lost-things/0.2.2/tower-of-lost-things-0.2.2-4.apk', ota: 'itms-services://?action=download-manifest&url=https://s3.delo.sh/builds/tower-of-lost-things/ios/manifest.plist', page: 'https://s3.delo.sh/builds/tower-of-lost-things/index.html', any: true };
 
 test('a deploy to both devices is one completed event naming each delivery, its status and the links', () => {
   const event = deploymentEvent({
@@ -419,7 +419,7 @@ test('a deploy to both devices is one completed event naming each delivery, its 
   assert.deepEqual(event.data.deliveries.map(item => [item.device, item.status, item.by]), [['S26', 'installed', 'deploy'], ['iPad', 'installed', 'deploy']]);
   assert.equal(event.data.verified, true);
   assert.equal(event.data.trigger, 'deploy');
-  assert.deepEqual(event.data.run, { id: '123', attempt: 2, url: 'https://github.com/delorenj/pile-of-dumb-things/actions/runs/123', hub_ref: 'v1.1.0' });
+  assert.deepEqual(event.data.run, { id: '123', attempt: 2, url: 'https://github.com/delorenj/tower-of-lost-things/actions/runs/123', hub_ref: 'v1.1.0' });
   assert.equal(event.data.deployed_at, '2026-10-09T12:00:00Z');
   assert.equal(event.data.summary, 'Tower of Lost Things 0.2.2 (4) bbbbbbb: S26 installed, iPad installed, verified=true');
   assert.deepEqual(event.data.links.map(link => [link.rel, link.label]), [['apk', 'Install APK'], ['page', 'Builds'], ['run', 'Run']], 'no Install on iPad when the iPad has it');

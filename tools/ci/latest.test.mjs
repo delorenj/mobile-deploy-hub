@@ -11,9 +11,9 @@ import { base, run, sampleLatest } from './test-fixtures.mjs';
 
 test('a complete latest.json parses, and its text round-trips', () => {
   const doc = sampleLatest();
-  assert.equal(validateLatest(doc, { base, slug: 'tower-of-dumb-things' }), doc);
+  assert.equal(validateLatest(doc, { base, slug: 'tower-of-lost-things' }), doc);
   assert.deepEqual(parseLatest(serializeLatest(doc)), doc);
-  assert.equal(doc.ios.install_url, 'itms-services://?action=download-manifest&url=https://s3.delo.sh/builds/tower-of-dumb-things/ios/manifest.plist', 'not percent-encoded, as Apple documents it');
+  assert.equal(doc.ios.install_url, 'itms-services://?action=download-manifest&url=https://s3.delo.sh/builds/tower-of-lost-things/ios/manifest.plist', 'not percent-encoded, as Apple documents it');
 });
 
 test('latest.json is strict: unknown keys, bad statuses, foreign keys and mismatched URLs are refused', () => {

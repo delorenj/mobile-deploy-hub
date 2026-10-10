@@ -4,8 +4,8 @@
   "event": { "per": "run-attempt", "strict": true, "catch_up": true, "types": ["bloodbank.project.deployment.completed", "bloodbank.project.deployment.failed"] },
   "manifest_schema": [2],
   "apps": {
-    "delorenj/pile-of-dumb-things": {
-      "slug": "tower-of-dumb-things", "lanes": ["android", "ios"],
+    "delorenj/tower-of-lost-things": {
+      "slug": "tower-of-lost-things", "lanes": ["android", "ios"],
       "android": { "package": "io.automaticai.towerofdumbthings", "signer_sha256": "2d4954863dabb5da86d69ce4b60b3e400e73669b50a80658b0941440a7941a97" },
       "ios": { "bundle": "io.automaticai.towerofdumbthings" }
     },

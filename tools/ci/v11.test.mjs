@@ -54,7 +54,7 @@ test('the policy parses strictly: unknown keys, a "none" bump, hosted runners an
 
 test('the policy names the three apps in Jarad\'s order with both lanes, and the front door\'s train agrees', async () => {
   assert.deepEqual(Object.entries(policy.apps).map(([repo, app]) => [repo, app.slug, app.lanes.join('+')]), [
-    ['delorenj/pile-of-dumb-things', 'tower-of-dumb-things', 'android+ios'],
+    ['delorenj/tower-of-lost-things', 'tower-of-lost-things', 'android+ios'],
     ['delorenj/green-in-between', 'green-in-between', 'android+ios'],
     ['delorenj/gruvato', 'gruvato', 'android+ios'],
   ]);
@@ -96,14 +96,14 @@ test('every caller deviation is refused: strict false, runners, manifest, no REA
 // ---------------------------------------------------------------------------------------------------- the gate
 
 // Tower's pins, as policy.json carries them: the gate, plan and deliver hold a manifest and an APK to these.
-const towerPin = policy.apps['delorenj/pile-of-dumb-things'];
+const towerPin = policy.apps['delorenj/tower-of-lost-things'];
 const towerPackage = towerPin.android.package;
 const towerSigner = towerPin.android.signer_sha256;
 
 function towerManifest(extra = {}) {
   return {
     schema: 2,
-    project: { slug: 'tower-of-dumb-things', name: 'Tower of Lost Things' },
+    project: { slug: 'tower-of-lost-things', name: 'Tower of Lost Things' },
     version: { read: 'node version.mjs', bump: 'node version.mjs bump' },
     android: { package: towerPackage, export: 'true', artifact: 'artifacts/App.apk', signer_sha256: towerSigner },
     ios: { bundle: towerPin.ios.bundle, device: 'true', device_artifact: 'App.xcarchive' },
@@ -117,7 +117,7 @@ const notFound = async () => ({ status: 404, ok: false, text: async () => '' });
 const serve = (text, only = null) => async url => (only && !String(url).includes(only) ? { status: 404, ok: false, text: async () => '' } : { status: 200, ok: true, text: async () => text });
 const noPhone = () => ({ startServer() {}, devices: () => [], prop() { throw new Error('offline'); } });
 
-async function gateFixture({ manifest = towerManifest(), caller = template, repo = 'delorenj/pile-of-dumb-things' } = {}) {
+async function gateFixture({ manifest = towerManifest(), caller = template, repo = 'delorenj/tower-of-lost-things' } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'hub-gate-'));
   const app = join(root, 'app');
   await mkdir(join(app, '.github/workflows'), { recursive: true });
@@ -142,7 +142,7 @@ test('the gate passes a well-formed run and reads the state of things: metered M
   const f = await gateFixture();
   try {
     const result = await gate(f.configure(), f.deps());
-    assert.deepEqual([result.ios_lane, result.mac_link, result.metered, result.slug, result.bundle], ['run', 'metered', true, 'tower-of-dumb-things', towerPin.ios.bundle]);
+    assert.deepEqual([result.ios_lane, result.mac_link, result.metered, result.slug, result.bundle], ['run', 'metered', true, 'tower-of-lost-things', towerPin.ios.bundle]);
     assert.ok(f.logs.some(line => /^HUB_CATCHUP_MODE big-chungus=watch mac=live$/.test(line)), 'the gate reads the catch-up mode on both hosts');
     assert.ok(f.logs.some(line => /^HUB_POLICY sha256=[0-9a-f]{8}$/.test(line)), f.logs.join('\n'));
     assert.ok(f.logs.some(line => /^HUB_MAC_LINK metered peer=carries-macbook-air runner=carries-macbook-air addr=76\.98\.73\.87/.test(line)), 'the gate checks this app\'s own Mac runner');
@@ -222,8 +222,8 @@ test('the writer\'s keys reach only the mc child\'s environment: never argv, nev
   const calls = [];
   const runner = (command, args, options) => { calls.push({ command, args, env: options.env }); return { ok: true, status: 0, stdout: '', stderr: '' }; };
   const s3 = createS3({ policy, credentials, env: { PATH: '/bin', GH_TOKEN: 'gh-secret', MC_HOST_other: 'http://x:y@z' }, runner });
-  s3.putText('{}', 'tower-of-dumb-things/latest.json');
-  s3.remove('tower-of-dumb-things/inflight.json');
+  s3.putText('{}', 'tower-of-lost-things/latest.json');
+  s3.remove('tower-of-lost-things/inflight.json');
   assert.equal(calls.length, 2);
   for (const call of calls) {
     assert.equal(call.command, 'mc');
@@ -234,7 +234,7 @@ test('the writer\'s keys reach only the mc child\'s environment: never argv, nev
   }
   assert.deepEqual(calls[0].args.slice(0, 5), ['--quiet', '--no-color', '--disable-pager', 'cp', '--attr']);
   assert.equal(calls[0].args[5], 'Content-Type="application/json";Cache-Control="no-cache"');
-  assert.match(calls[0].args.at(-1), /^builds\/builds\/tower-of-dumb-things\/latest\.json$/);
+  assert.match(calls[0].args.at(-1), /^builds\/builds\/tower-of-lost-things\/latest\.json$/);
   const failing = createS3({ policy, credentials, env: {}, runner: () => ({ ok: false, status: 1, stdout: '', stderr: `mc: <ERROR> http://mobile-deploy-hub:${secret}@127.0.0.1:9012 refused` }) });
   assert.throws(() => failing.remove('x/y.json'), error => !error.message.includes(secret) && /<redacted>/.test(error.message));
   assert.throws(() => mcEnvironment({}, credentials, 'https://s3.delo.sh'), /loopback only/);
@@ -250,20 +250,20 @@ async function deliverFixture({ iosSent = true, iosStatus = 'pending', androidSt
   await writeFile(join(app, 'mobile-deploy.json'), JSON.stringify(towerManifest()));
   await script(join(sdk, 'apksigner'), `echo "Signer #1 certificate SHA-256 digest: ${towerSigner}"`);
   await script(join(sdk, 'aapt2'), 'set -- $(cat "$3"); echo "package: name=\'$1\' versionCode=\'$3\' versionName=\'$2\'"');
-  const staging = join(root, '.cache/mobile-deploy-hub/staging/delorenj-pile-of-dumb-things/777');
+  const staging = join(root, '.cache/mobile-deploy-hub/staging/delorenj-tower-of-lost-things/777');
   await mkdir(join(staging, 'android'), { recursive: true });
   await mkdir(join(staging, 'ios'), { recursive: true });
-  const apkName = 'tower-of-dumb-things-0.2.2-5.apk';
+  const apkName = 'tower-of-lost-things-0.2.2-5.apk';
   await writeFile(join(staging, 'android', apkName), `${towerPackage} 0.2.2 5`);
   const sha = text => execFileSync('sha256sum', [], { input: text }).toString().slice(0, 64);
   const apkSha = sha(`${towerPackage} 0.2.2 5`);
-  const ipaName = 'tower-of-dumb-things-0.2.2-5.ipa';
+  const ipaName = 'tower-of-lost-things-0.2.2-5.ipa';
   if (iosSent) await writeFile(join(staging, 'ios', ipaName), 'ipa bytes');
   const receipts = join(out, 'receipts');
   await mkdir(receipts, { recursive: true });
   await writeFile(join(receipts, 'hub-receipt-android.json'), JSON.stringify({ lane: 'android', outcome: 'success', version: '0.2.2', staged: { name: apkName, bytes: 22, sha256: apkSha }, quickdrop: { status: 'written', name: apkName }, delivery: { platform: 'android', status: androidStatus, reason: androidStatus === 'pending' ? "not on big-chungus's adb" : null, sha256: apkSha } }));
   await writeFile(join(receipts, 'hub-receipt-ios.json'), JSON.stringify({ lane: 'ios', outcome: 'success', version: '0.2.2', ipa: { verified: true, sha256: sha('ipa bytes'), bytes: 9, build: '5', sent: iosSent, staged_name: iosSent ? ipaName : null }, delivery: { platform: 'ios', status: iosStatus, reason: iosStatus === 'pending' ? 'asleep or away' : null }, mac_bytes: { in: 1000, out: 9 } }));
-  const env = { PATH: process.env.PATH, ANDROID_HOME: join(root, 'sdk'), JAVA_HOME: join(root, 'java'), GITHUB_REPOSITORY: 'delorenj/pile-of-dumb-things', GITHUB_RUN_ID: '777', GITHUB_RUN_ATTEMPT: '1', HUB_REF: 'v1.1.0', HUB_LOCK_DIR: join(root, 'locks'), HUB_NEEDS: JSON.stringify({ plan: { result: 'success' }, android: { result: 'success' }, ios: { result: 'success' } }) };
+  const env = { PATH: process.env.PATH, ANDROID_HOME: join(root, 'sdk'), JAVA_HOME: join(root, 'java'), GITHUB_REPOSITORY: 'delorenj/tower-of-lost-things', GITHUB_RUN_ID: '777', GITHUB_RUN_ATTEMPT: '1', HUB_REF: 'v1.1.0', HUB_LOCK_DIR: join(root, 'locks'), HUB_NEEDS: JSON.stringify({ plan: { result: 'success' }, android: { result: 'success' }, ios: { result: 'success' } }) };
   const configure = (extra = []) => ({ ...parseConfig(['deliver', '--manifest', 'mobile-deploy.json', '--out', out, '--version', '0.2.2', '--android-code', '5', '--build-sha', 'b'.repeat(40), ...extra], env), cwd: app });
   const s3 = fakeS3();
   const pages = { writes: [] };
@@ -274,24 +274,24 @@ async function deliverFixture({ iosSent = true, iosStatus = 'pending', androidSt
 test('deliver publishes in order: versioned objects, manifest.plist, latest.json, then the pages; then retention and inflight', async () => {
   const f = await deliverFixture();
   try {
-    const inflight = JSON.stringify({ version: '0.2.2', run: { repo: 'delorenj/pile-of-dumb-things', id: '777', attempt: 1, url: null }, started_at: '2026-10-09T20:00:00Z', platforms: ['android', 'ios'] });
-    const result = await deliver(f.configure(['--dry-run', 'false']), { env: f.env, home: f.root, fetchImpl: serve(inflight, 'tower-of-dumb-things/inflight.json'), s3Factory: async () => f.s3, log: line => f.logs.push(line) });
+    const inflight = JSON.stringify({ version: '0.2.2', run: { repo: 'delorenj/tower-of-lost-things', id: '777', attempt: 1, url: null }, started_at: '2026-10-09T20:00:00Z', platforms: ['android', 'ios'] });
+    const result = await deliver(f.configure(['--dry-run', 'false']), { env: f.env, home: f.root, fetchImpl: serve(inflight, 'tower-of-lost-things/inflight.json'), s3Factory: async () => f.s3, log: line => f.logs.push(line) });
     const keys = f.s3.writes.map(write => `${write.op} ${write.key}`);
     const at = key => keys.indexOf(key);
-    assert.ok(at('put tower-of-dumb-things/0.2.2/tower-of-dumb-things-0.2.2-5.apk') >= 0, keys.join('\n'));
-    assert.ok(at('put tower-of-dumb-things/0.2.2/tower-of-dumb-things-0.2.2-5.ipa') >= 0);
-    assert.ok(at('put tower-of-dumb-things/0.2.2/tower-of-dumb-things-0.2.2-5.ipa') < at('put tower-of-dumb-things/ios/manifest.plist'));
-    assert.ok(at('put tower-of-dumb-things/ios/manifest.plist') < at('put tower-of-dumb-things/latest.json'));
-    assert.ok(at('put tower-of-dumb-things/latest.json') < at('put tower-of-dumb-things/index.html'));
-    assert.ok(at('put tower-of-dumb-things/index.html') < at('put index.html'));
-    assert.equal(keys.at(-1), 'rm tower-of-dumb-things/inflight.json');
-    const latest = parseLatest(f.s3.writes.find(write => write.key === 'tower-of-dumb-things/latest.json').text, { base: policy.delivery.s3.public });
+    assert.ok(at('put tower-of-lost-things/0.2.2/tower-of-lost-things-0.2.2-5.apk') >= 0, keys.join('\n'));
+    assert.ok(at('put tower-of-lost-things/0.2.2/tower-of-lost-things-0.2.2-5.ipa') >= 0);
+    assert.ok(at('put tower-of-lost-things/0.2.2/tower-of-lost-things-0.2.2-5.ipa') < at('put tower-of-lost-things/ios/manifest.plist'));
+    assert.ok(at('put tower-of-lost-things/ios/manifest.plist') < at('put tower-of-lost-things/latest.json'));
+    assert.ok(at('put tower-of-lost-things/latest.json') < at('put tower-of-lost-things/index.html'));
+    assert.ok(at('put tower-of-lost-things/index.html') < at('put index.html'));
+    assert.equal(keys.at(-1), 'rm tower-of-lost-things/inflight.json');
+    const latest = parseLatest(f.s3.writes.find(write => write.key === 'tower-of-lost-things/latest.json').text, { base: policy.delivery.s3.public });
     assert.deepEqual([latest.android.device.status, latest.ios.device.status, latest.mac_bytes], ['pending', 'pending', 1009]);
-    assert.equal(latest.android.quickdrop, 'builds/tower-of-dumb-things-0.2.2-5.apk');
-    assert.equal(latest.ios.install_url, 'itms-services://?action=download-manifest&url=https://s3.delo.sh/builds/tower-of-dumb-things/ios/manifest.plist');
-    assert.match(f.s3.writes.find(write => write.key === 'tower-of-dumb-things/ios/manifest.plist').text, /<string>software-package<\/string>[\s\S]*tower-of-dumb-things-0\.2\.2-5\.ipa/);
+    assert.equal(latest.android.quickdrop, 'builds/tower-of-lost-things-0.2.2-5.apk');
+    assert.equal(latest.ios.install_url, 'itms-services://?action=download-manifest&url=https://s3.delo.sh/builds/tower-of-lost-things/ios/manifest.plist');
+    assert.match(f.s3.writes.find(write => write.key === 'tower-of-lost-things/ios/manifest.plist').text, /<string>software-package<\/string>[\s\S]*tower-of-lost-things-0\.2\.2-5\.ipa/);
     assert.deepEqual(result.published.apk, latest.android.url);
-    assert.ok(f.logs.some(line => /^HUB_PUBLISHED tower-of-dumb-things 0\.2\.2/.test(line)), f.logs.join('\n'));
+    assert.ok(f.logs.some(line => /^HUB_PUBLISHED tower-of-lost-things 0\.2\.2/.test(line)), f.logs.join('\n'));
   } finally { await f.cleanup(); }
 });
 
@@ -301,7 +301,7 @@ test('a dry run deliver checks and renders everything and writes nothing', async
     const result = await deliver(f.configure(), { env: f.env, home: f.root, fetchImpl: notFound, s3Factory: async () => { throw new Error('a dry run must not ask for the writer'); }, log: line => f.logs.push(line) });
     assert.equal(result.dryRun, true);
     assert.equal(f.s3.writes.length, 0);
-    assert.ok(f.logs.some(line => /^HUB_PUBLISH_DRY_RUN would publish .*tower-of-dumb-things-0\.2\.2-5\.apk.*nothing was written$/.test(line)), f.logs.join('\n'));
+    assert.ok(f.logs.some(line => /^HUB_PUBLISH_DRY_RUN would publish .*tower-of-lost-things-0\.2\.2-5\.apk.*nothing was written$/.test(line)), f.logs.join('\n'));
     assert.equal(existsSync(join(f.staging, 'android')) || existsSync(join(f.staging, 'ios')), false, 'a dry run\'s staging is removed (each deliver job removes its own half)');
     assert.ok(result.published.ota, 'the would-be links reach the checked event');
   } finally { await f.cleanup(); }
@@ -311,9 +311,9 @@ test('the pointer only moves forward: an older run keeps the newer block and upl
   const f = await deliverFixture();
   try {
     const newer = sampleLatest({ version: '0.2.3' });
-    newer.android = { ...newer.android, version: '0.2.3', code: 9, key: apkKey('tower-of-dumb-things', '0.2.3', 9), url: `https://s3.delo.sh/builds/${apkKey('tower-of-dumb-things', '0.2.3', 9)}`, run: { ...newer.run, id: '900' } };
-    newer.ios = { ...newer.ios, version: '0.2.3', build: '9', key: ipaKey('tower-of-dumb-things', '0.2.3', '9'), url: `https://s3.delo.sh/builds/${ipaKey('tower-of-dumb-things', '0.2.3', '9')}`, run: { ...newer.run, id: '900' } };
-    await deliver(f.configure(['--dry-run', 'false']), { env: f.env, home: f.root, fetchImpl: serve(JSON.stringify(newer), 'tower-of-dumb-things/latest.json'), s3Factory: async () => f.s3, log: line => f.logs.push(line) });
+    newer.android = { ...newer.android, version: '0.2.3', code: 9, key: apkKey('tower-of-lost-things', '0.2.3', 9), url: `https://s3.delo.sh/builds/${apkKey('tower-of-lost-things', '0.2.3', 9)}`, run: { ...newer.run, id: '900' } };
+    newer.ios = { ...newer.ios, version: '0.2.3', build: '9', key: ipaKey('tower-of-lost-things', '0.2.3', '9'), url: `https://s3.delo.sh/builds/${ipaKey('tower-of-lost-things', '0.2.3', '9')}`, run: { ...newer.run, id: '900' } };
+    await deliver(f.configure(['--dry-run', 'false']), { env: f.env, home: f.root, fetchImpl: serve(JSON.stringify(newer), 'tower-of-lost-things/latest.json'), s3Factory: async () => f.s3, log: line => f.logs.push(line) });
     assert.ok(f.logs.filter(line => /^HUB_POINTER kept 0\.2\.3/.test(line)).length === 2, f.logs.join('\n'));
     assert.ok(!f.s3.writes.some(write => /0\.2\.2-5\.(apk|ipa)$/.test(write.key)), 'no older bytes uploaded');
     assert.ok(!f.s3.writes.some(write => /latest\.json$|index\.html$/.test(write.key)), 'no block moved: latest.json, its top level and the pages stay as they are');
@@ -325,9 +325,9 @@ test('an iPad installed over a metered link has no over-the-air copy, and its ma
   const f = await deliverFixture({ iosSent: false, iosStatus: 'installed' });
   try {
     await deliver(f.configure(['--dry-run', 'false']), { env: f.env, home: f.root, fetchImpl: notFound, s3Factory: async () => f.s3, log: () => {} });
-    const written = parseLatest(f.s3.writes.find(write => write.key === 'tower-of-dumb-things/latest.json').text);
+    const written = parseLatest(f.s3.writes.find(write => write.key === 'tower-of-lost-things/latest.json').text);
     assert.deepEqual([written.ios.key, written.ios.install_url, written.ios.device.status, written.ios.device.by], [null, null, 'installed', 'deploy']);
-    assert.ok(f.s3.writes.some(write => write.op === 'rm' && write.key === 'tower-of-dumb-things/ios/manifest.plist'));
+    assert.ok(f.s3.writes.some(write => write.op === 'rm' && write.key === 'tower-of-lost-things/ios/manifest.plist'));
   } finally { await f.cleanup(); }
 });
 
@@ -364,18 +364,18 @@ test('Quickdrop: a regular file through Syncthing\'s temporary name, one per app
   try {
     const dir = join(root, 'quickdrop/builds');
     await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, 'tower-of-dumb-things-0.2.1-4.apk'), 'old');
+    await writeFile(join(dir, 'tower-of-lost-things-0.2.1-4.apk'), 'old');
     await writeFile(join(dir, 'green-in-between-0.0.20-20.apk'), 'other app');
     await writeFile(join(root, 'Jarads.apk'), 'his');
     const apk = join(root, 'App.apk');
     await writeFile(apk, 'new apk bytes');
     const logs = [];
-    const dropped = dropApk({ apk, dir, name: 'tower-of-dumb-things-0.2.2-5.apk', slug: 'tower-of-dumb-things', maxBytes: 120e6, log: line => logs.push(line) });
+    const dropped = dropApk({ apk, dir, name: 'tower-of-lost-things-0.2.2-5.apk', slug: 'tower-of-lost-things', maxBytes: 120e6, log: line => logs.push(line) });
     assert.equal(dropped.status, 'written');
-    const info = lstatSync(join(dir, 'tower-of-dumb-things-0.2.2-5.apk'));
+    const info = lstatSync(join(dir, 'tower-of-lost-things-0.2.2-5.apk'));
     assert.ok(info.isFile() && !info.isSymbolicLink());
-    assert.deepEqual(readdirSync(dir).sort(), ['green-in-between-0.0.20-20.apk', 'tower-of-dumb-things-0.2.2-5.apk'], 'the older Tower APK is gone, other apps stay, no temporary file is left');
-    assert.match(logs[0], /^HUB_QUICKDROP tower-of-dumb-things-0\.2\.2-5\.apk 13 bytes; removed tower-of-dumb-things-0\.2\.1-4\.apk$/);
+    assert.deepEqual(readdirSync(dir).sort(), ['green-in-between-0.0.20-20.apk', 'tower-of-lost-things-0.2.2-5.apk'], 'the older Tower APK is gone, other apps stay, no temporary file is left');
+    assert.match(logs[0], /^HUB_QUICKDROP tower-of-lost-things-0\.2\.2-5\.apk 13 bytes; removed tower-of-lost-things-0\.2\.1-4\.apk$/);
     const big = dropApk({ apk, dir, name: 'gruvato-0.2.5-2005.apk', slug: 'gruvato', maxBytes: 5, log: line => logs.push(line) });
     assert.equal(big.status, 'skipped');
     assert.match(logs.at(-1), /^HUB_QUICKDROP_SKIPPED 13 bytes/);
@@ -448,7 +448,7 @@ test('the train dispatches Tower, then Green In Between, then Gruvato, and stops
   const logged = [];
   const recordingGh = (args, options) => { if (args[0] === 'workflow') seen.push(args[args.indexOf('--repo') + 1]); return gh(args, options); };
   const result = await deployTrain(parseArguments(['train']), { gh: recordingGh, git: () => 'main\n', log: line => logged.push(line), sleep: async () => {}, timeoutMs: 5000, pollMs: 1 });
-  assert.deepEqual(seen, ['delorenj/pile-of-dumb-things', 'delorenj/green-in-between']);
+  assert.deepEqual(seen, ['delorenj/tower-of-lost-things', 'delorenj/green-in-between']);
   assert.equal(result.stopped, 'delorenj/green-in-between');
   assert.equal(result.status, 1);
   assert.ok(logged.some(line => /^DEPLOY_TRAIN stopped at delorenj\/green-in-between/.test(line)));
@@ -525,19 +525,19 @@ test('the Xcode handoff is a tree delta into the Mac cache, cloned per run, chec
       if (command === 'tar') execFileSync('tar', args);
       return command === 'rsync' ? 'Total bytes sent: 1,234\nTotal bytes received: 56\n' : '';
     };
-    const env = { GITHUB_REPOSITORY: 'delorenj/pile-of-dumb-things', GITHUB_RUN_ID: '42' };
+    const env = { GITHUB_REPOSITORY: 'delorenj/tower-of-lost-things', GITHUB_RUN_ID: '42' };
     const logs = [];
     const sent = await sendHandoffDelta({ host: 'hub-mac', base: 'Library/Caches/mobile-deploy-hub/handoff', cache: 'Library/Caches/mobile-deploy-hub/handoff-cache', archives: [{ name: 'A-ipad.tgz', tgz }], receipts: [], unpackInto: join(root, 'trees'), env, runner, log: line => logs.push(line) });
     assert.deepEqual(sent.mac_bytes, { in: 1234, out: 56 });
     assert.equal(sent.archives[0].mode, 'tree');
     assert.equal(sent.archives[0].tree_sha256, (await treeDigest(src)).sha256);
-    assert.ok(calls.some(call => /^rsync --stats --info=progress2 --partial-dir=\.rsync-partial -e ssh .* -rlpt -z --checksum --delete .*\/A-ipad\.tree\/ hub-mac:Library\/Caches\/mobile-deploy-hub\/handoff-cache\/delorenj-pile-of-dumb-things\/A-ipad\/$/.test(call)), calls.join('\n'));
-    assert.ok(calls.some(call => /cp -cR 'Library\/Caches\/mobile-deploy-hub\/handoff-cache\/delorenj-pile-of-dumb-things\/A-ipad' 'Library\/Caches\/mobile-deploy-hub\/handoff\/delorenj-pile-of-dumb-things\/42\/A-ipad\.tree'/.test(call)), 'the run gets its own clone');
+    assert.ok(calls.some(call => /^rsync --stats --info=progress2 --partial-dir=\.rsync-partial -e ssh .* -rlpt -z --checksum --delete .*\/A-ipad\.tree\/ hub-mac:Library\/Caches\/mobile-deploy-hub\/handoff-cache\/delorenj-tower-of-lost-things\/A-ipad\/$/.test(call)), calls.join('\n'));
+    assert.ok(calls.some(call => /cp -cR 'Library\/Caches\/mobile-deploy-hub\/handoff-cache\/delorenj-tower-of-lost-things\/A-ipad' 'Library\/Caches\/mobile-deploy-hub\/handoff\/delorenj-tower-of-lost-things\/42\/A-ipad\.tree'/.test(call)), 'the run gets its own clone');
     assert.ok(logs.some(line => /^HUB_MAC_BYTES in=1234 out=56/.test(line)) && logs.some(line => /^HUB_HANDOFF_DELTA bytes=1290 A-ipad\.tgz=tree/.test(line)));
 
     // The Mac side: the run's clone checked against tree_sha256 and packed into the tarball the hook reads.
     const home = join(root, 'mac');
-    const clone = join(home, 'Library/Caches/mobile-deploy-hub/handoff/delorenj-pile-of-dumb-things/42/A-ipad.tree');
+    const clone = join(home, 'Library/Caches/mobile-deploy-hub/handoff/delorenj-tower-of-lost-things/42/A-ipad.tree');
     await mkdir(clone, { recursive: true });
     execFileSync('cp', ['-R', `${src}/.`, clone]);
     const into = join(root, 'into');

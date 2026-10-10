@@ -25,7 +25,7 @@ export function triggersOf(text) {
 }
 const dispatchOnly = text => { const triggers = triggersOf(text); return Array.isArray(triggers) && triggers.length === 1 && triggers[0] === 'workflow_dispatch'; };
 export const exceptions = Object.freeze({
-  'delorenj/pile-of-dumb-things': {
+  'delorenj/tower-of-lost-things': {
     '.github/workflows/testflight.yml': { reason: 'the pre-hub TestFlight fallback, dispatched by hand only (no tag trigger); deleted after the first hub --testflight run (design A3)', when: dispatchOnly },
     'task testflight': 'dispatches testflight.yml (above); deleted with it',
   },

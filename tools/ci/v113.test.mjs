@@ -34,14 +34,14 @@ const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 const { policy } = loadPolicy();
 const devices = loadDevices({});
 const template = readFileSync(templateFile, 'utf8');
-const tower = policy.apps['delorenj/pile-of-dumb-things'];
+const tower = policy.apps['delorenj/tower-of-lost-things'];
 
 // ---------------------------------------------------------------------------------------------------- only the template caller
 
 test('inside a job, every hub command refuses a run another workflow started; outside a job the check is a no-op', async () => {
-  const env = { GITHUB_ACTIONS: 'true', GITHUB_REPOSITORY: 'delorenj/pile-of-dumb-things', GITHUB_WORKFLOW_REF: 'delorenj/pile-of-dumb-things/.github/workflows/hotfix.yml@refs/heads/main' };
-  assert.throws(() => checkCallerRef({ policy, env }), /HUB_GATE_REFUSED caller: this job was started by .*hotfix\.yml.*only from delorenj\/pile-of-dumb-things\/\.github\/workflows\/deploy\.yml@/);
-  assert.equal(checkCallerRef({ policy, env: { ...env, GITHUB_WORKFLOW_REF: 'delorenj/pile-of-dumb-things/.github/workflows/deploy.yml@refs/heads/main' } }), 'refs/heads/main');
+  const env = { GITHUB_ACTIONS: 'true', GITHUB_REPOSITORY: 'delorenj/tower-of-lost-things', GITHUB_WORKFLOW_REF: 'delorenj/tower-of-lost-things/.github/workflows/hotfix.yml@refs/heads/main' };
+  assert.throws(() => checkCallerRef({ policy, env }), /HUB_GATE_REFUSED caller: this job was started by .*hotfix\.yml.*only from delorenj\/tower-of-lost-things\/\.github\/workflows\/deploy\.yml@/);
+  assert.equal(checkCallerRef({ policy, env: { ...env, GITHUB_WORKFLOW_REF: 'delorenj/tower-of-lost-things/.github/workflows/deploy.yml@refs/heads/main' } }), 'refs/heads/main');
   assert.equal(checkCallerRef({ policy, env: { ...env, GITHUB_ACTIONS: '' } }), null, 'a test or a person at a shell');
   // Every command goes through main(): android, release, deliver and announce included, not only the gate.
   for (const command of ['android', 'release', 'play', 'deliver', 'announce', 'ios', 'preflight-ios']) {
@@ -50,7 +50,7 @@ test('inside a job, every hub command refuses a run another workflow started; ou
 });
 
 test('conformance and the gate refuse a second workflow that calls the hub, at any ref, as a reusable workflow or an action', async () => {
-  const repo = 'delorenj/pile-of-dumb-things';
+  const repo = 'delorenj/tower-of-lost-things';
   const reusable = 'jobs:\n  x:\n    uses: delorenj/mobile-deploy-hub/.github/workflows/mobile-deploy.yml@v1.0.0\n';
   const action = 'jobs:\n  x:\n    runs-on: [self-hosted, Linux]\n    steps:\n      - uses: delorenj/mobile-deploy-hub/actions/hub@v1.1.2\n        with:\n          command: android\n';
   for (const text of [reusable, action]) assert.match(checkWorkflow(repo, '.github/workflows/hotfix.yml', text).join('\n'), /calls mobile-deploy-hub; only \.github\/workflows\/deploy\.yml/);
@@ -79,7 +79,7 @@ test('conformance and the gate refuse a second workflow that calls the hub, at a
 function towerManifest(extra = {}) {
   return {
     schema: 2,
-    project: { slug: 'tower-of-dumb-things', name: 'Tower of Lost Things' },
+    project: { slug: 'tower-of-lost-things', name: 'Tower of Lost Things' },
     version: { read: 'node version.mjs', bump: 'node version.mjs bump' },
     android: { package: tower.android.package, export: 'true', artifact: 'artifacts/App.apk', signer_sha256: tower.android.signer_sha256 },
     ios: { bundle: tower.ios.bundle, device: 'true', device_artifact: 'App.xcarchive' },
@@ -155,7 +155,7 @@ test('a device\'s state comes from its own lane: a failed Release step leaves th
 });
 
 test('a rerun after a failure resets it: a fresh pending replaces failed (the catch-up retries), an install the rerun did not see is kept', () => {
-  const top = { slug: 'tower-of-dumb-things', name: 'Tower of Lost Things', version: '0.2.2', commit: 'b'.repeat(40), hub_ref: 'v1.1.3', run: sampleLatest().run, correlation: sampleLatest().correlation };
+  const top = { slug: 'tower-of-lost-things', name: 'Tower of Lost Things', version: '0.2.2', commit: 'b'.repeat(40), hub_ref: 'v1.1.3', run: sampleLatest().run, correlation: sampleLatest().correlation };
   const failedFirst = sampleLatest();
   failedFirst.android.device = { ...failedFirst.android.device, status: 'failed', reason: 'Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]', failures: 0 };
   const rerun = structuredClone(sampleLatest().android);
@@ -167,7 +167,7 @@ test('a rerun after a failure resets it: a fresh pending replaces failed (the ca
   assert.equal(mergeLatest({ current: installedFirst, candidates: { android: structuredClone(sampleLatest().android), ios: null }, top, stamp: '2026-10-09T21:00:00Z', log: () => {} }).latest.android.device.status, 'installed');
   // Nothing moved: no top-level change and no write (deliver checks `moved`).
   const newer = sampleLatest({ version: '0.2.9' });
-  newer.android = { ...newer.android, version: '0.2.9', code: 9, key: 'tower-of-dumb-things/0.2.9/tower-of-dumb-things-0.2.9-9.apk', url: 'https://s3.delo.sh/builds/tower-of-dumb-things/0.2.9/tower-of-dumb-things-0.2.9-9.apk' };
+  newer.android = { ...newer.android, version: '0.2.9', code: 9, key: 'tower-of-lost-things/0.2.9/tower-of-lost-things-0.2.9-9.apk', url: 'https://s3.delo.sh/builds/tower-of-lost-things/0.2.9/tower-of-lost-things-0.2.9-9.apk' };
   const kept = mergeLatest({ current: newer, candidates: { android: structuredClone(sampleLatest().android), ios: null }, top, stamp: '2026-10-09T21:00:00Z', log: () => {} });
   assert.deepEqual([kept.moved, kept.latest.version, kept.latest.updated_at], [false, '0.2.9', newer.updated_at]);
 });
@@ -189,7 +189,7 @@ async function deliverHost({ needs, receipts, scope = 'both', dryRun = false }) 
   await mkdir(app, { recursive: true });
   await writeFile(join(app, 'mobile-deploy.json'), JSON.stringify(towerManifest()));
   for (const [lane, receipt] of Object.entries(receipts)) await writeFile(join(out, 'receipts', `hub-receipt-${lane}.json`), JSON.stringify({ lane, ...receipt }));
-  const env = { PATH: process.env.PATH, GITHUB_REPOSITORY: 'delorenj/pile-of-dumb-things', GITHUB_RUN_ID: '777', GITHUB_RUN_ATTEMPT: '2', HUB_REF: 'v1.1.3', HUB_LOCK_DIR: join(root, 'locks'), HUB_NEEDS: JSON.stringify(needs) };
+  const env = { PATH: process.env.PATH, GITHUB_REPOSITORY: 'delorenj/tower-of-lost-things', GITHUB_RUN_ID: '777', GITHUB_RUN_ATTEMPT: '2', HUB_REF: 'v1.1.3', HUB_LOCK_DIR: join(root, 'locks'), HUB_NEEDS: JSON.stringify(needs) };
   const config = { ...parseConfig(['deliver', '--manifest', 'mobile-deploy.json', '--out', out, '--version', '0.2.2', '--android-code', '5', '--build-sha', 'b'.repeat(40), '--scope', scope, '--dry-run', String(dryRun)], env), cwd: app };
   const writes = [];
   const s3 = { putText: (text, key) => writes.push(key), put: (file, key) => writes.push(key), remove: key => writes.push(`rm ${key}`), list: () => [] };
@@ -215,8 +215,8 @@ test('a lane that succeeded without a receipt deliver can read is a failure at d
 test('deliver refuses a manifest whose slug is not the policy\'s (a rename on main after the gate opens no new folder)', async () => {
   const f = await deliverHost({ needs: { plan: { result: 'success' } }, receipts: {}, scope: 'android' });
   try {
-    await writeFile(join(f.config.cwd, 'mobile-deploy.json'), JSON.stringify(towerManifest({ project: { slug: 'tower-of-lost-things', name: 'Tower of Lost Things' } })));
-    await assert.rejects(deliver(f.config, { env: f.env, home: f.root, fetchImpl: async () => ({ status: 404, ok: false, text: async () => '' }), s3Factory: async () => f.s3, log: () => {} }), /HUB_GATE_REFUSED slug: .*tower-of-lost-things.*tower-of-dumb-things/);
+    await writeFile(join(f.config.cwd, 'mobile-deploy.json'), JSON.stringify(towerManifest({ project: { slug: 'tower-of-lost-thingz', name: 'Tower of Lost Things' } })));
+    await assert.rejects(deliver(f.config, { env: f.env, home: f.root, fetchImpl: async () => ({ status: 404, ok: false, text: async () => '' }), s3Factory: async () => f.s3, log: () => {} }), /HUB_GATE_REFUSED slug: .*tower-of-lost-thingz.*tower-of-lost-things/);
   } finally { await f.cleanup(); }
 });
 
@@ -225,8 +225,8 @@ test('deliver refuses a manifest whose slug is not the policy\'s (a rename on ma
 const ok = { result: 'success' };
 const delivery = (platform, extra = {}) => ({ platform, target: platform === 'android' ? 'SM-S948U' : 'iPad14,5', version: '0.2.2', build: platform === 'android' ? '4' : '5', sha256: 'a'.repeat(64), verified: false, status: 'pending', ...extra });
 const both = { android: true, ios: true };
-const project = { slug: 'tower-of-dumb-things', name: 'Tower of Lost Things' };
-const runEnv = { GITHUB_REPOSITORY: 'delorenj/pile-of-dumb-things', GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '1', HUB_REF: 'v1.1.3' };
+const project = { slug: 'tower-of-lost-things', name: 'Tower of Lost Things' };
+const runEnv = { GITHUB_REPOSITORY: 'delorenj/tower-of-lost-things', GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '1', HUB_REF: 'v1.1.3' };
 
 test('a failed Release after the S26 lane is .failed at deliver, and the S26 stays pending', () => {
   const event = deploymentEvent({
@@ -251,7 +251,7 @@ test('a Mac job no runner ever took makes the iPad skipped (ios) or stops the ru
   const event = deploymentEvent({
     project, declared: both, devices, needs: { gate: ok, 'preflight-ios': ok, plan: ok, android: ok, 'ios-export': { result: 'skipped' }, ios: { result: 'cancelled' }, 'deliver-android': ok, 'deliver-ios': { result: 'skipped' } },
     receipts: { android: { outcome: 'success', delivery: delivery('android') } }, version: '0.2.2', androidCode: '4', commit: 'b'.repeat(40), env: runEnv, lostMac: lost,
-    published: { apk: 'https://s3.delo.sh/builds/tower-of-dumb-things/0.2.2/tower-of-dumb-things-0.2.2-4.apk', apk_bytes: 74_660_647, page: 'https://s3.delo.sh/builds/tower-of-dumb-things/index.html', any: true },
+    published: { apk: 'https://s3.delo.sh/builds/tower-of-lost-things/0.2.2/tower-of-lost-things-0.2.2-4.apk', apk_bytes: 74_660_647, page: 'https://s3.delo.sh/builds/tower-of-lost-things/index.html', any: true },
   });
   assert.equal(event.type, 'bloodbank.project.deployment.completed');
   assert.deepEqual(event.data.deliveries.map(item => [item.device, item.status]), [['S26', 'pending'], ['iPad', 'skipped']]);
@@ -277,7 +277,7 @@ test('announce finds a lost Mac job in GitHub\'s record of the run: cancelled an
   const lost = findLostMac({ env, needs: { ios: { result: 'cancelled' } }, policy, runner });
   assert.equal(lost.job, 'ios');
   assert.equal(seen.env.GH_TOKEN, undefined);
-  assert.match(seen.args[1], /^repos\/delorenj\/pile-of-dumb-things\/actions\/runs\/123\/attempts\/1\/jobs/);
+  assert.match(seen.args[1], /^repos\/delorenj\/tower-of-lost-things\/actions\/runs\/123\/attempts\/1\/jobs/);
   assert.equal(findLostMac({ env, needs: { ios: { result: 'cancelled' } }, policy, runner: () => JSON.stringify([{ name: 'deploy / ios', conclusion: 'cancelled', runner_name: 'carries-macbook-air' }]) }), null, 'a job a runner took was cancelled mid-build: not lost');
 });
 
@@ -323,18 +323,18 @@ test('Quickdrop never replaces a newer APK, and removes only older ones', async 
   try {
     const dir = join(root, 'builds');
     await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, 'tower-of-dumb-things-0.2.3-5.apk'), 'newer');
-    await writeFile(join(dir, 'tower-of-dumb-things-0.2.1-3.apk'), 'older');
+    await writeFile(join(dir, 'tower-of-lost-things-0.2.3-5.apk'), 'newer');
+    await writeFile(join(dir, 'tower-of-lost-things-0.2.1-3.apk'), 'older');
     const apk = join(root, 'App.apk');
     await writeFile(apk, 'rebuilt 0.2.2');
     const logs = [];
-    const result = dropApk({ apk, dir, name: 'tower-of-dumb-things-0.2.2-4.apk', slug: 'tower-of-dumb-things', maxBytes: 120e6, log: line => logs.push(line) });
+    const result = dropApk({ apk, dir, name: 'tower-of-lost-things-0.2.2-4.apk', slug: 'tower-of-lost-things', maxBytes: 120e6, log: line => logs.push(line) });
     assert.equal(result.status, 'skipped');
-    assert.match(logs[0], /^HUB_QUICKDROP_SKIPPED tower-of-dumb-things-0\.2\.2-4\.apk: Quickdrop already holds the newer tower-of-dumb-things-0\.2\.3-5\.apk/);
-    assert.deepEqual(readdirSync(dir).sort(), ['tower-of-dumb-things-0.2.1-3.apk', 'tower-of-dumb-things-0.2.3-5.apk'], 'a rerun of an older run changes nothing there');
-    const newest = dropApk({ apk, dir, name: 'tower-of-dumb-things-0.2.4-6.apk', slug: 'tower-of-dumb-things', maxBytes: 120e6, log: () => {} });
-    assert.deepEqual(newest.removed.sort(), ['tower-of-dumb-things-0.2.1-3.apk', 'tower-of-dumb-things-0.2.3-5.apk']);
-    assert.deepEqual(readdirSync(dir), ['tower-of-dumb-things-0.2.4-6.apk']);
+    assert.match(logs[0], /^HUB_QUICKDROP_SKIPPED tower-of-lost-things-0\.2\.2-4\.apk: Quickdrop already holds the newer tower-of-lost-things-0\.2\.3-5\.apk/);
+    assert.deepEqual(readdirSync(dir).sort(), ['tower-of-lost-things-0.2.1-3.apk', 'tower-of-lost-things-0.2.3-5.apk'], 'a rerun of an older run changes nothing there');
+    const newest = dropApk({ apk, dir, name: 'tower-of-lost-things-0.2.4-6.apk', slug: 'tower-of-lost-things', maxBytes: 120e6, log: () => {} });
+    assert.deepEqual(newest.removed.sort(), ['tower-of-lost-things-0.2.1-3.apk', 'tower-of-lost-things-0.2.3-5.apk']);
+    assert.deepEqual(readdirSync(dir), ['tower-of-lost-things-0.2.4-6.apk']);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -379,7 +379,7 @@ test('a broken IPA send resumes from its partial file and counts the bytes the f
     return '';
   };
   const logs = [];
-  const sent = sendIpa({ ipa: '/tmp/x.ipa', name: 'tower-of-dumb-things-0.2.2-4.ipa', devices, env: { GITHUB_REPOSITORY: 'delorenj/pile-of-dumb-things', GITHUB_RUN_ID: '42' }, runner, log: line => logs.push(line), sleep: () => {} });
+  const sent = sendIpa({ ipa: '/tmp/x.ipa', name: 'tower-of-lost-things-0.2.2-4.ipa', devices, env: { GITHUB_REPOSITORY: 'delorenj/tower-of-lost-things', GITHUB_RUN_ID: '42' }, runner, log: line => logs.push(line), sleep: () => {} });
   assert.deepEqual(sent, { out: 41_500_000, in: 60, failed: 30_000_000 });
   assert.ok(calls.filter(call => call.startsWith('rsync ')).every(call => / --partial-dir=\.rsync-partial /.test(call)), 'big-chungus keeps the partial file');
   assert.ok(logs.some(line => /^HUB_MAC_BYTES_RETRIED 30000000 bytes/.test(line)));
@@ -422,7 +422,7 @@ test('the watchdog cancels through the host\'s gh and logs why; an idle app cost
   const calls = [];
   const gh = args => {
     calls.push(args.join(' '));
-    if (/pile-of-dumb-things\/actions\/workflows\/deploy\.yml\/runs\?status=in_progress/.test(args[1] ?? '')) return JSON.stringify([{ id: 501, run_attempt: 1 }]);
+    if (/tower-of-lost-things\/actions\/workflows\/deploy\.yml\/runs\?status=in_progress/.test(args[1] ?? '')) return JSON.stringify([{ id: 501, run_attempt: 1 }]);
     if (/workflows\/deploy\.yml\/runs/.test(args[1] ?? '')) return '[]';
     if (/actions\/runners/.test(args[1] ?? '')) return JSON.stringify({ status: 'offline', busy: false });
     if (/runs\/501\/attempts\/1\/jobs/.test(args[1] ?? '')) return JSON.stringify([{ name: 'deploy / preflight-ios', status: 'queued', conclusion: null, created_at: '2026-10-09T19:30:00Z' }]);
@@ -431,9 +431,9 @@ test('the watchdog cancels through the host\'s gh and logs why; an idle app cost
   };
   const logs = [];
   const actions = await watch({ policy, devices, gh, now, log: line => logs.push(line) });
-  assert.deepEqual(actions.map(item => [item.repo, item.run, item.job]), [['delorenj/pile-of-dumb-things', 501, 'preflight-ios']]);
-  assert.ok(calls.includes('run cancel 501 --repo delorenj/pile-of-dumb-things'));
-  assert.match(logs[0], /^HUB_MACWATCH_CANCELLED delorenj\/pile-of-dumb-things run 501: preflight-ios waited 30 min and carries-macbook-air is offline/);
+  assert.deepEqual(actions.map(item => [item.repo, item.run, item.job]), [['delorenj/tower-of-lost-things', 501, 'preflight-ios']]);
+  assert.ok(calls.includes('run cancel 501 --repo delorenj/tower-of-lost-things'));
+  assert.match(logs[0], /^HUB_MACWATCH_CANCELLED delorenj\/tower-of-lost-things run 501: preflight-ios waited 30 min and carries-macbook-air is offline/);
   assert.equal(calls.filter(call => /green-in-between/.test(call)).length, 2, 'an app with no run in flight: two list calls, nothing else');
 });
 
