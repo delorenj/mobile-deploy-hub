@@ -92,7 +92,7 @@ Everything else dropped from the runners-up is listed in "Rejected" at the end.
   "event": { "per": "run-attempt", "strict": true, "catch_up": true, "types": ["bloodbank.project.deployment.completed", "bloodbank.project.deployment.failed"] },
   "manifest_schema": [2],
   "apps": {
-    "delorenj/pile-of-dumb-things": { "slug": "tower-of-dumb-things", "lanes": ["android", "ios"] },
+    "delorenj/tower-of-lost-things": { "slug": "tower-of-lost-things", "lanes": ["android", "ios"] },
     "delorenj/green-in-between": { "slug": "green-in-between", "lanes": ["android", "ios"] },
     "delorenj/gruvato": { "slug": "gruvato", "lanes": ["android", "ios"] }
   },
@@ -324,29 +324,29 @@ builds/.probe/<run>                                  the gate's write probe, del
 ```json
 {
   "schema": 1,
-  "slug": "tower-of-dumb-things",
+  "slug": "tower-of-lost-things",
   "name": "Tower of Lost Things",
   "version": "0.2.2",
   "commit": "<40 hex>",
   "hub_ref": "v1.1.0",
-  "run": { "repo": "delorenj/pile-of-dumb-things", "id": "37940000000", "attempt": 1, "url": "https://github.com/delorenj/pile-of-dumb-things/actions/runs/37940000000" },
+  "run": { "repo": "delorenj/tower-of-lost-things", "id": "37940000000", "attempt": 1, "url": "https://github.com/delorenj/tower-of-lost-things/actions/runs/37940000000" },
   "correlation": "<UUIDv5 of mobile-deploy:<repo>:<run id>>",
   "updated_at": "2026-10-09T20:00:00Z",
   "android": {
     "package": "io.automaticai.towerofdumbthings", "version": "0.2.2", "code": 4,
-    "key": "tower-of-dumb-things/0.2.2/tower-of-dumb-things-0.2.2-4.apk",
-    "url": "https://s3.delo.sh/builds/tower-of-dumb-things/0.2.2/tower-of-dumb-things-0.2.2-4.apk",
+    "key": "tower-of-lost-things/0.2.2/tower-of-lost-things-0.2.2-4.apk",
+    "url": "https://s3.delo.sh/builds/tower-of-lost-things/0.2.2/tower-of-lost-things-0.2.2-4.apk",
     "bytes": 72300000, "sha256": "<64 hex>", "signer_sha256": "<64 hex>",
-    "quickdrop": "builds/tower-of-dumb-things-0.2.2-4.apk",
+    "quickdrop": "builds/tower-of-lost-things-0.2.2-4.apk",
     "device": { "name": "S26", "model": "SM-S948U", "status": "pending", "since": "…", "by": null, "reason": "not on big-chungus's adb", "failures": 0 }
   },
   "ios": {
     "bundle": "io.automaticai.towerofdumbthings", "version": "0.2.2", "build": "4",
-    "key": "tower-of-dumb-things/0.2.2/tower-of-dumb-things-0.2.2-4.ipa",
-    "url": "https://s3.delo.sh/builds/tower-of-dumb-things/0.2.2/tower-of-dumb-things-0.2.2-4.ipa",
+    "key": "tower-of-lost-things/0.2.2/tower-of-lost-things-0.2.2-4.ipa",
+    "url": "https://s3.delo.sh/builds/tower-of-lost-things/0.2.2/tower-of-lost-things-0.2.2-4.ipa",
     "bytes": 27300000, "sha256": "<64 hex>",
-    "manifest_url": "https://s3.delo.sh/builds/tower-of-dumb-things/ios/manifest.plist",
-    "install_url": "itms-services://?action=download-manifest&url=https://s3.delo.sh/builds/tower-of-dumb-things/ios/manifest.plist",
+    "manifest_url": "https://s3.delo.sh/builds/tower-of-lost-things/ios/manifest.plist",
+    "install_url": "itms-services://?action=download-manifest&url=https://s3.delo.sh/builds/tower-of-lost-things/ios/manifest.plist",
     "device": { "name": "iPad", "model": "iPad14,5", "status": "installed", "since": "…", "by": "deploy", "reason": null, "failures": 0 }
   }
 }

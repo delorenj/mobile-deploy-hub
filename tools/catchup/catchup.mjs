@@ -281,10 +281,19 @@ async function settle(ctx, result) {
 
 // ---------------------------------------------------------------------------------------------------- reading
 
+// The "nothing pending" summary never reads as a healthy empty pass while a manifest went unreadable: those apps are
+// unseen this pass (their own HUB_CATCHUP_ERROR lines say why), so the idle line names them instead of "no apps".
+function idleSummary(quiet, unreadable) {
+  const parts = quiet.length > 0 ? [quiet.join(', ')] : [];
+  if (unreadable.length > 0) parts.push(`${unreadable.join(', ')} unreadable this pass`);
+  return parts.join('; ') || 'no apps';
+}
+
 async function readApps(ctx, platform) {
   const work = [];
   const quiet = [];
   const resend = [];
+  const unreadable = [];
   let errors = 0;
   for (const app of ctx.settings.apps) {
     let latest;
@@ -292,6 +301,7 @@ async function readApps(ctx, platform) {
       latest = await ctx.store.latest(app.slug);
     } catch (error) {
       errors += 1;
+      unreadable.push(app.slug);
       ctx.log(`HUB_CATCHUP_ERROR ${app.slug}: cannot read latest.json (${oneLine(error)})`);
       continue;
     }
@@ -299,6 +309,7 @@ async function readApps(ctx, platform) {
     const problems = latestProblems(latest, app.slug, ctx.settings.publicRoot, app);
     if (problems.length > 0) {
       errors += 1;
+      unreadable.push(app.slug);
       ctx.log(`HUB_CATCHUP_ERROR ${app.slug}: latest.json refused (${problems.join('; ')})`);
       continue;
     }
@@ -308,7 +319,7 @@ async function readApps(ctx, platform) {
     if (block.device.status !== 'pending') { quiet.push(`${app.slug} ${describe(block.version, buildOf(block, platform))} ${block.device.status}`); continue; }
     work.push({ app, latest, block });
   }
-  return { work, quiet, errors, resend };
+  return { work, quiet, unreadable, errors, resend };
 }
 
 // ---------------------------------------------------------------------------------------------------- the S26 pass
@@ -391,14 +402,14 @@ async function notInFlight(ctx, listed, platform) {
 }
 
 export async function androidPass(ctx) {
-  const { work: listed, quiet, errors: readErrors, resend } = await readApps(ctx, 'android');
+  const { work: listed, quiet, errors: readErrors, resend, unreadable } = await readApps(ctx, 'android');
   let errors = readErrors;
   for (const { app, platform } of resend) if (!await resendEvent(ctx, app, platform)) errors += 1;
   const held = await notInFlight(ctx, listed, 'android');
   const { work } = held;
   errors += held.errors;
   if (work.length === 0) {
-    if (listed.length === 0) ctx.log(`HUB_CATCHUP_IDLE android ${ctx.mode}: nothing pending (${quiet.join(', ') || 'no apps'})`);
+    if (listed.length === 0) ctx.log(`HUB_CATCHUP_IDLE android ${ctx.mode}: nothing pending (${idleSummary(quiet, unreadable)})`);
     return { errors, results: [] };
   }
   let results = null;
@@ -487,10 +498,10 @@ async function iosApp(ctx, item) {
 }
 
 export async function iosPass(ctx) {
-  const { work: listed, quiet, errors: readErrors } = await readApps(ctx, 'ios');
+  const { work: listed, quiet, errors: readErrors, unreadable } = await readApps(ctx, 'ios');
   let errors = readErrors;
   if (listed.length === 0) {
-    ctx.log(`HUB_CATCHUP_IDLE ios ${ctx.mode}: nothing pending (${quiet.join(', ') || 'no apps'})`);
+    ctx.log(`HUB_CATCHUP_IDLE ios ${ctx.mode}: nothing pending (${idleSummary(quiet, unreadable)})`);
     return { errors, results: [] };
   }
   const held = await notInFlight(ctx, listed, 'ios');

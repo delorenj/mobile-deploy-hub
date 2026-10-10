@@ -270,6 +270,20 @@ test('an absent S26 is idle: no event, no write, no failure counted', async () =
   } finally { host.cleanup(); }
 });
 
+test('a pass that cannot read any latest.json says so in its idle line and counts as failed, not healthy-empty', async () => {
+  const host = linuxHost();
+  try {
+    publish(host.s3, { latest: latestDoc(), apk: apkText() });
+    // Both of the Mac's paths down at once (the https fetch and the ssh fallback): the store itself throws.
+    host.ctx.store = { ...host.ctx.store, latest: async () => { throw new Error('ssh big-chungus curl failed (exit 255)'); } };
+    const result = await androidPass(host.ctx);
+    assert.ok(result.errors >= 1, 'the pass exits non-zero through its error count');
+    assert.equal(host.phone.calls(), '', 'a blind pass touches nothing');
+    assert.equal(host.lines(/HUB_CATCHUP_ERROR tower-of-lost-things: cannot read latest\.json/).length, 1);
+    assert.match(host.lines(/HUB_CATCHUP_IDLE android live/)[0], /nothing pending \(tower-of-lost-things, green-in-between, gruvato unreadable this pass\)/);
+  } finally { host.cleanup(); }
+});
+
 test('INSTALLED: fetched over loopback, sha256 and signer checked, installed in place, read back, one event', async () => {
   const host = linuxHost();
   try {
