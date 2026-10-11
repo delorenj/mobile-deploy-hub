@@ -24,6 +24,7 @@ import { buildReceipt, setOutputs, writeReceipt } from '../lib/receipt.mjs';
 import { jobWriter, readObject } from '../lib/s3.mjs';
 import { parseVersionInfo } from '../lib/version.mjs';
 import { checkCaller, refusal } from '../lib/caller.mjs';
+import { tagOnlyOf, tagPrefixOf } from '../lib/policy.mjs';
 import { checkDisk, checkSecrets, firstLine, guarded, isoNow, policyBanner, reachIpad, readMacLink, runOf, short } from './common.mjs';
 import { callerReader, checkPins } from './gate.mjs';
 
@@ -220,7 +221,9 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
       dryRun: config.dryRun,
       onMain,
       readVersion,
-      runBump: level => parseVersionInfo(hookOutput('version.bump', manifest.version.bump, { cwd: config.cwd, env: hooks, args: [level] }), { hook: 'version.bump', needAndroid: scope.android, needFiles: true }),
+      tagPrefix: tagPrefixOf(app),
+      tagOnly: tagOnlyOf(app),
+      runBump: level => parseVersionInfo(hookOutput('version.bump', manifest.version.bump, { cwd: config.cwd, env: hooks, args: [level] }), { hook: 'version.bump', needAndroid: scope.android, needFiles: true, tagOnly: tagOnlyOf(app) }),
       beforeCommit: ({ bumped }) => {
         track.stage = 'preflight';
         // The bump lands on main's newest tip. Its manifest must be the one the gate checked at the dispatched commit:
@@ -297,7 +300,7 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
     await setOutputs(outputs, env);
     track.receipt = { version: next.version, androidCode: next.android_code };
     const bump = { level: config.bump, from: result.current.version, to: next.version, tag: result.tag, files: result.files, committed: result.committed, rehearsed: result.rehearsed === true, attempts: result.attempts, base: result.base };
-    notes.push(result.committed ? `bumped ${result.current.version} -> ${next.version}, pushed ${result.tag} at ${short(result.sha)}` : `dry run: would bump ${result.current.version} -> ${next.version} (${result.files.join(', ')}); commit, tag and git push --dry-run rehearsed, then rewound: nothing reached the remote`);
+    notes.push(result.committed ? `bumped ${result.current.version} -> ${next.version}, pushed ${result.tag} at ${short(result.sha)}` : `dry run: would bump ${result.current.version} -> ${next.version} (${result.files.length > 0 ? result.files.join(', ') : `tag ${result.tag} only`}); ${result.files.length > 0 ? 'commit, ' : ''}tag and git push --dry-run rehearsed, then rewound: nothing reached the remote`);
     await writeReceipt(join(config.out, 'plan'), buildReceipt({
       lane: 'plan', config: { ...config, buildSha: result.sha }, env, version: next.version, androidCode: next.android_code, build: next.ios_build, notes,
       bump, devices: { s26: phone, s26_state: s26, ipad: declared.ios && iosLane === 'run' ? { version: config.ipadVersion, build: config.ipadBuild || null } : null, ios_lane: laneNow },

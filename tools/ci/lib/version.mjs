@@ -16,7 +16,9 @@ export function nextVersion(version, level) {
 }
 
 // One line of JSON on the hook's last stdout line. android_code is required when the Android lane runs.
-export function parseVersionInfo(stdout, { hook = 'version.read', needAndroid = false, needFiles = false } = {}) {
+// A tag-versioned app (policy `version: "tag"`) keeps its version in its tags alone: its bump hook changes nothing and
+// lists `"files": []`.
+export function parseVersionInfo(stdout, { hook = 'version.read', needAndroid = false, needFiles = false, tagOnly = false } = {}) {
   const line = stdout.trim().split('\n').pop() ?? '';
   let value;
   try { value = JSON.parse(line); } catch { throw new Error(`${hook} must print one line of JSON, got "${line.slice(0, 120)}"`); }
@@ -31,7 +33,9 @@ export function parseVersionInfo(stdout, { hook = 'version.read', needAndroid = 
   }
   const info = { version: value.version, android_code: value.android_code, ios_build: iosBuild };
   if (needFiles) {
-    if (!Array.isArray(value.files) || value.files.length === 0) throw new Error(`${hook} must list the files it changed in "files"`);
+    if (!Array.isArray(value.files)) throw new Error(`${hook} must list the files it changed in "files"`);
+    if (tagOnly && value.files.length > 0) throw new Error(`${hook} changed ${value.files.join(', ')}, but this app is tag-versioned: its version lives in its tags and the bump changes no file`);
+    if (!tagOnly && value.files.length === 0) throw new Error(`${hook} must list the files it changed in "files"`);
     for (const file of value.files) {
       if (typeof file !== 'string' || file === '' || file.startsWith('/') || file.split('/').includes('..') || /[\0\n\r]/.test(file)) throw new Error(`${hook} listed a file outside the checkout: ${JSON.stringify(file)}`);
     }

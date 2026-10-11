@@ -32,6 +32,15 @@ export const exceptions = Object.freeze({
   'delorenj/gruvato': {
     'task ios:simulator announce': 'announces its own simulator event, which is not a device deploy (design A3)',
   },
+  // A monorepo: the hub owns Navi's navi-v* tags; the repository's own v* version belongs to its server release
+  // groups (FieldOpsLine, Surface, Mirror), which never reach a phone.
+  'AutomaticAI-io/james-brennan': {
+    'task version:bump': "the suite's v* version, not Navi's navi-v* tags",
+    'task version:bump-minor': "the suite's v* version, not Navi's navi-v* tags",
+    'task version:bump-major': "the suite's v* version, not Navi's navi-v* tags",
+    'task version:sync': "the suite's v* version, not Navi's navi-v* tags",
+    'task release:announce': 'announces server release groups (FieldOpsLine, Surface, Mirror) from their tags; no phone build',
+  },
 });
 
 export const uploadPatterns = Object.freeze([

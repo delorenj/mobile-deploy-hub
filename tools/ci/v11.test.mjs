@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { callerHash, checkCaller, normalizeCaller, templateFile } from './lib/caller.mjs';
 import { parseConfig } from './lib/config.mjs';
-import { loadPolicy, parsePolicy, policyFile } from './lib/policy.mjs';
+import { loadPolicy, parsePolicy, policyFile, tagOf, tagOnlyOf } from './lib/policy.mjs';
 import * as hub from './hub.mjs';
 import { sampleLatest } from './test-fixtures.mjs';
 import { gate } from './hub.mjs';
@@ -44,6 +44,8 @@ test('the policy parses strictly: unknown keys, a "none" bump, hosted runners an
     'lane typo': p => { p.apps['delorenj/gruvato'].lanes = ['android', 'ipad']; },
     'absent stops': p => { p.devices.absent = 'stop'; },
     'duplicate slug': p => { p.apps['delorenj/gruvato'].slug = 'green-in-between'; },
+    'tag prefix not ending in v': p => { p.apps['AutomaticAI-io/james-brennan'].tag_prefix = 'navi-'; },
+    'version mode typo': p => { p.apps['AutomaticAI-io/james-brennan'].version = 'tags'; },
   };
   for (const [name, change] of Object.entries(cases)) {
     const copy = structuredClone(base);
@@ -52,12 +54,17 @@ test('the policy parses strictly: unknown keys, a "none" bump, hosted runners an
   }
 });
 
-test('the policy names the three apps in Jarad\'s order with both lanes, and the front door\'s train agrees', async () => {
+test('the policy names the four apps in Jarad\'s order with their lanes, and the front door\'s train agrees', async () => {
   assert.deepEqual(Object.entries(policy.apps).map(([repo, app]) => [repo, app.slug, app.lanes.join('+')]), [
     ['delorenj/tower-of-lost-things', 'tower-of-lost-things', 'android+ios'],
     ['delorenj/green-in-between', 'green-in-between', 'android+ios'],
     ['delorenj/gruvato', 'gruvato', 'android+ios'],
+    ['AutomaticAI-io/james-brennan', 'navi', 'android'],
   ]);
+  // v1.2: Navi lives in a monorepo whose main takes only reviewed pull requests: its own tag prefix, tag-only bumps.
+  const navi = policy.apps['AutomaticAI-io/james-brennan'];
+  assert.deepEqual([tagOf(navi, '0.1.1'), tagOnlyOf(navi)], ['navi-v0.1.1', true]);
+  assert.deepEqual([tagOf(policy.apps['delorenj/gruvato'], '0.2.4'), tagOnlyOf(policy.apps['delorenj/gruvato'])], ['v0.2.4', false]);
   const { train } = await import('../deploy.mjs');
   assert.deepEqual([...train], Object.keys(policy.apps));
   assert.equal(loadPolicy().short.length, 8);

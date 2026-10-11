@@ -10,9 +10,9 @@ export const policyFile = fileURLToPath(new URL('../policy.json', import.meta.ur
 const fail = message => { throw new Error(`policy.json: ${message}`); };
 const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
-function exact(where, value, keys) {
+function exact(where, value, keys, optional = []) {
   if (!isObject(value)) fail(`${where} must be an object`);
-  for (const key of Object.keys(value)) if (!keys.includes(key)) fail(`${where} has unknown key "${key}"`);
+  for (const key of Object.keys(value)) if (!keys.includes(key) && !optional.includes(key)) fail(`${where} has unknown key "${key}"`);
   for (const key of keys) if (!(key in value)) fail(`${where}.${key} is required`);
 }
 const positive = (where, value) => { if (!Number.isSafeInteger(value) || value <= 0) fail(`${where} must be a positive whole number`); };
@@ -49,7 +49,12 @@ export function parsePolicy(source) {
     if (app.lanes.length === 0 || app.lanes.some(lane => !['android', 'ios'].includes(lane)) || new Set(app.lanes).size !== app.lanes.length) fail(`apps.${repo}.lanes must list android and/or ios`);
     // Each lane pins what a device may receive (v1.1.3): the package and the signer on Android, the bundle on iOS. The
     // gate, deliver and the catch-up hold every build to these, never to a manifest or latest.json alone.
-    exact(`apps.${repo}`, app, ['slug', 'lanes', ...app.lanes]);
+    // v1.2: an app that shares its repository's tags with other things names its own tag prefix (a monorepo's
+    // `navi-v1.2.3` beside the repository's `v2.0.0`), and an app whose main takes only reviewed pull requests keeps
+    // its version in those tags alone (`version: "tag"`): the bump pushes the tag and commits nothing.
+    exact(`apps.${repo}`, app, ['slug', 'lanes', ...app.lanes], ['tag_prefix', 'version']);
+    if ('tag_prefix' in app && !/^[a-z][a-z0-9-]*v$/.test(app.tag_prefix ?? '')) fail(`apps.${repo}.tag_prefix must be lowercase and end in "v" (v, navi-v)`);
+    if ('version' in app && !['commit', 'tag'].includes(app.version)) fail(`apps.${repo}.version must be "commit" or "tag"`);
     if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(app.slug ?? '')) fail(`apps.${repo}.slug must be a pjangler slug`);
     if (slugs.has(app.slug)) fail(`apps: slug ${app.slug} is used twice`);
     slugs.add(app.slug);
@@ -111,6 +116,11 @@ export function loadPolicy(file = policyFile) {
   const sha256 = createHash('sha256').update(source).digest('hex');
   return { policy, sha256, short: sha256.slice(0, 8) };
 }
+
+// The tag a version is released under, and whether the bump commits a version file or only pushes that tag.
+export const tagPrefixOf = app => app?.tag_prefix ?? 'v';
+export const tagOf = (app, version) => `${tagPrefixOf(app)}${version}`;
+export const tagOnlyOf = app => app?.version === 'tag';
 
 // The app a repository deploys, or a refusal: only the repositories the policy lists deploy through the hub.
 export function appFor(policy, repo) {

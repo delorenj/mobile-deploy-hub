@@ -17,6 +17,7 @@ import { exportGodot } from '../lib/godot.mjs';
 import { apkName } from '../lib/latest.mjs';
 import { withLock } from '../lib/lock.mjs';
 import { loadManifest } from '../lib/manifest.mjs';
+import { loadPolicy, tagOf } from '../lib/policy.mjs';
 import { uploadBundle } from '../lib/play.mjs';
 import { dropApk, s26OnLan } from '../lib/quickdrop.mjs';
 import { buildReceipt, sha256File, writeReceipt } from '../lib/receipt.mjs';
@@ -196,9 +197,9 @@ async function releaseLane(config, { env }) {
   const out = join(config.out, 'android');
   const assets = [basename(spec.artifact), ...(spec.receipt ? [basename(spec.receipt)] : []), 'hub-receipt-android.json'].map(name => join(out, name));
   for (const asset of assets) if (!exists(asset)) throw new Error(`release asset missing: ${asset}`);
-  const tag = `v${config.version}`;
   const repo = env.GITHUB_REPOSITORY;
   if (!repo) throw new Error('GITHUB_REPOSITORY is not set');
+  const tag = tagOf(loadPolicy().policy.apps[repo], config.version);
   // The commit the APK was built from: the bump commit, never the commit before it.
   const sha = config.buildSha || env.GITHUB_SHA || 'HEAD';
   const digest = await sha256File(join(out, basename(spec.artifact)));

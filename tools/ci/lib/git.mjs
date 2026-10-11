@@ -97,6 +97,8 @@ export function createGit({ cwd, env = process.env, token } = {}) {
     tag: (name, message) => git(['tag', '-a', name, '-m', message]),
     deleteTag: name => attempt('git', ['tag', '-d', name], { cwd, env: gitEnv }),
     push: (tag, { dryRun = false } = {}) => attempt('git', ['push', ...(dryRun ? ['--dry-run'] : []), '--atomic', 'origin', 'HEAD:refs/heads/main', `refs/tags/${tag}`], { cwd, env: gitEnv, timeout: 300_000 }),
+    // A tag-versioned app: the tag alone, on the commit that was dispatched; main is never written.
+    pushTag: (tag, { dryRun = false } = {}) => attempt('git', ['push', ...(dryRun ? ['--dry-run'] : []), '--atomic', 'origin', `refs/tags/${tag}`], { cwd, env: gitEnv, timeout: 300_000 }),
     // Back to the base commit after a dry run's rehearsal: the bump commit and its local tag are dropped.
     rewind: (sha, tag) => { git(['reset', '--quiet', '--hard', sha]); attempt('git', ['tag', '-d', tag], { cwd, env: gitEnv }); },
     apply: patch => {
@@ -120,7 +122,11 @@ const short = sha => (sha ?? '').slice(0, 8);
 // tags, and runs `git push --dry-run --atomic` with the same token (the pre-push guard runs and GitHub checks write
 // access), then rewinds the checkout to the base commit. It returns the patch the later jobs apply to their own
 // checkouts. Nothing reaches the remote: --dry-run sends no objects and updates no ref.
-export async function bumpTransaction({ git, level, dryRun, onMain = true, readVersion, runBump, beforeCommit, message, maxAttempts = 3, log = console.log }) {
+//
+// A tag-versioned app (tagOnly) has no version file and a main that only takes reviewed pull requests: the bump is
+// the annotated tag `<tagPrefix><version>` on the base commit, pushed alone. Nothing is committed and the lanes build
+// the base commit with HUB_VERSION and HUB_ANDROID_CODE.
+export async function bumpTransaction({ git, level, dryRun, onMain = true, readVersion, runBump, beforeCommit, message, tagPrefix = 'v', tagOnly = false, maxAttempts = 3, log = console.log }) {
   if (git.shallow()) throw new Error('the plan checkout is shallow; the bump needs full history (actions/checkout fetch-depth: 0), because the pre-push guard cannot verify a shallow push');
   for (let round = 1; round <= maxAttempts; round += 1) {
     let base;
@@ -138,7 +144,7 @@ export async function bumpTransaction({ git, level, dryRun, onMain = true, readV
     checkBump(current, bumped, level);
     const changed = git.changed();
     if (!sameFiles(changed, bumped.files)) throw new Error(`version.bump listed ${bumped.files.join(', ')} but changed ${changed.join(', ') || 'nothing'}; the listed files must be exactly the diff`);
-    const tag = `v${bumped.version}`;
+    const tag = `${tagPrefix}${bumped.version}`;
     const existing = git.remoteTag(tag);
     if (existing) {
       const remote = onMain ? git.remoteMain() : base;
@@ -146,6 +152,25 @@ export async function bumpTransaction({ git, level, dryRun, onMain = true, readV
       throw new Error(`tag ${tag} already exists on origin (at ${short(existing.commit)}); a version is never reused. Bump past it, or delete the tag if that version never shipped`);
     }
     if (beforeCommit) await beforeCommit({ current, bumped, tag });
+    if (tagOnly) {
+      git.tag(tag, tag);
+      const pushed = git.pushTag(tag, { dryRun });
+      git.deleteTag(tag);
+      if (dryRun) {
+        if (!pushed.ok) {
+          const why = `${pushed.stdout}${pushed.stderr}`.trim().split('\n').slice(-6).join('\n');
+          throw new Error(`the rehearsal \`git push --dry-run --atomic\` of ${tag} failed${pushed.timedOut ? ' (timed out)' : ''}; a real deploy would stop here:\n${why}`);
+        }
+        log(`HUB_PUSH_REHEARSED ${tag}: tag and git push --dry-run --atomic passed (guards and write access) at ${short(base)}; nothing committed`);
+        return { base, sha: base, current, next: bumped, tag, files: [], patch: '', committed: false, rehearsed: true, attempts: round };
+      }
+      if (!pushed.ok) {
+        const why = `${pushed.stdout}${pushed.stderr}`.trim().split('\n').slice(-6).join('\n');
+        throw new Error(`git push of ${tag} failed${pushed.timedOut ? ' (timed out)' : ''}:\n${why}`);
+      }
+      log(`HUB_BUMPED ${current.version} -> ${bumped.version} ${tag} at ${short(base)} (tag only, attempt ${round})`);
+      return { base, sha: base, current, next: bumped, tag, files: [], patch: '', committed: true, attempts: round };
+    }
     git.add(bumped.files);
     const patch = git.diffCached();
     git.commit(message({ current, bumped, tag, level }));

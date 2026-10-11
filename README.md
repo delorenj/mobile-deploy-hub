@@ -100,6 +100,7 @@ The `REAL` in a real run's title is how the front door finds the last real run. 
 | `project` | `{slug, name, icon?}`: the pjangler slug (it must match the policy), the name the event uses, and an optional square PNG for the iPad's install prompt |
 | `version.read` | prints one line of JSON: `{"version":"X.Y.Z","android_code":N,"ios_build":...}` |
 | `version.bump` | `<level>` is appended; rewrites the app's version authority files (no git) and prints the same JSON plus `"files"`, exactly the files it changed |
+| (tag-versioned apps) | an app whose policy entry says `"version": "tag"` keeps its version in its tags alone: `version.read` reads the newest `<tag_prefix>X.Y.Z` tag, `version.bump` changes nothing and prints `"files": []`, and the plan pushes only the annotated tag on main's tip (no commit; main may require pull requests). `tag_prefix` (default `v`) also names the Release. Navi (`AutomaticAI-io/james-brennan`, `navi-v`) is the first |
 | `android.package`, `prepare`, `export`, `artifact`, `receipt`, `signer_sha256` | the APK; the signer pin is mandatory (the key on the phone) |
 | `android.bundle`, `bundle_artifact` | the Play AAB, used with `--play` |
 | `ios.bundle`, `device`, `device_artifact` | the Mac hook that leaves an unsigned `.xcarchive` (the hub exports it) or an `.ipa` in `$HUB_OUT/ios` |

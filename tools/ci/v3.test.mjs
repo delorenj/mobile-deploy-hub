@@ -255,6 +255,55 @@ test('a push that loses the race to a new main commit bumps again on the new tip
   } finally { await f.cleanup(); }
 });
 
+// v1.2: a tag-versioned app (a monorepo whose main takes only reviewed pull requests) is bumped by its tag alone.
+function tagOnlyArgs(f, { dryRun = true } = {}) {
+  const tags = () => git(f.app, ['tag', '--list', 'navi-v*'], f.env).trim().split('\n').filter(Boolean).map(tag => tag.slice('navi-v'.length));
+  const read = () => ({ version: tags().sort().pop() ?? '0.2.1', android_code: 2001 });
+  return {
+    ...transactionArgs(f, { dryRun }),
+    tagPrefix: 'navi-v',
+    tagOnly: true,
+    readVersion: read,
+    runBump: level => parseVersionInfo(JSON.stringify({ version: nextVersion(read().version, level), android_code: 2002, files: [] }), { hook: 'version.bump', needFiles: true, tagOnly: true }),
+  };
+}
+
+test('a tag-versioned app: the dry run rehearses the tag push alone and leaves no commit and no tag', async () => {
+  const f = await gitFixture();
+  try {
+    const mainBefore = f.remote(['rev-parse', 'main']);
+    const result = await bumpTransaction(tagOnlyArgs(f));
+    assert.deepEqual([result.tag, result.sha, result.base, result.patch, result.committed, result.rehearsed], ['navi-v0.2.2', mainBefore, mainBefore, '', false, true]);
+    assert.deepEqual(result.files, []);
+    assert.equal(f.remote(['rev-parse', 'main']), mainBefore);
+    assert.equal(f.remote(['tag', '--list']), '', 'no tag reached origin');
+    assert.equal(git(f.app, ['tag', '--list'], f.env).trim(), '', 'the local tag is gone');
+    assert.match(await readFile(join(f.root, 'pre-push.log'), 'utf8'), /^pre-push origin /m, 'the pre-push guard ran on the rehearsal');
+  } finally { await f.cleanup(); }
+});
+
+test('a tag-versioned app: a real bump pushes only the prefixed tag, on main as it was, and never writes main', async () => {
+  const f = await gitFixture();
+  try {
+    git(f.seed, ['tag', 'v2.0.0'], f.env);
+    git(f.seed, ['push', '-q', f.origin, 'v2.0.0'], f.env);
+    const base = f.remote(['rev-parse', 'main']);
+    const result = await bumpTransaction(tagOnlyArgs(f, { dryRun: false }));
+    assert.equal(result.committed, true);
+    assert.equal(result.sha, base);
+    assert.equal(f.remote(['rev-parse', 'main']), base, 'main did not move');
+    assert.equal(f.remote(['rev-parse', 'navi-v0.2.2^{commit}']), base, 'the tag names the dispatched tip');
+    assert.equal(f.remote(['tag', '--list', 'v*']), 'v2.0.0', 'the repository\'s own tags are untouched');
+    await assert.rejects(bumpTransaction(tagOnlyArgs(f, { dryRun: false })), /tag navi-v0\.2\.2 already exists on origin/, 'a version is never reused');
+  } finally { await f.cleanup(); }
+});
+
+test('a tag-versioned bump hook may not change a file, and a committing one must list its files', () => {
+  assert.throws(() => parseVersionInfo('{"version":"0.2.2","android_code":2,"files":["version.json"]}', { hook: 'version.bump', needFiles: true, tagOnly: true }), /tag-versioned/);
+  assert.throws(() => parseVersionInfo('{"version":"0.2.2","android_code":2,"files":[]}', { hook: 'version.bump', needFiles: true }), /must list the files/);
+  assert.deepEqual(parseVersionInfo('{"version":"0.2.2","android_code":2,"files":[]}', { hook: 'version.bump', needFiles: true, tagOnly: true }).files, []);
+});
+
 test('a shallow checkout is refused before anything else', async () => {
   const f = await gitFixture();
   try {

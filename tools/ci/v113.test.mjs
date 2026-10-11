@@ -91,7 +91,7 @@ test('the policy pins each app\'s package, signer and bundle; the gate refuses a
   for (const [repo, app] of Object.entries(policy.apps)) {
     assert.match(app.android.package, /^[a-z]/, repo);
     assert.match(app.android.signer_sha256, /^[0-9a-f]{64}$/, repo);
-    assert.match(app.ios.bundle, /^[a-z]/, repo);
+    if (app.lanes.includes('ios')) assert.match(app.ios.bundle, /^[a-z]/, repo);
   }
   const base = JSON.parse(readFileSync(policyFile, 'utf8'));
   for (const [name, change] of Object.entries({
