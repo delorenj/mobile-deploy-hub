@@ -178,6 +178,23 @@ test('the gate decides the iPad lane: home runs it, offline skips it, a metered 
   } finally { await f.cleanup(); }
 });
 
+test('an Android-only app never puts the Mac in scope, whatever platform the run asks for', async () => {
+  const navi = policy.apps['AutomaticAI-io/james-brennan'];
+  const manifest = {
+    schema: 2,
+    project: { slug: 'navi', name: 'Navi' },
+    version: { read: 'node v.mjs', bump: 'node v.mjs bump' },
+    android: { package: navi.android.package, export: 'true', artifact: 'a/App.apk', signer_sha256: navi.android.signer_sha256 },
+  };
+  const f = await gateFixture({ manifest, repo: 'AutomaticAI-io/james-brennan' });
+  try {
+    let asked = false;
+    const result = await gate(f.configure(['--platform', 'both']), f.deps({ tailscale: () => { asked = true; return peer('192.168.1.23:41641'); } }));
+    assert.deepEqual([result.ios_lane, result.slug], ['skip-platform', 'navi']);
+    assert.equal(asked, false, 'the Mac is not even probed');
+  } finally { await f.cleanup(); }
+});
+
 test('the gate refuses before anything is spent: schema 1, a dropped lane, another repo, strict false, runners, v2 inputs, a real run off a release', async () => {
   const cases = [
     [{ manifest: JSON.stringify({ schema: 1, version: 'x', android: {} }) }, [], /HUB_GATE_REFUSED manifest schema 1/],

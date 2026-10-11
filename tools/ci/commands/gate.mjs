@@ -118,7 +118,9 @@ export async function gate(config, {
     const { app, caller } = checkRun({ policy, config, env, read: callerReader(config, env) });
     const manifest = await checkManifest({ policy, app, config });
     checkConformance({ policy, app, config, env });
-    const scope = { android: config.platform !== 'ios', ios: config.platform !== 'android' };
+    // A lane the policy does not give the app is never in scope: an Android-only app (Navi) must not queue a job on
+    // the Mac, whose runner is not registered to its repository and would hold the run for 24 hours.
+    const scope = { android: config.platform !== 'ios' && app.lanes.includes('android'), ios: config.platform !== 'android' && app.lanes.includes('ios') };
 
     // The newest published state, for the metered estimate (and, in plan, the downgrade check).
     let latest = null;
