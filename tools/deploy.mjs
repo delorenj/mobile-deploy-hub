@@ -29,7 +29,7 @@ export const phone = Object.freeze({ serial: 'R5GL43A7PCH', model: 'SM-S948U', h
 export const levels = Object.freeze(['patch', 'minor', 'major']);
 export const meteredModes = Object.freeze(['auto', 'allow']);
 // Jarad's order, the hub policy's apps (a hub test keeps the two equal).
-export const train = Object.freeze(['delorenj/tower-of-lost-things', 'delorenj/green-in-between', 'delorenj/gruvato', 'AutomaticAI-io/james-brennan']);
+export const train = Object.freeze(['delorenj/tower-of-lost-things', 'delorenj/green-in-between', 'delorenj/gruvato', 'AutomaticAI-io/navi']);
 const usage = 'Usage: deploy.mjs [train] [--dry-run true|false] [--bump patch|minor|major] [--platform both|android|ios] [--testflight true|false] [--play true|false] [--dry-handoff true|false] [--metered auto|allow] [--workflow deploy.yml] [--hub-ref REF] [--repo owner/repo] [--print]';
 
 function flag(name, value, fallback) {

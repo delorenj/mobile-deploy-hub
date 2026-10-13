@@ -44,8 +44,8 @@ test('the policy parses strictly: unknown keys, a "none" bump, hosted runners an
     'lane typo': p => { p.apps['delorenj/gruvato'].lanes = ['android', 'ipad']; },
     'absent stops': p => { p.devices.absent = 'stop'; },
     'duplicate slug': p => { p.apps['delorenj/gruvato'].slug = 'green-in-between'; },
-    'tag prefix not ending in v': p => { p.apps['AutomaticAI-io/james-brennan'].tag_prefix = 'navi-'; },
-    'version mode typo': p => { p.apps['AutomaticAI-io/james-brennan'].version = 'tags'; },
+    'tag prefix not ending in v': p => { p.apps['AutomaticAI-io/navi'].tag_prefix = 'navi-'; },
+    'version mode typo': p => { p.apps['AutomaticAI-io/navi'].version = 'tags'; },
   };
   for (const [name, change] of Object.entries(cases)) {
     const copy = structuredClone(base);
@@ -59,10 +59,10 @@ test('the policy names the four apps in Jarad\'s order with their lanes, and the
     ['delorenj/tower-of-lost-things', 'tower-of-lost-things', 'android+ios'],
     ['delorenj/green-in-between', 'green-in-between', 'android+ios'],
     ['delorenj/gruvato', 'gruvato', 'android+ios'],
-    ['AutomaticAI-io/james-brennan', 'navi', 'android+ios'],
+    ['AutomaticAI-io/navi', 'navi', 'android+ios'],
   ]);
   // v1.2: Navi lives in a monorepo whose main takes only reviewed pull requests: its own tag prefix, tag-only bumps.
-  const navi = policy.apps['AutomaticAI-io/james-brennan'];
+  const navi = policy.apps['AutomaticAI-io/navi'];
   assert.deepEqual([tagOf(navi, '0.1.1'), tagOnlyOf(navi)], ['navi-v0.1.1', true]);
   assert.deepEqual([tagOf(policy.apps['delorenj/gruvato'], '0.2.4'), tagOnlyOf(policy.apps['delorenj/gruvato'])], ['v0.2.4', false]);
   const { train } = await import('../deploy.mjs');
@@ -181,7 +181,7 @@ test('the gate decides the iPad lane: home runs it, offline skips it, a metered 
 test('an Android-only app never puts the Mac in scope, whatever platform the run asks for', async () => {
   // Navi carried this case until it gained its iOS lane; a synthetic policy keeps it (the seam is policyBanner's
   // file argument, which only tests pass).
-  const navi = policy.apps['AutomaticAI-io/james-brennan'];
+  const navi = policy.apps['AutomaticAI-io/navi'];
   const manifest = {
     schema: 2,
     project: { slug: 'navi', name: 'Navi' },
@@ -189,8 +189,8 @@ test('an Android-only app never puts the Mac in scope, whatever platform the run
     android: { package: navi.android.package, export: 'true', artifact: 'a/App.apk', signer_sha256: navi.android.signer_sha256 },
   };
   const androidOnly = structuredClone(policy);
-  androidOnly.apps['AutomaticAI-io/james-brennan'] = { slug: 'navi', lanes: ['android'], tag_prefix: 'navi-v', version: 'tag', android: navi.android };
-  const f = await gateFixture({ manifest, repo: 'AutomaticAI-io/james-brennan' });
+  androidOnly.apps['AutomaticAI-io/navi'] = { slug: 'navi', lanes: ['android'], tag_prefix: 'navi-v', version: 'tag', android: navi.android };
+  const f = await gateFixture({ manifest, repo: 'AutomaticAI-io/navi' });
   try {
     const policyPath = join(f.root, 'policy.json');
     await writeFile(policyPath, JSON.stringify(androidOnly));
