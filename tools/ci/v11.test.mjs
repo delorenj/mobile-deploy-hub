@@ -59,7 +59,7 @@ test('the policy names the four apps in Jarad\'s order with their lanes, and the
     ['delorenj/tower-of-lost-things', 'tower-of-lost-things', 'android+ios'],
     ['delorenj/green-in-between', 'green-in-between', 'android+ios'],
     ['delorenj/gruvato', 'gruvato', 'android+ios'],
-    ['AutomaticAI-io/james-brennan', 'navi', 'android'],
+    ['AutomaticAI-io/james-brennan', 'navi', 'android+ios'],
   ]);
   // v1.2: Navi lives in a monorepo whose main takes only reviewed pull requests: its own tag prefix, tag-only bumps.
   const navi = policy.apps['AutomaticAI-io/james-brennan'];
@@ -179,6 +179,8 @@ test('the gate decides the iPad lane: home runs it, offline skips it, a metered 
 });
 
 test('an Android-only app never puts the Mac in scope, whatever platform the run asks for', async () => {
+  // Navi carried this case until it gained its iOS lane; a synthetic policy keeps it (the seam is policyBanner's
+  // file argument, which only tests pass).
   const navi = policy.apps['AutomaticAI-io/james-brennan'];
   const manifest = {
     schema: 2,
@@ -186,10 +188,14 @@ test('an Android-only app never puts the Mac in scope, whatever platform the run
     version: { read: 'node v.mjs', bump: 'node v.mjs bump' },
     android: { package: navi.android.package, export: 'true', artifact: 'a/App.apk', signer_sha256: navi.android.signer_sha256 },
   };
+  const androidOnly = structuredClone(policy);
+  androidOnly.apps['AutomaticAI-io/james-brennan'] = { slug: 'navi', lanes: ['android'], tag_prefix: 'navi-v', version: 'tag', android: navi.android };
   const f = await gateFixture({ manifest, repo: 'AutomaticAI-io/james-brennan' });
   try {
+    const policyPath = join(f.root, 'policy.json');
+    await writeFile(policyPath, JSON.stringify(androidOnly));
     let asked = false;
-    const result = await gate(f.configure(['--platform', 'both']), f.deps({ tailscale: () => { asked = true; return peer('192.168.1.23:41641'); } }));
+    const result = await gate(f.configure(['--platform', 'both']), f.deps({ policyFile: policyPath, tailscale: () => { asked = true; return peer('192.168.1.23:41641'); } }));
     assert.deepEqual([result.ios_lane, result.slug], ['skip-platform', 'navi']);
     assert.equal(asked, false, 'the Mac is not even probed');
   } finally { await f.cleanup(); }

@@ -20,8 +20,9 @@
       "ios": { "bundle": "sh.delo.gruvato" }
     },
     "AutomaticAI-io/james-brennan": {
-      "slug": "navi", "lanes": ["android"], "tag_prefix": "navi-v", "version": "tag",
-      "android": { "package": "io.automaticai.ipm.navi", "signer_sha256": "d09a011f872cc3e25f5b6c46e66a5e07c68c1240566bc0d4b66bf41e0fff3a3c" }
+      "slug": "navi", "lanes": ["android", "ios"], "tag_prefix": "navi-v", "version": "tag",
+      "android": { "package": "io.automaticai.ipm.navi", "signer_sha256": "d09a011f872cc3e25f5b6c46e66a5e07c68c1240566bc0d4b66bf41e0fff3a3c" },
+      "ios": { "bundle": "io.automaticai.ipm.navi" }
     }
   },
   "callers": {

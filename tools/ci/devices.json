@@ -13,7 +13,8 @@
     "runners": {
       "delorenj/tower-of-lost-things": { "name": "carries-macbook-air", "dir": "actions-runner" },
       "delorenj/green-in-between": { "name": "delonet-gib-mac-r1", "dir": "actions-runner/gib" },
-      "delorenj/gruvato": { "name": "mommymac-gruvato", "dir": "actions-runner/gruvato" }
+      "delorenj/gruvato": { "name": "mommymac-gruvato", "dir": "actions-runner/gruvato" },
+      "AutomaticAI-io/james-brennan": { "name": "mommymac-james-brennan", "dir": "actions-runner/james-brennan" }
     }
   },
   "linux": { "host": "big-chungus", "staging_dir": ".cache/mobile-deploy-hub/staging" }

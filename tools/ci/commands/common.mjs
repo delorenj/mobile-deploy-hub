@@ -20,9 +20,10 @@ export const firstLine = message => String(message ?? '').split('\n').find(line 
 export const isoNow = (date = new Date()) => date.toISOString().replace(/\.\d{3}Z$/, 'Z');
 export const exists = path => { try { const info = statSync(path); return info.isFile() && info.size > 0; } catch { return false; } };
 
-// Every job logs the policy it obeys.
-export function policyBanner(log = console.log) {
-  const loaded = loadPolicy();
+// Every job logs the policy it obeys. The file argument exists only for tests (a synthetic policy for a lane case
+// the live one no longer has); the jobs never take it from an input or an environment variable.
+export function policyBanner(log = console.log, file = undefined) {
+  const loaded = loadPolicy(file);
   log(`HUB_POLICY sha256=${loaded.short}`);
   return loaded;
 }

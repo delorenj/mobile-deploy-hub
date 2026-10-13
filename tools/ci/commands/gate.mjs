@@ -107,8 +107,9 @@ async function quickS26({ env, home, devices, adbFactory }) {
 export async function gate(config, {
   env = process.env, home = homedir(), fetchImpl = fetch, log = console.log, s3Factory = null,
   tailscale = () => tailscaleStatus({ env }), macProbe = null, runnerStatus = null, adbFactory = createAdb,
+  policyFile = undefined,
 } = {}) {
-  const loaded = policyBanner(log);
+  const loaded = policyBanner(log, policyFile);
   const { policy } = loaded;
   const makeS3 = s3Factory ?? (() => jobWriter(policy, env));
   const out = join(config.out, 'gate');
@@ -118,7 +119,7 @@ export async function gate(config, {
     const { app, caller } = checkRun({ policy, config, env, read: callerReader(config, env) });
     const manifest = await checkManifest({ policy, app, config });
     checkConformance({ policy, app, config, env });
-    // A lane the policy does not give the app is never in scope: an Android-only app (Navi) must not queue a job on
+    // A lane the policy does not give the app is never in scope: an Android-only app must not queue a job on
     // the Mac, whose runner is not registered to its repository and would hold the run for 24 hours.
     const scope = { android: config.platform !== 'ios' && app.lanes.includes('android'), ios: config.platform !== 'android' && app.lanes.includes('ios') };
 
