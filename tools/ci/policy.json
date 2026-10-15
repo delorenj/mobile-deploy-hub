@@ -16,7 +16,7 @@
     },
     "delorenj/gruvato": {
       "slug": "gruvato", "lanes": ["android", "ios"],
-      "android": { "package": "sh.delo.drumjangler", "signer_sha256": "d09a011f872cc3e25f5b6c46e66a5e07c68c1240566bc0d4b66bf41e0fff3a3c" },
+      "android": { "package": "sh.delo.gruvato", "signer_sha256": "30ab84a95061f8479f603c5e8357905dfa811b950634f31b2c26dde90f5f098d" },
       "ios": { "bundle": "sh.delo.gruvato" }
     },
     "AutomaticAI-io/navi": {
