@@ -5,6 +5,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { levels } from './version.mjs';
+import { defaultPlayStatus } from './play.mjs';
 
 export const commands = Object.freeze(['gate', 'preflight-ios', 'plan', 'android', 'play', 'release', 'ios-export', 'ios', 'deliver', 'announce']);
 export const platforms = Object.freeze(['both', 'android', 'ios']);
@@ -150,7 +151,9 @@ export function parseConfig(argv, env = process.env) {
     platform: oneOf('platform', raw.platform || 'both', platforms),
     channel: oneOf('android channel', raw.channel || 'sideload', channels),
     track,
-    playStatus: oneOf('play status', raw.playStatus || 'draft', playStatuses),
+    // Empty means the hub decides: completed on the internal track, draft on every other. playStatusExplicit marks a caller's own value.
+    playStatus: oneOf('play status', raw.playStatus || defaultPlayStatus(track), playStatuses),
+    playStatusExplicit: Boolean(raw.playStatus),
     build,
     dryRun: bool('dry_run', raw.dryRun, true),
     dryHandoff: bool('dry_handoff', raw.dryHandoff, false),

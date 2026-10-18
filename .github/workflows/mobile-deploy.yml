@@ -85,9 +85,9 @@ on:
         type: string
         default: internal
       play_status:
-        description: Play release status, draft until the app has shipped once
+        description: Play release status; empty lets the hub decide (completed on the internal track, draft elsewhere; an internal app never published falls back to draft)
         type: string
-        default: draft
+        default: ''
       build:
         description: v2 input, kept for the v1 interface; the gate refuses a value
         type: string

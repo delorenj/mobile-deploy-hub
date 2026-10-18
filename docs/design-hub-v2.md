@@ -57,7 +57,7 @@ Each receipt records `hub_ref` (the ref the runner fetched the hub at: `main` du
 | `platform` | android, ios, both | both |
 | `android_channel` | sideload, play | sideload |
 | `track` | Play track | internal |
-| `play_status` | Play release status | draft |
+| `play_status` | Play release status; empty lets the hub decide (2026-10-18: `completed` on the internal track, `draft` elsewhere) | '' |
 | `build` | iOS build override, positive integer | blank, meaning next after App Store Connect |
 | `dry_run` | bool | true on dispatch |
 | `dry_handoff` | bool | false |
@@ -114,7 +114,7 @@ apksigner execs bare `java`, and the runner service has no `JAVA_HOME` or `ANDRO
 
 `debug.keystore` exists only on big-chungus, so this lane is pinned to that machine and the signer check is the guard, until Jarad approves saving it to 1Password.
 
-**Play.** With `android_channel=play` the hub needs an `android.bundle` hook (and `bundle_artifact`); Tower declares none, so `plan` refuses with a clear message. It stays blocked on the Play spec: release keystore, Gradle template, versionCode and the bundled-only call. The uploader still ships now. It refuses a versionCode at or below the Console maximum (bundles and APKs), deletes its edit on any failure, and defaults the release status to `draft`, because `completed` on a never-released app is likely rejected (unverified). Unit-tested against a fake API.
+**Play.** With `android_channel=play` the hub needs an `android.bundle` hook (and `bundle_artifact`); Tower declares none, so `plan` refuses with a clear message. It stays blocked on the Play spec: release keystore, Gradle template, versionCode and the bundled-only call. The uploader still ships now. It refuses a versionCode at or below the Console maximum (bundles and APKs), deletes its edit on any failure, and defaults the release status to `completed` on the internal track and `draft` on every other (owner decision 2026-10-18, auto-rollout for internal; before that it was `draft` everywhere). Google refuses a non-draft release on an app that has never been published (HTTP 400, "Only releases with status draft may be created on draft app.", seen on the track PUT and on the commit): when the status came from the default, the uploader retries once in the same edit as `draft`, logs `PLAY_DRAFT_APP` and returns status `draft`; an explicit status from a caller is never softened, and any other error still deletes the edit and fails. Unit-tested against a fake API.
 
 ## Keyless auth
 

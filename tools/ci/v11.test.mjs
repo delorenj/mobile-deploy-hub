@@ -531,7 +531,7 @@ test('the v1 caller surface is frozen: every workflow_call input keeps its name,
     'manifest:string=mobile-deploy.json', 'platform:string=both', 'bump:string=patch', 'testflight:boolean=false', 'play:boolean=false',
     'dry_run:boolean=true', 'dry_handoff:boolean=false', 'strict:boolean=true', 'metered:string=auto', "linux_runner:string='[\"self-hosted\",\"Linux\"]'",
     "mac_runner:string='[\"self-hosted\",\"macOS\"]'", "wif_provider:string=''", "play_sa:string=''", 'android_channel:string=sideload', 'track:string=internal',
-    'play_status:string=draft', "build:string=''",
+    "play_status:string=''", "build:string=''",
   ]);
   for (const name of ['dry_run', 'bump', 'platform', 'testflight', 'play', 'dry_handoff', 'metered']) assert.match(template, new RegExp(`^ {6}${name}: \\$\\{\\{ inputs\\.${name} \\}\\}$`, 'm'), `the template passes ${name}`);
 });

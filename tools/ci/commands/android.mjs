@@ -167,7 +167,7 @@ export async function play(config, { env = process.env, fetchImpl } = {}) {
       aab: join(config.out, 'android', basename(spec.bundle_artifact)),
       token: env.PLAY_TOKEN,
       expectedCode: config.androidCode ? Number(config.androidCode) : undefined,
-      status: config.playStatus,
+      status: config.playStatusExplicit ? config.playStatus : undefined,
       fetchImpl,
     });
     await writeReceipt(join(config.out, 'android'), buildReceipt({ lane: 'android-play', config, env, version: config.version, androidCode: config.androidCode, notes: [`Play ${config.track}: uploaded`] }), env);

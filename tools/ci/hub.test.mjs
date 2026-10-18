@@ -94,7 +94,11 @@ test('defaults are the safe ones: dry run, sideload, both platforms, no build ov
   assert.equal(config.platform, 'both');
   assert.equal(config.channel, 'sideload');
   assert.equal(config.track, 'internal');
-  assert.equal(config.playStatus, 'draft');
+  assert.equal(config.playStatus, 'completed', 'the internal track rolls out to testers by default');
+  assert.equal(config.playStatusExplicit, false);
+  assert.equal(parseConfig(['plan', '--track', 'alpha'], {}).playStatus, 'draft', 'every other track defaults to draft');
+  assert.equal(parseConfig(['plan'], { HUB_PLAY_STATUS: '' }).playStatusExplicit, false, 'the workflow passes an empty status when the caller gave none');
+  assert.deepEqual([parseConfig(['plan', '--play-status', 'draft'], {}).playStatus, parseConfig(['plan', '--play-status', 'draft'], {}).playStatusExplicit], ['draft', true]);
   assert.equal(config.build, '');
   assert.equal(config.manifest, 'mobile-deploy.json');
   assert.equal(config.metered, 'auto', 'the iPad lane is skipped on a metered link that would go over budget unless asked');
@@ -249,12 +253,15 @@ test('a different signer fails the check and says why', async () => {
 
 // ---- play uploader ----
 
-function playApi({ bundles = [], apks = [], uploadedCode = 5, failOn } = {}) {
+function playApi({ bundles = [], apks = [], uploadedCode = 5, failOn, refuse } = {}) {
   const calls = [];
+  let lastStatus = '';
   const fetchImpl = async (url, init) => {
     const { pathname } = new URL(url);
     calls.push({ method: init.method, path: pathname, body: init.body, auth: init.headers.Authorization });
     const reply = (value, ok = true) => ({ ok, status: ok ? 200 : 500, json: async () => value, text: async () => JSON.stringify(value) });
+    if (init.method === 'PUT') lastStatus = JSON.parse(init.body).releases[0].status;
+    if (refuse && refuse.when === `${init.method} ${pathname.split('/').pop().split(':')[0]}` && (refuse.always || lastStatus === 'completed')) return { ok: false, status: 400, json: async () => ({}), text: async () => JSON.stringify({ error: { code: 400, message: 'Invalid request - Only releases with status draft may be created on draft app.', status: 'INVALID_ARGUMENT' } }) };
     if (failOn === `${init.method} ${pathname.split('/').pop().split(':')[0]}`) return reply({ error: 'boom' }, false);
     if (pathname.endsWith('/edits') && init.method === 'POST') return reply({ id: 'E1' });
     if (pathname.endsWith('/bundles') && init.method === 'GET') return reply({ bundles });
@@ -268,20 +275,79 @@ function playApi({ bundles = [], apks = [], uploadedCode = 5, failOn } = {}) {
   return { fetchImpl, calls };
 }
 
-test('play upload creates an edit, uploads, assigns a draft release and commits', async () => {
+test('play upload creates an edit, uploads, assigns the default release and commits', async () => {
   const f = await fixture();
   try {
     await writeFile(join(f.root, 'app.aab'), 'aab');
     const api = playApi({ bundles: [{ versionCode: 3 }], uploadedCode: 5 });
     const logs = [];
     const result = await uploadBundle({ pkg: 'io.example.app', track: 'internal', aab: join(f.root, 'app.aab'), token: 'tok', expectedCode: 5, fetchImpl: api.fetchImpl, log: line => logs.push(line) });
-    assert.equal(result.status, 'draft');
+    assert.equal(result.status, 'completed', 'the internal track defaults to a completed release');
     const put = api.calls.find(call => call.method === 'PUT');
-    assert.deepEqual(JSON.parse(put.body), { track: 'internal', releases: [{ versionCodes: ['5'], status: 'draft' }] });
+    assert.deepEqual(JSON.parse(put.body), { track: 'internal', releases: [{ versionCodes: ['5'], status: 'completed' }] });
     assert.ok(api.calls.at(-1).path.endsWith(':commit'));
     assert.ok(api.calls.every(call => call.auth === 'Bearer tok'));
     assert.ok(logs.every(line => !line.includes('tok')));
   } finally { await f.cleanup(); }
+});
+
+const playRun = async (options, args) => {
+  const f = await fixture();
+  try {
+    await writeFile(join(f.root, 'app.aab'), 'aab');
+    const api = playApi({ uploadedCode: 5, ...options });
+    const logs = [];
+    let outcome;
+    try { outcome = { result: await uploadBundle({ pkg: 'io.example.app', aab: join(f.root, 'app.aab'), token: 'tok', fetchImpl: api.fetchImpl, log: line => logs.push(line), ...args }) }; } catch (error) { outcome = { error }; }
+    return { ...outcome, api, logs, puts: api.calls.filter(call => call.method === 'PUT').map(call => JSON.parse(call.body).releases[0].status) };
+  } finally { await f.cleanup(); }
+};
+
+test('play status: internal defaults to completed, every other track to draft, an explicit status passes through', async () => {
+  assert.deepEqual((await playRun({}, { track: 'internal' })).puts, ['completed']);
+  assert.deepEqual((await playRun({}, {})).puts, ['completed'], 'the track itself defaults to internal');
+  assert.deepEqual((await playRun({}, { track: 'internal', status: '' })).puts, ['completed']);
+  for (const track of ['alpha', 'beta', 'production', 'qa-testers']) {
+    const run = await playRun({}, { track });
+    assert.deepEqual([run.puts, run.result.status], [['draft'], 'draft'], track);
+  }
+  assert.deepEqual((await playRun({}, { track: 'internal', status: 'draft' })).puts, ['draft']);
+  assert.deepEqual((await playRun({}, { track: 'alpha', status: 'inProgress' })).puts, ['inProgress']);
+});
+
+test('play upload falls back to one draft retry in the same edit when the default completed hits a draft app', async () => {
+  for (const when of ['PUT internal', 'POST E1']) {
+    const refuse = { when };
+    const run = await playRun({ refuse }, { track: 'internal' });
+    assert.equal(run.error, undefined, when);
+    assert.equal(run.result.status, 'draft');
+    assert.deepEqual(run.puts, ['completed', 'draft'], 'exactly one retry');
+    assert.ok(run.logs.some(line => /^PLAY_DRAFT_APP io\.example\.app track=internal .*roll out in Play Console/.test(line)));
+    assert.ok(run.logs.some(line => line.includes('PLAY_COMMITTED') && line.includes('status=draft')));
+    assert.equal(run.api.calls.filter(call => call.method === 'POST' && call.path.endsWith('/edits')).length, 1, 'same edit');
+    assert.ok(!run.api.calls.some(call => call.method === 'DELETE'), 'the edit is kept and committed');
+    assert.ok(run.api.calls.at(-1).path.endsWith(':commit'));
+  }
+});
+
+test('play upload never softens an explicit completed and never swallows another error', async () => {
+  const refuse = { when: 'PUT internal' };
+  const explicit = await playRun({ refuse }, { track: 'internal', status: 'completed' });
+  assert.match(explicit.error.message, /Only releases with status draft may be created on draft app/);
+  assert.deepEqual(explicit.puts, ['completed'], 'no retry');
+  assert.ok(explicit.api.calls.some(call => call.method === 'DELETE'));
+  assert.ok(!explicit.logs.some(line => line.includes('PLAY_DRAFT_APP')));
+
+  const other = await playRun({ failOn: 'PUT internal' }, { track: 'internal' });
+  assert.match(other.error.message, /Play PUT .*500/);
+  assert.deepEqual(other.puts, ['completed'], 'no retry');
+  assert.ok(other.api.calls.some(call => call.method === 'DELETE' && call.path.endsWith('/edits/E1')), 'edit deleted');
+  assert.ok(!other.api.calls.some(call => call.path.endsWith(':commit')));
+
+  const failedRetry = await playRun({ refuse: { when: 'PUT internal', always: true } }, { track: 'internal' });
+  assert.match(failedRetry.error.message, /draft app/, 'a refused draft retry still fails loudly');
+  assert.deepEqual(failedRetry.puts, ['completed', 'draft']);
+  assert.ok(failedRetry.api.calls.some(call => call.method === 'DELETE'));
 });
 
 test('play upload refuses a versionCode at or below the Console maximum and deletes its edit', async () => {
@@ -315,7 +381,7 @@ test('play upload deletes its edit on any later failure', async () => {
   } finally { await f.cleanup(); }
 });
 
-test('the play command reads its token from PLAY_TOKEN and uses the draft status by default', async () => {
+test('the play command reads its token from PLAY_TOKEN and uses the track default status', async () => {
   const manifest = JSON.parse(manifestText());
   manifest.android.bundle = 'true';
   manifest.android.bundle_artifact = 'artifacts/App.aab';

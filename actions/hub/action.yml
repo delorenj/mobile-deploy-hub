@@ -23,7 +23,8 @@ inputs:
   track:
     default: internal
   play_status:
-    default: draft
+    description: Play release status; empty lets the hub decide (completed on the internal track, draft elsewhere)
+    default: ''
   build:
     description: v2 input; the gate refuses a value
     default: ''
