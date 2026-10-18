@@ -69,11 +69,11 @@ on:
         type: string
         default: '["self-hosted","macOS"]'
       wif_provider:
-        description: Workload Identity Federation provider, real Play runs only
+        description: Workload Identity Federation provider, every Play run (a dry run mints the token and stops there)
         type: string
         default: ''
       play_sa:
-        description: Service account the Play upload impersonates, real Play runs only
+        description: Service account the Play upload impersonates, every Play run
         type: string
         default: ''
       android_channel:
@@ -262,8 +262,10 @@ jobs:
           android_code: ${{ needs.plan.outputs.android_code }}
           build_sha: ${{ needs.plan.outputs.build_sha }}
           bump_patch: ${{ needs.plan.outputs.bump_patch }}
+      # A dry run authenticates too: the token proves the keyless exchange (the caller's OIDC token, its WIF provider,
+      # the publisher service account) before a real run spends a version. Only the real upload below contacts Play.
       - name: Authenticate to Google Cloud (keyless)
-        if: ${{ !inputs.dry_run && needs.plan.outputs.play_lane == 'true' }}
+        if: ${{ needs.plan.outputs.play_lane == 'true' }}
         id: auth
         uses: google-github-actions/auth@v3
         with:

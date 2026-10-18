@@ -440,6 +440,10 @@ test('the reusable workflow is hardened: no hosted runners, no shell interpolati
   const writes = bodies.filter(body => /\n {6}contents: write\n/.test(body)).map(body => body.split(':')[0]);
   assert.deepEqual(writes, ['plan', 'android']);
   assert.deepEqual(bodies.filter(body => /\n {6}id-token: write\n/.test(body)).map(body => body.split(':')[0]), ['android']);
+  // A Play dry run mints the token (the keyless exchange is proven before a version is spent); only a real run uploads.
+  assert.match(workflow, /- name: Authenticate to Google Cloud \(keyless\)\n\s+if: \$\{\{ needs\.plan\.outputs\.play_lane == 'true' \}\}\n/);
+  assert.match(workflow, /- name: Upload to Play\n\s+if: \$\{\{ !inputs\.dry_run && needs\.plan\.outputs\.play_lane == 'true' \}\}\n/);
+  assert.match(workflow, /create_credentials_file: false\n/, 'the token never lands in a credentials file');
 });
 
 test('the composite action gives every run step a shell and reads inputs only', async () => {

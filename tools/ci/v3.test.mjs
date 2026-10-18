@@ -17,7 +17,7 @@ import { createIpad, pickApp, pickIpad } from './lib/devicectl.mjs';
 import { bbEmitPath, correlationFor, deploymentEvent, emitArgs, sanitizeReason, targetOf, uuidv5 } from './lib/announce.mjs';
 import { loadDevices, parseDevices } from './lib/devices.mjs';
 import { parseManifest } from './lib/manifest.mjs';
-import { android, announce, plan, preflightIos, release } from './hub.mjs';
+import { android, announce, plan, play, preflightIos, release } from './hub.mjs';
 import { checkPhone, lanesFrom, parseArguments, phone } from '../deploy.mjs';
 
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
@@ -821,6 +821,22 @@ test('the plan holds the event to its contract before it spends a version', asyn
     await assert.rejects(quiet(() => plan(host.configure('plan', ['--dry-run', 'false']), { env: host.env, home: f.root, fetchImpl: noLatest, s3Factory: async () => host.s3 })), /fails its contract.*Nothing was bumped/);
     assert.equal(f.remote(['tag', '--list']), '');
     assert.equal(f.remote(['log', '-1', '--format=%s', 'main']), 'init');
+  } finally { await f.cleanup(); }
+});
+
+test('a --play run needs the keyless inputs, a dry run too, and the dry run never contacts Play', async () => {
+  const base = v3Manifest();
+  const f = await gitFixture({ manifest: { ...base, android: { ...base.android, bundle: 'true', bundle_artifact: 'artifacts/App.aab' } } });
+  try {
+    const host = await laneHost(f);
+    await host.installApk('io.example.app 0.2.1 4');
+    await assert.rejects(quiet(() => plan(host.configure('plan', ['--play', 'true']), { env: host.env, home: f.root, fetchImpl: noLatest })), /a Play run, dry or real, needs wif_provider and play_sa/);
+    const keyless = { ...host.env, HUB_WIF_PROVIDER: 'projects/1/locations/global/workloadIdentityPools/github/providers/example-app', HUB_PLAY_SA: 'publish@example.iam.gserviceaccount.com' };
+    await assert.rejects(quiet(() => plan(host.configure('plan', ['--play', 'true'], { HUB_PLAY_SA: '' }), { env: { ...keyless, HUB_PLAY_SA: '' }, home: f.root, fetchImpl: noLatest })), /needs wif_provider and play_sa/);
+    const planned = await quiet(() => plan(host.configure('plan', ['--play', 'true']), { env: keyless, home: f.root, fetchImpl: noLatest }));
+    assert.equal(planned.bumped, false);
+    assert.equal(host.outputs().play_lane, 'true');
+    await assert.rejects(play(host.configure('play', ['--play', 'true']), { env: { ...keyless, PLAY_TOKEN: 'tok' }, fetchImpl: async () => { throw new Error('Play was contacted'); } }), /refusing to contact Play on a dry run/);
   } finally { await f.cleanup(); }
 });
 

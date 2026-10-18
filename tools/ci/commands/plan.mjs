@@ -162,7 +162,8 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
     if (config.play) {
       if (!scope.android) throw new Error('--play needs the Android lane (platform both or android)');
       if (!manifest.android.bundle) throw new Error(`--play needs an android.bundle hook and ${manifest.android.package} declares none; Play stays blocked on the Play launch spec`);
-      if (!config.dryRun && (!env.HUB_WIF_PROVIDER || !env.HUB_PLAY_SA)) throw new Error('a real Play run needs wif_provider and play_sa (the caller passes vars.GCP_WIF_PROVIDER and vars.PLAY_SA_EMAIL)');
+      // A dry run needs them too: it mints the Play token to prove the keyless exchange (it never contacts Play).
+      if (!env.HUB_WIF_PROVIDER || !env.HUB_PLAY_SA) throw new Error('a Play run, dry or real, needs wif_provider and play_sa (the caller passes vars.GCP_WIF_PROVIDER and vars.PLAY_SA_EMAIL)');
     }
     const onMain = env.GITHUB_REF === 'refs/heads/main';
     if (!config.dryRun && !onMain) throw new Error(`a real deploy bumps main, so it must be dispatched on main (this run is on ${env.GITHUB_REF ?? 'no ref'})`);
