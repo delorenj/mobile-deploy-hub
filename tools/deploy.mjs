@@ -129,20 +129,71 @@ export const lastRealRun = runs => runs.filter(run => /\bREAL\b/.test(run.displa
 
 const listFields = 'databaseId,headSha,event,status,conclusion,createdAt,url,displayTitle';
 
-// `gh run watch --exit-status` exits non-zero for a red run, and also when gh itself cannot talk to GitHub (a rate limit
-// shared with every other agent, a dropped connection): that is no verdict, and reporting it red once rolled a hub
-// release back over a green dry run (v1.2.14, Gruvato). Ask the run itself, and watch again while it is unfinished.
-export async function watchRun(gh, id, R, { sleep, log = console.log, attempts = 30, waitMs = 60_000 } = {}) {
-  for (let attempt = 1; ; attempt += 1) {
-    const status = gh(['run', 'watch', String(id), ...R, '--exit-status'], { inherit: true });
-    if (status === 0) return 0;
+// The exit status of a watch that never saw the run finish. Not red: red is 1, green is 0, and this is "we do not know".
+export const unknownStatus = 3;
+
+// What a person types to finish a watch the front door gave up on.
+export const finishByHand = (id, R) => `gh run watch ${id} ${R.join(' ')} --interval 30 --exit-status`.replace(/ {2,}/g, ' ');
+
+// How long to sit out GitHub's primary rate limit: `gh api rate_limit` is not itself metered, so it is cheap to ask.
+// Null when the core budget is not spent (a secondary limit, a dropped connection) or the answer is unreadable.
+export function rateLimitWaitMs(gh, now = Date.now) {
+  try {
+    const core = JSON.parse(gh(['api', 'rate_limit'])).resources?.core;
+    if (core && core.remaining < 1 && core.reset * 1000 > now()) return core.reset * 1000 - now() + 2000;
+  } catch { /* unreadable: back off blind */ }
+  return null;
+}
+
+// Wait for a run to report `completed`, and say what it concluded. The old watch was `gh run watch --exit-status`, which
+// polls every 3 s (a run and its jobs and each job's annotations: about 2,300 requests in 25 minutes) and exits non-zero
+// both for a red run and when gh cannot talk to GitHub (a rate limit shared with every other agent, a dropped
+// connection). That second exit is no verdict, and reporting it red once rolled a hub release back over a green dry run
+// (v1.2.14, Gruvato) and again turned a green green-in-between run red (2026-10-19). So: one `gh api` read of the run
+// every `intervalMs`, backing off (to `backoffMaxMs`, or to the rate limit's reset) while GitHub cannot be read, until
+// the run says `completed`: 0 for success, 1 for any other conclusion. Only `capMs` of no verdict ends it, as
+// `unknownStatus`, never as red.
+export async function watchRun(gh, id, R, {
+  sleep, log = console.log, now = Date.now,
+  intervalMs = 30_000, backoffMaxMs = 300_000, capMs = 6 * 3_600_000, heartbeatMs = 300_000,
+} = {}) {
+  const path = `repos/${R[1] ?? '{owner}/{repo}'}/actions/runs/${id}`;
+  const began = now();
+  let failures = 0;
+  let seen = null;
+  let lastSaid = began;
+  for (;;) {
     let state = null;
-    try { state = JSON.parse(gh(['run', 'view', String(id), ...R, '--json', 'status,conclusion'])); } catch { /* unreadable: not a verdict */ }
-    if (state?.status === 'completed') return state.conclusion === 'success' ? 0 : status;
-    if (attempt >= attempts) return status;
-    log(`DEPLOY_WATCH_RETRY run ${id}: the watch ended without a verdict (${state ? state.status : 'GitHub unreachable or rate limited'}); watching again in ${waitMs / 1000}s`);
-    await sleep(waitMs);
+    let why = '';
+    try { state = JSON.parse(gh(['api', path, '--jq', '{status,conclusion}'])); } catch (error) { why = error.message.split('\n')[0]; }
+    if (state && typeof state.status !== 'string') { state = null; why = 'GitHub answered without a status'; }
+    if (state?.status === 'completed') return state.conclusion === 'success' ? 0 : 1;
+    const elapsed = now() - began;
+    if (elapsed >= capMs) return unknownStatus;
+    let wait = intervalMs;
+    if (state) {
+      failures = 0;
+      if (state.status !== seen || now() - lastSaid >= heartbeatMs) {
+        log(`DEPLOY_WATCH run ${id}: ${state.status} (${Math.round(elapsed / 60_000)} min)`);
+        seen = state.status;
+        lastSaid = now();
+      }
+    } else {
+      failures += 1;
+      const limited = rateLimitWaitMs(gh, now);
+      wait = limited ?? Math.min(backoffMaxMs, intervalMs * 2 ** failures);
+      wait = Math.min(wait, Math.max(capMs - elapsed, 1));
+      log(`DEPLOY_WATCH_RETRY run ${id}: no verdict yet (${why || 'GitHub unreachable or rate limited'}); asking again in ${Math.round(wait / 1000)}s${limited ? ' (the rate limit resets then)' : ''}`);
+    }
+    await sleep(wait);
   }
+}
+
+// The line that ends a watch, and the status it settles on.
+export function verdictLine(status, id, kind, url, R) {
+  if (status === 0) return `DEPLOY_GREEN run ${id} ${kind} ${url}`;
+  if (status === unknownStatus) return `DEPLOY_UNKNOWN run ${id} ${kind} ${url}: no verdict from GitHub, so this is neither green nor red; finish by hand: ${finishByHand(id, R)}`;
+  return `DEPLOY_RED run ${id} ${kind} ${url}`;
 }
 
 // On big-chungus, look for the S26 before dispatching. Information only: away means the S26 delivery is pending.
@@ -166,7 +217,7 @@ export const rerunWindowDays = 7;
 
 export async function deploy(options, {
   gh, git, adb = null, host = hostname(), prompt = null, cwd = process.cwd(),
-  sleep = ms => new Promise(done => setTimeout(done, ms)), log = console.log, timeoutMs = 120_000, pollMs = 3000, now = Date.now,
+  sleep = ms => new Promise(done => setTimeout(done, ms)), log = console.log, timeoutMs = 120_000, pollMs = 3000, now = Date.now, watch = {},
 }) {
   const dispatch = dispatchArguments(options);
   if (options.print) {
@@ -224,8 +275,8 @@ export async function deploy(options, {
         gh(['run', 'rerun', String(last.databaseId), ...R, '--failed']);
         log(`DEPLOY_RERUN ${last.databaseId} failed jobs re-run (same version, same commit)`);
         await sleep(pollMs);
-        const status = await watchRun(gh, last.databaseId, R, { sleep, log });
-        log(`${status === 0 ? 'DEPLOY_GREEN' : 'DEPLOY_RED'} run ${last.databaseId} rerun ${last.url}`);
+        const status = await watchRun(gh, last.databaseId, R, { sleep, log, now, ...watch });
+        log(verdictLine(status, last.databaseId, 'rerun', last.url, R));
         return { run: last, status, rerun: true };
       }
     }
@@ -242,12 +293,12 @@ export async function deploy(options, {
     started = newRuns(runs(), { after, sha });
   }
   if (started.length === 0) throw new Error(`no new ${options.workflow} run appeared within ${timeoutMs / 1000}s of the dispatch; look at the Actions tab, do not trust an older run`);
-  if (started.length > 1) throw new Error(`more than one new run started (${started.map(run => run.url).join(', ')}); another dispatch raced this one, watch the right one by hand: gh run watch <id> --exit-status`);
+  if (started.length > 1) throw new Error(`more than one new run started (${started.map(run => run.url).join(', ')}); another dispatch raced this one, watch the right one by hand: gh run watch <id> --interval 30 --exit-status`);
 
   const [run] = started;
   log(`DEPLOY_RUN ${run.databaseId} ${run.url}`);
-  const status = await watchRun(gh, run.databaseId, R, { sleep, log });
-  log(`${status === 0 ? 'DEPLOY_GREEN' : 'DEPLOY_RED'} run ${run.databaseId} ${options.dryRun ? 'dry run' : 'real run'} ${run.url}`);
+  const status = await watchRun(gh, run.databaseId, R, { sleep, log, now, ...watch });
+  log(verdictLine(status, run.databaseId, options.dryRun ? 'dry run' : 'real run', run.url, R));
 
   if (status === 0 && !options.dryRun) {
     try {
@@ -279,7 +330,7 @@ export async function deployTrain(options, deps, { apps = train, log = deps.log 
     }
     results.push({ repo, ...result });
     if ((result.status ?? 0) !== 0) {
-      log(`DEPLOY_TRAIN stopped at ${repo}: run ${result.run?.databaseId ?? '?'} is red; the apps after it were not dispatched`);
+      log(`DEPLOY_TRAIN stopped at ${repo}: run ${result.run?.databaseId ?? '?'} is ${result.status === unknownStatus ? 'unknown (no verdict from GitHub)' : 'red'}; the apps after it were not dispatched`);
       return { results, stopped: repo, status: result.status };
     }
   }
@@ -287,10 +338,8 @@ export async function deployTrain(options, deps, { apps = train, log = deps.log 
   return { results, stopped: null, status: 0 };
 }
 
-// gh and git as child processes. `inherit` streams the watch to the terminal and returns the exit status; everything
-// else returns stdout and throws with the tail of stderr.
-export function realGh(args, { inherit = false } = {}) {
-  if (inherit) return spawnSync('gh', args, { stdio: 'inherit' }).status ?? 1;
+// gh and git as child processes: stdout back, and a throw with the tail of stderr.
+export function realGh(args) {
   const result = spawnSync('gh', args, { encoding: 'utf8' });
   if (result.error || result.status !== 0) throw new Error(`gh ${args.slice(0, 2).join(' ')} failed: ${result.error?.message ?? result.stderr.trim().slice(-400)}`);
   return result.stdout;

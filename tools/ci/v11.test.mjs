@@ -440,7 +440,7 @@ function fakeGh({ red = false, conclusion = () => 0, repo = 'delorenj/gruvato' }
       return JSON.stringify({ schema: 2, android: {}, ios: {} });
     }
     if (args[0] === 'workflow' && args[1] === 'run') { dispatched += 1; return ''; }
-    if (args[0] === 'run' && args[1] === 'watch') return options.inherit ? conclusion(args) : '';
+    if (args[0] === 'api' && args.some(arg => /actions\/runs\/\d+$/.test(arg))) return JSON.stringify({ status: 'completed', conclusion: conclusion(args) === 0 ? 'success' : 'failure' });
     return '';
   };
   return { gh, calls };

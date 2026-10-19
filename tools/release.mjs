@@ -11,7 +11,7 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { deploy, parseArguments, realGh, realGit } from './deploy.mjs';
+import { deploy, finishByHand, parseArguments, realGh, realGit, unknownStatus } from './deploy.mjs';
 import { conformance } from './conformance.mjs';
 import { loadPolicy } from './ci/lib/policy.mjs';
 
@@ -77,11 +77,13 @@ export async function release(version, { log = console.log, dryRuns = true } = {
 
   const runs = [];
   let red = null;
+  let unknown = null;
   for (const repo of Object.keys(loadPolicy().policy.apps)) {
     log(`RELEASE_DRY_RUN ${repo} at ${major} (${tag})`);
     try {
       const result = await deploy({ ...parseArguments(['--dry-run', 'true', '--dry-handoff', 'true', '--repo', repo, '--hub-ref', major]) }, { gh: realGh, git: realGit, log });
       runs.push({ repo, id: result.run?.databaseId ?? null, url: result.run?.url ?? null, status: result.status });
+      if (result.status === unknownStatus) { unknown = { repo, id: result.run?.databaseId, url: result.run?.url }; break; }
       if (result.status !== 0) { red = repo; break; }
     } catch (error) {
       runs.push({ repo, id: null, url: null, status: 1, error: error.message.split('\n')[0] });
@@ -89,7 +91,13 @@ export async function release(version, { log = console.log, dryRuns = true } = {
       break;
     }
   }
-  const lines = runs.map(item => `${item.repo}: ${item.status === 0 ? 'green' : 'RED'} ${item.id ?? ''} ${item.url ?? item.error ?? ''}`.trim());
+  const lines = runs.map(item => `${item.repo}: ${item.status === 0 ? 'green' : item.status === unknownStatus ? 'UNKNOWN' : 'RED'} ${item.id ?? ''} ${item.url ?? item.error ?? ''}`.trim());
+  if (unknown) {
+    // No verdict is not red: v1 stays where it is, the release stays unproven, and a person finishes the watch.
+    git(['tag', '-f', '-a', tag, commit, '-m', `mobile-deploy-hub ${tag}\n\nRelease dry runs: UNKNOWN at ${unknown.repo} (GitHub gave no verdict); ${major} was moved and not rolled back.\n${lines.join('\n')}`]);
+    git(['push', '-q', '-f', 'origin', `refs/tags/${tag}`]);
+    throw new Error(`the release dry run of ${unknown.repo} has no verdict (${unknown.url ?? 'no run'}); ${major} stays on ${tag}, unproven, not rolled back. Finish by hand: ${finishByHand(unknown.id, ['--repo', unknown.repo])}`);
+  }
   if (red) {
     if (previous) {
       git(['tag', '-f', major, previous.commit]);

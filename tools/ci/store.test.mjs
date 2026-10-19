@@ -193,40 +193,123 @@ test('the ios lane builds and checks the store IPA through the hook; a hook that
 
 // ---------------------------------------------------------------------------------------------------- the watch
 
-import { watchRun } from '../deploy.mjs';
+import { deploy, finishByHand, parseArguments, unknownStatus, verdictLine, watchRun } from '../deploy.mjs';
 
-test('a watch that dies without a verdict (a rate limit) is watched again; only the run itself says red', async () => {
-  const R = ['--repo', 'delorenj/gruvato'];
-  const make = (watches, views) => {
-    const calls = [];
-    const gh = (args, options = {}) => {
-      calls.push(args.slice(0, 2).join(' '));
-      if (args[1] === 'watch' && options.inherit) return watches.shift();
-      if (args[1] === 'view') {
-        const view = views.shift();
-        if (view === 'rate limited') throw new Error('gh run view failed: HTTP 403: API rate limit exceeded');
-        return JSON.stringify(view);
-      }
-      throw new Error(`unexpected ${args.join(' ')}`);
-    };
-    return { gh, calls };
+// A fake gh with a clock: `script` answers each read of the run (a state object, or a string for an error that gh
+// would throw), `sleep` advances the clock, and every call is recorded.
+function watchRig(script, { rateLimit = null } = {}) {
+  let clock = 1_000_000;
+  const calls = [];
+  const waits = [];
+  const logs = [];
+  const gh = args => {
+    calls.push(args.join(' '));
+    if (args[0] === 'api' && args[1] === 'rate_limit') {
+      if (!rateLimit) throw new Error('gh api failed: HTTP 403');
+      return JSON.stringify({ resources: { core: rateLimit(clock) } });
+    }
+    if (args[0] === 'api' && /actions\/runs\/7$/.test(args[1])) {
+      const next = typeof script === 'function' ? script(calls.filter(call => /actions\/runs\/7 /.test(call)).length, clock) : script.shift();
+      if (typeof next === 'string') throw new Error(`gh api failed: ${next}`);
+      return JSON.stringify(next);
+    }
+    throw new Error(`unexpected ${args.join(' ')}`);
+  };
+  const options = { sleep: async ms => { waits.push(ms); clock += ms; }, now: () => clock, log: line => logs.push(line) };
+  return { gh, calls, waits, logs, options, reads: () => calls.filter(call => /actions\/runs\/7 /.test(call)).length };
+}
+
+const R = ['--repo', 'delorenj/green-in-between'];
+const limited = 'HTTP 403: API rate limit exceeded';
+
+test('a run that is green while GitHub fails every read is GREEN once the API recovers, never red', async () => {
+  // every watch and view fails for a long stretch (the secondary limit), then the run reports it finished green
+  const rig = watchRig((read) => (read <= 40 ? limited : read <= 41 ? { status: 'in_progress', conclusion: null } : { status: 'completed', conclusion: 'success' }));
+  assert.equal(await watchRun(rig.gh, 7, R, rig.options), 0);
+  assert.equal(rig.logs.filter(line => /^DEPLOY_WATCH_RETRY run 7/.test(line)).length, 40);
+  assert.ok(rig.waits.every(ms => ms <= 300_000), 'the backoff stops at five minutes');
+  assert.ok(rig.waits.slice(0, 3).every((ms, index, all) => index === 0 || ms >= all[index - 1]), 'and grows until then');
+  assert.equal(rig.waits.at(-1), 30_000, 'a good read goes back to the 30 s poll');
+});
+
+test('GitHub failing for the whole cap ends UNKNOWN with the run and the command to finish by hand, never red', async () => {
+  const rig = watchRig(() => limited);
+  const status = await watchRun(rig.gh, 7, R, { ...rig.options, capMs: 3_600_000 });
+  assert.equal(status, unknownStatus);
+  assert.notEqual(status, 0);
+  assert.notEqual(status, 1);
+  const line = verdictLine(status, 7, 'dry run', 'https://github.com/x/actions/runs/7', R);
+  assert.match(line, /^DEPLOY_UNKNOWN run 7 dry run https:\/\/github\.com\/x\/actions\/runs\/7/);
+  assert.ok(line.includes('gh run watch 7 --repo delorenj/green-in-between --interval 30 --exit-status'), line);
+  assert.ok(!/DEPLOY_RED/.test(line));
+  assert.ok(rig.waits.reduce((sum, ms) => sum + ms, 0) <= 3_600_000 + 1, 'it never sleeps past the cap');
+});
+
+test('a run that never finishes within the cap is UNKNOWN too, not red', async () => {
+  const rig = watchRig(() => ({ status: 'in_progress', conclusion: null }));
+  assert.equal(await watchRun(rig.gh, 7, R, { ...rig.options, capMs: 600_000 }), unknownStatus);
+  assert.equal(rig.reads(), 21, 'one read per 30 s, not one per 3 s');
+});
+
+test('a genuinely red run still ends RED, and a green one GREEN, on the first completed read', async () => {
+  for (const conclusion of ['failure', 'cancelled', 'timed_out']) {
+    const red = watchRig([{ status: 'in_progress', conclusion: null }, { status: 'completed', conclusion }]);
+    assert.equal(await watchRun(red.gh, 7, R, red.options), 1, conclusion);
+    assert.deepEqual(red.waits, [30_000]);
+    assert.match(verdictLine(1, 7, 'real run', 'u', R), /^DEPLOY_RED run 7 real run u$/);
+  }
+  const green = watchRig([{ status: 'completed', conclusion: 'success' }]);
+  assert.equal(await watchRun(green.gh, 7, R, green.options), 0);
+  assert.deepEqual(green.waits, []);
+  assert.match(verdictLine(0, 7, 'real run', 'u', R), /^DEPLOY_GREEN run 7 real run u$/);
+  // red after a stretch of rate limiting is still red, once the run says so
+  const late = watchRig([limited, limited, { status: 'completed', conclusion: 'failure' }]);
+  assert.equal(await watchRun(late.gh, 7, R, late.options), 1);
+});
+
+test('a spent core budget is waited out to its reset (read from the unmetered rate_limit), not hammered', async () => {
+  const reset = 1_000 + 900; // seconds; the rig clock starts at 1_000_000 ms = 1000 s
+  const rig = watchRig([limited, { status: 'completed', conclusion: 'success' }], { rateLimit: () => ({ remaining: 0, reset }) });
+  assert.equal(await watchRun(rig.gh, 7, R, rig.options), 0);
+  assert.deepEqual(rig.waits, [900_000 + 2000]);
+  assert.ok(rig.logs.some(line => /rate limit resets then/.test(line)));
+});
+
+test('a watch costs one request per 30 s: 51 for a 25 minute run, against about 2,300 for gh run watch', async () => {
+  const rig = watchRig((read) => (read <= 50 ? { status: 'in_progress', conclusion: null } : { status: 'completed', conclusion: 'success' }));
+  assert.equal(await watchRun(rig.gh, 7, R, rig.options), 0);
+  assert.equal(rig.reads(), 51);
+  assert.ok(rig.calls.every(call => call.startsWith('api repos/delorenj/green-in-between/actions/runs/7 ')), 'one api read, no watch, no jobs, no annotations');
+  assert.ok(rig.calls.every(call => !/run watch/.test(call)));
+  assert.ok(rig.logs.filter(line => /^DEPLOY_WATCH run 7/.test(line)).length <= 7, 'a heartbeat every five minutes, not a line per poll');
+});
+
+test('finishByHand names the repo when there is one and works without', () => {
+  assert.equal(finishByHand(9, ['--repo', 'a/b']), 'gh run watch 9 --repo a/b --interval 30 --exit-status');
+  assert.equal(finishByHand(9, []), 'gh run watch 9 --interval 30 --exit-status');
+});
+
+test('the front door ends DEPLOY_UNKNOWN (exit status 3) when GitHub never gives a verdict,', async () => {
+  const runs = (extra = []) => [...extra, { databaseId: 21, headSha: 'a'.repeat(40), event: 'workflow_dispatch', status: 'in_progress', url: 'https://x/21', displayTitle: 'Deploy (dry run)' }];
+  let dispatched = false;
+  const calls = [];
+  let clock = Date.now();
+  const gh = args => {
+    calls.push(args.join(' '));
+    if (args[0] === 'run' && args[1] === 'list') return JSON.stringify(dispatched ? runs() : []);
+    if (args[0] === 'repo') return 'delorenj/green-in-between\n';
+    if (args[0] === 'api' && args.some(arg => /commits\/main$/.test(arg))) return `${'a'.repeat(40)}\n`;
+    if (args[0] === 'api' && args.some(arg => /actions\/runners$/.test(arg))) return '[]';
+    if (args[0] === 'api' && args.includes('Accept: application/vnd.github.raw')) return '';
+    if (args[0] === 'workflow' && args[1] === 'run') { dispatched = true; return ''; }
+    throw new Error('HTTP 403: API rate limit exceeded');
   };
   const logs = [];
-  const waited = [];
-  const options = { sleep: async ms => { waited.push(ms); }, log: line => logs.push(line), waitMs: 5 };
-  // gh could not reach GitHub, then the run turned out green: not red
-  const green = make([1, 1, 0], ['rate limited', { status: 'in_progress', conclusion: '' }]);
-  assert.equal(await watchRun(green.gh, 7, R, options), 0);
-  assert.deepEqual(waited, [5, 5]);
-  assert.equal(logs.filter(line => /^DEPLOY_WATCH_RETRY run 7/.test(line)).length, 2);
-  // the run is finished and failed: red at once, one watch
-  const red = make([1], [{ status: 'completed', conclusion: 'failure' }]);
-  assert.equal(await watchRun(red.gh, 8, R, options), 1);
-  assert.deepEqual(red.calls, ['run watch', 'run view']);
-  // the watch said red but the run says success (the watch died at the end): green
-  const late = make([1], [{ status: 'completed', conclusion: 'success' }]);
-  assert.equal(await watchRun(late.gh, 9, R, options), 0);
-  // no verdict after every attempt: the watch's own status, not an invented success
-  const never = make([1, 1, 1], ['rate limited', 'rate limited', 'rate limited']);
-  assert.equal(await watchRun(never.gh, 10, R, { ...options, attempts: 3 }), 1);
+  const result = await deploy(parseArguments(['--dry-run', 'true', '--repo', 'delorenj/green-in-between', '--platform', 'android']), {
+    gh, git: () => 'main\n', log: line => logs.push(line), sleep: async ms => { clock += ms; }, now: () => clock, timeoutMs: 5000, pollMs: 1, watch: { capMs: 7_200_000 },
+  });
+  assert.equal(result.status, unknownStatus);
+  assert.ok(logs.some(line => /^DEPLOY_UNKNOWN run 21 dry run https:\/\/x\/21: .*gh run watch 21 --repo delorenj\/green-in-between --interval 30 --exit-status/.test(line)), logs.join('\n'));
+  assert.ok(!logs.some(line => /DEPLOY_RED/.test(line)), 'never red');
+  assert.ok(!calls.some(call => /^run watch/.test(call)));
 });
