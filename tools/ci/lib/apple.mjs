@@ -162,9 +162,9 @@ export function exportIpa({ archive, out, team, env = process.env, runner = runB
   return join(exportPath, ipas[0]);
 }
 
-// Unpacks the IPA into `into` (kept: the install uses the .app) and checks it is the planned development build:
-// bundle id, version, signature, entitlements, the embedded profile and the signer.
-export function inspectIpa({ ipa, into, bundle, version, team, udid, signer, env = process.env, runner = runBounded, now = Date.now() }) {
+// Unpacks the IPA into `into` (kept: the install uses the .app) and reads the app's Info.plist, held to the planned
+// bundle id and version.
+function unpackApp({ ipa, into, bundle, version, env, runner }) {
   rmSync(into, { recursive: true, force: true });
   mkdirSync(into, { recursive: true });
   runner('unzip', ['-q', '-o', ipa, '-d', into], { env, timeout: 300_000, label: 'unzip ipa' });
@@ -176,25 +176,78 @@ export function inspectIpa({ ipa, into, bundle, version, team, udid, signer, env
   if (info.CFBundleIdentifier !== bundle) throw new Error(`the IPA is ${info.CFBundleIdentifier}, the manifest pins ${bundle}`);
   if (version && info.CFBundleShortVersionString !== version) throw new Error(`the IPA says version ${info.CFBundleShortVersionString} but the plan says ${version}`);
   if (!info.CFBundleVersion) throw new Error('the IPA has no CFBundleVersion');
+  return { app, info };
+}
+
+// The signature, entitlements and embedded profile of an unpacked app, held to the team and the bundle.
+function signedApp({ app, bundle, team, env, runner }) {
   runner('codesign', ['--verify', '--deep', '--strict', app], { env, timeout: 180_000, label: 'codesign verify' });
   const entitlements = plistText(runner('codesign', ['-d', '--entitlements', ':-', app], { env, timeout: 60_000, label: 'codesign entitlements' }), { env, runner });
   if (entitlements['application-identifier'] !== `${team}.${bundle}`) throw new Error(`signed application-identifier ${entitlements['application-identifier']} is not ${team}.${bundle}`);
   if (entitlements['com.apple.developer.team-identifier'] !== team) throw new Error(`signed team ${entitlements['com.apple.developer.team-identifier']} is not ${team}`);
-  if (entitlements['get-task-allow'] !== true) throw new Error('the IPA is not a development build (get-task-allow is not true); the iPad build must be exported with method debugging');
-  const profile = profileFacts(plistText(runner('security', ['cms', '-D', '-i', join(app, 'embedded.mobileprovision')], { env, timeout: 30_000, label: 'security cms' }), { env, runner }));
+  return entitlements;
+}
+
+function embeddedProfile({ app, env, runner }) {
+  return profileFacts(plistText(runner('security', ['cms', '-D', '-i', join(app, 'embedded.mobileprovision')], { env, timeout: 30_000, label: 'security cms' }), { env, runner }));
+}
+
+function signerOf({ app, into, env, runner }) {
   const certs = join(into, 'signer');
   runner('codesign', ['-d', `--extract-certificates=${certs}`, app], { env, timeout: 60_000, label: 'codesign extract certificates' });
   if (!existsSync(`${certs}0`)) throw new Error('codesign extracted no signing certificate');
-  const actual = sha1(readFileSync(`${certs}0`));
+  return sha1(readFileSync(`${certs}0`));
+}
+
+const ipaFacts = ({ app, info, actual, profile }) => ({
+  app,
+  bundle: info.CFBundleIdentifier,
+  version: info.CFBundleShortVersionString,
+  build: String(info.CFBundleVersion),
+  signer: actual,
+  profile: { uuid: profile.uuid, name: profile.name, expires_at: profile.expires_at, xcode_managed: profile.xcode_managed },
+});
+
+// Checks the IPA is the planned development build: bundle id, version, signature, entitlements, the embedded profile
+// and the signer.
+export function inspectIpa({ ipa, into, bundle, version, team, udid, signer, env = process.env, runner = runBounded, now = Date.now() }) {
+  const { app, info } = unpackApp({ ipa, into, bundle, version, env, runner });
+  const entitlements = signedApp({ app, bundle, team, env, runner });
+  if (entitlements['get-task-allow'] !== true) throw new Error('the IPA is not a development build (get-task-allow is not true); the iPad build must be exported with method debugging');
+  const profile = embeddedProfile({ app, env, runner });
+  const actual = signerOf({ app, into, env, runner });
   if (actual !== signer) throw new Error(`the IPA is signed by ${actual.slice(0, 8)}, not the development identity ${signer.slice(0, 8)}`);
   const problems = devProfileProblems(profile, { team, udid, signer, bundle, minDays: 0, now });
   if (problems.length > 0) throw new Error(`the embedded profile ${profile.name ?? profile.uuid} ${problems.join('; ')}`);
-  return {
-    app,
-    bundle: info.CFBundleIdentifier,
-    version: info.CFBundleShortVersionString,
-    build: String(info.CFBundleVersion),
-    signer: actual,
-    profile: { uuid: profile.uuid, name: profile.name, expires_at: profile.expires_at, xcode_managed: profile.xcode_managed },
-  };
+  return ipaFacts({ app, info, actual, profile });
+}
+
+// Why a profile cannot sign an App Store build of this bundle; empty when it can. An App Store profile names no
+// devices, carries the distribution certificate and refuses get-task-allow.
+export function storeProfileProblems(facts, { team, signer, bundle, now = Date.now() }) {
+  const problems = [];
+  if (facts.team.length !== 1 || facts.team[0] !== team) problems.push(`team ${facts.team.join(',') || '-'} is not ${team}`);
+  if (!facts.certificate_sha1s.includes(signer)) problems.push(`does not include the distribution certificate ${signer.slice(0, 8)}`);
+  if (facts.devices.length > 0 || facts.provisions_all) problems.push('is not an App Store profile (it lists devices or provisions all of them)');
+  if (facts.get_task_allow) problems.push('is a development profile (get-task-allow is true)');
+  if (bundle && !appIdMatches(facts.application_identifier, `${team}.${bundle}`)) problems.push(`application-identifier ${facts.application_identifier} does not cover ${bundle}`);
+  const expires = Date.parse(facts.expires_at ?? '');
+  if (!Number.isFinite(expires)) problems.push('has no expiry');
+  else if (expires < now) problems.push(`expired ${facts.expires_at.slice(0, 10)}`);
+  return problems;
+}
+
+// The App Store IPA the app's ios.store.build hook left: the planned bundle, version and build number, signed by the
+// pinned distribution identity with an App Store profile and no get-task-allow. Unpacked into `into`.
+export function inspectStoreIpa({ ipa, into, bundle, version, build, team, signer, env = process.env, runner = runBounded, now = Date.now() }) {
+  const { app, info } = unpackApp({ ipa, into, bundle, version, env, runner });
+  if (build && String(info.CFBundleVersion) !== String(build)) throw new Error(`the IPA's build is ${info.CFBundleVersion} but the plan says ${build}`);
+  const entitlements = signedApp({ app, bundle, team, env, runner });
+  if (entitlements['get-task-allow'] === true) throw new Error('the store IPA is a development build (get-task-allow is true); TestFlight takes an App Store export');
+  const profile = embeddedProfile({ app, env, runner });
+  const actual = signerOf({ app, into, env, runner });
+  if (actual !== signer) throw new Error(`the store IPA is signed by ${actual.slice(0, 8)}, not the distribution identity ${signer.slice(0, 8)}`);
+  const problems = storeProfileProblems(profile, { team, signer, bundle, now });
+  if (problems.length > 0) throw new Error(`the embedded profile ${profile.name ?? profile.uuid} ${problems.join('; ')}`);
+  return ipaFacts({ app, info, actual, profile });
 }

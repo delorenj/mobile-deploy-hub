@@ -52,6 +52,10 @@ export async function preflightIos(config, { env = process.env, home = homedir()
     if (config.testflight) {
       if (!config.iosStore) throw new Error(`--testflight is for an app with ios.store; ${config.slug || config.bundle} has none`);
       if (config.iosStore.signer_sha1 && !valid.has(config.iosStore.signer_sha1)) throw new Error(`the App Store identity ${config.iosStore.signer_sha1.slice(0, 8)} is not in this Mac's keychain`);
+      if (config.iosStore.signer_sha1) {
+        signingProbe({ signer: config.iosStore.signer_sha1, env, timeoutMs: Number(env.HUB_SIGNING_TIMEOUT_MS) || 60_000 });
+        notes.push(`signing probe passed with the App Store identity ${config.iosStore.signer_sha1.slice(0, 8)}`);
+      }
       checkSecrets(config.iosStore.secrets ?? [], { config, env, notes });
     }
     const ipad = createIpad({ devicectl: createDevicectl({ env }), udid: devices.ios.udid, model: devices.ios.model });

@@ -81,6 +81,12 @@ export function checkPins({ app, manifest }) {
     if (manifest.android.signer_sha256 !== app.android.signer_sha256) throw refusal('pins', `the manifest's android.signer_sha256 is ${String(manifest.android.signer_sha256).slice(0, 12)}...; the policy pins ${app.android.signer_sha256.slice(0, 12)}... (a new signing key is a hub release)`);
   }
   if (app.ios && manifest.ios && manifest.ios.bundle !== app.ios.bundle) throw refusal('pins', `the manifest's ios.bundle is ${manifest.ios.bundle}; the policy pins ${app.ios.bundle}`);
+  // The App Store bundle is pinned too: the policy's store_bundle, else the device bundle (Tower's is one id).
+  if (app.ios && manifest.ios?.store) {
+    const store = manifest.ios.store.bundle ?? manifest.ios.bundle;
+    const pinned = app.ios.store_bundle ?? app.ios.bundle;
+    if (store !== pinned) throw refusal('pins', `the manifest's App Store bundle is ${store}; the policy pins ${pinned} (a new store bundle id is a hub release)`);
+  }
 }
 
 // The app's own conformance on the gate's checkout (design A3, run on every deploy since v1.1.3, dry runs included):

@@ -64,8 +64,11 @@ export function parsePolicy(source) {
       if (!/^[0-9a-f]{64}$/.test(app.android.signer_sha256 ?? '')) fail(`apps.${repo}.android.signer_sha256 must be the lowercase sha256 of the signing certificate`);
     }
     if (app.lanes.includes('ios')) {
-      exact(`apps.${repo}.ios`, app.ios, ['bundle']);
+      // store_bundle: the App Store bundle id, when it differs from the iPad's development one (Green In Between's
+      // dev builds are `.spike`, its TestFlight app is the clean id, so both live on the iPad side by side).
+      exact(`apps.${repo}.ios`, app.ios, ['bundle'], ['store_bundle']);
       if (!/^[A-Za-z][A-Za-z0-9-]*(\.[A-Za-z][A-Za-z0-9-]*)+$/.test(app.ios.bundle ?? '')) fail(`apps.${repo}.ios.bundle must be a reverse-DNS bundle id`);
+      if ('store_bundle' in app.ios && !/^[A-Za-z][A-Za-z0-9-]*(\.[A-Za-z][A-Za-z0-9-]*)+$/.test(app.ios.store_bundle ?? '')) fail(`apps.${repo}.ios.store_bundle must be a reverse-DNS bundle id`);
     }
   }
 

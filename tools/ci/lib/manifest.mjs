@@ -9,7 +9,13 @@ import { join } from 'node:path';
 const topKeys = ['schema', 'project', 'version', 'android', 'ios'];
 const androidKeys = ['package', 'prepare', 'export', 'godot', 'bundle', 'bundle_artifact', 'artifact', 'receipt', 'signer_sha256'];
 const iosKeys = ['bundle', 'prepare', 'export', 'archive', 'receipt', 'device', 'device_artifact', 'store'];
-const storeKeys = ['archive', 'receipt', 'upload', 'assign', 'signer_sha1', 'secrets'];
+// Two shapes of one store lane. With ios.export (Tower, Navi) the Linux half writes the App Store Xcode project: archive and
+// receipt name it, and the app's upload hook signs and uploads it on the Mac. Without ios.export (a Mac-only app, Green In
+// Between) the Mac builds the App Store IPA itself: `build` is the hook (it runs in a dry run too, so the signing is proven
+// before a version is spent) and `artifact` the IPA it leaves in $HUB_OUT/ios, which the hub checks (bundle, version, build,
+// signer, an App Store profile) before upload and assign are called. `bundle` names a store bundle id that differs from the
+// iPad's development one; the policy pins it (apps.<repo>.ios.store_bundle).
+const storeKeys = ['bundle', 'archive', 'receipt', 'build', 'artifact', 'upload', 'assign', 'signer_sha1', 'secrets'];
 
 const fail = message => { throw new Error(`mobile-deploy.json: ${message}`); };
 
@@ -94,10 +100,18 @@ function iosSection(ios) {
   relativePath('ios', ios, 'device_artifact', { suffix: ['.xcarchive', '.ipa'], bare: true, required: true });
   if (ios.store !== undefined) {
     exactKeys('ios.store', ios.store, storeKeys);
-    if (!linux) fail('ios.store needs ios.export: the Linux export writes the App Store Xcode project');
-    relativePath('ios.store', ios.store, 'archive', { suffix: '.tgz', bare: true, required: true });
-    relativePath('ios.store', ios.store, 'receipt', { suffix: '.json', bare: true, required: true });
-    if (ios.store.archive === ios.archive) fail('ios.store.archive must differ from ios.archive: the iPad gets the private project, TestFlight the store one');
+    if (ios.store.bundle !== undefined) bundleId('ios.store', ios.store);
+    if (linux) {
+      relativePath('ios.store', ios.store, 'archive', { suffix: '.tgz', bare: true, required: true });
+      relativePath('ios.store', ios.store, 'receipt', { suffix: '.json', bare: true, required: true });
+      if (ios.store.archive === ios.archive) fail('ios.store.archive must differ from ios.archive: the iPad gets the private project, TestFlight the store one');
+      for (const key of ['build', 'artifact']) if (ios.store[key] !== undefined) fail(`ios.store.${key} is for an app without ios.export (the Mac builds the store IPA); this one hands the store project over in ios.store.archive`);
+    } else {
+      for (const key of ['archive', 'receipt']) if (ios.store[key] !== undefined) fail(`ios.store.${key} needs ios.export: the Linux export writes the App Store Xcode project. A Mac-only app declares ios.store.build and ios.store.artifact instead`);
+      text('ios.store', ios.store, 'build', { required: true });
+      relativePath('ios.store', ios.store, 'artifact', { suffix: '.ipa', bare: true, required: true });
+      if (ios.store.signer_sha1 === undefined) fail('ios.store.signer_sha1 is required without ios.export: the hub checks the store IPA against it');
+    }
     for (const key of ['upload', 'assign']) text('ios.store', ios.store, key, { required: true });
     sha1('ios.store', ios.store);
     secrets('ios.store', ios.store);

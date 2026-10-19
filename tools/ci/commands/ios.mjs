@@ -21,6 +21,7 @@ import { withLock } from '../lib/lock.mjs';
 import { loadManifest } from '../lib/manifest.mjs';
 import { macGatewayLink, parseRsyncStats } from '../lib/metered.mjs';
 import { buildReceipt, sha256File, writeReceipt } from '../lib/receipt.mjs';
+import { buildStoreIpa, receiptStoreIpa } from '../lib/store.mjs';
 import { applyBump, checkAppReceipt, checkDisk, exists, firstLine, guarded, installCurrent, policyBanner, reachIpad, requirePlan, short } from './common.mjs';
 
 // ---------------------------------------------------------------------------------------------------- ios-export (Linux)
@@ -277,22 +278,32 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
     }
 
     let testflight = null;
+    let storeIpa = null;
     if (config.testflight) {
+      // A Mac-only app (ios.store.build) builds and signs its App Store IPA here, a dry run included: the hub checks it
+      // (bundle, version, build, distribution signer, App Store profile) before anything can be uploaded.
+      if (spec.store.build) {
+        track.stage = 'build';
+        storeIpa = await withLock('mac-ios', () => buildStoreIpa({ spec, config, out, team: devices.apple.team, hooks, env, runner, log }), { env, timeoutMs: 40 * 60_000 });
+        track.receipt.store_ipa = receiptStoreIpa(storeIpa);
+      }
       // Publishing, not the device: a failed upload or assign is reported at stage deliver and the iPad keeps its status.
       track.stage = 'deliver';
+      const built = storeIpa ? `the App Store IPA ${storeIpa.version} (${storeIpa.build}) is built and checked; ` : '';
       if (config.dryRun) {
-        testflight = 'dry run: upload and assign were not called';
+        testflight = `dry run: ${built}upload and assign were not called`;
       } else {
         hook('ios.store.upload', spec.store.upload, { cwd: config.cwd, env: hooks });
         hook('ios.store.assign', spec.store.assign, { cwd: config.cwd, env: hooks });
         testflight = 'uploaded and assigned to Owner Testing by the app hooks';
       }
       notes.push(`TestFlight: ${testflight}`);
+      if (storeIpa) log(`HUB_TESTFLIGHT ${config.dryRun ? 'DRY RUN' : 'UPLOADED'} ${storeIpa.bundle} ${storeIpa.version} (${storeIpa.build}) sha256=${short(storeIpa.sha256)}`);
     }
     if (!config.dryRun) {
       try { installCurrent({ hubRef: env.HUB_REF, home, log }); } catch (error) { log(`::warning::could not refresh the catch-up code (${firstLine(error.message)})`); }
     }
-    await writeReceipt(out, buildReceipt({ lane: 'ios', config, env, version: config.version, build: delivery.build, notes, delivery, ipa: ipa ? receiptIpa(ipa) : null, testflight, mac_bytes: macBytes }), env);
+    await writeReceipt(out, buildReceipt({ lane: 'ios', config, env, version: config.version, build: delivery.build, notes, delivery, ipa: ipa ? receiptIpa(ipa) : null, testflight, store_ipa: storeIpa ? receiptStoreIpa(storeIpa) : null, mac_bytes: macBytes }), env);
     return { out, delivery, ipa, notes, macBytes };
   });
 }
