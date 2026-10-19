@@ -6,7 +6,7 @@
 //   node deploy.mjs [--dry-run true|false] [--bump patch|minor|major] [--platform both|android|ios]
 //                   [--testflight true|false] [--play true|false] [--dry-handoff true|false] [--metered auto|allow]
 //                   [--workflow deploy.yml] [--hub-ref REF] [--repo owner/repo] [--print]
-//   node deploy.mjs train [--dry-run true|false] [...]     Tower, Green In Between, Gruvato, then Navi; stops at a red run
+//   node deploy.mjs train [--dry-run true|false] [...]     Tower, Green In Between, Gruvato, Navi, then Earshot; stops at a red run
 //
 // A dry run is the default. It dispatches the app's deploy.yml on main, watches only the run it started, and after a
 // green real run pulls the bump commit (`git pull --ff-only`) in the app's checkout. Nothing here refuses a deploy:
@@ -29,7 +29,7 @@ export const phone = Object.freeze({ serial: 'R5GL43A7PCH', model: 'SM-S948U', h
 export const levels = Object.freeze(['patch', 'minor', 'major']);
 export const meteredModes = Object.freeze(['auto', 'allow']);
 // Jarad's order, the hub policy's apps (a hub test keeps the two equal).
-export const train = Object.freeze(['delorenj/tower-of-lost-things', 'delorenj/green-in-between', 'delorenj/gruvato', 'AutomaticAI-io/navi']);
+export const train = Object.freeze(['delorenj/tower-of-lost-things', 'delorenj/green-in-between', 'delorenj/gruvato', 'AutomaticAI-io/navi', 'delorenj/earshot']);
 const usage = 'Usage: deploy.mjs [train] [--dry-run true|false] [--bump patch|minor|major] [--platform both|android|ios] [--testflight true|false] [--play true|false] [--dry-handoff true|false] [--metered auto|allow] [--workflow deploy.yml] [--hub-ref REF] [--repo owner/repo] [--print]';
 
 function flag(name, value, fallback) {
@@ -265,7 +265,7 @@ export async function deploy(options, {
   return { run, status };
 }
 
-// Tower, Green In Between, Gruvato, then Navi, one at a time; the first red run stops the train.
+// Tower, Green In Between, Gruvato, Navi, then Earshot, one at a time; the first red run stops the train.
 export async function deployTrain(options, deps, { apps = train, log = deps.log ?? console.log } = {}) {
   const results = [];
   for (const repo of apps) {

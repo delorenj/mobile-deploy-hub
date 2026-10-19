@@ -54,13 +54,17 @@ test('the policy parses strictly: unknown keys, a "none" bump, hosted runners an
   }
 });
 
-test('the policy names the four apps in Jarad\'s order with their lanes, and the front door\'s train agrees', async () => {
+test('the policy names the five apps in Jarad\'s order with their lanes, and the front door\'s train agrees', async () => {
   assert.deepEqual(Object.entries(policy.apps).map(([repo, app]) => [repo, app.slug, app.lanes.join('+')]), [
     ['delorenj/tower-of-lost-things', 'tower-of-lost-things', 'android+ios'],
     ['delorenj/green-in-between', 'green-in-between', 'android+ios'],
     ['delorenj/gruvato', 'gruvato', 'android+ios'],
     ['AutomaticAI-io/navi', 'navi', 'android+ios'],
+    ['delorenj/earshot', 'earshot', 'android'],
   ]);
+  // Earshot is Android-only: one lane, the S26, commit-versioned (version.properties), the key pinned in the policy.
+  const earshot = policy.apps['delorenj/earshot'];
+  assert.deepEqual([earshot.android.package, tagOf(earshot, '0.1.1'), tagOnlyOf(earshot), 'ios' in earshot], ['sh.delo.earshot', 'v0.1.1', false, false]);
   // v1.2: Navi lives in a monorepo whose main takes only reviewed pull requests: its own tag prefix, tag-only bumps.
   const navi = policy.apps['AutomaticAI-io/navi'];
   assert.deepEqual([tagOf(navi, '0.1.1'), tagOnlyOf(navi)], ['navi-v0.1.1', true]);

@@ -221,7 +221,7 @@ test('latest.json is held to the contract before anything acts on it', () => {
   };
   for (const [name, latest] of Object.entries(bad)) assert.notDeepEqual(latestProblems(latest, slug, 'https://s3.delo.sh/builds'), [], name);
   const settings = loadSettings();
-  assert.deepEqual(settings.apps.map(app => app.slug), ['tower-of-lost-things', 'green-in-between', 'gruvato', 'navi']);
+  assert.deepEqual(settings.apps.map(app => app.slug), ['tower-of-lost-things', 'green-in-between', 'gruvato', 'navi', 'earshot']);
   assert.deepEqual([settings.loopbackRoot, settings.publicRoot, settings.maxFailures, settings.lanCidr], ['http://127.0.0.1:9012/builds', 'https://s3.delo.sh/builds', 3, '192.168.1.0/24']);
   assert.match(settings.digest, /^[0-9a-f]{8}$/, 'read from tools/ci/policy.json through the hub\'s strict parser');
 });
@@ -280,7 +280,7 @@ test('a pass that cannot read any latest.json says so in its idle line and count
     assert.ok(result.errors >= 1, 'the pass exits non-zero through its error count');
     assert.equal(host.phone.calls(), '', 'a blind pass touches nothing');
     assert.equal(host.lines(/HUB_CATCHUP_ERROR tower-of-lost-things: cannot read latest\.json/).length, 1);
-    assert.match(host.lines(/HUB_CATCHUP_IDLE android live/)[0], /nothing pending \(tower-of-lost-things, green-in-between, gruvato, navi unreadable this pass\)/);
+    assert.match(host.lines(/HUB_CATCHUP_IDLE android live/)[0], /nothing pending \(tower-of-lost-things, green-in-between, gruvato, navi, earshot unreadable this pass\)/);
   } finally { host.cleanup(); }
 });
 

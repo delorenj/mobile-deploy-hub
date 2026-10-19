@@ -35,7 +35,7 @@ What it pins: bump levels (patch by default, never "none"), one Bloodbank event 
 **Changing a rule, once, for every app:**
 
 1. Edit `tools/ci/policy.json` and its test in this repo.
-2. `mise run release`: it checks a clean tree, runs `mise run check` and `mise run conformance` (every app's caller hash, manifest and out-of-hub drift), tags `vX.Y.Z`, moves `v1`, and proves the release with one strict dry run per app in the policy (Tower, Green In Between, Gruvato, Navi) — moving `v1` back if any is red.
+2. `mise run release`: it checks a clean tree, runs `mise run check` and `mise run conformance` (every app's caller hash, manifest and out-of-hub drift), tags `vX.Y.Z`, moves `v1`, and proves the release with one strict dry run per app in the policy (Tower, Green In Between, Gruvato, Navi, Earshot) — moving `v1` back if any is red.
 
 Apps need no edit for a policy change: their callers pin `@v1`. A caller changes only when the template itself changes, and the new template's hash joins `callers.accept` in the same release, so moving `v1` never refuses a caller that has not been updated yet.
 

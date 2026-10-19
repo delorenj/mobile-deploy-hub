@@ -23,6 +23,10 @@
       "slug": "navi", "lanes": ["android", "ios"], "tag_prefix": "navi-v", "version": "tag",
       "android": { "package": "io.automaticai.ipm.navi", "signer_sha256": "d09a011f872cc3e25f5b6c46e66a5e07c68c1240566bc0d4b66bf41e0fff3a3c" },
       "ios": { "bundle": "io.automaticai.ipm.navi" }
+    },
+    "delorenj/earshot": {
+      "slug": "earshot", "lanes": ["android"],
+      "android": { "package": "sh.delo.earshot", "signer_sha256": "edcb667da42bd67c7de3d31cb22c38e223d81c159d0987d186cda24e951d6eac" }
     }
   },
   "callers": {
