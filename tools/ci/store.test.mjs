@@ -190,3 +190,43 @@ test('the ios lane builds and checks the store IPA through the hook; a hook that
     assert.equal(built.name, 'Game-store.ipa');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+// ---------------------------------------------------------------------------------------------------- the watch
+
+import { watchRun } from '../deploy.mjs';
+
+test('a watch that dies without a verdict (a rate limit) is watched again; only the run itself says red', async () => {
+  const R = ['--repo', 'delorenj/gruvato'];
+  const make = (watches, views) => {
+    const calls = [];
+    const gh = (args, options = {}) => {
+      calls.push(args.slice(0, 2).join(' '));
+      if (args[1] === 'watch' && options.inherit) return watches.shift();
+      if (args[1] === 'view') {
+        const view = views.shift();
+        if (view === 'rate limited') throw new Error('gh run view failed: HTTP 403: API rate limit exceeded');
+        return JSON.stringify(view);
+      }
+      throw new Error(`unexpected ${args.join(' ')}`);
+    };
+    return { gh, calls };
+  };
+  const logs = [];
+  const waited = [];
+  const options = { sleep: async ms => { waited.push(ms); }, log: line => logs.push(line), waitMs: 5 };
+  // gh could not reach GitHub, then the run turned out green: not red
+  const green = make([1, 1, 0], ['rate limited', { status: 'in_progress', conclusion: '' }]);
+  assert.equal(await watchRun(green.gh, 7, R, options), 0);
+  assert.deepEqual(waited, [5, 5]);
+  assert.equal(logs.filter(line => /^DEPLOY_WATCH_RETRY run 7/.test(line)).length, 2);
+  // the run is finished and failed: red at once, one watch
+  const red = make([1], [{ status: 'completed', conclusion: 'failure' }]);
+  assert.equal(await watchRun(red.gh, 8, R, options), 1);
+  assert.deepEqual(red.calls, ['run watch', 'run view']);
+  // the watch said red but the run says success (the watch died at the end): green
+  const late = make([1], [{ status: 'completed', conclusion: 'success' }]);
+  assert.equal(await watchRun(late.gh, 9, R, options), 0);
+  // no verdict after every attempt: the watch's own status, not an invented success
+  const never = make([1, 1, 1], ['rate limited', 'rate limited', 'rate limited']);
+  assert.equal(await watchRun(never.gh, 10, R, { ...options, attempts: 3 }), 1);
+});

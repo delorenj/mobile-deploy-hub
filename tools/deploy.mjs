@@ -129,6 +129,22 @@ export const lastRealRun = runs => runs.filter(run => /\bREAL\b/.test(run.displa
 
 const listFields = 'databaseId,headSha,event,status,conclusion,createdAt,url,displayTitle';
 
+// `gh run watch --exit-status` exits non-zero for a red run, and also when gh itself cannot talk to GitHub (a rate limit
+// shared with every other agent, a dropped connection): that is no verdict, and reporting it red once rolled a hub
+// release back over a green dry run (v1.2.14, Gruvato). Ask the run itself, and watch again while it is unfinished.
+export async function watchRun(gh, id, R, { sleep, log = console.log, attempts = 30, waitMs = 60_000 } = {}) {
+  for (let attempt = 1; ; attempt += 1) {
+    const status = gh(['run', 'watch', String(id), ...R, '--exit-status'], { inherit: true });
+    if (status === 0) return 0;
+    let state = null;
+    try { state = JSON.parse(gh(['run', 'view', String(id), ...R, '--json', 'status,conclusion'])); } catch { /* unreadable: not a verdict */ }
+    if (state?.status === 'completed') return state.conclusion === 'success' ? 0 : status;
+    if (attempt >= attempts) return status;
+    log(`DEPLOY_WATCH_RETRY run ${id}: the watch ended without a verdict (${state ? state.status : 'GitHub unreachable or rate limited'}); watching again in ${waitMs / 1000}s`);
+    await sleep(waitMs);
+  }
+}
+
 // On big-chungus, look for the S26 before dispatching. Information only: away means the S26 delivery is pending.
 export async function checkPhone({ adb, log = console.log, sleep = ms => new Promise(done => setTimeout(done, ms)), waitMs = 20_000, pollMs = 2000, now = Date.now }) {
   try { adb(['start-server']); } catch (error) { return { found: false, why: `adb could not start (${error.message.split('\n')[0]})` }; }
@@ -208,7 +224,7 @@ export async function deploy(options, {
         gh(['run', 'rerun', String(last.databaseId), ...R, '--failed']);
         log(`DEPLOY_RERUN ${last.databaseId} failed jobs re-run (same version, same commit)`);
         await sleep(pollMs);
-        const status = gh(['run', 'watch', String(last.databaseId), ...R, '--exit-status'], { inherit: true });
+        const status = await watchRun(gh, last.databaseId, R, { sleep, log });
         log(`${status === 0 ? 'DEPLOY_GREEN' : 'DEPLOY_RED'} run ${last.databaseId} rerun ${last.url}`);
         return { run: last, status, rerun: true };
       }
@@ -230,7 +246,7 @@ export async function deploy(options, {
 
   const [run] = started;
   log(`DEPLOY_RUN ${run.databaseId} ${run.url}`);
-  const status = gh(['run', 'watch', String(run.databaseId), ...R, '--exit-status'], { inherit: true });
+  const status = await watchRun(gh, run.databaseId, R, { sleep, log });
   log(`${status === 0 ? 'DEPLOY_GREEN' : 'DEPLOY_RED'} run ${run.databaseId} ${options.dryRun ? 'dry run' : 'real run'} ${run.url}`);
 
   if (status === 0 && !options.dryRun) {
