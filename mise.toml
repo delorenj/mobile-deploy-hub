@@ -39,10 +39,6 @@ task = "link:agentfiles"
 description = "Symlink all agent files to AGENTS.md"
 run = "'{{config_root}}/.mise/scripts/link-agentfiles.sh' '{{config_root}}'"
 
-[tasks."skills:sync"]
-description = "Reconcile this project's selected skills"
-tools = { "npm:@delorenj/skillex" = { version = "0.1.2", allow_low_downloads = true }, node = "24" }
-run = "skillex sync --scope project --project '{{config_root}}'"
 [tasks."hindsight:setup"]
 description = "Provision this dev's shared project Hindsight key from 1Password into .env (op read; upserts those two keys, leaves the rest of .env intact)"
 run = "'{{config_root}}/.mise/scripts/hindsight-setup.sh'"
