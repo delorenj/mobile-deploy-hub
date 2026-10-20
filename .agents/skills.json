@@ -1,6 +1,5 @@
 {
   "inherit_global": true,
-  "registry": "github.com/delorenj/skills",
   "skills": [
     "mobile-devex"
   ],
