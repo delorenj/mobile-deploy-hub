@@ -1,8 +1,8 @@
 {
   "inherit_global": true,
   "registry": "github.com/delorenj/skills",
-  "sets": [
-    "mobile-dev"
+  "skills": [
+    "mobile-devex"
   ],
   "exclude": [
     "bmad-advanced-elicitation",
