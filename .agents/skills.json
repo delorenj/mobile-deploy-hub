@@ -1,7 +1,8 @@
 {
   "inherit_global": true,
   "skills": [
-    "mobile-devex"
+    "mobile-devex",
+    "g33-33god-integration"
   ],
   "exclude": [
     "bmad-advanced-elicitation",
