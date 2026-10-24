@@ -31,6 +31,16 @@ export function pickIpad(document, { udid, model }) {
   const hardware = device.hardwareProperties ?? {};
   const connection = device.connectionProperties ?? {};
   const properties = device.deviceProperties ?? {};
+  // devicectl can list the iPad by UDID with the hardware details it reads live left out (a run logged "undefined
+  // iPad14,5" and failed the whole deploy, 2026-10-24; seen with the iPad away, the record's cause is not captured).
+  // An unproven identity is never reachable: it is reported as tunnel 'unavailable', which reachIpad and the catch-up
+  // treat as pending. A state the record states explicitly and wrongly (unpaired, Developer Mode off, simulated,
+  // another model) stays a hard error.
+  if (hardware.reality === undefined && (hardware.productType === undefined || hardware.productType === model)) {
+    if (connection.pairingState !== undefined && connection.pairingState !== 'paired') throw new Error(`the iPad is not paired with this Mac (pairingState ${connection.pairingState})`);
+    if (properties.developerModeStatus && properties.developerModeStatus !== 'enabled') throw new Error('Developer Mode is off on the iPad (Settings > Privacy & Security > Developer Mode)');
+    return { identifier: device.identifier, name: properties.name ?? null, os: properties.osVersionNumber ?? null, transport: connection.transportType ?? null, tunnel: 'unavailable' };
+  }
   if (hardware.reality !== 'physical' || hardware.productType !== model) throw new Error(`devicectl lists ${udid} as ${hardware.reality} ${hardware.productType}, not the physical ${model}`);
   if (connection.pairingState !== 'paired') throw new Error(`the iPad is not paired with this Mac (pairingState ${connection.pairingState})`);
   if (properties.developerModeStatus && properties.developerModeStatus !== 'enabled') throw new Error('Developer Mode is off on the iPad (Settings > Privacy & Security > Developer Mode)');

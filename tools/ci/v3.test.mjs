@@ -14,6 +14,7 @@ import { checkBump, levels, nextVersion, parseVersionInfo } from './lib/version.
 import { bumpTransaction, createGit, parseRemoteTag, parseStatus } from './lib/git.mjs';
 import { createAdb, findPhone, parseBaseApk, parseDeviceList, parseMdnsEndpoint, parsePackage, parseSha256 } from './lib/adb.mjs';
 import { createIpad, pickApp, pickIpad } from './lib/devicectl.mjs';
+import { reachIpad } from './commands/common.mjs';
 import { bbEmitPath, correlationFor, deploymentEvent, emitArgs, sanitizeReason, targetOf, uuidv5 } from './lib/announce.mjs';
 import { loadDevices, parseDevices } from './lib/devices.mjs';
 import { parseManifest } from './lib/manifest.mjs';
@@ -432,6 +433,25 @@ test('devicectl output is read by UDID: the physical, paired iPad with Developer
   assert.throws(() => pickIpad(devicectlList({ connection: { pairingState: 'unpaired' } }), { udid: devices.ios.udid, model: 'iPad14,5' }), /not paired/);
   assert.throws(() => pickIpad(devicectlList({ device: { developerModeStatus: 'disabled' } }), { udid: devices.ios.udid, model: 'iPad14,5' }), /Developer Mode is off/);
   assert.throws(() => pickIpad(devicectlList({ hardware: { productType: 'iPad13,1' } }), { udid: devices.ios.udid, model: 'iPad14,5' }), /not the physical iPad14,5/);
+  assert.throws(() => pickIpad(devicectlList({ hardware: { reality: 'simulated' } }), { udid: devices.ios.udid, model: 'iPad14,5' }), /not the physical iPad14,5/);
+  assert.throws(() => pickIpad(devicectlList({ hardware: { reality: undefined, productType: 'iPad13,1' } }), { udid: devices.ios.udid, model: 'iPad14,5' }), /not the physical iPad14,5/, 'a cached record of another model is still wrong');
+  assert.throws(() => pickIpad(devicectlList({ hardware: { reality: undefined }, connection: { pairingState: 'unpaired' } }), { udid: devices.ios.udid, model: 'iPad14,5' }), /not paired/, 'a sparse record that says unpaired is still a failure');
+  assert.throws(() => pickIpad(devicectlList({ hardware: { reality: undefined }, device: { developerModeStatus: 'disabled' } }), { udid: devices.ios.udid, model: 'iPad14,5' }), /Developer Mode is off/, 'a sparse record that says Developer Mode is off is still a failure');
+});
+
+test('an iPad that devicectl lists without its live hardware details is unavailable (pending), not a failure', async () => {
+  // Run 40116263423 (2026-10-24): "devicectl lists 00008112-000138390CFB401E as undefined iPad14,5" failed the whole deploy.
+  for (const hardware of [{ reality: undefined }, { reality: undefined, productType: undefined }]) {
+    const sparse = devicectlList({ hardware, connection: { pairingState: undefined, tunnelState: 'connected', transportType: undefined }, device: { developerModeStatus: undefined } });
+    const found = pickIpad(sparse, { udid: devices.ios.udid, model: 'iPad14,5' });
+    assert.equal(found.tunnel, 'unavailable', 'unproven identity is never reachable, whatever tunnel state the cache reports');
+    assert.equal(found.identifier, 'CORE-ID');
+    let clock = 0;
+    const reach = await reachIpad({ find: () => pickIpad(sparse, { udid: devices.ios.udid, model: 'iPad14,5' }) }, { waitMs: 10, pollMs: 5, sleep: async ms => { clock += ms; }, now: () => clock });
+    assert.equal(reach.reachable, false);
+    assert.equal(reach.reason, 'asleep or away');
+    assert.match(reach.detail, /listed by devicectl but unavailable/);
+  }
 });
 
 test('devicectl app info is read back as version and build', () => {
