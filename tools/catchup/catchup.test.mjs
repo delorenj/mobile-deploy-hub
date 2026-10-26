@@ -846,7 +846,8 @@ test('units: the S26 pass every 2 minutes under systemd, the iPad pass every 5 i
   const install = unit('install.sh');
   assert.match(install, /launchctl bootstrap "\$domain" "\$plist"/);
   assert.match(install, /domain="gui\/\$\(id -u\)"/);
-  assert.match(install, /systemctl --user enable --now mobile-deploy-hub-catchup\.timer/);
+  assert.doesNotMatch(install, /^\s*systemctl --user enable --now mobile-deploy-hub-(?:catchup|macwatch)\.timer/m, 'candybar owns the Linux cadence; a release must not resurrect the timers');
+  assert.match(install, /cp "\$units\/mobile-deploy-hub-catchup\.service" "\$units\/mobile-deploy-hub-catchup\.timer" "\$dest\/"/, 'unit files remain available for rollback');
   assert.match(install, /if \[\[ ! -f \$config \]\]; then[\s\S]*"mode":"watch"/, 'a new host watches');
   assert.doesNotMatch(install, /"mode":"live"|mode live"/, 'going live is never the installer\'s call');
   if (spawnSync('plutil', ['-help']).status === 0 || existsSync('/usr/bin/plutil')) assert.equal(spawnSync('plutil', ['-lint', join(hubRoot, 'tools/catchup/units/sh.delo.mobile-deploy-hub.catchup.plist')]).status, 0);
