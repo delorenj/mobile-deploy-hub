@@ -82,18 +82,18 @@ export function createAdb({ env: given = process.env, home = homedir(), runner =
 // The optional AbortSignal is for interactive runs; deploy jobs can continue calling this unchanged.
 export async function findPhone(adb, { serial, model, waitMs = 180_000, pollMs = 3000, nudgeEvery = 5, sleep = ms => new Promise(done => setTimeout(done, ms)), now = Date.now, log = console.log, signal } = {}) {
   signal?.throwIfAborted();
-  adb.startServer();
+  await adb.startServer();
   const deadline = now() + waitMs;
   let seen = [];
   for (let poll = 1; ; poll += 1) {
     signal?.throwIfAborted();
-    seen = adb.devices();
+    seen = await adb.devices();
     for (const device of seen.filter(entry => entry.state === 'device')) {
       signal?.throwIfAborted();
       let found;
-      try { found = adb.prop(device.id, 'ro.serialno'); } catch { continue; }
+      try { found = await adb.prop(device.id, 'ro.serialno'); } catch { continue; }
       if (found !== serial) continue;
-      const actual = adb.prop(device.id, 'ro.product.model');
+      const actual = await adb.prop(device.id, 'ro.product.model');
       if (model && actual !== model) throw new Error(`adb device ${device.id} has serial ${serial} but model ${actual}, not ${model}`);
       signal?.throwIfAborted();
       log(`HUB_S26 ${model ?? ''} serial=${serial} adb=${device.id}`);
@@ -102,9 +102,9 @@ export async function findPhone(adb, { serial, model, waitMs = 180_000, pollMs =
     if (now() >= deadline) break;
     if (poll % nudgeEvery === 0 && adb.mdnsEndpoint && adb.connect) {
       try {
-        const endpoint = adb.mdnsEndpoint(serial);
+        const endpoint = await adb.mdnsEndpoint(serial);
         signal?.throwIfAborted();
-        if (endpoint) { log(`HUB_S26_CONNECT ${endpoint} (mDNS lists it; auto-connect had not)`); adb.connect(endpoint); }
+        if (endpoint) { log(`HUB_S26_CONNECT ${endpoint} (mDNS lists it; auto-connect had not)`); await adb.connect(endpoint); }
       } catch { /* the next poll tries again */ }
     }
     if (!signal) { await sleep(pollMs); continue; }

@@ -127,14 +127,12 @@ function processStart(pid) {
 }
 
 function staleWaiter(ticket) {
-  if (ticket.host === hostname() && Number.isSafeInteger(ticket.pid)) {
-    if (!alive(ticket.pid)) return true;
-    const actual = processStart(ticket.pid);
-    if (ticket.process_start && actual && ticket.process_start !== actual) return true;
-  }
-  // Older queue records had no process identity. Limit even a still-live PID's ticket to one day.
-  const enqueued = Date.parse(ticket.enqueued_at);
-  return Number.isFinite(enqueued) && Date.now() - enqueued > 24 * 3600_000;
+  // Queue tickets are new in this change, so a valid one always names the exact process that took it. A ticket
+  // missing its process identity, or whose pid now belongs to a different process, is stale.
+  if (ticket.host !== hostname() || !Number.isSafeInteger(ticket.pid) || !ticket.process_start) return true;
+  if (!alive(ticket.pid)) return true;
+  const actual = processStart(ticket.pid);
+  return actual !== ticket.process_start;
 }
 
 // The waiters for a lock, oldest first. Observers only report stale tickets; acquire prunes them.

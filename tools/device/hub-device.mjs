@@ -15,9 +15,10 @@ import { spawn } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { constants, hostname } from 'node:os';
 import { pathToFileURL } from 'node:url';
-import { createAdb, findPhone } from '../ci/lib/adb.mjs';
+import { findPhone } from '../ci/lib/adb.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
 import { MAX_LEASE_MS, acquireLease, isLease, listLocks, listWaiters, lockDir, releaseLease, updateLease } from '../ci/lib/lock.mjs';
+import { createAsyncAdb } from './async-adb.mjs';
 import { inventory } from './inventory.mjs';
 
 // Devices this tool can lease, by name, and the host lock each one is.
@@ -95,7 +96,9 @@ async function takeLease(name, options, context) {
       const devices = loadDevices(env);
       const adbEnv = { ...env, ANDROID_ADB_SERVER_PORT: port };
       delete adbEnv.ANDROID_SERIAL;
-      const adb = (context.adbFactory ?? createAdb)({ env: adbEnv });
+      const adb = context.adbFactory
+        ? context.adbFactory({ env: adbEnv, signal: options.signal })
+        : createAsyncAdb({ env: adbEnv, signal: options.signal });
       device.adb_id = await findPhone(adb, { serial: devices.android.serial, model: devices.android.model, waitMs: options.phoneWaitMs, pollMs: timing.phonePollMs, sleep: timing.sleep, now: timing.now, log, signal: options.signal });
       device.serial = device.adb_id;
     } catch (error) {
@@ -132,15 +135,31 @@ function report(error, parsed, context) {
 }
 
 async function lease(parsed, context) {
-  const { stdout } = context;
+  const { stdout, env, signals } = context;
   const { lock, forMs, why, waitMs, holderPid } = setup(parsed, { needForWhy: true });
-  const holder = parsed.flags.holder ?? context.env.HUB_DEVICE_HOLDER ?? `${context.env.USER ?? 'unknown'}@${hostname()}`;
-  const options = { holder, why, forMs, waitMs, id: parsed.flags.id ?? null, holderPid, noConnect: Boolean(parsed.flags['no-connect']), phoneWaitMs: waitMs };
-  const { lease: record, device } = await takeLease(lock, options, context);
-  const vars = exportsOf(record, device, parsed.envSerial);
-  if (parsed.flags.json) stdout(JSON.stringify({ lease_id: record.lease_id, device: 's26', holder, why, expires_at: record.expires_at, env: vars }));
-  else for (const [name, value] of Object.entries(vars)) stdout(`export ${name}=${shellQuote(value)}`);
-  return 0;
+  const holder = parsed.flags.holder ?? env.HUB_DEVICE_HOLDER ?? `${env.USER ?? 'unknown'}@${hostname()}`;
+  const abort = new AbortController();
+  let received = null;
+  const onSignal = signal => { received ??= signal; abort.abort(); };
+  const names = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+  for (const name of names) signals.on(name, onSignal);
+  try {
+    const options = { holder, why, forMs, waitMs, id: parsed.flags.id ?? null, holderPid, noConnect: Boolean(parsed.flags['no-connect']), phoneWaitMs: waitMs, signal: abort.signal };
+    const { lease: record, device } = await takeLease(lock, options, context);
+    if (received) {
+      releaseLease(lock, record.lease_id, { env });
+      return 128 + constants.signals[received];
+    }
+    const vars = exportsOf(record, device, parsed.envSerial);
+    if (parsed.flags.json) stdout(JSON.stringify({ lease_id: record.lease_id, device: 's26', holder, why, expires_at: record.expires_at, env: vars }));
+    else for (const [name, value] of Object.entries(vars)) stdout(`export ${name}=${shellQuote(value)}`);
+    return 0;
+  } catch (error) {
+    if (received) return 128 + constants.signals[received];
+    throw error;
+  } finally {
+    for (const name of names) signals.off(name, onSignal);
+  }
 }
 
 // Idempotent for a named lease: one that is already gone (expired, reclaimed, released) is not an error, so an adapter can

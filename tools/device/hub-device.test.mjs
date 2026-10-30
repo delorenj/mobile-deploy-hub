@@ -315,6 +315,38 @@ test('SIGTERM and SIGINT abort phone discovery promptly and release the lease', 
   });
 });
 
+test('SIGTERM aborts an in-flight adb devices call within a second', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hub-slow-adb-'));
+  try {
+    const adb = join(root, 'adb');
+    writeFileSync(adb, `#!/bin/sh
+case "$1" in
+  start-server) exit 0 ;;
+  devices) touch "${root}/entered"; sleep 4; printf 'List of devices attached\\n'; exit 0 ;;
+  *) exit 1 ;;
+esac
+`);
+    chmodSync(adb, 0o755);
+    const child = spawn(process.execPath, [tool, 'run', 's26', '--wait', '30s', '--', process.execPath, '-e', 'process.exit(0)'], {
+      env: { ...process.env, HUB_ADB: adb, HUB_LOCK_DIR: join(root, 'locks'), HUB_DEVICE_POLL_MS: '50' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.stdout.resume();
+    child.stderr.resume();
+    const exit = new Promise(done => child.on('close', (code, signal) => done({ code, signal })));
+    for (let i = 0; i < 200 && !existsSync(join(root, 'entered')); i += 1) await settle(10);
+    assert.ok(existsSync(join(root, 'entered')), 'fake devices invoked');
+    const start = Date.now();
+    child.kill('SIGTERM');
+    const result = await exit;
+    assert.equal(result.code, 143);
+    assert.ok(Date.now() - start < 1500, `discovery still waited ${Date.now() - start}ms after SIGTERM`);
+    assert.ok(!existsSync(join(root, 'locks/adb.lock')), 'nothing held');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // A /proc of other people's processes.
 function fakeProc(root, processes) {
   for (const [pid, { argv, env = {} }] of Object.entries(processes)) {

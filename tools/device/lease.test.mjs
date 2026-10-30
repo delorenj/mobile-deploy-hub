@@ -179,6 +179,20 @@ test('a ticket with a reused live pid but a different process start is stale and
   } finally { f.cleanup(); }
 });
 
+test('a legacy ticket without process_start is stale even when its pid is still alive', async () => {
+  const f = fixture();
+  try {
+    const queue = join(f.root, 'locks/adb.queue');
+    mkdirSync(queue, { recursive: true });
+    const ghost = join(queue, '000000000000001-000000-00000001.json');
+    writeFileSync(ghost, JSON.stringify({ lease_id: 'legacy', holder: 'old', why: 'gone', pid: process.pid, host: hostname(), enqueued_at: new Date().toISOString() }));
+    assert.equal(listWaiters('adb', { env: f.env })[0].stale, true, 'reported stale, not trusted');
+    assert.ok(existsSync(ghost), 'observing never prunes');
+    assert.equal((await lease(f, { id: 'next', waitMs: 100 })).lease_id, 'next', 'the legacy ticket cannot starve a free lock');
+    assert.ok(!existsSync(ghost), 'acquisition prunes it');
+  } finally { f.cleanup(); }
+});
+
 test('a waiter that times out leaves the queue; a queued lease says how many are ahead', async () => {
   const f = fixture();
   try {
