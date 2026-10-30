@@ -117,8 +117,8 @@ function writeOwner(path, owner) {
 
 let ticketCounter = 0;
 
-// The waiters for a lock, oldest first. A waiter whose process is gone (on this host) is dropped.
-export function listWaiters(name, { env = process.env } = {}) {
+// The waiters for a lock, oldest first. Observers only report stale tickets; acquire prunes them.
+export function listWaiters(name, { env = process.env, prune = false } = {}) {
   const dir = queuePath(name, env);
   let files = [];
   try { files = readdirSync(dir).filter(file => file.endsWith('.json')).sort(); } catch { return []; }
@@ -127,16 +127,17 @@ export function listWaiters(name, { env = process.env } = {}) {
     let ticket = null;
     try { ticket = JSON.parse(readFileSync(join(dir, file), 'utf8')); } catch { /* being written, or junk */ }
     if (ticket && ticket.host === hostname() && Number.isSafeInteger(ticket.pid) && !alive(ticket.pid)) {
-      rmSync(join(dir, file), { force: true });
+      if (prune) rmSync(join(dir, file), { force: true });
+      else waiters.push({ ...ticket, file, stale: true });
       continue;
     }
     if (!ticket) {
       let age = 0;
       try { age = Date.now() - statSync(join(dir, file)).mtimeMs; } catch { continue; }
-      if (age > 60_000) rmSync(join(dir, file), { force: true });
+      if (prune && age > 60_000) rmSync(join(dir, file), { force: true });
       continue;
     }
-    waiters.push({ ...ticket, file });
+    waiters.push({ ...ticket, file, stale: false });
   }
   return waiters;
 }
@@ -157,6 +158,7 @@ export async function acquireLease(name, {
   log = console.log,
   sleep = ms => new Promise(done => setTimeout(done, ms)),
   now = Date.now,
+  signal,
 } = {}) {
   const path = lockPath(name, env);
   if (!(forMs > 0) || forMs > MAX_LEASE_MS) throw new Error(`a lease runs for more than 0 and at most ${MAX_LEASE_MS / 3600_000}h`);
@@ -172,8 +174,9 @@ export async function acquireLease(name, {
   let waiting = false;
   try {
     for (;;) {
+      signal?.throwIfAborted();
       try { statSync(ticketFile); } catch { throw failure('HUB_LEASE_CANCELLED', `lease ${lease_id} was released while it waited for ${name}`); }
-      const waiters = listWaiters(name, { env });
+      const waiters = listWaiters(name, { env, prune: true });
       const position = waiters.findIndex(waiter => waiter.file === ticket);
       if (position === 0) {
         const started = now();
@@ -201,7 +204,13 @@ export async function acquireLease(name, {
         if (now() >= deadline) throw failure('HUB_LOCK_TIMEOUT', `host lock ${name} has ${position} waiter${position === 1 ? '' : 's'} ahead of lease ${lease_id}; gave up after ${Math.round(waitMs / 1000)}s`);
         if (!waiting) { log(`HUB_LOCK_WAIT ${name} queued behind ${position} (${describe(readOwner(path))})`); waiting = true; }
       }
-      await sleep(pollMs);
+      if (!signal) { await sleep(pollMs); continue; }
+      await new Promise(done => {
+        const timer = setTimeout(() => { signal.removeEventListener('abort', abort); done(); }, pollMs);
+        const abort = () => { clearTimeout(timer); done(); };
+        signal.addEventListener('abort', abort, { once: true });
+        if (signal.aborted) abort();
+      });
     }
   } finally {
     rmSync(ticketFile, { force: true });

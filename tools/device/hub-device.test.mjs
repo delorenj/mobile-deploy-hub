@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { acquireLease, releaseLease, withLock } from '../ci/lib/lock.mjs';
@@ -276,6 +276,43 @@ test('waiting runs are served in order once the lease is released', async () => 
     assert.equal(readFileSync(log, 'utf8'), 'one\ntwo\nthree\n');
     assert.ok(!existsSync(f.lock));
   } finally { f.cleanup(); }
+});
+
+test('status observes stale waiter tickets without removing or rewriting them', async () => {
+  const f = fixture();
+  try {
+    const queue = join(f.root, 'locks/adb.queue');
+    mkdirSync(queue, { recursive: true });
+    const ghost = join(queue, '000000000000001-000000-00000001.json');
+    writeFileSync(ghost, JSON.stringify({ lease_id: 'ghost', holder: 'former', why: 'gone', pid: 999999999, host: hostname(), enqueued_at: new Date(0).toISOString() }));
+    const bytes = readFileSync(ghost);
+    const before = statSync(ghost);
+    const result = await f.run(['status', '--json']);
+    assert.equal(result.code, 0);
+    assert.deepEqual(JSON.parse(result.out.join('\n')).waiters.map(waiter => [waiter.lease_id, waiter.stale]), [['ghost', true]]);
+    assert.deepEqual(readFileSync(ghost), bytes);
+    assert.equal(statSync(ghost).mtimeMs, before.mtimeMs);
+    assert.deepEqual(readdirSync(queue), ['000000000000001-000000-00000001.json']);
+  } finally { f.cleanup(); }
+});
+
+test('SIGTERM and SIGINT abort phone discovery promptly and release the lease', async t => {
+  for (const [signal, code] of [['SIGTERM', 143], ['SIGINT', 130]]) await t.test(signal, async () => {
+    const f = fixture();
+    try {
+      f.away(true);
+      const { child, exit } = spawnRun(f, ['run', 's26', '--for', '10m', '--why', 'discovery', '--wait', '6s', '--', process.execPath, '-e', 'process.exit(0)'], { HUB_DEVICE_POLL_MS: '100' });
+      for (let i = 0; i < 100 && !f.calls().includes('devices'); i += 1) await settle(20);
+      assert.match(f.calls(), /devices/, 'discovery has started');
+      assert.ok(existsSync(f.lock), 'the lease is held while looking for the phone');
+      const started = Date.now();
+      child.kill(signal);
+      const result = await exit;
+      assert.equal(result.code, code);
+      assert.ok(Date.now() - started < 1500, `discovery still waited ${Date.now() - started}ms after ${signal}`);
+      assert.ok(!existsSync(f.lock), 'the lease is released promptly');
+    } finally { f.cleanup(); }
+  });
 });
 
 // A /proc of other people's processes.

@@ -96,7 +96,7 @@ async function takeLease(name, options, context) {
       const adbEnv = { ...env, ANDROID_ADB_SERVER_PORT: port };
       delete adbEnv.ANDROID_SERIAL;
       const adb = (context.adbFactory ?? createAdb)({ env: adbEnv });
-      device.adb_id = await findPhone(adb, { serial: devices.android.serial, model: devices.android.model, waitMs: options.phoneWaitMs, pollMs: timing.phonePollMs, sleep: timing.sleep, now: timing.now, log });
+      device.adb_id = await findPhone(adb, { serial: devices.android.serial, model: devices.android.model, waitMs: options.phoneWaitMs, pollMs: timing.phonePollMs, sleep: timing.sleep, now: timing.now, log, signal: options.signal });
       device.serial = device.adb_id;
     } catch (error) {
       releaseLease(name, lease.lease_id, { env });
@@ -183,7 +183,7 @@ function status(parsed, context) {
   });
   const waiters = [];
   for (const name of new Set([...Object.values(DEVICES), ...locks.map(entry => entry.lock)])) {
-    listWaiters(name, { env }).forEach((waiter, index) => waiters.push({ lock: name, device: nameOf(name), position: index + 1, lease_id: waiter.lease_id, holder: waiter.holder, why: waiter.why, since: waiter.enqueued_at }));
+    listWaiters(name, { env }).forEach((waiter, index) => waiters.push({ lock: name, device: nameOf(name), position: index + 1, lease_id: waiter.lease_id, holder: waiter.holder, why: waiter.why, since: waiter.enqueued_at, stale: waiter.stale }));
   }
   const found = (context.inventory ?? inventory)({ lockRoot: lockDir(env), hubAdbPort: Number(env.HUB_ADB_SERVER_PORT) || 5037 });
   const result = { locks, waiters, inventory: found };
@@ -201,7 +201,7 @@ function status(parsed, context) {
   }
   stdout('WAITERS');
   if (waiters.length === 0) stdout('  none');
-  for (const waiter of waiters) stdout(`  ${waiter.device ?? waiter.lock} #${waiter.position}  ${waiter.lease_id}  holder=${waiter.holder}  why="${waiter.why}"  waiting since ${waiter.since}`);
+  for (const waiter of waiters) stdout(`  ${waiter.device ?? waiter.lock} #${waiter.position}  ${waiter.lease_id}  holder=${waiter.holder}  why="${waiter.why}"  waiting since ${waiter.since}${waiter.stale ? '  [stale]' : ''}`);
   stdout('INVENTORY (read only)');
   const tag = managed => (managed ? 'managed' : 'foreign');
   for (const server of found.adb_servers) stdout(`  adb server  port ${server.port}  pid ${server.pid}  ${tag(server.managed)}${server.cwd ? `  cwd ${server.cwd}` : ''}`);
@@ -220,10 +220,12 @@ async function runCommand(parsed, context) {
   const holder = parsed.flags.holder ?? env.HUB_DEVICE_HOLDER ?? `${env.USER ?? 'unknown'}@${hostname()}`;
   let child = null;
   let received = null;
+  const abort = new AbortController();
   let wake = () => {};
   const woken = new Promise(done => { wake = done; });
   const onSignal = signal => {
     received ??= signal;
+    abort.abort();
     if (child) { child.kill(signal); setTimeout(() => child.kill('SIGKILL'), context.killGraceMs).unref(); } else wake();
   };
   const names = ['SIGINT', 'SIGTERM', 'SIGHUP'];
@@ -231,12 +233,18 @@ async function runCommand(parsed, context) {
   const giveBack = () => { try { releaseLease(lock, id, { env }); } catch { /* the holder_pid rule and expiry still reclaim it */ } };
   signals.once('exit', giveBack);
   try {
-    const taking = takeLease(lock, { holder, why, forMs, waitMs, id, holderPid: holderPid ?? process.pid, noConnect: false, phoneWaitMs: waitMs }, context);
-    // A signal while queued for the phone drops the place in the queue and ends the run.
+    const taking = takeLease(lock, { holder, why, forMs, waitMs, id, holderPid: holderPid ?? process.pid, noConnect: false, phoneWaitMs: waitMs, signal: abort.signal }, context);
+    // A signal while queued for the phone drops its place; await discovery settlement before exiting.
     const taken = await Promise.race([taking.then(value => ({ value }), error => ({ error })), woken.then(() => ({ signalled: true }))]);
-    if (taken.signalled) { giveBack(); return 128 + constants.signals[received]; }
+    if (taken.signalled) {
+      giveBack();
+      const settled = await taking.then(value => ({ value }), error => ({ error }));
+      if (settled.value) giveBack();
+      return 128 + constants.signals[received];
+    }
     if (taken.error) throw taken.error;
     const { lease: record, device } = taken.value;
+    if (received) return 128 + constants.signals[received];
     const childEnv = { ...env, ...exportsOf(record, device, parsed.envSerial) };
     const code = await new Promise(done => {
       child = spawn(parsed.command[0], parsed.command.slice(1), { stdio: 'inherit', env: childEnv });

@@ -79,18 +79,23 @@ export function createAdb({ env: given = process.env, home = homedir(), runner =
 // Starts the adb server if it is down (a dead server is what an idle big-chungus looks like) and waits for the
 // phone, which usually reconnects over Wireless debugging within seconds once the server is up. When mDNS auto-connect
 // is slow, every few polls it looks the phone up in `adb mdns services` and connects to that endpoint itself.
-export async function findPhone(adb, { serial, model, waitMs = 180_000, pollMs = 3000, nudgeEvery = 5, sleep = ms => new Promise(done => setTimeout(done, ms)), now = Date.now, log = console.log }) {
+// The optional AbortSignal is for interactive runs; deploy jobs can continue calling this unchanged.
+export async function findPhone(adb, { serial, model, waitMs = 180_000, pollMs = 3000, nudgeEvery = 5, sleep = ms => new Promise(done => setTimeout(done, ms)), now = Date.now, log = console.log, signal } = {}) {
+  signal?.throwIfAborted();
   adb.startServer();
   const deadline = now() + waitMs;
   let seen = [];
   for (let poll = 1; ; poll += 1) {
+    signal?.throwIfAborted();
     seen = adb.devices();
     for (const device of seen.filter(entry => entry.state === 'device')) {
+      signal?.throwIfAborted();
       let found;
       try { found = adb.prop(device.id, 'ro.serialno'); } catch { continue; }
       if (found !== serial) continue;
       const actual = adb.prop(device.id, 'ro.product.model');
       if (model && actual !== model) throw new Error(`adb device ${device.id} has serial ${serial} but model ${actual}, not ${model}`);
+      signal?.throwIfAborted();
       log(`HUB_S26 ${model ?? ''} serial=${serial} adb=${device.id}`);
       return device.id;
     }
@@ -98,11 +103,19 @@ export async function findPhone(adb, { serial, model, waitMs = 180_000, pollMs =
     if (poll % nudgeEvery === 0 && adb.mdnsEndpoint && adb.connect) {
       try {
         const endpoint = adb.mdnsEndpoint(serial);
+        signal?.throwIfAborted();
         if (endpoint) { log(`HUB_S26_CONNECT ${endpoint} (mDNS lists it; auto-connect had not)`); adb.connect(endpoint); }
       } catch { /* the next poll tries again */ }
     }
-    await sleep(pollMs);
+    if (!signal) { await sleep(pollMs); continue; }
+    await new Promise(done => {
+      const timer = setTimeout(() => { signal.removeEventListener('abort', abort); done(); }, pollMs);
+      const abort = () => { clearTimeout(timer); done(); };
+      signal.addEventListener('abort', abort, { once: true });
+      if (signal.aborted) abort();
+    });
   }
+  signal?.throwIfAborted();
   const listed = seen.map(entry => `${entry.id} (${entry.state})`).join(', ') || 'none';
   throw new Error(`the ${model ?? 'phone'} (serial ${serial}) is not on this host's adb server after ${Math.round(waitMs / 1000)}s (devices: ${listed}). Turn on Wireless debugging on the phone and check \`adb devices\` on big-chungus`);
 }
