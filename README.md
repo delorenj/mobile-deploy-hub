@@ -115,6 +115,20 @@ The `REAL` in a real run's title is how the front door finds the last real run. 
 
 Hooks are shell commands from the committed manifest, run under `bash -eo pipefail` in the app root with `HUB_OUT`, `HUB_DRY_RUN`, `HUB_VERSION`, `HUB_ANDROID_CODE`, `HUB_IOS_BUILD`, `HUB_TEAM` set, and throwaway `GITHUB_ENV`, `GITHUB_OUTPUT`, `GITHUB_PATH` files. Store, GitHub, OIDC and MinIO credentials never reach a hook. Unknown keys, non-string hooks and paths outside the checkout are rejected; schema 1 is gone. Devices (the S26, the iPad, the Apple team and signer, the Mac's ssh alias `hub-mac` and tailscale peer, big-chungus's staging) live once, in [`tools/ci/devices.json`](tools/ci/devices.json).
 
+## Devices
+
+The S26 and the emulator host are shared by many repos and no one owns them, so the phone is a lease on the hub's own `adb` host lock (`~/.cache/mobile-deploy-hub/locks/adb.lock`, or `$HUB_LOCK_DIR`): a deploy takes that lock for the length of its job, `hub-device` takes it for a person or an agent for as long as they ask, and the two exclude each other. A lease outlives the command that took it and ends at `release` or at its `--for` expiry; a lease whose `--pid` process is gone is reclaimed like a dead job. Waiters for a lease queue first in, first out (`<name>.queue/` beside the lock); a deploy keeps polling the lock as before. `lease` and `run` connect the phone through the same `findPhone` the deploys use (adb server on 5037, mDNS nudge included) and give you `ANDROID_SERIAL` and `ANDROID_ADB_SERVER_PORT`. A phone that does not come within `--wait` (default 2m) prints exactly `HUB_DEVICE_AWAY s26` and exits 75, holding nothing; a lock that is not free within `--wait` prints `HUB_DEVICE_BUSY s26 ...` and exits 76. `status` only looks: it never kills, starts or reconnects anything. `tools/catchup/units/install.sh` links `~/.local/bin/hub-device` to the release's copy.
+
+```sh
+eval "$(hub-device lease s26 --for 30m --why 'tower: S26 proof' [--wait 5m] [--env-serial MY_DEVICE])"   # exports HUB_LEASE_ID, ANDROID_SERIAL, ANDROID_ADB_SERVER_PORT
+hub-device release [<lease_id>]                       # no id: frees whatever lease holds the phone; a deploy's lock is never touched
+hub-device status [--json]                            # leases, waiters, and adb servers / emulators / Xvfb displays marked managed or foreign
+hub-device run s26 [--for 1h --why TEXT --wait 5m] [--env-serial NAME]... -- <cmd...>   # lease, run, release on any exit; returns the command's code
+hub-device lease s26 --for 12h --why 'who: why' --no-connect --id my-hold   # the lock only, phone away or not (adapters, e.g. green-in-between's loop-ship hold)
+```
+
+The hub's own adb server (the port deploys use) is `managed`; an emulator or Xvfb is `managed` only when its environment has `HUB_MANAGED=1` or its pid is in `<lock dir>/managed.json` (`{"pids": [...]}`), and everything else is `foreign`.
+
 ## Hosts and checks
 
 ```sh

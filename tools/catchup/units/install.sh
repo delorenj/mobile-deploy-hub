@@ -32,6 +32,13 @@ fi
 ln -sfn "releases/$ref" "$share/current"
 echo "catch-up code: $share/current -> releases/$ref"
 
+# hub-device, the lease on the shared phone, for people and agents: ~/.local/bin/hub-device points into this release (not
+# at `current`), so a session that started with it keeps the code it started with.
+chmod +x "$release/tools/device/hub-device.mjs"
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$release/tools/device/hub-device.mjs" "$HOME/.local/bin/hub-device"
+echo "hub-device: ~/.local/bin/hub-device -> $release/tools/device/hub-device.mjs"
+
 # The mode belongs to the host, not the code: a missing file means watch, and an existing one is left alone.
 config="${XDG_CONFIG_HOME:-$HOME/.config}/mobile-deploy-hub/catchup.json"
 if [[ ! -f $config ]]; then
