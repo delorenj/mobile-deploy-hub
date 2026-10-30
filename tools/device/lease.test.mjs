@@ -165,6 +165,20 @@ test('a waiter whose process died is dropped from the queue, and releasing a wai
   } finally { f.cleanup(); }
 });
 
+test('a ticket with a reused live pid but a different process start is stale and cannot block a new lease', async () => {
+  const f = fixture();
+  try {
+    const queue = join(f.root, 'locks/adb.queue');
+    mkdirSync(queue, { recursive: true });
+    const ghost = join(queue, '000000000000001-000000-00000001.json');
+    writeFileSync(ghost, JSON.stringify({ lease_id: 'ghost', holder: 'old', why: 'gone', pid: process.pid, host: hostname(), process_start: '0', enqueued_at: new Date(0).toISOString() }));
+    assert.equal(listWaiters('adb', { env: f.env })[0].stale, true, 'read-only status sees the stale identity');
+    assert.ok(existsSync(ghost), 'observing does not prune');
+    assert.equal((await lease(f, { id: 'next', waitMs: 100 })).lease_id, 'next');
+    assert.ok(!existsSync(ghost), 'acquisition prunes the reused-pid ticket');
+  } finally { f.cleanup(); }
+});
+
 test('a waiter that times out leaves the queue; a queued lease says how many are ahead', async () => {
   const f = fixture();
   try {

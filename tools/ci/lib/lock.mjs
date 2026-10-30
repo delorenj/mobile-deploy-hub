@@ -117,6 +117,26 @@ function writeOwner(path, owner) {
 
 let ticketCounter = 0;
 
+// A Linux PID can be reused. /proc/<pid>/stat field 22 identifies one process lifetime (the comm field
+// is parenthesized and may contain spaces); on non-Linux hosts the timestamp still bounds legacy tickets.
+function processStart(pid) {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)[19] ?? null;
+  } catch { return null; }
+}
+
+function staleWaiter(ticket) {
+  if (ticket.host === hostname() && Number.isSafeInteger(ticket.pid)) {
+    if (!alive(ticket.pid)) return true;
+    const actual = processStart(ticket.pid);
+    if (ticket.process_start && actual && ticket.process_start !== actual) return true;
+  }
+  // Older queue records had no process identity. Limit even a still-live PID's ticket to one day.
+  const enqueued = Date.parse(ticket.enqueued_at);
+  return Number.isFinite(enqueued) && Date.now() - enqueued > 24 * 3600_000;
+}
+
 // The waiters for a lock, oldest first. Observers only report stale tickets; acquire prunes them.
 export function listWaiters(name, { env = process.env, prune = false } = {}) {
   const dir = queuePath(name, env);
@@ -126,7 +146,7 @@ export function listWaiters(name, { env = process.env, prune = false } = {}) {
   for (const file of files) {
     let ticket = null;
     try { ticket = JSON.parse(readFileSync(join(dir, file), 'utf8')); } catch { /* being written, or junk */ }
-    if (ticket && ticket.host === hostname() && Number.isSafeInteger(ticket.pid) && !alive(ticket.pid)) {
+    if (ticket && staleWaiter(ticket)) {
       if (prune) rmSync(join(dir, file), { force: true });
       else waiters.push({ ...ticket, file, stale: true });
       continue;
@@ -169,7 +189,7 @@ export async function acquireLease(name, {
   mkdirSync(queue, { recursive: true });
   const ticket = `${String(now()).padStart(15, '0')}-${String(ticketCounter++).padStart(6, '0')}-${String(process.pid).padStart(8, '0')}.json`;
   const ticketFile = join(queue, ticket);
-  writeFileSync(ticketFile, JSON.stringify({ lease_id, holder, why, pid: process.pid, host: hostname(), enqueued_at: new Date(now()).toISOString() }), { flag: 'wx' });
+  writeFileSync(ticketFile, JSON.stringify({ lease_id, holder, why, pid: process.pid, host: hostname(), process_start: processStart(process.pid), enqueued_at: new Date(now()).toISOString() }), { flag: 'wx' });
   const deadline = now() + waitMs;
   let waiting = false;
   try {
