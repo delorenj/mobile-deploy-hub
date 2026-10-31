@@ -115,6 +115,25 @@ The `REAL` in a real run's title is how the front door finds the last real run. 
 
 Hooks are shell commands from the committed manifest, run under `bash -eo pipefail` in the app root with `HUB_OUT`, `HUB_DRY_RUN`, `HUB_VERSION`, `HUB_ANDROID_CODE`, `HUB_IOS_BUILD`, `HUB_TEAM` set, and throwaway `GITHUB_ENV`, `GITHUB_OUTPUT`, `GITHUB_PATH` files. Store, GitHub, OIDC and MinIO credentials never reach a hook. Unknown keys, non-string hooks and paths outside the checkout are rejected; schema 1 is gone. Devices (the S26, the iPad, the Apple team and signer, the Mac's ssh alias `hub-mac` and tailscale peer, big-chungus's staging) live once, in [`tools/ci/devices.json`](tools/ci/devices.json).
 
+## Devices
+
+The S26 and the emulator host are shared by many repos and no one owns them, so the phone is a lease on the hub's own `adb` host lock (`~/.cache/mobile-deploy-hub/locks/adb.lock`, or `$HUB_LOCK_DIR`): a deploy takes that lock for the length of its job, `hub-device` takes it for a person or an agent for as long as they ask, and the two exclude each other. A lease outlives the command that took it and ends at `release` or at its `--for` expiry; a lease whose `--pid` process is gone (or is now another process) is reclaimed like a dead job. Waiters for a lease queue first in, first out (`<name>.queue/` beside the lock); a deploy keeps polling the lock as before. A deploy itself takes the `adb` lock twice with a gap in between (the plan job's S26 check, then the android job's install), so a lease taken in that gap is not wrong — it simply makes that run's android job wait on the lock (up to its 15-minute limit) and fail if the lease outlasts it. `lease` and `run` connect the phone through the same `findPhone` the deploys use (adb server on 5037, mDNS nudge included) and give you `ANDROID_SERIAL` and `ANDROID_ADB_SERVER_PORT`; SIGINT or SIGTERM while they look for it stops at once and holds nothing. A phone that does not come within `--wait` (default 2m) prints exactly `HUB_DEVICE_AWAY s26` on stdout and exits 75, holding nothing; a lock that is not free within `--wait` prints `HUB_DEVICE_BUSY s26 ...` (naming the holder) on stderr and exits 76. Check `$?` for both: never `eval` the output unchecked, or the AWAY line runs as a command. `status` only looks: it never kills, starts or reconnects anything. `tools/catchup/units/install.sh` installs `~/.local/bin/hub-device`, a wrapper that runs the release's copy.
+
+```sh
+vars="$(hub-device lease s26 --for 30m --why 'tower: S26 proof' [--wait 5m] [--holder WHO] [--env-serial MY_DEVICE] [--verbose])" && eval "$vars"
+                                                      # exports HUB_LEASE_ID, ANDROID_SERIAL, ANDROID_ADB_SERVER_PORT; $? is 75 (away) or 76 (busy) otherwise
+hub-device release [<lease_id>|--any]                # no id: $HUB_LEASE_ID (what lease exported); a bare release with neither refuses (exit 2) rather than freeing whatever is there; --any frees whichever lease holds the phone; a deploy's lock is never touched
+hub-device status [--json]                            # leases, waiters, and adb servers / emulators / Xvfb displays marked managed or foreign
+hub-device run s26 [--for 1h --why TEXT --wait 5m --holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...>   # lease, run, release on any exit; returns the command's code
+hub-device lease s26 --for 12h --why 'who: why' --no-connect --id my-hold   # the lock only, phone away or not (adapters, e.g. green-in-between's loop-ship hold)
+```
+
+`--holder` names who holds the lease (default `$HUB_DEVICE_HOLDER`, else `user@host`); `--verbose` adds why the phone was away to an AWAY. `release` answers `HUB_DEVICE_RELEASED`, `HUB_DEVICE_CANCELLED` (it was still queued) or `HUB_DEVICE_NOT_HELD` (nothing, or something else, holds it; exit 0 either way), and exits 1 only when it would have to touch a deploy job's lock or a lock that is mid-change.
+
+The hub's own adb server (the port deploys use) is `managed`; an emulator or Xvfb is `managed` only when its environment has `HUB_MANAGED=1` or its pid is in `<lock dir>/managed.json` (`{"pids": [...]}`), and everything else is `foreign`.
+
+Rollout: leases are honoured only by hub code with this `lock.mjs`. A deploy on an older pin (`actions/hub@v1.2.25` and before) and a catch-up from an older `current` see a lease's short-lived `pid` as a dead job and reclaim the lock at once. So the hub release that carries leases (the pin flip) must land before, or with, `hosts:install` putting `hub-device` on PATH; until then `lease` and `run` print one warning on stderr when `~/.local/share/mobile-deploy-hub/current` predates leases — that warning sees only the installed catch-up, never the deploys' pin, so the pin flip landing first is the only real guard.
+
 ## Hosts and checks
 
 ```sh

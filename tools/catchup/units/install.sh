@@ -32,6 +32,15 @@ fi
 ln -sfn "releases/$ref" "$share/current"
 echo "catch-up code: $share/current -> releases/$ref"
 
+# hub-device, the lease on the shared phone, for people and agents: ~/.local/bin/hub-device runs this release's copy
+# (not `current`) with this node, so a session that started with it keeps the code it started with. Leases are honoured
+# only by hub releases with this lock.mjs: land the release (pin flip) before or with this install (README, Devices).
+mkdir -p "$HOME/.local/bin"
+printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' "$node" "$release/tools/device/hub-device.mjs" > "$HOME/.local/bin/hub-device.part"
+chmod +x "$HOME/.local/bin/hub-device.part"
+mv -f "$HOME/.local/bin/hub-device.part" "$HOME/.local/bin/hub-device"
+echo "hub-device: ~/.local/bin/hub-device runs $release/tools/device/hub-device.mjs"
+
 # The mode belongs to the host, not the code: a missing file means watch, and an existing one is left alone.
 config="${XDG_CONFIG_HOME:-$HOME/.config}/mobile-deploy-hub/catchup.json"
 if [[ ! -f $config ]]; then

@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { androidSdk } from './android.mjs';
 import { isCredentialVariable } from './config.mjs';
 import { runBounded } from './exec.mjs';
+import { pause, sleep as realSleep } from './pause.mjs';
 
 export const adbPath = (env = process.env, home = homedir()) => env.HUB_ADB || join(androidSdk(env, home), 'platform-tools/adb');
 
@@ -51,10 +52,15 @@ export function parseMdnsEndpoint(output, serial) {
   return null;
 }
 
-export function createAdb({ env: given = process.env, home = homedir(), runner = runBounded } = {}) {
-  // No token reaches adb: its server outlives the job (below), and it must not carry the job's credentials with it.
+// No token reaches adb: its server outlives the job (below), and it must not carry the job's credentials with it.
+export function adbEnv(given = process.env) {
   const env = {};
   for (const [name, value] of Object.entries(given)) if (!isCredentialVariable(name)) env[name] = value;
+  return env;
+}
+
+export function createAdb({ env: given = process.env, home = homedir(), runner = runBounded } = {}) {
+  const env = adbEnv(given);
   const adb = adbPath(env, home);
   const call = (args, timeout = 30_000) => runner(adb, args, { env, timeout, label: `adb ${args.filter(arg => !arg.startsWith('/')).slice(0, 4).join(' ')}` });
   return {
@@ -78,31 +84,39 @@ export function createAdb({ env: given = process.env, home = homedir(), runner =
 
 // Starts the adb server if it is down (a dead server is what an idle big-chungus looks like) and waits for the
 // phone, which usually reconnects over Wireless debugging within seconds once the server is up. When mDNS auto-connect
-// is slow, every few polls it looks the phone up in `adb mdns services` and connects to that endpoint itself.
-export async function findPhone(adb, { serial, model, waitMs = 180_000, pollMs = 3000, nudgeEvery = 5, sleep = ms => new Promise(done => setTimeout(done, ms)), now = Date.now, log = console.log }) {
-  adb.startServer();
+// is slow, every few polls it looks the phone up in `adb mdns services` and connects to that endpoint itself. A phone
+// that never comes throws code HUB_PHONE_AWAY. `signal` (hub-device's interactive runs) stops the wait between calls;
+// deploys pass none and see no change.
+export async function findPhone(adb, { serial, model, waitMs = 180_000, pollMs = 3000, nudgeEvery = 5, sleep = realSleep, now = Date.now, log = console.log, signal } = {}) {
+  signal?.throwIfAborted();
+  await adb.startServer();
   const deadline = now() + waitMs;
   let seen = [];
   for (let poll = 1; ; poll += 1) {
-    seen = adb.devices();
+    signal?.throwIfAborted();
+    seen = await adb.devices();
     for (const device of seen.filter(entry => entry.state === 'device')) {
+      signal?.throwIfAborted();
       let found;
-      try { found = adb.prop(device.id, 'ro.serialno'); } catch { continue; }
+      try { found = await adb.prop(device.id, 'ro.serialno'); } catch { continue; }
       if (found !== serial) continue;
-      const actual = adb.prop(device.id, 'ro.product.model');
+      const actual = await adb.prop(device.id, 'ro.product.model');
       if (model && actual !== model) throw new Error(`adb device ${device.id} has serial ${serial} but model ${actual}, not ${model}`);
+      signal?.throwIfAborted();
       log(`HUB_S26 ${model ?? ''} serial=${serial} adb=${device.id}`);
       return device.id;
     }
     if (now() >= deadline) break;
     if (poll % nudgeEvery === 0 && adb.mdnsEndpoint && adb.connect) {
       try {
-        const endpoint = adb.mdnsEndpoint(serial);
-        if (endpoint) { log(`HUB_S26_CONNECT ${endpoint} (mDNS lists it; auto-connect had not)`); adb.connect(endpoint); }
+        const endpoint = await adb.mdnsEndpoint(serial);
+        signal?.throwIfAborted();
+        if (endpoint) { log(`HUB_S26_CONNECT ${endpoint} (mDNS lists it; auto-connect had not)`); await adb.connect(endpoint); }
       } catch { /* the next poll tries again */ }
     }
-    await sleep(pollMs);
+    await pause(pollMs, { signal, sleep });
   }
+  signal?.throwIfAborted();
   const listed = seen.map(entry => `${entry.id} (${entry.state})`).join(', ') || 'none';
-  throw new Error(`the ${model ?? 'phone'} (serial ${serial}) is not on this host's adb server after ${Math.round(waitMs / 1000)}s (devices: ${listed}). Turn on Wireless debugging on the phone and check \`adb devices\` on big-chungus`);
+  throw Object.assign(new Error(`the ${model ?? 'phone'} (serial ${serial}) is not on this host's adb server after ${Math.round(waitMs / 1000)}s (devices: ${listed}). Turn on Wireless debugging on the phone and check \`adb devices\` on big-chungus`), { code: 'HUB_PHONE_AWAY' });
 }
