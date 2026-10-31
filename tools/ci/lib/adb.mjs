@@ -1,4 +1,4 @@
-// The S26 over big-chungus's adb server, which holds the wireless pairing. The phone is picked by its
+// The phones over big-chungus's adb server, which holds their wireless pairings. A phone is picked by its
 // ro.serialno, not by the adb id (the mDNS suffix of a wireless id changes). The hub only ever runs
 // `install -r`, which updates in place and keeps the app's data; a test greps the hub for the commands that
 // would not (removing the app, clearing its data, or allowing a downgrade).
@@ -43,13 +43,26 @@ export function parseResumedPackage(output) {
 // `dumpsys power`: whether the screen is on.
 export const parseAwake = output => /\bmWakefulness=Awake\b/.test(output ?? '') || /Display Power: state=ON\b/.test(output ?? '');
 
-// `adb mdns services`: the phone's wireless debugging endpoint, by the serial in its service name.
-export function parseMdnsEndpoint(output, serial) {
+// `adb mdns services`: every advertised phone's endpoint, by the serial in its service name (`adb-<serial>-<suffix>`).
+// A serial advertising twice (two mDNS names for one phone) keeps the last listed — either endpoint reaches it.
+export function parseMdnsServices(output) {
+  const found = new Map();
   for (const line of output.split('\n')) {
     const [name, type, endpoint] = line.trim().split(/\s+/);
-    if (name?.startsWith(`adb-${serial}-`) && type?.startsWith('_adb-tls-connect') && /^[\d.]+:\d+$/.test(endpoint ?? '')) return endpoint;
+    const serial = /^adb-([A-Za-z0-9]+)-/.exec(name ?? '')?.[1];
+    if (serial && type?.startsWith('_adb-tls-connect') && /^[\d.]+:\d+$/.test(endpoint ?? '')) found.set(serial, endpoint);
   }
-  return null;
+  return found;
+}
+
+// The phone's wireless debugging endpoint, by the serial in its service name.
+export const parseMdnsEndpoint = (output, serial) => parseMdnsServices(output).get(serial) ?? null;
+
+// Whether an adb device id can be the phone with this serial, without talking to the phone: over USB the id is
+// the serial itself, over Wireless debugging the mDNS auto-connect id embeds it (`adb-<serial>-<suffix>`), and a
+// manual `adb connect` names the endpoint, which the mDNS service list ties back to the serial.
+export function idMatchesSerial(id, serial, mdnsServices = new Map()) {
+  return id === serial || id.startsWith(`adb-${serial}-`) || mdnsServices.get(serial) === id;
 }
 
 // No token reaches adb: its server outlives the job (below), and it must not carry the job's credentials with it.
@@ -68,6 +81,7 @@ export function createAdb({ env: given = process.env, home = homedir(), runner =
     // server that dies with every job makes the next one wait for the phone's wireless reconnect. Without the id the
     // server stays up on big-chungus between jobs and runs, holding the connection like a person's adb would.
     startServer: () => runner(adb, ['start-server'], { env: { ...env, RUNNER_TRACKING_ID: '' }, timeout: 60_000, label: 'adb start-server' }),
+    mdnsServices: () => parseMdnsServices(call(['mdns', 'services'], 15_000)),
     mdnsEndpoint: serial => parseMdnsEndpoint(call(['mdns', 'services'], 15_000), serial),
     connect: endpoint => call(['connect', endpoint], 30_000),
     devices: () => parseDeviceList(call(['devices'])),
@@ -85,9 +99,10 @@ export function createAdb({ env: given = process.env, home = homedir(), runner =
 // Starts the adb server if it is down (a dead server is what an idle big-chungus looks like) and waits for the
 // phone, which usually reconnects over Wireless debugging within seconds once the server is up. When mDNS auto-connect
 // is slow, every few polls it looks the phone up in `adb mdns services` and connects to that endpoint itself. A phone
-// that never comes throws code HUB_PHONE_AWAY. `signal` (hub-device's interactive runs) stops the wait between calls;
-// deploys pass none and see no change.
-export async function findPhone(adb, { serial, model, waitMs = 180_000, pollMs = 3000, nudgeEvery = 5, sleep = realSleep, now = Date.now, log = console.log, signal } = {}) {
+// that never comes throws code HUB_PHONE_AWAY with a `reason` ('unauthorized' or 'offline' when adb lists it unusable,
+// 'absent' when it is not listed at all). `signal` (hub-device's interactive runs) stops the wait between calls;
+// deploys pass none and see no change. `label` names the log lines (deploys keep the default HUB_S26).
+export async function findPhone(adb, { serial, model, waitMs = 180_000, pollMs = 3000, nudgeEvery = 5, label = 'HUB_S26', sleep = realSleep, now = Date.now, log = console.log, signal } = {}) {
   signal?.throwIfAborted();
   await adb.startServer();
   const deadline = now() + waitMs;
@@ -103,7 +118,7 @@ export async function findPhone(adb, { serial, model, waitMs = 180_000, pollMs =
       const actual = await adb.prop(device.id, 'ro.product.model');
       if (model && actual !== model) throw new Error(`adb device ${device.id} has serial ${serial} but model ${actual}, not ${model}`);
       signal?.throwIfAborted();
-      log(`HUB_S26 ${model ?? ''} serial=${serial} adb=${device.id}`);
+      log(`${label} ${model ?? ''} serial=${serial} adb=${device.id}`);
       return device.id;
     }
     if (now() >= deadline) break;
@@ -111,12 +126,20 @@ export async function findPhone(adb, { serial, model, waitMs = 180_000, pollMs =
       try {
         const endpoint = await adb.mdnsEndpoint(serial);
         signal?.throwIfAborted();
-        if (endpoint) { log(`HUB_S26_CONNECT ${endpoint} (mDNS lists it; auto-connect had not)`); await adb.connect(endpoint); }
+        if (endpoint) { log(`${label}_CONNECT ${endpoint} (mDNS lists it; auto-connect had not)`); await adb.connect(endpoint); }
       } catch { /* the next poll tries again */ }
     }
     await pause(pollMs, { signal, sleep });
   }
   signal?.throwIfAborted();
-  const listed = seen.map(entry => `${entry.id} (${entry.state})`).join(', ') || 'none';
-  throw Object.assign(new Error(`the ${model ?? 'phone'} (serial ${serial}) is not on this host's adb server after ${Math.round(waitMs / 1000)}s (devices: ${listed}). Turn on Wireless debugging on the phone and check \`adb devices\` on big-chungus`), { code: 'HUB_PHONE_AWAY' });
+  // A phone that is listed but unusable says which way, so AWAY can name the reason. A bare host:port id (what a
+  // manual `adb connect` leaves) is tied back to its serial by the mDNS service list.
+  let mdns = new Map();
+  if (adb.mdnsServices) { try { mdns = await adb.mdnsServices(); } catch { /* the mdns query is advisory */ } }
+  const listed = seen.find(entry => entry.state !== 'device' && idMatchesSerial(entry.id, serial, mdns))?.state ?? null;
+  const reason = listed ?? 'absent';
+  const devicesListed = seen.map(entry => `${entry.id} (${entry.state})`).join(', ') || 'none';
+  const where = listed ? `is on this host's adb server but shows ${listed}` : `is not on this host's adb server`;
+  const advice = listed === 'unauthorized' ? 'Redo the Wireless debugging pairing on the phone (or accept its debugging prompt) and check `adb devices` on big-chungus' : 'Turn on Wireless debugging on the phone and check `adb devices` on big-chungus';
+  throw Object.assign(new Error(`the ${model ?? 'phone'} (serial ${serial}) ${where} after ${Math.round(waitMs / 1000)}s (devices: ${devicesListed}). ${advice}`), { code: 'HUB_PHONE_AWAY', reason });
 }

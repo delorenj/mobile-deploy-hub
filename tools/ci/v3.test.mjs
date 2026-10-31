@@ -619,11 +619,17 @@ test('the hub never removes an app, clears its data or downgrades it', () => {
   assert.match(readFileSync(join(repoRoot, 'tools/ci/lib/devicectl.mjs'), 'utf8'), /\['device', 'install', 'app', '--device', udid, app\]/);
 });
 
-test('devices.json names the S26, the iPad, the team and the Mac once, and is validated', () => {
-  assert.deepEqual([devices.android.serial, devices.android.model, devices.ios.udid, devices.ios.model, devices.apple.team], ['R5GL43A7PCH', 'SM-S948U', '00008112-000138390CFB401E', 'iPad14,5', 'YJ7W7Z36FP']);
+test('devices.json names the phones, the iPad, the team and the Mac once, and is validated', () => {
+  assert.deepEqual([devices.android.serial, devices.android.model, devices.android_extra[0].name, devices.android_extra[0].model, devices.android_extra[0].serial, devices.ios.udid, devices.ios.model, devices.apple.team], ['R5GL43A7PCH', 'SM-S948U', 'S24', 'SM-S928U', 'R5CX31AEJDA', '00008112-000138390CFB401E', 'iPad14,5', 'YJ7W7Z36FP']);
   const text = readFileSync(join(repoRoot, 'tools/ci/devices.json'), 'utf8');
   assert.throws(() => parseDevices(text.replace('"R5GL43A7PCH"', '"R5GL 43"')), /android\.serial/);
   assert.throws(() => parseDevices(text.replace('"Library/Caches/mobile-deploy-hub/handoff"', '"../etc"')), /handoff_dir/);
+  // the extra phones are hub-device's; a bad one is refused, and none may repeat the deploy phone or its words
+  assert.throws(() => parseDevices(text.replace('"R5CX31AEJDA"', '"nope!"')), /android_extra\[\]\.serial/);
+  assert.throws(() => parseDevices(JSON.stringify({ ...devices, android_extra: [{ name: 'S26', model: 'SM-S948U', serial: 'R5GL43A7PCH' }] })), /twice/);
+  assert.throws(() => parseDevices(JSON.stringify({ ...devices, android_extra: [{ name: 'phone', model: 'SM-S928U', serial: 'R5CX31AEJDA' }] })), /may not be "phone"/);
+  assert.throws(() => parseDevices(JSON.stringify({ ...devices, android_extra: [{ name: 'Adb', model: 'SM-S928U', serial: 'R5CX31AEJDA' }] })), /may not be "adb"/, 'an extra named Adb would lease on the deploy lock');
+  assert.equal(parseDevices(JSON.stringify({ ...devices, android_extra: undefined })).android_extra, undefined, 'android_extra itself is optional');
 });
 
 test('the Mac preflight has no checkout: it needs the bundle id from the gate', async () => {
@@ -829,6 +835,17 @@ test('an away S26 is pending, not a stop: the plan still bumps, and the lane pub
     assert.ok(existsSync(join(f.root, '.cache/mobile-deploy-hub/staging/delorenj-example-app/777/android/example-app-0.2.2-5.apk')), 'staged for deliver');
     assert.equal(lane.quickdrop.status, 'skipped', 'a dry run drops nothing in Quickdrop');
     assert.doesNotMatch(host.adbCalls(), /\binstall\b/);
+    // A phone adb lists but cannot use — unauthorized (pairing lost) or offline (dozed wireless TLS) — is the
+    // same pending, not a red plan or lane: the lanes read findPhone's error code, never its wording.
+    await script(join(f.root, 'bin/adb'), `echo "$*" >> "${host.state}/calls.log"\n[ "$1" = devices ] && printf 'List of devices attached\\nadb-R5GL43A7PCH-q\\tunauthorized\\n'\nexit 0`);
+    const logsAgain = [];
+    const plannedAgain = await plan(host.configure('plan'), { env: { ...host.env, HUB_ADB_WAIT_MS: '1' }, home: f.root, fetchImpl: noLatest, log: line => logsAgain.push(line) });
+    assert.equal(plannedAgain.s26, 'away', 'an unauthorized S26 is away, not a failure');
+    assert.ok(logsAgain.some(line => /^HUB_S26_PENDING /.test(line)), logsAgain.join('\n'));
+    const outAgain = host.outputs();
+    const laneAgain = await quiet(() => android(host.configure('android', ['--version', outAgain.version, '--android-code', outAgain.android_code, '--build-sha', outAgain.build_sha, '--bump-patch', outAgain.bump_patch]), { env: { ...host.env, HUB_ADB_LANE_WAIT_MS: '1' }, home: f.root }));
+    assert.equal(laneAgain.delivery.status, 'pending', 'the unauthorized S26 lane publishes as pending');
+    assert.equal(laneAgain.delivery.reason, "not on big-chungus's adb");
   } finally { await f.cleanup(); }
 });
 

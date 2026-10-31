@@ -8,6 +8,7 @@ import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createAdb, findPhone } from '../ci/lib/adb.mjs';
+import { loadDevices } from '../ci/lib/devices.mjs';
 import { acquireLease, releaseLease, withLock } from '../ci/lib/lock.mjs';
 import { runAdb } from './async-adb.mjs';
 import { inventory } from './inventory.mjs';
@@ -15,25 +16,39 @@ import { leaseSupport, main, parseArgs, parseDuration } from './hub-device.mjs';
 
 const tool = fileURLToPath(new URL('./hub-device.mjs', import.meta.url));
 const hubRoot = fileURLToPath(new URL('../../', import.meta.url));
-const SERIAL = 'R5GL43A7PCH';
+const SERIAL = 'R5GL43A7PCH';          // the S26, the deploy phone
+const S24_SERIAL = 'R5CX31AEJDA';      // the extra phone in devices.json's android_extra
 const settle = ms => new Promise(done => setTimeout(done, ms));
 
-// The S26 as a shell script over a state folder: `away` hides it; every call is logged.
+// The two phones as a shell script over a state folder: `away-<serial>` hides one, `unauth-<serial>` lists it
+// unauthorized, every call is logged. getprop answers by the serial embedded in the adb id, as the real one does.
 const fakeAdb = state => `#!/bin/sh
 echo "$*" >> "${state}/calls.log"
-[ "$1" = "-s" ] && shift 2
+id=""
+[ "$1" = "-s" ] && { id="$2"; shift 2; }
 case "$1" in
-  start-server|connect|mdns) exit 0 ;;
-  devices) printf 'List of devices attached\\n'; [ -f "${state}/away" ] || printf 'adb-${SERIAL}-zz._adb-tls-connect._tcp\\tdevice\\n'; exit 0 ;;
+  start-server|connect) exit 0 ;;
+  mdns) printf 'adb-${S24_SERIAL}-YYVl71._adb-tls-connect._tcp\\t_adb-tls-connect._tcp\\t192.168.1.34:38423\\nadb-${SERIAL}-qq._adb-tls-connect._tcp\\t_adb-tls-connect._tcp\\t192.168.1.50:41234\\n'; exit 0 ;;
+  devices)
+    printf 'List of devices attached\\n'
+    for s in ${S24_SERIAL} ${SERIAL}; do
+      [ -f "${state}/away-$s" ] && continue
+      [ -f "${state}/unauth-$s" ] && { printf 'adb-%s-zz._adb-tls-connect._tcp\\tunauthorized\\n' "$s"; continue; }
+      printf 'adb-%s-zz._adb-tls-connect._tcp\\tdevice\\n' "$s"
+    done
+    exit 0 ;;
   shell)
+    s=$(printf '%s' "$id" | sed -e 's/^adb-//' -e 's/-.*//')
     case "$2 $3" in
-      "getprop ro.serialno") echo ${SERIAL} ;;
-      "getprop ro.product.model") echo SM-S948U ;;
+      "getprop ro.serialno") printf '%s\\n' "$s" ;;
+      "getprop ro.product.model") case "$s" in ${S24_SERIAL}) echo SM-S928U ;; *) echo SM-S948U ;; esac ;;
       *) exit 1 ;;
     esac ;;
   *) exit 1 ;;
 esac
 `;
+
+const serialOf = { s24: S24_SERIAL, s26: SERIAL };
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'hub-device-'));
@@ -42,18 +57,20 @@ function fixture() {
   const adb = join(root, 'adb');
   writeFileSync(adb, fakeAdb(state));
   chmodSync(adb, 0o755);
-  const env = { PATH: process.env.PATH, HOME: root, USER: 'tester', HUB_ADB: adb, HUB_LOCK_DIR: join(root, 'locks'), HUB_DEVICE_POLL_MS: '5', HUB_ADB_SERVER_PORT: '5037' };
+  const env = { PATH: process.env.PATH, HOME: root, USER: 'tester', HUB_ADB: adb, HUB_LOCK_DIR: join(root, 'locks'), HUB_DEVICE_POLL_MS: '5', HUB_DEVICE_PHONE_SLICE_MS: '300', HUB_ADB_SERVER_PORT: '5037' };
   const run = async (argv, extra = {}) => {
     const out = [];
     const err = [];
     const code = await main(argv, { env, stdout: line => out.push(line), stderr: line => err.push(line), inventory: () => ({ adb_servers: [], emulators: [], xvfb: [] }), ...extra });
     return { code, out, err };
   };
+  const flag = (name, on) => { const file = join(state, name); if (on) writeFileSync(file, ''); else rmSync(file, { force: true }); };
   return {
-    root, env, state, run, lock: join(root, 'locks/adb.lock'),
-    away: on => (on ? writeFileSync(join(state, 'away'), '') : rmSync(join(state, 'away'), { force: true })),
+    root, env, state, run, lock: join(root, 'locks/adb.lock'), s24lock: join(root, 'locks/s24.lock'),
+    away: (device, on = true) => flag(`away-${serialOf[device]}`, on),
+    unauth: (device, on = true) => flag(`unauth-${serialOf[device]}`, on),
     calls: () => { try { return readFileSync(join(state, 'calls.log'), 'utf8'); } catch { return ''; } },
-    owner: () => JSON.parse(readFileSync(join(root, 'locks/adb.lock/owner.json'), 'utf8')),
+    owner: (lock = 'adb') => JSON.parse(readFileSync(join(root, `locks/${lock}.lock/owner.json`), 'utf8')),
     cleanup: () => rmSync(root, { recursive: true, force: true }),
   };
 }
@@ -86,7 +103,7 @@ test('lease connects the phone, prints the exports, persists, and release frees 
     assert.equal(vars.ANDROID_ADB_SERVER_PORT, '5037');
     assert.equal(vars.ADB_DEVICE, vars.ANDROID_SERIAL);
     assert.equal(vars.SERIAL2, vars.ANDROID_SERIAL);
-    assert.ok(result.err.some(line => /^HUB_S26 SM-S948U serial=R5GL43A7PCH/.test(line)), 'findPhone ran');
+    assert.ok(result.err.some(line => /^HUB_PHONE SM-S948U serial=R5GL43A7PCH/.test(line)), 'findPhone ran and named the phone');
     const owner = f.owner();
     assert.equal(owner.kind, 'lease');
     assert.equal(owner.why, 'device proof');
@@ -103,7 +120,7 @@ test('lease connects the phone, prints the exports, persists, and release frees 
     const released = await f.run(['release', vars.HUB_LEASE_ID]);
     assert.deepEqual([released.code, released.out], [0, [`HUB_DEVICE_RELEASED s26 ${vars.HUB_LEASE_ID}`]]);
     assert.ok(!existsSync(f.lock));
-    assert.deepEqual((await f.run(['release', vars.HUB_LEASE_ID])).out, [`HUB_DEVICE_NOT_HELD s26 ${vars.HUB_LEASE_ID} (nothing holds s26)`], 'release is idempotent');
+    assert.deepEqual((await f.run(['release', vars.HUB_LEASE_ID])).out, [`HUB_DEVICE_NOT_HELD phone ${vars.HUB_LEASE_ID} (no phone lease by that id)`], 'release is idempotent');
     const again = await f.run(['lease', 's26', '--for', '5m', '--why', 'other', '--wait', '0', '--json']);
     assert.equal(again.code, 0);
     const json = JSON.parse(again.out[0]);
@@ -147,9 +164,10 @@ test('lease needs --for and --why, and a known device', async () => {
 test('a phone that is away prints exactly HUB_DEVICE_AWAY s26, exits 75 and leaves no lease behind', async () => {
   const f = fixture();
   try {
-    f.away(true);
+    f.away('s26');
     const result = await f.run(['lease', 's26', '--for', '5m', '--why', 'x', '--wait', '0']);
     assert.deepEqual([result.code, result.out], [75, ['HUB_DEVICE_AWAY s26']]);
+    assert.match(result.err.join('\n'), /s26 is away: absent/, 'the reason is always said');
     assert.ok(!existsSync(f.lock), 'the lock is given back');
     const ran = await f.run(['run', 's26', '--wait', '0', '--', process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(join(f.root, 'ran'))}, 'x')`]);
     assert.deepEqual([ran.code, ran.out], [75, ['HUB_DEVICE_AWAY s26']]);
@@ -162,24 +180,296 @@ test('a phone that is away prints exactly HUB_DEVICE_AWAY s26, exits 75 and leav
 test('the mDNS nudge runs while waiting for the phone', async () => {
   const f = fixture();
   try {
-    f.away(true);
+    f.away('s26');
     const result = await f.run(['lease', 's26', '--for', '5m', '--why', 'x', '--wait', '1s']);
     assert.equal(result.code, 75);
     assert.match(f.calls(), /^mdns services$/m, 'findPhone asked mDNS for the phone');
+    assert.match(f.calls(), /^connect 192\.168\.1\.50:41234$/m, 'and connected to the endpoint mDNS listed');
+    assert.ok(result.err.some(line => /HUB_PHONE_CONNECT 192\.168\.1\.50:41234/.test(line)));
   } finally { f.cleanup(); }
 });
 
 test('--no-connect takes the lease without touching adb, even with the phone away', async () => {
   const f = fixture();
   try {
-    f.away(true);
+    f.away('s26');
     const result = await f.run(['lease', 's26', '--for', '12h', '--why', 'gib: hold', '--no-connect', '--id', 'gib-hold']);
     assert.equal(result.code, 0, result.err.join());
-    assert.deepEqual(result.out, ["export HUB_LEASE_ID='gib-hold'", "export ANDROID_ADB_SERVER_PORT='5037'"]);
+    assert.deepEqual(result.out, ["export HUB_LEASE_ID='gib-hold'", "export HUB_DEVICE='s26'", "export ANDROID_ADB_SERVER_PORT='5037'"]);
     assert.equal(f.calls(), '', 'adb was never called');
     assert.equal(f.owner().lease_id, 'gib-hold');
     assert.equal(f.owner().device, undefined);
     assert.equal((await f.run(['release', 'gib-hold'])).code, 0);
+  } finally { f.cleanup(); }
+});
+
+test('the s24 leases under its own lock, connects by its serial, and never blocks the s26 or a deploy', async () => {
+  const f = fixture();
+  try {
+    const result = await f.run(['lease', 's24', '--for', '30m', '--why', 'S24 proof', '--env-serial', 'MY_PHONE', '--json']);
+    assert.equal(result.code, 0, result.err.join('\n'));
+    const json = JSON.parse(result.out[0]);
+    assert.equal(json.device, 's24');
+    assert.equal(json.env.HUB_DEVICE, 's24');
+    assert.equal(json.env.ANDROID_SERIAL, `adb-${S24_SERIAL}-zz._adb-tls-connect._tcp`);
+    assert.equal(json.env.MY_PHONE, json.env.ANDROID_SERIAL);
+    assert.equal(json.env.ANDROID_ADB_SERVER_PORT, '5037');
+    assert.ok(result.err.some(line => /^HUB_PHONE SM-S928U serial=R5CX31AEJDA/.test(line)), 'the S24 was found by its serial');
+    const owner = f.owner('s24');
+    assert.equal(owner.lease_id, json.lease_id);
+    assert.deepEqual([owner.device.phone, owner.device.serial], ['s24', S24_SERIAL]);
+    assert.ok(!existsSync(f.lock), 'the deploy lock (adb) is untouched');
+    // its own lock, its own queue: a second s24 lease waits or is busy, an s26 lease sails through, and so does a deploy
+    const busy = await f.run(['lease', 's24', '--for', '5m', '--why', 'other', '--wait', '0']);
+    assert.equal(busy.code, 76);
+    assert.match(busy.err.join('\n'), /^HUB_DEVICE_BUSY s24 host lock s24 is held by lease /m);
+    const deploy = withLock('adb', async () => 'deploy ran', { env: f.env, log: () => {} });
+    assert.equal(await deploy, 'deploy ran', 'an s24 lease does not block the deploy lock');
+    const s26 = await f.run(['lease', 's26', '--for', '5m', '--why', 'meanwhile', '--id', 's26-mine']);
+    assert.equal(s26.code, 0, s26.err.join('\n'));
+    // release by the lease id frees the s24 whatever phone it names; each release says which phone it freed
+    assert.deepEqual((await f.run(['release', json.lease_id])).out, [`HUB_DEVICE_RELEASED s24 ${json.lease_id}`]);
+    assert.deepEqual((await f.run(['release', 's26-mine'])).out, ['HUB_DEVICE_RELEASED s26 s26-mine']);
+    assert.ok(!existsSync(f.s24lock) && !existsSync(f.lock), 'both locks are free again');
+  } finally { f.cleanup(); }
+});
+
+test('run s24 exports the S24 to the command, returns its code and releases its lock', async () => {
+  const f = fixture();
+  try {
+    const probe = join(f.root, 'probe');
+    const script = `const fs=require('fs');const e=process.env;fs.writeFileSync(${JSON.stringify(probe)},JSON.stringify({d:e.HUB_DEVICE,s:e.ANDROID_SERIAL,held:fs.existsSync(${JSON.stringify(f.s24lock)}),adbLock:fs.existsSync(${JSON.stringify(f.lock)})}));process.exit(Number(process.argv[1]))`;
+    const ok = await f.run(['run', 's24', '--for', '10m', '--why', 'probe', '--', process.execPath, '-e', script, '0']);
+    assert.equal(ok.code, 0, ok.err.join());
+    const seen = JSON.parse(readFileSync(probe, 'utf8'));
+    assert.deepEqual([seen.d, seen.s, seen.held, seen.adbLock], ['s24', `adb-${S24_SERIAL}-zz._adb-tls-connect._tcp`, true, false]);
+    assert.ok(!existsSync(f.s24lock), 'released after success');
+    const failed = await f.run(['run', 's24', '--', process.execPath, '-e', script, '3']);
+    assert.equal(failed.code, 3, 'the command exit code comes back');
+    assert.ok(!existsSync(f.s24lock), 'released after failure');
+  } finally { f.cleanup(); }
+});
+
+test('phone takes whichever phone is free, s24 first, and says which one it took', async () => {
+  const f = fixture();
+  try {
+    // both free and reachable: the s24, the first in the fleet
+    const first = await f.run(['lease', 'phone', '--for', '5m', '--why', 'any phone', '--id', 'p1', '--json']);
+    assert.equal(first.code, 0, first.err.join('\n'));
+    assert.equal(JSON.parse(first.out[0]).device, 's24');
+    assert.equal(f.owner('s24').lease_id, 'p1');
+    // the s24 held: the s26, without waiting out the slice (the s24 is merely held, not away)
+    const second = await f.run(['lease', 'phone', '--for', '5m', '--why', 'fallback', '--id', 'p2']);
+    assert.equal(second.code, 0, second.err.join('\n'));
+    assert.match(second.out.join('\n'), /export HUB_DEVICE='s26'/);
+    assert.equal(f.owner().lease_id, 'p2');
+    await f.run(['release', 'p1']);
+    await f.run(['release', 'p2']);
+    // the s24 away: the s26, after one slice of looking for the s24
+    f.away('s24');
+    const third = await f.run(['lease', 'phone', '--for', '5m', '--why', 'fallback', '--id', 'p3', '--json']);
+    assert.equal(third.code, 0, third.err.join('\n'));
+    assert.equal(JSON.parse(third.out[0]).device, 's26');
+    assert.ok(!existsSync(f.s24lock), 'the away s24 was looked for and its lock given back');
+    await f.run(['release', 'p3']);
+    // and run phone behaves the same way
+    f.away('s24', false);
+    const probe = join(f.root, 'probe');
+    const ran = await f.run(['run', 'phone', '--', process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(probe)}, process.env.HUB_DEVICE + ' ' + process.env.ANDROID_SERIAL)`]);
+    assert.equal(ran.code, 0, ran.err.join());
+    assert.equal(readFileSync(probe, 'utf8'), `s24 adb-${S24_SERIAL}-zz._adb-tls-connect._tcp`);
+  } finally { f.cleanup(); }
+});
+
+test('phone with every phone held is BUSY naming the holders; with every free phone away it is AWAY', async () => {
+  const f = fixture();
+  try {
+    await acquireLease('s24', { holder: 'agent-a', why: 'long proof', forMs: 600_000, id: 'on-s24', env: f.env, log: () => {} });
+    await acquireLease('adb', { holder: 'agent-b', why: 'another', forMs: 600_000, id: 'on-s26', env: f.env, log: () => {} });
+    const busy = await f.run(['lease', 'phone', '--for', '5m', '--why', 'x', '--wait', '0']);
+    assert.equal(busy.code, 76);
+    assert.deepEqual(busy.out, [], 'BUSY never reaches stdout');
+    assert.match(busy.err.join('\n'), /^HUB_DEVICE_BUSY phone every phone is held: s24 \(s24\) is held by lease on-s24 of agent-a \(long proof\).*s26 \(adb\) is held by lease on-s26 of agent-b/m);
+    const busyRun = await f.run(['run', 'phone', '--wait', '0', '--', 'true']);
+    assert.equal(busyRun.code, 76);
+    await f.run(['release', 'on-s24']);
+    await f.run(['release', 'on-s26']);
+    // free but neither reachable: AWAY, with each phone's reason on stderr
+    f.away('s24');
+    f.unauth('s26');
+    const away = await f.run(['lease', 'phone', '--for', '5m', '--why', 'x', '--wait', '0', '--verbose']);
+    assert.deepEqual([away.code, away.out], [75, ['HUB_DEVICE_AWAY phone']]);
+    assert.match(away.err.join('\n'), /phone is away: absent, unauthorized/, 'the reasons come in fleet order, deduped');
+    assert.match(away.err.join('\n'), /no free phone came within the wait: s24 absent, s26 unauthorized/);
+    assert.ok(!existsSync(f.s24lock) && !existsSync(f.lock), 'no lock was kept');
+    // one phone away, the other held: still AWAY, because turning the away one on is the actionable fix
+    const s26held = await f.run(['lease', 's26', '--for', '5m', '--why', 'held', '--id', 'h1', '--no-connect']);
+    assert.equal(s26held.code, 0);
+    const mixed = await f.run(['lease', 'phone', '--for', '5m', '--why', 'x', '--wait', '0']);
+    assert.equal(mixed.code, 75, mixed.err.join('\n'));
+    await f.run(['release', 'h1']);
+  } finally { f.cleanup(); }
+});
+
+test('the s24 away says why on stderr: absent, unauthorized', async () => {
+  const f = fixture();
+  try {
+    f.unauth('s24');
+    f.away('s26');
+    const unauthorized = await f.run(['lease', 's24', '--for', '5m', '--why', 'x', '--wait', '0', '--verbose']);
+    assert.deepEqual([unauthorized.code, unauthorized.out], [75, ['HUB_DEVICE_AWAY s24']]);
+    assert.match(unauthorized.err.join('\n'), /s24 is away: unauthorized/);
+    assert.match(unauthorized.err.join('\n'), /shows unauthorized.*Redo the Wireless debugging pairing/s, '--verbose adds the detail that names the fix');
+    f.unauth('s24', false);
+    f.away('s24');
+    const gone = await f.run(['lease', 's24', '--for', '5m', '--why', 'x', '--wait', '0']);
+    assert.deepEqual([gone.code, gone.out], [75, ['HUB_DEVICE_AWAY s24']]);
+    assert.match(gone.err.join('\n'), /s24 is away: absent/);
+    assert.ok(!existsSync(f.s24lock), 'nothing held');
+  } finally { f.cleanup(); }
+});
+
+test('the extra phones are hub-device\'s alone: no deploy-side reader of devices.json touches android_extra, and the deploy phone is still the S26', () => {
+  const devices = loadDevices();
+  assert.deepEqual([devices.android.serial, devices.android.model], ['R5GL43A7PCH', 'SM-S948U'], 'devices.android is unchanged: what every deploy reads');
+  const sides = ['tools/deploy.mjs', 'tools/hosts.mjs', 'tools/ci/macwatch.mjs'];
+  for (const dir of ['tools/ci/commands', 'tools/ci/lib', 'tools/catchup']) {
+    for (const file of readdirSync(join(hubRoot, dir)).filter(name => name.endsWith('.mjs'))) sides.push(join(dir, file));
+  }
+  for (const side of sides) {
+    if (side.endsWith('tools/ci/lib/devices.mjs')) continue;   // the one definition and its validation
+    assert.doesNotMatch(readFileSync(join(hubRoot, side), 'utf8'), /android_extra/, `${side} reads devices.android only`);
+  }
+});
+
+test('a devices.json without android_extra still leases: phone means the s26, and s24 is not a device', async () => {
+  const f = fixture();
+  try {
+    const bare = { ...loadDevices(), android_extra: undefined };
+    delete bare.android_extra;
+    const file = join(f.root, 'devices.json');
+    writeFileSync(file, JSON.stringify(bare));
+    f.env.HUB_DEVICES = file;
+    assert.match((await f.run(['lease', 's24', '--for', '5m', '--why', 'x'])).err.join(), /unknown device "s24" \(known: s26, phone, emulator\)/);
+    const result = await f.run(['lease', 'phone', '--for', '5m', '--why', 'any phone', '--id', 'only']);
+    assert.equal(result.code, 0, result.err.join('\n'));
+    assert.match(result.out.join('\n'), /export HUB_DEVICE='s26'/);
+    await f.run(['release', 'only']);
+    const status = (await f.run(['status'])).out;
+    const phonesBlock = status.slice(status.findIndex(line => line.startsWith('PHONES')) + 1, status.indexOf('LOCKS'));
+    assert.deepEqual(phonesBlock, ['  s26  free  no adb server  SM-S948U  serial R5GL43A7PCH  lock adb  (the deploy phone)']);
+  } finally { f.cleanup(); }
+});
+
+test('release --any frees whichever phone lease is held; a deploy job on one phone does not stop the other being freed', async () => {
+  const f = fixture();
+  try {
+    let done;
+    const job = withLock('s24', () => new Promise(resolve => { done = resolve; }), { env: f.env, log: () => {} });
+    await settle(20);
+    await acquireLease('adb', { holder: 'agent-a', why: 'proof', forMs: 600_000, id: 'on-s26', env: f.env, log: () => {} });
+    const result = await f.run(['release', '--any']);
+    assert.deepEqual([result.code, result.out], [0, ['HUB_DEVICE_RELEASED s26 on-s26']], 'the s26 lease was freed');
+    assert.ok(existsSync(f.s24lock), 'the deploy job on the s24 was left alone');
+    assert.equal(f.owner('s24').kind, undefined, 'the job lock is not a lease record');
+    done();
+    await job;
+    assert.ok(!existsSync(f.s24lock));
+  } finally { f.cleanup(); }
+});
+
+test('status settles as soon as the phones are answered: the query timeout is cleared, not left holding the process open', async () => {
+  const f = fixture();
+  let decoy = null;
+  try {
+    // a decoy posing as the adb server on 5039 (the inventory reads /proc and matches adb ... server); the fake
+    // HUB_ADB answers at once, so any lingering five-second query timer would show up as the process not exiting.
+    decoy = spawn('/bin/sh', ['-c', 'while :; do sleep 5; done', 'server'], { argv0: 'adb', env: { ...process.env, ANDROID_ADB_SERVER_PORT: '5039' }, stdio: 'ignore' });
+    for (let i = 0; i < 200; i += 1) {
+      let cmdline = '';
+      try { cmdline = readFileSync(`/proc/${decoy.pid}/cmdline`, 'utf8'); } catch { /* not yet */ }
+      if (/^adb\0.*server\0/.test(cmdline)) break;
+      await settle(10);
+    }
+    const started = Date.now();
+    const child = spawn(process.execPath, [tool, 'status'], { env: { ...f.env, HUB_ADB_SERVER_PORT: '5039' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    child.stdout.on('data', chunk => { out += chunk; });
+    child.stderr.resume();
+    const closed = new Promise(done => child.on('close', (code, signal) => done({ code, signal })));
+    const result = await closed;
+    const elapsed = Date.now() - started;
+    assert.equal(result.code, 0, out);
+    assert.ok(elapsed < 1500, `status took ${elapsed}ms to exit after the phones were answered; the query timer should be cleared`);
+    assert.match(out, /s24  free  reachable/, 'the fake adb answered the presence query');
+    assert.match(out, /s26  free  reachable/);
+  } finally {
+    decoy?.kill('SIGKILL');
+    f.cleanup();
+  }
+});
+
+test('status asks the hub port whatever a stray ANDROID_ADB_SERVER_PORT says, and starts no server', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hub-presence-'));
+  let decoy = null;
+  try {
+    const state = join(root, 'state');
+    mkdirSync(state, { recursive: true });
+    const adb = join(root, 'adb');
+    // The fake serves devices only on the hub port (5039); any other ANDROID_ADB_SERVER_PORT is recorded and fails,
+    // the way a real adb would reach a different server — or start one on a dead port.
+    writeFileSync(adb, `#!/bin/sh
+echo "$*" >> "${state}/calls.log"
+echo "$ANDROID_ADB_SERVER_PORT" >> "${state}/ports.log"
+[ "$ANDROID_ADB_SERVER_PORT" = "5039" ] || { echo "stray port $ANDROID_ADB_SERVER_PORT" >> "${state}/stray.log"; exit 1; }
+[ "$1" = devices ] && printf 'List of devices attached\\nadb-${S24_SERIAL}-zz._adb-tls-connect._tcp\\tdevice\\nadb-${SERIAL}-zz._adb-tls-connect._tcp\\tdevice\\n'
+exit 0
+`);
+    chmodSync(adb, 0o755);
+    decoy = spawn('/bin/sh', ['-c', 'while :; do sleep 5; done', 'server'], { argv0: 'adb', env: { ...process.env, ANDROID_ADB_SERVER_PORT: '5039' }, stdio: 'ignore' });
+    for (let i = 0; i < 200; i += 1) {
+      let cmdline = '';
+      try { cmdline = readFileSync(`/proc/${decoy.pid}/cmdline`, 'utf8'); } catch { /* not yet */ }
+      if (/^adb\0.*server\0/.test(cmdline)) break;
+      await settle(10);
+    }
+    // a stray ANDROID_ADB_SERVER_PORT names a dead port; the presence query must go to the hub port regardless
+    const child = spawn(process.execPath, [tool, 'status'], { env: { PATH: process.env.PATH, HOME: root, USER: 'tester', HUB_ADB: adb, HUB_LOCK_DIR: join(root, 'locks'), HUB_ADB_SERVER_PORT: '5039', ANDROID_ADB_SERVER_PORT: '15170' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    child.stdout.on('data', chunk => { out += chunk; });
+    child.stderr.resume();
+    const result = await new Promise(done => child.on('close', (code, signal) => done({ code, signal })));
+    assert.equal(result.code, 0, out);
+    assert.match(out, /s24  free  reachable/, 'the hub port answered for both phones');
+    assert.match(out, /s26  free  reachable/);
+    assert.ok(!existsSync(join(state, 'stray.log')), 'the stray port never reached the adb client');
+    assert.ok(readFileSync(join(state, 'ports.log'), 'utf8').trim().split('\n').every(port => port === '5039'), 'every query went to the hub port');
+    assert.doesNotMatch(readFileSync(join(state, 'calls.log'), 'utf8'), /start-server/, 'status starts nothing');
+  } finally {
+    decoy?.kill('SIGKILL');
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a --id that already names a lease or a waiter anywhere is refused: one id, one lease', async () => {
+  const f = fixture();
+  try {
+    await f.run(['lease', 's24', '--for', '1h', '--why', 'hold', '--no-connect', '--id', 'dup']);
+    for (const device of ['s24', 's26', 'phone']) {
+      const refused = await f.run(['lease', device, '--for', '5m', '--why', 'x', '--no-connect', '--id', 'dup', '--wait', '0']);
+      assert.equal(refused.code, 2, device);
+      assert.match(refused.err.join('\n'), /--id dup already names a lease or a waiter on s24/, device);
+    }
+    assert.equal(f.calls(), '', 'a refused --id never reaches adb');
+    // a waiting ticket counts too, on either lock
+    await f.run(['lease', 's26', '--for', '30m', '--why', 'held', '--no-connect', '--id', 'holder', '--wait', '0']);
+    const waiting = f.run(['lease', 's26', '--for', '30m', '--why', 'queued', '--no-connect', '--id', 'queued-one', '--wait', '10s']);
+    await settle(60);
+    const refused = await f.run(['lease', 's24', '--for', '5m', '--why', 'x', '--no-connect', '--id', 'queued-one', '--wait', '0']);
+    assert.equal(refused.code, 2);
+    assert.match(refused.err.join('\n'), /--id queued-one already names a lease or a waiter on s26/);
+    await f.run(['release', 'holder']);
+    assert.equal((await waiting).code, 0, 'the queued lease itself was never refused');
   } finally { f.cleanup(); }
 });
 
@@ -309,7 +599,7 @@ test('SIGTERM and SIGINT abort phone discovery promptly and release the lease', 
   for (const [signal, code] of [['SIGTERM', 143], ['SIGINT', 130]]) await t.test(signal, async () => {
     const f = fixture();
     try {
-      f.away(true);
+      f.away('s26');
       const { child, exit } = spawnRun(f, ['run', 's26', '--for', '10m', '--why', 'discovery', '--wait', '6s', '--', process.execPath, '-e', 'process.exit(0)'], { HUB_DEVICE_POLL_MS: '100' });
       for (let i = 0; i < 100 && !f.calls().includes('devices'); i += 1) await settle(20);
       assert.match(f.calls(), /devices/, 'discovery has started');
@@ -396,27 +686,27 @@ test('release says what it found, per reason, and falls back to $HUB_LEASE_ID', 
   const f = fixture();
   try {
     const bare = await f.run(['release']);
-    assert.deepEqual([bare.code, bare.out, bare.err], [2, [], ['hub-device: release needs a lease id, $HUB_LEASE_ID, or --any to free whichever lease holds s26']], 'a bare release refuses rather than freeing whatever is there');
-    assert.deepEqual((await f.run(['release', '--any'])).out, ['HUB_DEVICE_NOT_HELD s26 - (nothing holds s26)']);
+    assert.deepEqual([bare.code, bare.out, bare.err], [2, [], ['hub-device: release needs a lease id, $HUB_LEASE_ID, or --any to free whichever lease holds a phone']], 'a bare release refuses rather than freeing whatever is there');
+    assert.deepEqual((await f.run(['release', '--any'])).out, ['HUB_DEVICE_NOT_HELD phone - (no phone is held)']);
     await acquireLease('adb', { holder: 'agent-a', why: 'proof', forMs: 600_000, id: 'held', env: f.env, log: () => {} });
     const other = await f.run(['release', 'mine']);
-    assert.deepEqual([other.code, other.out, other.err], [0, ['HUB_DEVICE_NOT_HELD s26 mine'], ['hub-device: s26 is leased as held (agent-a), not mine; left alone']]);
+    assert.deepEqual([other.code, other.out, other.err], [0, ['HUB_DEVICE_NOT_HELD phone mine (no phone lease by that id)'], ['hub-device: s26 is leased as held (agent-a), not mine; left alone']]);
     f.env.HUB_LEASE_ID = 'mine';
-    assert.deepEqual((await f.run(['release'])).out, ['HUB_DEVICE_NOT_HELD s26 mine'], 'no id: $HUB_LEASE_ID, which is not the holder');
+    assert.deepEqual((await f.run(['release'])).out, ['HUB_DEVICE_NOT_HELD phone mine (no phone lease by that id)'], 'no id: $HUB_LEASE_ID, which is not the holder');
     assert.equal(f.owner().lease_id, 'held');
     f.env.HUB_LEASE_ID = 'held';
     assert.deepEqual((await f.run(['release'])).out, ['HUB_DEVICE_RELEASED s26 held'], 'no id: $HUB_LEASE_ID');
     delete f.env.HUB_LEASE_ID;
     await acquireLease('adb', { holder: 'agent-b', why: 'again', forMs: 600_000, id: 'other', env: f.env, log: () => {} });
-    assert.deepEqual((await f.run(['release', '--any'])).out, ['HUB_DEVICE_RELEASED s26 other'], '--any frees whichever lease holds the phone');
+    assert.deepEqual((await f.run(['release', '--any'])).out, ['HUB_DEVICE_RELEASED s26 other'], '--any frees whichever lease holds a phone');
     assert.match((await f.run(['release', 'x', '--any'])).err.join(), /--any or an id, not both/);
     let done;
     const job = withLock('adb', () => new Promise(resolve => { done = resolve; }), { env: f.env, log: () => {} });
     await settle(20);
     const withId = await f.run(['release', 'mine']);
-    assert.deepEqual([withId.code, withId.out, withId.err], [0, ['HUB_DEVICE_NOT_HELD s26 mine'], ['hub-device: s26 is held by a deploy job now; left alone']]);
+    assert.deepEqual([withId.code, withId.out, withId.err], [0, ['HUB_DEVICE_NOT_HELD phone mine (no phone lease by that id)'], ['hub-device: s26 is held by a deploy job now; left alone']]);
     const bareHere = await f.run(['release']);
-    assert.deepEqual([bareHere.code, bareHere.err], [2, ['hub-device: release needs a lease id, $HUB_LEASE_ID, or --any to free whichever lease holds s26']], 'a bare release never acts on whatever holds the lock');
+    assert.deepEqual([bareHere.code, bareHere.err], [2, ['hub-device: release needs a lease id, $HUB_LEASE_ID, or --any to free whichever lease holds a phone']], 'a bare release never acts on whatever holds the lock');
     const jobHeld = await f.run(['release', '--any']);
     assert.deepEqual([jobHeld.code, jobHeld.err], [1, ['hub-device: s26 is held by a deploy job, not a lease; left alone']]);
     done();
@@ -573,13 +863,17 @@ test('status lists leases, waiters and the marked inventory, changes nothing and
     assert.deepEqual(doc.inventory.adb_servers.map(server => server.managed), [true]);
     assert.deepEqual(doc.inventory.emulators.map(emulator => [emulator.avd, emulator.managed]), [['tower-pixel', false]]);
     assert.deepEqual(doc.inventory.xvfb.map(display => [display.display, display.managed]), [[':100', false]]);
+    assert.deepEqual(doc.phones.map(phone => [phone.device, phone.held, phone.lease_id, phone.presence, phone.deploy]), [['s24', 'free', null, 'reachable', false], ['s26', 'lease', 'held', 'reachable', true]]);
     const text = (await f.run(['status'], { inventory: real })).out.join('\n');
+    assert.match(text, /s24  free  reachable  SM-S928U  serial R5CX31AEJDA  lock s24/);
+    assert.match(text, /s26  LEASE held  holder=agent-a.*reachable  SM-S948U  serial R5GL43A7PCH  lock adb  \(the deploy phone\)/);
     assert.match(text, /s26 \(adb\)  LEASE held  holder=agent-a  why="device proof"  expires in 60m/);
     assert.match(text, /s26 #1  next  holder=agent-b/);
     assert.match(text, /adb server  port 5037  pid 100  managed/);
     assert.match(text, /emulator  avd tower-pixel  console port 5730  adb server 15170  pid 200  foreign/);
     assert.match(text, /Xvfb  display :100  pid 300  foreign/);
-    assert.equal(f.calls(), '', 'status never calls adb');
+    assert.doesNotMatch(f.calls(), /connect|start-server/, 'status queries adb; it never connects or starts anything');
+    assert.match(f.calls(), /^devices$/m, 'the phones were looked up in adb devices');
     assert.deepEqual(readdirSync(join(f.root, 'locks')).sort(), before, 'status changed nothing');
     assert.equal(f.owner().lease_id, 'held');
     releaseLease('adb', 'next', { env: f.env });
@@ -587,11 +881,22 @@ test('status lists leases, waiters and the marked inventory, changes nothing and
   } finally { f.cleanup(); }
 });
 
-test('status with nothing held says so', async () => {
+test('status with nothing held says so (and, with no adb server running, does not ask adb at all)', async () => {
   const f = fixture();
   try {
     const result = await f.run(['status']);
-    assert.deepEqual(result.out, ['LOCKS', '  none held', 'WAITERS', '  none', 'INVENTORY (read only)', '  nothing running']);
+    assert.deepEqual(result.out, [
+      'PHONES (read only; adb is queried, never connected)',
+      `  s24  free  no adb server  SM-S928U  serial R5CX31AEJDA  lock s24`,
+      `  s26  free  no adb server  SM-S948U  serial R5GL43A7PCH  lock adb  (the deploy phone)`,
+      'LOCKS',
+      '  none held',
+      'WAITERS',
+      '  none',
+      'INVENTORY (read only)',
+      '  nothing running',
+    ]);
+    assert.equal(f.calls(), '', 'no adb server in the inventory means no adb call');
   } finally { f.cleanup(); }
 });
 

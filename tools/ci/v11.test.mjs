@@ -165,6 +165,16 @@ test('the gate passes a well-formed run and reads the state of things: metered M
   } finally { await f.cleanup(); }
 });
 
+test('an S26 that adb lists but cannot use (unauthorized) is away, not a red gate: away is the code, not the wording', async () => {
+  const f = await gateFixture();
+  try {
+    const listed = () => ({ startServer() {}, devices: () => [{ id: 'adb-R5GL43A7PCH-x', state: 'unauthorized' }], prop() { throw new Error('device unauthorized'); } });
+    const result = await gate(f.configure(), f.deps({ adbFactory: listed }));
+    assert.equal(result.ios_lane, 'run');
+    assert.ok(f.logs.some(line => /^HUB_GATE ok policy=[0-9a-f]{8} mac=metered s26=away s3=ok/.test(line)), f.logs.join('\n'));
+  } finally { await f.cleanup(); }
+});
+
 test('the gate decides the iPad lane: home runs it, offline skips it, a metered link over budget defers it unless allowed', async () => {
   const f = await gateFixture();
   try {

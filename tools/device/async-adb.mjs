@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { closeSync, mkdtempSync, openSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { adbEnv, adbPath, parseDeviceList, parseMdnsEndpoint } from '../ci/lib/adb.mjs';
+import { adbEnv, adbPath, parseDeviceList, parseMdnsEndpoint, parseMdnsServices } from '../ci/lib/adb.mjs';
 
 export const aborted = signal => signal.reason ?? Object.assign(new Error('adb aborted'), { name: 'AbortError' });
 
@@ -56,6 +56,7 @@ export function createAsyncAdb({ env: given = process.env, signal } = {}) {
   return {
     // The server must outlive this process, as createAdb's does: no RUNNER_TRACKING_ID on it.
     startServer: () => call(['start-server'], 60_000, { RUNNER_TRACKING_ID: '' }),
+    mdnsServices: async () => parseMdnsServices(await call(['mdns', 'services'], 15_000)),
     mdnsEndpoint: async serial => parseMdnsEndpoint(await call(['mdns', 'services'], 15_000), serial),
     connect: endpoint => call(['connect', endpoint], 30_000),
     devices: async () => parseDeviceList(await call(['devices'])),

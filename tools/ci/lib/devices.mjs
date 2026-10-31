@@ -1,6 +1,7 @@
-// The devices every deploy targets, kept once in tools/ci/devices.json: the S26 on big-chungus's adb server, the
-// iPad behind the Mac's devicectl, the Apple team and development signer, the Mac (its ssh alias on big-chungus, its
-// tailscale peer, the handoff folders and the IPA outbox) and big-chungus (its ssh alias on the Mac, the staging folder).
+// The devices every deploy targets, kept once in tools/ci/devices.json: the S26 on big-chungus's adb server (any
+// further phones for hub-device in android_extra), the iPad behind the Mac's devicectl, the Apple team and
+// development signer, the Mac (its ssh alias on big-chungus, its tailscale peer, the handoff folders and the IPA
+// outbox) and big-chungus (its ssh alias on the Mac, the staging folder).
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -14,6 +15,25 @@ export function parseDevices(source) {
   const { android, ios, apple, mac, linux } = devices;
   if (!/^[A-Za-z0-9]+$/.test(android?.serial ?? '')) fail('android.serial must be the ro.serialno of the phone');
   if (!/^[A-Za-z0-9_-]+$/.test(android?.model ?? '')) fail('android.model must be the ro.product.model');
+  // Extra phones for hub-device alone (leases and interactive runs); deploys, the gate and the catch-up read
+  // android only. The lowercase of each name is hub-device's device word and its own lock name.
+  if (devices.android_extra !== undefined) {
+    if (!Array.isArray(devices.android_extra) || devices.android_extra.length === 0) fail('android_extra must be a list of extra phones for hub-device');
+    const serials = new Set([android.serial]);
+    const names = [];
+    for (const entry of devices.android_extra) {
+      if (!/^[A-Za-z0-9]+$/.test(entry?.serial ?? '')) fail('android_extra[].serial must be the ro.serialno of the phone');
+      if (!/^[A-Za-z0-9_-]+$/.test(entry?.model ?? '')) fail('android_extra[].model must be the ro.product.model');
+      if (!/^[A-Za-z][A-Za-z0-9]*$/.test(entry?.name ?? '')) fail('android_extra[].name must be a phone name like S24 (its lowercase is hub-device\'s device word and lock)');
+      if (serials.has(entry.serial)) fail(`android_extra lists serial ${entry.serial} twice (android_extra and android name different phones)`);
+      serials.add(entry.serial);
+      names.push(entry.name.toLowerCase());
+    }
+    if (new Set(names).size !== names.length) fail('android_extra[].name must be unique');
+    // s26/phone/emulator are hub-device's own words; adb is the deploy lock — an extra phone named "Adb" would
+    // build a second fleet entry on the lock deploys take.
+    for (const reserved of ['s26', 'phone', 'emulator', 'adb']) if (names.includes(reserved)) fail(`android_extra[].name may not be "${reserved}" (a hub-device device word or the deploy lock already)`);
+  }
   if (!/^[0-9A-F]{8}-[0-9A-F]{16}$|^[0-9a-f]{40}$/.test(ios?.udid ?? '')) fail('ios.udid must be the device UDID');
   if (!/^[A-Za-z]+\d+,\d+$/.test(ios?.model ?? '')) fail('ios.model must be a product type like iPad14,5');
   if (!/^[A-Z0-9]{10}$/.test(apple?.team ?? '')) fail('apple.team must be a 10-character team id');

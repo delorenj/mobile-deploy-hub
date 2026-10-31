@@ -134,7 +134,8 @@ async function eventPreflight({ config, manifest, devices, version, androidCode,
   return tree;
 }
 
-const notOnAdb = error => /is not on this host's adb server/.test(error.message);
+// Away is the code findPhone attaches, never its wording: the message names the reason (absent, unauthorized, offline).
+const notOnAdb = error => error?.code === 'HUB_PHONE_AWAY';
 
 export async function plan(config, { env = process.env, home = homedir(), fetchImpl = fetch, s3Factory = null, log = console.log, macLinkNow = null } = {}) {
   const { policy } = policyBanner(log);

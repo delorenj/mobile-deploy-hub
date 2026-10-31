@@ -105,7 +105,8 @@ async function quickS26({ env, home, devices, adbFactory }) {
     await findPhone(adbFactory({ env, home }), { serial: devices.android.serial, model: devices.android.model, waitMs: Number(env.HUB_GATE_ADB_WAIT_MS) || 6000, pollMs: 2000, nudgeEvery: 2, log: () => {} });
     return 'present';
   } catch (error) {
-    if (/is not on this host's adb server/.test(error.message)) return 'away';
+    // Away is the code findPhone attaches, never its wording: the message names the reason (absent, unauthorized, offline).
+    if (error?.code === 'HUB_PHONE_AWAY') return 'away';
     throw error;
   }
 }

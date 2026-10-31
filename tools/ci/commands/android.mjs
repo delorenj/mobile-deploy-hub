@@ -23,7 +23,8 @@ import { dropApk, s26OnLan } from '../lib/quickdrop.mjs';
 import { buildReceipt, sha256File, writeReceipt } from '../lib/receipt.mjs';
 import { applyBump, checkAppReceipt, exists, guarded, policyBanner, requirePlan, semver, stagingDir } from './common.mjs';
 
-const notOnAdb = error => /is not on this host's adb server/.test(error.message);
+// Away is the code findPhone attaches, never its wording: the message names the reason (absent, unauthorized, offline).
+const notOnAdb = error => error?.code === 'HUB_PHONE_AWAY';
 
 async function androidLane(config, manifest, { env, home, track, policy, log, quickdropLink }) {
   const spec = manifest.android ?? (() => { throw new Error('the manifest has no android section'); })();
