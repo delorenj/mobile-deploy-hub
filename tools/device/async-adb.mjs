@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { adbEnv, adbPath, parseDeviceList, parseMdnsEndpoint } from '../ci/lib/adb.mjs';
 
-const aborted = signal => signal.reason ?? Object.assign(new Error('adb aborted'), { name: 'AbortError' });
+export const aborted = signal => signal.reason ?? Object.assign(new Error('adb aborted'), { name: 'AbortError' });
 
 export function runAdb(adb, args, { env, signal, timeout = 30_000 } = {}) {
   return new Promise((resolve, reject) => {

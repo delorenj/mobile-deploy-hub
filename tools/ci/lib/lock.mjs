@@ -20,7 +20,7 @@ const alive = pid => {
 };
 
 // A record from before leases (pid, host, repo, run, started_at) still parses; anything that is not an object is no owner.
-function readOwner(path) {
+export function readOwner(path) {
   try {
     const owner = JSON.parse(readFileSync(join(path, 'owner.json'), 'utf8'));
     return owner && typeof owner === 'object' && !Array.isArray(owner) ? owner : null;
@@ -125,7 +125,7 @@ let ticketCounter = 0;
 // A pid can be reused, so a queue ticket names one process lifetime: pid plus its start time. On Linux that is
 // /proc/<pid>/stat field 22 (the comm field is parenthesized and may contain spaces); elsewhere (the Mac) it is
 // `ps -o lstart=`. Null when the process is gone or unreadable.
-function processStart(pid) {
+export function processStart(pid) {
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
     return stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)[19] ?? null;
