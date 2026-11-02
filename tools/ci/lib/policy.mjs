@@ -24,7 +24,7 @@ const labels = (where, value) => {
 export function parsePolicy(source) {
   let policy;
   try { policy = JSON.parse(source); } catch (error) { fail(`not valid JSON (${error.message})`); }
-  exact('policy', policy, ['schema', 'bump', 'event', 'manifest_schema', 'apps', 'callers', 'runners', 'devices', 'delivery', 'mac', 'catch_up']);
+  exact('policy', policy, ['schema', 'bump', 'event', 'manifest_schema', 'apps', 'callers', 'runners', 'devices', 'delivery', 'mac', 'catch_up', 'completion']);
   if (policy.schema !== 1) fail('schema must be 1');
 
   exact('bump', policy.bump, ['levels', 'default']);
@@ -110,7 +110,36 @@ export function parsePolicy(source) {
   positive('catch_up.android_every_s', policy.catch_up.android_every_s);
   positive('catch_up.ios_every_s', policy.catch_up.ios_every_s);
   positive('catch_up.max_failures', policy.catch_up.max_failures);
+
+  // What "shipped" means, for every app at once (TOWE-76): the required targets, what the gate does when a required
+  // lane cannot run, and how many same-version reruns `ship` may do on its own. No per-app switch exists on purpose:
+  // an app is a TestFlight app because its manifest declares ios.store, never because the policy names it.
+  exact('completion', policy.completion, ['required', 'lane_unavailable', 'reruns']);
+  exact('completion.required', policy.completion.required, ['devices', 'testflight']);
+  if (!completionDevices.includes(policy.completion.required.devices)) fail(`completion.required.devices must be one of ${completionDevices.join(', ')} (every lane the policy gives an app owes its device)`);
+  if (!completionTestflight.includes(policy.completion.required.testflight)) fail(`completion.required.testflight must be one of ${completionTestflight.join(', ')} (store: every app whose manifest declares ios.store owes TestFlight)`);
+  if (!laneUnavailable.includes(policy.completion.lane_unavailable)) fail(`completion.lane_unavailable must be one of ${laneUnavailable.join(', ')}`);
+  if (!Number.isSafeInteger(policy.completion.reruns) || policy.completion.reruns < 0 || policy.completion.reruns > maxReruns) fail(`completion.reruns must be a whole number from 0 to ${maxReruns}`);
   return policy;
+}
+
+export const completionDevices = Object.freeze(['lanes']);
+export const completionTestflight = Object.freeze(['store', 'never']);
+// refuse: a real run whose required lane would not run (the Mac offline, or a metered link over budget) stops at the
+// gate, before any version is spent. skip: the v1.2 behaviour (the lane is skipped and the run goes on), kept as the
+// one-line rollback.
+export const laneUnavailable = Object.freeze(['refuse', 'skip']);
+export const maxReruns = 3;
+
+// The targets one app owes for a run to be complete: its lanes' devices (S26 for android, iPad for ios) and TestFlight
+// when the manifest declares ios.store. `store` is the manifest's say; the rule is the policy's.
+export function requiredTargets(policy, app, { store = false } = {}) {
+  const lanes = app?.lanes ?? [];
+  return {
+    android: lanes.includes('android'),
+    ios: lanes.includes('ios'),
+    testflight: policy.completion.required.testflight === 'store' && Boolean(store) && lanes.includes('ios'),
+  };
 }
 
 export function loadPolicy(file = policyFile) {
