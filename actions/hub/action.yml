@@ -14,6 +14,10 @@ inputs:
     description: patch, minor or major (every deploy bumps)
     default: patch
   testflight:
+    description: The gate's derived TestFlight decision (policy completion + the manifest's ios.store); never the caller's input
+    default: 'false'
+  store_preflight:
+    description: The gate's word that preflight-ios runs the app's ios.store.preflight hook (a store app that declares one)
     default: 'false'
   play:
     default: 'false'
@@ -115,6 +119,12 @@ outputs:
   ios_store:
     description: The TestFlight signer and references as JSON (gate)
     value: ${{ steps.hub.outputs.ios_store }}
+  testflight:
+    description: true when this run owes TestFlight (gate; policy completion + the manifest's ios.store)
+    value: ${{ steps.hub.outputs.testflight }}
+  store_preflight:
+    description: true when preflight-ios runs the app's ios.store.preflight hook (gate)
+    value: ${{ steps.hub.outputs.store_preflight }}
   policy:
     description: The first 8 hex of the policy's sha256 (gate)
     value: ${{ steps.hub.outputs.policy }}
@@ -173,6 +183,7 @@ runs:
         HUB_PLATFORM: ${{ inputs.platform }}
         HUB_BUMP: ${{ inputs.bump }}
         HUB_TESTFLIGHT: ${{ inputs.testflight }}
+        HUB_STORE_PREFLIGHT: ${{ inputs.store_preflight }}
         HUB_PLAY: ${{ inputs.play }}
         HUB_CHANNEL: ${{ inputs.channel }}
         HUB_TRACK: ${{ inputs.track }}

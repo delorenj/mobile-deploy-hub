@@ -18,6 +18,12 @@ name: Mobile Deploy
 # runs-on is the policy's self-hosted labels, written here: a caller's linux_runner or mac_runner input can never put
 # a job on a billed hosted runner (the gate still refuses any non-default value).
 #
+# v1.3 (TOWE-76, policy `completion`): TestFlight is the gate's decision, never the caller's. The gate derives it (a store
+# app owes TestFlight whenever its iOS lane is in scope, dry runs included) and every job reads needs.gate.outputs.testflight;
+# no job reads inputs.testflight. A real run whose required iOS lane would not run is refused at the gate, before plan.
+# A store app that declares ios.store.preflight checks its tree out in preflight-ios and runs that hook before the bump.
+# announce writes the completion verdict (COMPLETE, INCOMPLETE or RED, and what is owed) as the completion-out artifact.
+#
 # `uses:` takes no expressions, so every `delorenj/mobile-deploy-hub/actions/hub@<tag>` below names one exact hub
 # version: a run and its reruns use one version, whatever `v1` points at later. `mise run release` flips them all in
 # one commit, tags it vX.Y.Z and moves v1.
@@ -37,7 +43,7 @@ on:
         type: string
         default: patch
       testflight:
-        description: Also upload to TestFlight Owner Testing (apps with ios.store)
+        description: Kept for the v1 caller interface and read by no job; the gate derives TestFlight (every app with ios.store owes it)
         type: boolean
         default: false
       play:
@@ -110,6 +116,8 @@ jobs:
       bundle: ${{ steps.hub.outputs.bundle }}
       slug: ${{ steps.hub.outputs.slug }}
       ios_store: ${{ steps.hub.outputs.ios_store }}
+      testflight: ${{ steps.hub.outputs.testflight }}
+      store_preflight: ${{ steps.hub.outputs.store_preflight }}
       policy: ${{ steps.hub.outputs.policy }}
     steps:
       # The caller file and the manifest at the dispatched commit.
@@ -125,7 +133,6 @@ jobs:
           manifest: ${{ inputs.manifest }}
           platform: ${{ inputs.platform }}
           bump: ${{ inputs.bump }}
-          testflight: ${{ inputs.testflight }}
           play: ${{ inputs.play }}
           channel: ${{ inputs.android_channel }}
           build: ${{ inputs.build }}
@@ -144,8 +151,10 @@ jobs:
           overwrite: true
           retention-days: ${{ inputs.dry_run && 1 || 7 }}
 
-  # No checkout and no artifact upload: the bundle id comes from the gate and the receipt goes back as a job output,
-  # so a Mac on a metered link downloads only the hub action.
+  # No artifact upload: the bundle id comes from the gate and the receipt goes back as a job output. Only a store app
+  # that declares ios.store.preflight checks its tree out (depth 1, the dispatched commit, in the workspace the ios job
+  # keeps warm), so the hook proves the store toolchain before plan; every other run stays checkout-free and a Mac on a
+  # metered link downloads only the hub action.
   preflight-ios:
     needs: gate
     if: ${{ needs.gate.outputs.ios_lane == 'run' }}
@@ -158,13 +167,20 @@ jobs:
       ipad_build: ${{ steps.hub.outputs.ipad_build }}
       receipt: ${{ steps.hub.outputs.receipt }}
     steps:
+      - uses: actions/checkout@v4
+        if: ${{ needs.gate.outputs.store_preflight == 'true' }}
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - id: hub
-        name: Signing, profile, disk, the iPad
+        name: Signing, profile, disk, the store preflight, the iPad
         uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.25
         with:
           command: preflight-ios
+          manifest: ${{ inputs.manifest }}
           platform: ${{ inputs.platform }}
-          testflight: ${{ inputs.testflight }}
+          testflight: ${{ needs.gate.outputs.testflight }}
+          store_preflight: ${{ needs.gate.outputs.store_preflight }}
           dry_run: ${{ inputs.dry_run }}
           strict: ${{ inputs.strict }}
           bundle: ${{ needs.gate.outputs.bundle }}
@@ -211,7 +227,7 @@ jobs:
           manifest: ${{ inputs.manifest }}
           platform: ${{ inputs.platform }}
           bump: ${{ inputs.bump }}
-          testflight: ${{ inputs.testflight }}
+          testflight: ${{ needs.gate.outputs.testflight }}
           play: ${{ inputs.play }}
           track: ${{ inputs.track }}
           play_status: ${{ inputs.play_status }}
@@ -329,7 +345,7 @@ jobs:
         with:
           command: ios-export
           manifest: ${{ inputs.manifest }}
-          testflight: ${{ inputs.testflight }}
+          testflight: ${{ needs.gate.outputs.testflight }}
           dry_run: ${{ inputs.dry_run }}
           dry_handoff: ${{ inputs.dry_handoff }}
           version: ${{ needs.plan.outputs.version }}
@@ -373,7 +389,7 @@ jobs:
           command: ios
           manifest: ${{ inputs.manifest }}
           bump: ${{ inputs.bump }}
-          testflight: ${{ inputs.testflight }}
+          testflight: ${{ needs.gate.outputs.testflight }}
           dry_run: ${{ inputs.dry_run }}
           dry_handoff: ${{ inputs.dry_handoff }}
           strict: ${{ inputs.strict }}
@@ -498,12 +514,22 @@ jobs:
         with:
           pattern: '{gate-out,plan-out,android-out,ios-receipt,ios-out,deliver-android-out,deliver-ios-out}'
           path: ${{ runner.temp }}/hub-out/receipts
-      - name: One Bloodbank event (a dry run only checks it)
+      - name: One Bloodbank event (a dry run only checks it) and the completion verdict
         uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.25
         with:
           command: announce
           manifest: ${{ inputs.manifest }}
           platform: ${{ inputs.platform }}
+          testflight: ${{ needs.gate.outputs.testflight }}
           dry_run: ${{ inputs.dry_run }}
           ios_lane: ${{ needs.gate.outputs.ios_lane }}
           needs: ${{ toJSON(needs) }}
+      # The verdict `deploy.mjs ship` reads: COMPLETE, INCOMPLETE or RED, each required target and what is owed.
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: completion-out
+          path: ${{ runner.temp }}/hub-out/completion/completion.json
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: ${{ inputs.dry_run && 1 || 7 }}

@@ -37,6 +37,7 @@ const flags = Object.freeze({
   '--ios-build': 'iosBuild',
   '--bump': 'bump',
   '--testflight': 'testflight',
+  '--store-preflight': 'storePreflight',
   '--play': 'play',
   '--build-sha': 'buildSha',
   '--bump-patch': 'bumpPatch',
@@ -69,6 +70,7 @@ const environment = Object.freeze({
   iosBuild: 'HUB_IOS_BUILD',
   bump: 'HUB_BUMP',
   testflight: 'HUB_TESTFLIGHT',
+  storePreflight: 'HUB_STORE_PREFLIGHT',
   play: 'HUB_PLAY',
   buildSha: 'HUB_BUILD_SHA',
   bumpPatch: 'HUB_BUMP_PATCH',
@@ -159,7 +161,11 @@ export function parseConfig(argv, env = process.env) {
     dryHandoff: bool('dry_handoff', raw.dryHandoff, false),
     strict: bool('strict', raw.strict, true),
     bump: oneOf('bump', raw.bump || 'patch', levels),
+    // Since hub v1.3 the gate derives it (policy completion + the manifest's ios.store) and every later job reads the
+    // gate's output; the caller's testflight input reaches no job.
     testflight: bool('testflight', raw.testflight, false),
+    // The gate's word that this store app has an ios.store.preflight hook, so preflight-ios checks the tree out and runs it.
+    storePreflight: bool('store_preflight', raw.storePreflight, false),
     play: bool('play', raw.play, false),
     out: raw.out || join(env.RUNNER_TEMP || tmpdir(), 'hub-out'),
     version: matching('version', raw.version, /^\d+\.\d+\.\d+$/, 'X.Y.Z'),

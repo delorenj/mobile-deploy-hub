@@ -467,10 +467,14 @@ test('the reusable workflow is hardened: no hosted runners, no shell interpolati
   assert.equal(refs.size, 1, 'one exact hub ref everywhere; mise run release flips them together');
   assert.match([...refs][0], /^v\d+\.\d+\.\d+$/, 'the inner refs are an exact tag, never v1 or main');
   assert.match(workflow, /retention-days: \$\{\{ inputs\.dry_run && 1 \|\| 7 \}\}/);
-  // The Mac preflight: after the gate, only when the gate runs the iPad lane, no checkout and no artifact.
+  // The Mac preflight: after the gate, only when the gate runs the iPad lane, no artifact, and a checkout only for a
+  // store app whose manifest declares ios.store.preflight (v1.3): every other run downloads only the hub action.
   const preflight = workflow.slice(workflow.indexOf('\n  preflight-ios:\n'), workflow.indexOf('\n  plan:\n'));
   assert.match(preflight, /needs: gate\n\s+if: \$\{\{ needs\.gate\.outputs\.ios_lane == 'run' \}\}/);
-  assert.doesNotMatch(preflight, /actions\/checkout|upload-artifact/, 'a metered Mac downloads only the hub action');
+  assert.doesNotMatch(preflight, /upload-artifact/, 'a metered Mac uploads nothing');
+  assert.equal([...preflight.matchAll(/actions\/checkout/g)].length, 1);
+  assert.match(preflight, /- uses: actions\/checkout@v4\n\s+if: \$\{\{ needs\.gate\.outputs\.store_preflight == 'true' \}\}\n\s+with:\n\s+ref: \$\{\{ github\.sha \}\}\n\s+persist-credentials: false\n/, 'the checkout is the store preflight\'s alone, at the dispatched commit');
+  assert.match(preflight, /store_preflight: \$\{\{ needs\.gate\.outputs\.store_preflight \}\}/);
   assert.match(preflight, /receipt: \$\{\{ steps\.hub\.outputs\.receipt \}\}/, 'its receipt goes back as a job output');
   assert.match(workflow, /plan:\n\s+needs: \[gate, preflight-ios\]\n\s+if: \$\{\{ !cancelled\(\) && needs\.gate\.result == 'success' && \(needs\.preflight-ios\.result == 'success' \|\| needs\.preflight-ios\.result == 'skipped'\) \}\}/);
   assert.match(workflow, /ios:\n\s+needs: \[gate, plan, ios-export\]/);
@@ -485,7 +489,7 @@ test('the reusable workflow is hardened: no hosted runners, no shell interpolati
   assert.match(workflow, /ios_lane: \$\{\{ steps\.hub\.outputs\.ios_lane \}\}\n\s+steps:\n\s+# Full history/, 'the plan has the last word on the iPad lane');
   // Every upload can be redone by "Re-run failed jobs", and receipts upload even when the lane failed.
   const uploads = workflow.split('uses: actions/upload-artifact@v4').slice(1).map(block => block.split(/\n {6}- |\n\n/)[0]);
-  assert.deepEqual(uploads.map(block => /name: (\S+)/.exec(block)[1]), ['gate-out', 'plan-out', 'android-out', 'ios-receipt', 'ios-out', 'deliver-android-out', 'deliver-ios-out']);
+  assert.deepEqual(uploads.map(block => /name: (\S+)/.exec(block)[1]), ['gate-out', 'plan-out', 'android-out', 'ios-receipt', 'ios-out', 'deliver-android-out', 'deliver-ios-out', 'completion-out']);
   for (const block of uploads) assert.match(block, /^\s+overwrite: true$/m, block);
   // The build itself never takes artifact quota: staging, the build directory and the Release hold it.
   assert.match(workflow, /name: android-out\n\s+path: \$\{\{ runner\.temp \}\}\/hub-out\/android\/\*\.json\n/);

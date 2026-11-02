@@ -6,16 +6,20 @@
 // since the dispatched commit (the bump lands on main's newest tip, which the gate never saw), and probes the Mac once
 // more right before the iPad lane: a Mac that went away after the gate turns the lane into skip-lost instead of a job
 // that waits 24 hours for its runner.
+// v1.3 (TOWE-76): for a store app that declares ios.store.preflight, preflight-ios checks the dispatched commit out and
+// runs that hook on the Mac, so a stale store toolchain (an Xcode pin the Mac no longer has) fails before the bump.
+// TestFlight is the gate's derived decision; an iOS lane the gate skipped no longer turns into a red plan.
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { createAdb, findPhone } from '../lib/adb.mjs';
 import { bbEmit, bloodbankTree, correlationFor, deploymentEvent, scopeOf } from '../lib/announce.mjs';
+import { testflightDelivery } from '../lib/completion.mjs';
 import { devProfile, identities, installedProfiles, signingProbe } from '../lib/apple.mjs';
 import { hookEnvironment } from '../lib/config.mjs';
 import { createDevicectl, createIpad } from '../lib/devicectl.mjs';
 import { loadDevices } from '../lib/devices.mjs';
-import { hookOutput, run } from '../lib/exec.mjs';
+import { attempt, hook, hookOutput, run } from '../lib/exec.mjs';
 import { bumpTransaction, createGit } from '../lib/git.mjs';
 import { compareBuild, compareSemver, inflightKey, latestKey, parseLatest } from '../lib/latest.mjs';
 import { withLock } from '../lib/lock.mjs';
@@ -57,6 +61,11 @@ export async function preflightIos(config, { env = process.env, home = homedir()
         notes.push(`signing probe passed with the App Store identity ${config.iosStore.signer_sha1.slice(0, 8)}`);
       }
       checkSecrets(config.iosStore.secrets ?? [], { config, env, notes });
+      if (config.storePreflight) {
+        await storePreflight(config, { env, devices, notes, log });
+      }
+    } else if (config.storePreflight) {
+      throw new Error('store_preflight without testflight: the gate sets both, so these inputs did not come from the gate');
     }
     const ipad = createIpad({ devicectl: createDevicectl({ env }), udid: devices.ios.udid, model: devices.ios.model });
     const waitMs = Number(env.HUB_IPAD_WAIT_MS) || policy.devices.ipad_wait_s * 1000;
@@ -92,10 +101,27 @@ export async function preflightIos(config, { env = process.env, home = homedir()
   }
 }
 
+// The app's own store preflight (ios.store.preflight), on the Mac, from the dispatched commit: the store toolchain the
+// upload hook will need (its Xcode pin, its signing) is proven before plan spends a version. The job checks the tree out
+// only for this; the checkout must be the commit the gate checked.
+export async function storePreflight(config, { env, devices, notes, log = console.log }) {
+  if (env.GITHUB_ACTIONS === 'true' && /^[0-9a-f]{40}$/.test(env.GITHUB_SHA ?? '')) {
+    const head = attempt('git', ['rev-parse', 'HEAD'], { cwd: config.cwd, env, timeout: 15_000 });
+    const at = head.ok ? head.stdout.trim() : '';
+    if (at !== env.GITHUB_SHA) throw new Error(`the store preflight needs the dispatched commit ${short(env.GITHUB_SHA)} checked out; this Mac's workspace is at ${short(at) || 'no commit'}`);
+  }
+  const manifest = await loadManifest(config.cwd, config.manifest);
+  const command = manifest.ios?.store?.preflight;
+  if (!command) throw new Error(`the gate said ${config.manifest} has ios.store.preflight, and the checkout's copy has none`);
+  hook('ios.store.preflight', command, { cwd: config.cwd, env: hookEnvironment(config, env, { HUB_TEAM: devices.apple.team }) });
+  notes.push('ios.store.preflight passed: the store toolchain is ready before any version is spent');
+  log('HUB_STORE_PREFLIGHT ok (the app\'s ios.store.preflight hook, before the bump)');
+}
+
 // ---------------------------------------------------------------------------------------------------- plan
 
 // A representative completed event for this app, held to the schema before any version is spent: one device
-// installed, one pending, with the links the notification renders.
+// installed, one pending, with the links the notification renders, and TestFlight assigned for a store app.
 export function sampleEvent({ manifest, devices, version, androidCode, commit, env }) {
   const declared = { android: Boolean(manifest.android), ios: Boolean(manifest.ios) };
   const needs = { gate: { result: 'success' }, plan: { result: 'success' }, android: { result: 'success' }, ios: { result: 'success' }, 'ios-export': { result: 'success' }, deliver: { result: 'success' } };
@@ -106,7 +132,8 @@ export function sampleEvent({ manifest, devices, version, androidCode, commit, e
   const base = 'https://s3.delo.sh/builds';
   const slug = manifest.project.slug;
   const published = { apk: `${base}/${slug}/${version}/${slug}-${version}-${androidCode ?? 1}.apk`, ota: `itms-services://?action=download-manifest&url=${base}/${slug}/ios/manifest.plist`, page: `${base}/${slug}/index.html` };
-  return deploymentEvent({ project: manifest.project, declared, devices, needs, receipts, version, androidCode, commit, published, env: { ...env, GITHUB_RUN_ID: env.GITHUB_RUN_ID || '1' } });
+  const extraDeliveries = manifest.ios?.store ? [testflightDelivery({ status: 'assigned', reason: 'uploaded and assigned to Owner Testing' }, { version, build: '1' })] : [];
+  return deploymentEvent({ project: manifest.project, declared, devices, needs, receipts, version, androidCode, commit, published, env: { ...env, GITHUB_RUN_ID: env.GITHUB_RUN_ID || '1' }, extraDeliveries });
 }
 
 // bb-emit validates against the live bloodbank checkout, so the contract it enforces must be committed there, and
@@ -162,8 +189,10 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
     const scope = { android: declared.android, ios: declared.ios && iosLane === 'run' };
     if (config.platform === 'android' && !manifest.android) throw new Error('platform android but the manifest has no android section');
     if (config.platform === 'ios' && !manifest.ios) throw new Error('platform ios but the manifest has no ios section');
-    if (config.testflight && !scope.ios) throw new Error(`--testflight needs the iOS lane (platform both or ios, and the Mac reachable; the gate said ${iosLane})`);
-    if (config.testflight && !manifest.ios.store) throw new Error(`--testflight is for an app with ios.store; ${manifest.project.slug} has no App Store Connect app in its manifest`);
+    if (config.testflight && !manifest.ios?.store) throw new Error(`TestFlight is for an app with ios.store; ${manifest.project.slug} has no App Store Connect app in its manifest`);
+    // The gate derives TestFlight and refuses a real run whose required iOS lane would not run; what reaches here with the
+    // lane skipped is a dry run (or the skip policy): TestFlight rides the iOS lane, so it is owed, not a red plan.
+    if (config.testflight && !scope.ios) log(`HUB_TESTFLIGHT_SKIPPED the iOS lane does not run (ios_lane=${iosLane}); TestFlight is owed by this version`);
     if (config.play) {
       if (!scope.android) throw new Error('--play needs the Android lane (platform both or android)');
       if (!manifest.android.bundle) throw new Error(`--play needs an android.bundle hook and ${manifest.android.package} declares none; Play stays blocked on the Play launch spec`);

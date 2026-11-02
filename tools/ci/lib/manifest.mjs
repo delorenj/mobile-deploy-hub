@@ -15,7 +15,10 @@ const iosKeys = ['bundle', 'prepare', 'export', 'archive', 'receipt', 'device', 
 // before a version is spent) and `artifact` the IPA it leaves in $HUB_OUT/ios, which the hub checks (bundle, version, build,
 // signer, an App Store profile) before upload and assign are called. `bundle` names a store bundle id that differs from the
 // iPad's development one; the policy pins it (apps.<repo>.ios.store_bundle).
-const storeKeys = ['bundle', 'archive', 'receipt', 'build', 'artifact', 'upload', 'assign', 'signer_sha1', 'secrets'];
+// Two optional hooks (hub v1.3, TOWE-76): `preflight` runs on the Mac in preflight-ios, before plan spends a version, so a
+// stale store toolchain (an Xcode pin the Mac no longer has) fails a dry run and a real run before the bump; `state`
+// answers whether App Store Connect already has the planned (version, build), so a rerun never uploads it twice.
+const storeKeys = ['bundle', 'archive', 'receipt', 'build', 'artifact', 'upload', 'assign', 'signer_sha1', 'secrets', 'preflight', 'state'];
 
 const fail = message => { throw new Error(`mobile-deploy.json: ${message}`); };
 
@@ -113,6 +116,7 @@ function iosSection(ios) {
       if (ios.store.signer_sha1 === undefined) fail('ios.store.signer_sha1 is required without ios.export: the hub checks the store IPA against it');
     }
     for (const key of ['upload', 'assign']) text('ios.store', ios.store, key, { required: true });
+    for (const key of ['preflight', 'state']) text('ios.store', ios.store, key);
     sha1('ios.store', ios.store);
     secrets('ios.store', ios.store);
   }
