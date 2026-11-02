@@ -17,6 +17,10 @@
 // not. A lane that succeeded without a receipt announce can read is failed ("receipt missing"), never a quiet
 // pending. A Mac job that no runner ever picked up (the Mac went away after the gate) makes the iPad skipped. The
 // install buttons carry the download's size.
+//
+// v1.3 (TOWE-76): a run that owes TestFlight (the gate derives it for a store app) carries it as a third delivery,
+// device "TestFlight": installed once uploaded and assigned to Owner Testing, failed, skipped with the iOS lane, or
+// pending in a dry run (checked, never uploaded). lib/completion.mjs turns the same facts into the completion verdict.
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -156,7 +160,7 @@ export function linksFor({ type, published, runUrl, deliveries, trigger = 'deplo
   return links.filter(link => /^(https|itms-services):\/\/[^\s"<>]+$/.test(link.url) && link.url.length <= 600).slice(0, 6);
 }
 
-const statusPhrase = delivery => (delivery.status === 'installed' ? 'installed' : delivery.status);
+const statusPhrase = delivery => (delivery.device === 'TestFlight' && delivery.status === 'installed' ? 'assigned' : delivery.status);
 
 // G2: one line that works on its own, at most 200 characters.
 export function summaryOf({ name, version, androidCode, commit, deliveries, verified, failure }) {
@@ -168,8 +172,10 @@ export function summaryOf({ name, version, androidCode, commit, deliveries, veri
   return line.length > 200 ? `${line.slice(0, 199)}…` : line;
 }
 
-export function deploymentEvent({ project, declared, platform = 'both', devices, needs, receipts, version, androidCode, commit, iosLane = 'run', published = null, env = process.env, now = new Date(), extras = [], lostMac = null }) {
-  const { deliveries, failure } = deliveriesFrom({ declared, platform, devices, needs, receipts, version, iosLane, lostMac });
+export function deploymentEvent({ project, declared, platform = 'both', devices, needs, receipts, version, androidCode, commit, iosLane = 'run', published = null, env = process.env, now = new Date(), extras = [], lostMac = null, extraDeliveries = [] }) {
+  const lanes = deliveriesFrom({ declared, platform, devices, needs, receipts, version, iosLane, lostMac });
+  const { failure } = lanes;
+  const deliveries = [...lanes.deliveries, ...extraDeliveries].slice(0, 8);
   const scope = { android: deliveries.some(item => item.platform === 'android'), ios: deliveries.some(item => item.platform === 'ios') };
   const built = { android: declared.android && (platform === 'both' || platform === 'android'), ios: declared.ios && (platform === 'both' || platform === 'ios') };
   const target = targetOf(scope.android || scope.ios ? scope : { android: true, ios: false }, devices);

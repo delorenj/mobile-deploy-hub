@@ -1,8 +1,13 @@
 // announce (Linux, always): one event per run attempt from the job results and the receipts, with each delivery's
 // status, the download links the deliver jobs published and trigger: deploy. A dry run only checks it.
+// v1.3 (TOWE-76): it also writes the completion verdict (lib/completion.mjs) to $HUB_OUT/completion/completion.json,
+// which the workflow uploads as the completion-out artifact `deploy.mjs ship` reads, and a run that owes TestFlight
+// carries it as a delivery.
+import { mkdir, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { bbEmit, correlationFor, deploymentEvent } from '../lib/announce.mjs';
+import { completionOf, testflightDelivery, testflightOf } from '../lib/completion.mjs';
 import { hookEnvironment } from '../lib/config.mjs';
 import { loadDevices } from '../lib/devices.mjs';
 import { hookOutput, runBounded } from '../lib/exec.mjs';
@@ -10,7 +15,17 @@ import { latestKey, parseLatest } from '../lib/latest.mjs';
 import { loadManifest } from '../lib/manifest.mjs';
 import { readObject } from '../lib/s3.mjs';
 import { parseVersionInfo } from '../lib/version.mjs';
-import { parseNeeds, policyBanner, readReceipts, semver } from './common.mjs';
+import { firstLine, parseNeeds, policyBanner, readReceipts, runOf, semver } from './common.mjs';
+
+export const completionFile = out => join(out, 'completion', 'completion.json');
+
+async function writeCompletion(out, completion, log) {
+  const file = completionFile(out);
+  await mkdir(join(out, 'completion'), { recursive: true });
+  await writeFile(file, `${JSON.stringify(completion, null, 2)}\n`);
+  log(`HUB_COMPLETION ${completion.verdict} ${completion.summary}`);
+  return file;
+}
 
 // preflight-ios has no artifact: its receipt travels as a job output (base64 JSON).
 function preflightReceipt(needs) {
@@ -83,10 +98,14 @@ export async function announce(config, { env = process.env, home = homedir(), fe
   }
   const commit = planReceipt?.sha || planOutputs.build_sha || env.GITHUB_SHA || '';
   if (!/^[0-9a-f]{7,40}$/.test(commit)) throw new Error('announce cannot name the commit (no plan receipt and no GITHUB_SHA)');
-  const extras = [];
-  if (receipts.ios?.testflight && !config.dryRun && /uploaded/.test(receipts.ios.testflight)) extras.push('TestFlight');
-  // The plan has the last word on the iPad lane (it probes the Mac again right before it), else the gate.
-  const iosLane = planOutputs.ios_lane || needs.gate?.outputs?.ios_lane || config.iosLane || 'run';
+  // The plan has the last word on the iPad lane (it probes the Mac again right before it), else the gate (its receipt
+  // too: a gate that refused a lane still recorded what it read).
+  const gateFacts = receipts.gate?.gate ?? {};
+  const iosLane = planOutputs.ios_lane || needs.gate?.outputs?.ios_lane || gateFacts.ios_lane || config.iosLane || 'run';
+  // TestFlight is the gate's derived decision (config.testflight is its output), a delivery of its own in the event.
+  const iosBuild = receipts.plan?.build || planOutputs.ios_build || '';
+  const tf = testflightOf({ testflight: config.testflight, iosLane, needs, receipts, dryRun: config.dryRun });
+  const extraDeliveries = tf ? [testflightDelivery(tf, { version, build: receipts.ios?.store?.build ?? receipts.ios?.delivery?.build ?? iosBuild })] : [];
   // What the deliver jobs published: the APK half (deliver-android), the IPA half (deliver-ios), or one deliver (v1.1).
   const published = { apk: null, apk_bytes: null, ota: null, ipa_bytes: null, page: null, manifest: null, any: false };
   for (const job of ['deliver', 'deliver-android', 'deliver-ios']) {
@@ -98,14 +117,34 @@ export async function announce(config, { env = process.env, home = homedir(), fe
   }
   const lost = lostMac === undefined ? findLostMac({ env, needs, policy }) : lostMac;
   if (lost) log(`HUB_MAC_LOST ${lost.job}: ${lost.reason}`);
-  const event = deploymentEvent({ project, declared, platform: config.platform, devices, needs, receipts, version, androidCode: androidCode ? String(androidCode) : '', commit, iosLane, published: published.page ? published : null, env, extras, lostMac: lost });
+  const event = deploymentEvent({ project, declared, platform: config.platform, devices, needs, receipts, version, androidCode: androidCode ? String(androidCode) : '', commit, iosLane, published: published.page ? published : null, env, lostMac: lost, extraDeliveries });
+
+  // The completion verdict, written before the event goes out so a dead bus still leaves it (rewritten red below).
+  let latest = null;
+  if (!config.dryRun) {
+    try { const text = await readObject(policy, latestKey(project.slug), { fetchImpl }); latest = text ? parseLatest(text, { slug: project.slug }) : null; } catch (error) { log(`HUB_COMPLETION_LATEST ${firstLine(error.message)}: a pending device cannot be shown durable`); }
+  }
+  const run = runOf(env);
+  const judge = failure => completionOf({
+    policy, repo: env.GITHUB_REPOSITORY ?? '', slug: project.slug, store: Boolean(manifest?.ios?.store), required: gateFacts.completion?.required ?? null,
+    dryRun: config.dryRun, platform: config.platform, iosLane, catchup: gateFacts.catchup ?? {}, deliveries: event.data.deliveries, testflight: tf, latest,
+    version, androidCode: androidCode ? String(androidCode) : null, iosBuild, failure, bumped: !config.dryRun && receipts.plan?.bump?.committed === true,
+    run: { id: run.id, attempt: run.attempt, url: run.url }, commit,
+  });
+  await writeCompletion(config.out, judge(event.failure), log);
+
   const correlation = correlationFor(env);
-  bbEmit({ type: event.type, data: event.data, correlation, check: true, env, home });
+  try {
+    bbEmit({ type: event.type, data: event.data, correlation, check: true, env, home });
+    if (!config.dryRun) bbEmit({ type: event.type, data: event.data, correlation, check: false, env, home });
+  } catch (error) {
+    await writeCompletion(config.out, judge(event.failure ?? { job: 'announce', stage: 'deliver', reason: firstLine(error.message).slice(0, 300) }), log);
+    throw error;
+  }
   if (config.dryRun) {
     log(`HUB_EVENT_CHECKED ${event.type}: ${event.data.summary} (dry run, not sent; ${event.data.links?.length ?? 0} links)`);
     return { ...event, sent: false, correlation };
   }
-  bbEmit({ type: event.type, data: event.data, correlation, check: false, env, home });
   log(`HUB_EVENT_SENT ${event.type}: ${event.data.summary}`);
   return { ...event, sent: true, correlation };
 }
