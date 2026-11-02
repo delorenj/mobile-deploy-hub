@@ -7,16 +7,24 @@
 //                   [--testflight true|false] [--play true|false] [--dry-handoff true|false] [--metered auto|allow]
 //                   [--workflow deploy.yml] [--hub-ref REF] [--repo owner/repo] [--print]
 //   node deploy.mjs train [--dry-run true|false] [...]     Tower, Green In Between, Gruvato, Navi, then Earshot; stops at a red run
+//   node deploy.mjs ship [--bump patch|minor|major] [--metered auto|allow] [--abandon RUN_ID] [--hub-ref REF] [--repo owner/repo]
+//                                                           one command: recover a red last real run, else dry run, then the
+//                                                           real run on the same commit, then the completion verdict
 //
 // A dry run is the default. It dispatches the app's deploy.yml on main, watches only the run it started, and after a
 // green real run pulls the bump commit (`git pull --ff-only`) in the app's checkout. Nothing here refuses a deploy:
 // the hub's gate holds every run to the policy, whoever dispatches it. An away S26 or an offline Mac only earns a
 // note (the S26 delivery will be pending; the iPad lane skipped), and a red last real run earns an offer of
 // `gh run rerun <id> --failed`.
+//
+// `ship` (hub v1.3, TOWE-76) is the one deploy command, and its exit says whether the app shipped: every target the hub
+// policy's `completion` block requires (the S26, the iPad, TestFlight for a store app) holds the version or durably owes
+// it. It encodes no rule of its own: it reads the policy at the hub ref and the completion-out artifact the run's
+// announce job writes (tools/ci/lib/completion.mjs). `deploy` stays the primitive for dry runs and narrowed runs.
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { homedir, hostname } from 'node:os';
-import { join, resolve } from 'node:path';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { homedir, hostname, tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 
@@ -30,7 +38,9 @@ export const levels = Object.freeze(['patch', 'minor', 'major']);
 export const meteredModes = Object.freeze(['auto', 'allow']);
 // Jarad's order, the hub policy's apps (a hub test keeps the two equal).
 export const train = Object.freeze(['delorenj/tower-of-lost-things', 'delorenj/green-in-between', 'delorenj/gruvato', 'AutomaticAI-io/navi', 'delorenj/earshot']);
-const usage = 'Usage: deploy.mjs [train] [--dry-run true|false] [--bump patch|minor|major] [--platform both|android|ios] [--testflight true|false] [--play true|false] [--dry-handoff true|false] [--metered auto|allow] [--workflow deploy.yml] [--hub-ref REF] [--repo owner/repo] [--print]';
+const usage = 'Usage: deploy.mjs [train] [--dry-run true|false] [--bump patch|minor|major] [--platform both|android|ios] [--testflight true|false] [--play true|false] [--dry-handoff true|false] [--metered auto|allow] [--workflow deploy.yml] [--hub-ref REF] [--repo owner/repo] [--print]\n       deploy.mjs ship [--bump patch|minor|major] [--metered auto|allow] [--abandon RUN_ID] [--workflow deploy.yml] [--hub-ref REF] [--repo owner/repo]';
+// What ship never takes: it never narrows a run, never skips its dry run and never turns TestFlight off.
+const notForShip = Object.freeze(['--dry-run', '--platform', '--testflight', '--play', '--dry-handoff', '--print']);
 
 function flag(name, value, fallback) {
   if (value === undefined || value === '') return fallback;
@@ -41,16 +51,18 @@ function flag(name, value, fallback) {
 
 // mise passes every flag, with "" for the ones left unset, so blank means the default.
 export function parseArguments(argv) {
-  const known = ['--dry-run', '--bump', '--platform', '--testflight', '--play', '--dry-handoff', '--metered', '--workflow', '--hub-ref', '--repo'];
+  const known = ['--dry-run', '--bump', '--platform', '--testflight', '--play', '--dry-handoff', '--metered', '--workflow', '--hub-ref', '--repo', '--abandon'];
   const values = {};
   let print = false;
   let mode = 'deploy';
   const args = [...argv];
-  if (args[0] === 'train') { mode = 'train'; args.shift(); }
+  if (args[0] === 'train' || args[0] === 'ship') mode = args.shift();
   for (let index = 0; index < args.length; index += 1) {
     const name = args[index];
+    if (mode === 'ship' && notForShip.includes(name) && (name === '--print' || (args[index + 1] ?? '') !== '')) throw new Error(`ship takes no ${name}: it never narrows, never skips its dry run and never turns TestFlight off; use \`deploy\` for that`);
     if (name === '--print') { print = true; continue; }
     if (!known.includes(name)) throw new Error(`Unknown option ${name}. ${usage}`);
+    if (name === '--abandon' && mode !== 'ship') throw new Error('--abandon is a ship option');
     if (args[index + 1] === undefined) throw new Error(`${name} needs a value`);
     values[name] = args[index + 1];
     index += 1;
@@ -68,6 +80,8 @@ export function parseArguments(argv) {
   const repo = values['--repo'] ?? '';
   if (repo !== '' && !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) throw new Error(`repo must be owner/repo, got "${repo}"`);
   if (mode === 'train' && repo) throw new Error('the train deploys every app in order; drop --repo');
+  const abandon = values['--abandon'] ?? '';
+  if (abandon !== '' && !/^\d{1,20}$/.test(abandon)) throw new Error(`--abandon takes the red real run's id, got "${abandon}"`);
   return {
     mode,
     dryRun: flag('dry-run', values['--dry-run'], true),
@@ -82,6 +96,7 @@ export function parseArguments(argv) {
     hubRef,
     repo,
     print,
+    abandon,
   };
 }
 
@@ -300,20 +315,23 @@ export async function deploy(options, {
   const status = await watchRun(gh, run.databaseId, R, { sleep, log, now, ...watch });
   log(verdictLine(status, run.databaseId, options.dryRun ? 'dry run' : 'real run', run.url, R));
 
-  if (status === 0 && !options.dryRun) {
-    try {
-      const target = options.repo ? { cwd: join(homedir(), 'code', options.repo.split('/')[1]) } : {};
-      if (git(['rev-parse', '--abbrev-ref', 'HEAD'], target).trim() === 'main') {
-        git(['pull', '--ff-only', 'origin', 'main'], target);
-        log('DEPLOY_PULLED the bump commit (git pull --ff-only)');
-      } else {
-        log('DEPLOY_NOTE that checkout is not on main; pull the bump commit there: git pull --ff-only');
-      }
-    } catch (error) {
-      log(`DEPLOY_NOTE git pull --ff-only did not run (${error.message.split('\n')[0]}); pull the bump commit by hand`);
-    }
-  }
+  if (status === 0 && !options.dryRun) pullBump(git, options, log);
   return { run, status };
+}
+
+// After a real run that bumped: the bump commit into the app's checkout (this one, or ~/code/<name> for --repo).
+export function pullBump(git, options, log, prefix = 'DEPLOY') {
+  try {
+    const target = options.repo ? { cwd: join(homedir(), 'code', options.repo.split('/')[1]) } : {};
+    if (git(['rev-parse', '--abbrev-ref', 'HEAD'], target).trim() === 'main') {
+      git(['pull', '--ff-only', 'origin', 'main'], target);
+      log(`${prefix}_PULLED the bump commit (git pull --ff-only)`);
+    } else {
+      log(`${prefix}_NOTE that checkout is not on main; pull the bump commit there: git pull --ff-only`);
+    }
+  } catch (error) {
+    log(`${prefix}_NOTE git pull --ff-only did not run (${error.message.split('\n')[0]}); pull the bump commit by hand`);
+  }
 }
 
 // Tower, Green In Between, Gruvato, Navi, then Earshot, one at a time; the first red run stops the train.
@@ -336,6 +354,271 @@ export async function deployTrain(options, deps, { apps = train, log = deps.log 
   }
   log(`DEPLOY_TRAIN done: ${apps.join(', ')} green`);
   return { results, stopped: null, status: 0 };
+}
+
+// ---------------------------------------------------------------------------------------------------- ship
+
+// ship's one-line verdicts and their exit statuses. 4 and 5 are neither green nor red: something is owed (4), or ship
+// would not start because something has to happen first (5: a real run in flight, or a required lane that cannot run).
+export const shipExit = Object.freeze({ COMPLETE: 0, RED: 1, UNKNOWN: 3, INCOMPLETE: 4, RECOVERY_BLOCKED: 4, BUSY: 5, BLOCKED: 5 });
+export const hubRepo = 'delorenj/mobile-deploy-hub';
+const short = sha => String(sha ?? '').slice(0, 8);
+
+// The paths a hook command names (node tools/testflight.mjs upload ... -> tools/testflight.mjs).
+export const hookScripts = command => [...new Set([...String(command ?? '').matchAll(/(?:^|[\s'"=])((?:[\w.-]+\/)+[\w.-]+\.(?:mjs|cjs|js|ts|sh|py|rb))\b/g)].map(match => match[1]).filter(path => !path.startsWith('/') && !path.split('/').includes('..')))];
+
+// The hook a failure names ("hook ios.store.upload failed (exit 1)"), and its command in a manifest.
+export const failedHook = reason => /\bhook ([a-z]+(?:\.[a-z_]+)+) failed\b/.exec(String(reason ?? ''))?.[1] ?? null;
+export const hookCommand = (manifest, name) => { const found = String(name).split('.').reduce((node, key) => (node && typeof node === 'object' ? node[key] : undefined), manifest); return typeof found === 'string' ? found : null; };
+
+// A frozen-tools failure: the hook that failed runs files that changed on main since the commit the run built. A rerun
+// checks that commit out again, so it would run the same broken tools. The files a hook runs are the scripts its command
+// names and their sibling modules (the same folder), and the command itself when the manifest changed it.
+export function frozenTools({ hook, before, after, changed }) {
+  if (!hook || !before) return null;
+  const scripts = hookScripts(before);
+  const folders = new Set(scripts.map(path => dirname(path)));
+  const touched = (changed ?? []).filter(file => scripts.includes(file) || folders.has(dirname(file)));
+  if (after !== null && after !== undefined && after !== before) touched.push(`the ${hook} command in the manifest`);
+  return touched.length > 0 ? { hook, touched: [...new Set(touched)] } : null;
+}
+
+// The policy's completion rules at the hub ref this app pins (never a copy: ship encodes no rule of its own).
+export function readShipPolicy(gh, hubRef) {
+  try {
+    const policy = JSON.parse(gh(['api', '-H', 'Accept: application/vnd.github.raw', `repos/${hubRepo}/contents/tools/ci/policy.json?ref=${hubRef}`]));
+    const completion = policy?.completion;
+    const reruns = Number.isSafeInteger(completion?.reruns) && completion.reruns >= 0 && completion.reruns <= 3 ? completion.reruns : 0;
+    return { reruns, laneUnavailable: completion?.lane_unavailable === 'skip' ? 'skip' : 'refuse', read: Boolean(completion) };
+  } catch (error) {
+    return { reruns: 0, laneUnavailable: 'refuse', read: false, why: error.message.split('\n')[0] };
+  }
+}
+
+function findFile(dir, name) {
+  let entries = [];
+  try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return null; }
+  for (const entry of entries) {
+    const path = join(dir, entry.name);
+    if (entry.isFile() && entry.name === name) return path;
+    if (entry.isDirectory()) { const found = findFile(path, name); if (found) return found; }
+  }
+  return null;
+}
+
+function receiptsIn(dir, found = {}) {
+  let entries = [];
+  try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return found; }
+  for (const entry of entries) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) receiptsIn(path, found);
+    else if (/^hub-receipt-[\w-]+\.json$/.test(entry.name)) { try { const receipt = JSON.parse(readFileSync(path, 'utf8')); if (receipt?.lane) found[receipt.lane] = receipt; } catch { /* a torn receipt adds nothing */ } }
+  }
+  return found;
+}
+
+// The one command (TOWE-76). Exit statuses: shipExit. Nothing here prompts: running ship is the consent to recover a red
+// last real run with `gh run rerun --failed`, so an agent without a terminal gets the same behaviour as a person.
+export async function ship(options, {
+  gh, git, sleep = ms => new Promise(done => setTimeout(done, ms)), log = console.log, now = Date.now, timeoutMs = 120_000, pollMs = 3000, watch = {},
+  scratch = () => mkdtempSync(join(tmpdir(), 'hub-ship-')),
+}) {
+  const repo = options.repo || gh(['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner']).trim();
+  const R = ['--repo', repo];
+  const finish = (verdict, line, extra = {}) => { log(line); return { status: shipExit[verdict], verdict, line, ...extra }; };
+  const mainSha = () => {
+    const sha = gh(['api', `repos/${repo}/commits/main`, '--jq', '.sha']).trim();
+    if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error(`could not read main from GitHub (got "${sha.slice(0, 60)}")`);
+    return sha;
+  };
+  const readRemote = (path, ref = 'main') => gh(['api', '-H', 'Accept: application/vnd.github.raw', `repos/${repo}/contents/${path}?ref=${ref}`]);
+  const listRuns = () => JSON.parse(gh(['run', 'list', ...R, '--workflow', options.workflow, '--event', 'workflow_dispatch', '--limit', '30', '--json', listFields]) || '[]');
+  const download = (id, artifact, consume) => {
+    const dir = scratch();
+    try {
+      gh(['run', 'download', String(id), ...R, '-n', artifact, '-D', dir]);
+      return consume(dir);
+    } catch { return null; } finally { rmSync(dir, { recursive: true, force: true }); }
+  };
+  const completionOf = id => download(id, 'completion-out', dir => { const file = findFile(dir, 'completion.json'); return file ? JSON.parse(readFileSync(file, 'utf8')) : null; });
+  const state = { realDispatched: false };
+
+  let workflowText = '';
+  try { workflowText = readRemote(`.github/workflows/${options.workflow}`); } catch { /* the gate holds the caller to the template */ }
+  const hubRef = options.hubRef || hubRefFrom(workflowText) || 'v1';
+  const manifestPath = /^\s+manifest:\s*(\S+)\s*$/m.exec(workflowText)?.[1] ?? 'tools/ci/mobile-deploy.json';
+  const policy = readShipPolicy(gh, hubRef);
+  if (!policy.read) log(`SHIP_NOTE could not read the completion policy at ${hubRepo}@${hubRef}${policy.why ? ` (${policy.why})` : ''}: no automatic reruns this time`);
+
+  // What a run left behind: from its completion-out (hub v1.3), else from its plan, lane and deliver receipts and the
+  // plan job's result (a run of an older hub).
+  const inspect = id => {
+    const completion = completionOf(id);
+    if (completion) return { completion, bumped: completion.bumped === true, buildSha: completion.commit ?? null, version: completion.version, failure: completion.failure };
+    let jobs = [];
+    try { jobs = JSON.parse(gh(['api', `repos/${repo}/actions/runs/${id}/jobs?per_page=100`, '--jq', '[.jobs[] | {name, conclusion}]']) || '[]'); } catch { /* the receipts may still say */ }
+    const planJob = jobs.find(job => /(^|\/ )plan$/.test(job.name ?? ''));
+    const receipts = {};
+    for (const artifact of ['plan-out', 'ios-out', 'android-out', 'deliver-ios-out', 'deliver-android-out']) download(id, artifact, dir => receiptsIn(dir, receipts));
+    const plan = receipts.plan;
+    const bumped = plan?.bump?.committed === true || (plan?.outcome !== 'failure' && planJob?.conclusion === 'success');
+    const failed = ['ios', 'android', 'android-release', 'android-play', 'ios-export', 'deliver-ios', 'deliver-android', 'plan', 'gate'].map(lane => receipts[lane]).find(receipt => receipt?.outcome === 'failure');
+    return { completion: null, bumped, buildSha: plan?.sha ?? null, version: plan?.version ?? null, failure: failed ? { job: failed.lane, stage: failed.stage ?? null, reason: failed.reason ?? null } : null };
+  };
+
+  // The verdict of a finished run, from its completion-out.
+  const settle = (run, completion, how = '', older = false) => {
+    if (!completion) return finish('UNKNOWN', `SHIP_UNKNOWN ${repo} run ${run.databaseId} ${run.url}: the run is green but its completion verdict could not be read (gh run download ${run.databaseId} --repo ${repo} -n completion-out)${how}`);
+    if (completion.verdict === 'COMPLETE' || completion.verdict === 'INCOMPLETE') {
+      if (completion.bumped) pullBump(git, options, log, 'SHIP');
+      if (older) log(`SHIP_NOTE ${repo} ${completion.version ?? ''} was recovered; anything newer on main ships with the next \`mise run ship\``);
+      return finish(completion.verdict, `SHIP_${completion.verdict} ${completion.summary} (run ${run.databaseId}${how})`, { run, completion });
+    }
+    return finish('RED', `SHIP_RED ${completion.summary} (run ${run.databaseId}${how})`, { run, completion });
+  };
+
+  // RECOVER: a red real run that spent its version is finished before anything new is shipped (never a second bump for
+  // one failure). A rerun checks the run's own commit out again, so a failure in an app hook whose files changed on main
+  // since is not rerun: the same tools would fail the same way.
+  const recover = async (run, facts, { older = false } = {}) => {
+    const id = run.databaseId;
+    let current = facts;
+    for (let attempt = 1; ; attempt += 1) {
+      const hook = failedHook(current.failure?.reason);
+      if (hook && current.buildSha) {
+        const main = mainSha();
+        let before = null;
+        let after = null;
+        let changed = null;
+        try { before = hookCommand(JSON.parse(readRemote(manifestPath, current.buildSha)), hook); } catch { /* unreadable: judged below */ }
+        try { after = hookCommand(JSON.parse(readRemote(manifestPath, main)), hook); } catch { /* unreadable: not a difference we can show */ }
+        try { changed = JSON.parse(gh(['api', `repos/${repo}/compare/${current.buildSha}...${main}`, '--jq', '[.files[].filename]']) || '[]'); } catch (error) { log(`SHIP_NOTE could not compare ${short(current.buildSha)}...${short(main)} (${error.message.split('\n')[0]}); rerunning`); }
+        const frozen = frozenTools({ hook, before, after, changed });
+        if (frozen) {
+          return finish('RECOVERY_BLOCKED', `SHIP_RECOVERY_BLOCKED ${repo} ${current.version ?? '?'} run ${id}: hook ${hook} failed at ${short(current.buildSha)} and ${frozen.touched.join(', ')} changed on main since (${short(main)}), so a rerun would run the same tools again. Two ways on: (1) the hub's same-version recover with repaired tools (mobile-deploy-hub slice 2, not released yet), or (2) ship a new version that carries main's tools: mise run ship --abandon ${id}`, { run, facts: current });
+        }
+      }
+      if (attempt > policy.reruns) {
+        const owed = `gh run rerun ${id} --repo ${repo} --failed`;
+        const why = current.failure ? `${current.failure.job} failed at ${current.failure.stage ?? '?'}: ${current.failure.reason ?? 'no reason'}` : 'it is red';
+        return finish('RED', `SHIP_RED ${repo} ${current.version ?? '?'} run ${id} ${run.url}: ${why}; ${policy.reruns === 0 ? 'the policy allows no automatic rerun' : `still red after ${policy.reruns} automatic rerun${policy.reruns === 1 ? '' : 's'}`} (same version, same commit). Owed: ${owed}`, { run, facts: current });
+      }
+      let before = 1;
+      try { before = Number(JSON.parse(gh(['api', `repos/${repo}/actions/runs/${id}`, '--jq', '{status,conclusion,run_attempt}'])).run_attempt) || 1; } catch { /* the rerun still happens */ }
+      gh(['run', 'rerun', String(id), ...R, '--failed']);
+      state.realDispatched = true;
+      log(`SHIP_RERUN ${repo} run ${id} failed jobs re-run (${attempt}/${policy.reruns}; same version ${current.version ?? '?'}, same commit)`);
+      // Wait for GitHub to start the new attempt, so the watch does not read the old attempt's verdict.
+      let restarted = false;
+      for (let tries = Math.max(1, Math.ceil(timeoutMs / Math.max(pollMs, 1))); tries > 0 && !restarted; tries -= 1) {
+        await sleep(pollMs);
+        try {
+          const seen = JSON.parse(gh(['api', `repos/${repo}/actions/runs/${id}`, '--jq', '{status,conclusion,run_attempt}']));
+          restarted = Number(seen.run_attempt) > before || seen.status !== 'completed';
+        } catch { /* ask again */ }
+      }
+      if (!restarted) return finish('UNKNOWN', `SHIP_UNKNOWN ${repo} run ${id}: the rerun was asked for, but GitHub shows no new attempt within ${Math.round(timeoutMs / 1000)}s; look at ${run.url}`);
+      const status = await watchRun(gh, id, R, { sleep, log, now, ...watch });
+      if (status === unknownStatus) return finish('UNKNOWN', `SHIP_UNKNOWN ${repo} run ${id} ${run.url}: no verdict from GitHub on the rerun; finish by hand: ${finishByHand(id, R)}`);
+      if (status === 0) return settle(run, completionOf(id), `, recovered by rerun ${attempt}`, older);
+      current = inspect(id);
+    }
+  };
+
+  // ---- 0. precheck: one real run at a time, and a red one that spent its version is recovered first
+  const before = listRuns();
+  const busy = before.filter(run => /\bREAL\b/.test(run.displayTitle ?? '') && run.status !== 'completed').sort((a, b) => b.databaseId - a.databaseId)[0];
+  if (busy) return finish('BUSY', `SHIP_BUSY ${repo}: real run ${busy.databaseId} is ${busy.status} (${busy.url}); ship again when it ends: ${finishByHand(busy.databaseId, R)}`);
+  const last = lastRealRun(before);
+  if (last && last.status === 'completed' && last.conclusion !== 'success') {
+    const ageDays = (now() - Date.parse(last.createdAt ?? '')) / 86_400_000;
+    if (String(last.databaseId) === options.abandon) {
+      log(`SHIP_ABANDON ${repo} run ${last.databaseId} is left as it is (--abandon); this ship is a new version`);
+    } else if (!(ageDays < rerunWindowDays)) {
+      log(`SHIP_NOTE ${repo} run ${last.databaseId} is red and ${Number.isFinite(ageDays) ? `${Math.floor(ageDays)} days old` : 'of unknown age'}, past the ${rerunWindowDays}-day window of its receipts and staging; this ship is a new version`);
+    } else {
+      const facts = inspect(last.databaseId);
+      if (facts.bumped) {
+        log(`SHIP_RECOVER ${repo} run ${last.databaseId} spent ${facts.version ?? 'its version'} and is red${facts.failure ? ` (${facts.failure.job} at ${facts.failure.stage ?? '?'}: ${facts.failure.reason ?? '-'})` : ''}: finishing that version first, no new bump`);
+        try { return await recover(last, facts, { older: true }); } catch (error) {
+          if (state.realDispatched) return finish('UNKNOWN', `SHIP_UNKNOWN ${repo} run ${last.databaseId}: ${error.message.split('\n')[0]}`);
+          throw error;
+        }
+      }
+      log(`SHIP_NOTE ${repo} run ${last.databaseId} is red before its bump (nothing was spent); this ship is a new version`);
+    }
+  }
+
+  // A Mac that GitHub shows offline makes the gate skip the iPad lane; with lane_unavailable: refuse there is no point
+  // in a dry run that would only prove it.
+  const lanes = lanesFrom(workflowText, path => readRemote(path));
+  if (lanes.ios && policy.laneUnavailable === 'refuse') {
+    try {
+      const runners = JSON.parse(gh(['api', `repos/${repo}/actions/runners`, '--jq', '[.runners[] | {name, status, labels: [.labels[].name]}]']) || '[]');
+      const macs = runners.filter(runner => runner.labels.some(label => label.toLowerCase() === 'macos'));
+      if (!macs.some(runner => runner.status === 'online')) {
+        return finish('BLOCKED', `SHIP_BLOCKED ${repo}: ${macs.length === 0 ? 'no macOS runner is registered' : `the Mac runner (${macs.map(runner => runner.name).join(', ')}) is offline`}, so the iPad lane would not run and the iPad (and TestFlight, for a store app) would be owed; bring the Mac online and ship again. No version was spent`);
+      }
+    } catch (error) {
+      log(`SHIP_NOTE could not read the runners of ${repo} (${error.message.split('\n')[0]}); the gate decides the iPad lane`);
+    }
+  }
+
+  // One dispatch on main, the run it started, and its verdict.
+  const dispatchAndWatch = async ({ dryRun, sha }) => {
+    const after = newestId(listRuns());
+    log(`SHIP_DISPATCH ${repo} ${dryRun ? 'dry run (dry_handoff)' : 'REAL run'} bump=${options.bump} metered=${options.metered} main=${short(sha)} hub=${hubRef} (TestFlight: the gate's)`);
+    gh(dispatchArguments({ workflow: options.workflow, dryRun, bump: options.bump, platform: 'both', testflight: false, play: false, dryHandoff: dryRun, metered: options.metered, repo }));
+    if (!dryRun) state.realDispatched = true;
+    let started = [];
+    for (let tries = Math.max(1, Math.ceil(timeoutMs / Math.max(pollMs, 1))); tries > 0 && started.length === 0; tries -= 1) {
+      await sleep(pollMs);
+      started = newRuns(listRuns(), { after, sha });
+    }
+    if (started.length === 0) throw new Error(`no new ${options.workflow} run on ${short(sha)} appeared within ${Math.round(timeoutMs / 1000)}s of the ${dryRun ? 'dry' : 'real'} dispatch (did main move?); look at the Actions tab`);
+    if (started.length > 1) throw new Error(`more than one new run started (${started.map(run => run.url).join(', ')}); another dispatch raced this one`);
+    const [run] = started;
+    log(`SHIP_RUN ${run.databaseId} ${dryRun ? 'dry run' : 'real run'} ${run.url}`);
+    const status = await watchRun(gh, run.databaseId, R, { sleep, log, now, ...watch });
+    log(verdictLine(status, run.databaseId, dryRun ? 'dry run' : 'real run', run.url, R));
+    return { run, status };
+  };
+
+  try {
+    // ---- 1. dry: the whole run on main's tip with the Mac handoff, nothing spent; again if main moves before the real run
+    let sha = mainSha();
+    for (let round = 1; ; round += 1) {
+      const dry = await dispatchAndWatch({ dryRun: true, sha });
+      const id = dry.run.databaseId;
+      if (dry.status === unknownStatus) return finish('UNKNOWN', `SHIP_UNKNOWN ${repo} dry run ${id} ${dry.run.url}: no verdict from GitHub; no version was spent. Finish by hand: ${finishByHand(id, R)}`);
+      const proof = completionOf(id);
+      if (dry.status !== 0) return finish('RED', `SHIP_RED stage=dry ${repo} run ${id} ${dry.run.url}: ${proof?.failure ? `${proof.failure.job} failed at ${proof.failure.stage}: ${proof.failure.reason}` : 'the dry run is red'}; no version was spent`, { run: dry.run, completion: proof });
+      if (!proof) return finish('UNKNOWN', `SHIP_UNKNOWN ${repo} dry run ${id} ${dry.run.url}: green, but its completion verdict could not be read (gh run download ${id} --repo ${repo} -n completion-out); no version was spent`);
+      if (proof.verdict !== 'COMPLETE') {
+        const owed = (proof.owed ?? []).map(item => `${item.target} ${item.status}: ${item.why} (${item.command})`).join('; ');
+        return finish('BLOCKED', `SHIP_BLOCKED ${repo} dry run ${id}: a real run would leave required targets owed: ${owed || proof.summary}. No version was spent`, { run: dry.run, completion: proof });
+      }
+      const tip = mainSha();
+      if (tip === sha) break;
+      if (round >= 3) return finish('BLOCKED', `SHIP_BLOCKED ${repo}: main moved during each of ${round} dry runs (now ${short(tip)}); ship again when it settles. No version was spent`);
+      log(`SHIP_REDRY main moved from ${short(sha)} to ${short(tip)} after dry run ${id}; the real run builds only a proven commit, so it is proved again`);
+      sha = tip;
+    }
+
+    // ---- 2. real, on the commit the dry run proved
+    const real = await dispatchAndWatch({ dryRun: false, sha });
+    const id = real.run.databaseId;
+    if (real.status === unknownStatus) return finish('UNKNOWN', `SHIP_UNKNOWN ${repo} real run ${id} ${real.run.url}: no verdict from GitHub, so this is neither shipped nor red; finish by hand: ${finishByHand(id, R)}`);
+    if (real.status === 0) return settle(real.run, completionOf(id));
+    const facts = inspect(id);
+    if (facts.completion?.blocked) return finish('BLOCKED', `SHIP_BLOCKED ${repo} real run ${id}: the gate refused it (${facts.failure?.reason ?? 'a required lane would not run'}). No version was spent`, { run: real.run, completion: facts.completion });
+    if (!facts.bumped) return finish('RED', `SHIP_RED ${repo} real run ${id} ${real.run.url}: ${facts.failure ? `${facts.failure.job} failed at ${facts.failure.stage ?? '?'}: ${facts.failure.reason ?? '-'}` : 'it is red'}, before the bump; no version was spent`, { run: real.run, completion: facts.completion });
+    log(`SHIP_RECOVER ${repo} real run ${id} spent ${facts.version ?? 'its version'} and is red: recovering it`);
+    return await recover(real.run, facts);
+  } catch (error) {
+    if (state.realDispatched) return finish('UNKNOWN', `SHIP_UNKNOWN ${repo}: ${error.message.split('\n')[0]}; a real run may be in flight, look at the Actions tab before shipping again`);
+    throw error;
+  }
 }
 
 // gh and git as child processes: stdout back, and a throw with the tail of stderr.
@@ -366,7 +649,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   try {
     const options = parseArguments(process.argv.slice(2));
     const deps = { gh: realGh, git: realGit, adb: realAdb, prompt: process.stdin.isTTY ? terminalPrompt : null };
-    const result = options.mode === 'train' ? await deployTrain(options, deps) : await deploy(options, deps);
+    const result = options.mode === 'train' ? await deployTrain(options, deps) : options.mode === 'ship' ? await ship(options, deps) : await deploy(options, deps);
     process.exitCode = result.status ?? 0;
   } catch (error) {
     console.error(`::error::${error.message}`);
