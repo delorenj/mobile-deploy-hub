@@ -191,6 +191,62 @@ test('the ios lane builds and checks the store IPA through the hook; a hook that
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+// ---------------------------------------------------------------------------------------------------- state before upload
+
+import { parseStoreState, testflightStep } from './commands/ios.mjs';
+
+// The ios lane's TestFlight step with the app's hooks faked: `state` answers ios.store.state, `fail` names a hook to fail.
+function storeRig({ state = null, fail = null, dryRun = false } = {}) {
+  const spec = parseManifest(macOnly(m => { if (state !== null) m.ios.store.state = 'node tools/testflight.mjs state'; })).ios;
+  const calls = [];
+  const logs = [];
+  const runHook = name => { calls.push(name); if (name === fail) throw new Error(`hook ${name} failed (exit 1)`); };
+  const runOutput = name => { calls.push(name); if (name === fail) throw new Error(`hook ${name} failed (exit 1)`); return typeof state === 'function' ? state() : `${JSON.stringify(state)}\n`; };
+  const store = { status: 'checked', version: '1.2.3', build: '55', uploaded: null, state: null, reason: null };
+  const step = () => testflightStep({ spec, config: { dryRun, cwd: '/tmp' }, store, hooks: {}, log: line => logs.push(line), runHook, runOutput });
+  return { step, calls, logs, store };
+}
+
+test('a build App Store Connect already has is not uploaded again: upload is skipped, assign still runs', () => {
+  const rig = storeRig({ state: { present: true, version: '1.2.3', build: '55', state: 'VALID' } });
+  assert.match(rig.step(), /already in App Store Connect \(ios\.store\.state\); assigned to Owner Testing/);
+  assert.deepEqual(rig.calls, ['ios.store.state', 'ios.store.assign'], 'no second Apple upload on a rerun');
+  assert.deepEqual([rig.store.status, rig.store.uploaded, rig.store.state], ['assigned', 'earlier', 'VALID']);
+  assert.ok(rig.logs.some(line => /^HUB_TESTFLIGHT_ALREADY_UPLOADED 1\.2\.3 \(55\) is in App Store Connect \(VALID\); upload skipped, assign runs$/.test(line)));
+});
+
+test('a build App Store Connect does not have is uploaded, then assigned; an app without ios.store.state behaves as before', () => {
+  const absent = storeRig({ state: { present: false } });
+  assert.match(absent.step(), /^uploaded and assigned to Owner Testing/);
+  assert.deepEqual(absent.calls, ['ios.store.state', 'ios.store.upload', 'ios.store.assign']);
+  assert.deepEqual([absent.store.status, absent.store.uploaded], ['assigned', 'run']);
+  const plain = storeRig();
+  plain.step();
+  assert.deepEqual(plain.calls, ['ios.store.upload', 'ios.store.assign']);
+});
+
+test('a dry run asks App Store Connect (proving the hook) and never uploads or assigns', () => {
+  const rig = storeRig({ state: { present: false }, dryRun: true });
+  assert.match(rig.step(), /^dry run: App Store Connect does not have 1\.2\.3 \(55\); upload and assign were not called$/);
+  assert.deepEqual(rig.calls, ['ios.store.state']);
+  assert.equal(rig.store.status, 'checked');
+});
+
+test('an unclear answer from ios.store.state fails the step (stage deliver) instead of guessing, and a failed hook is recorded', () => {
+  const other = storeRig({ state: { present: true, version: '1.2.3', build: '54' } });
+  assert.throws(() => other.step(), /answered for 1\.2\.3 \(54\), not the planned 1\.2\.3 \(55\)/);
+  assert.deepEqual(other.calls, ['ios.store.state']);
+  assert.equal(other.store.status, 'failed');
+  const garbage = storeRig({ state: () => 'processing...\n' });
+  assert.throws(() => garbage.step(), /must print one line of JSON/);
+  assert.throws(() => parseStoreState('{"version":"1.2.3"}', { version: '1.2.3', build: '55' }), /must answer \{"present": true\|false/);
+  assert.deepEqual(parseStoreState('log line\n{"present":false}\n', { version: '1.2.3', build: '55' }), { present: false, state: null }, 'the last line is the answer');
+  const upload = storeRig({ state: { present: false }, fail: 'ios.store.upload' });
+  assert.throws(() => upload.step(), /hook ios\.store\.upload failed/);
+  assert.deepEqual(upload.calls, ['ios.store.state', 'ios.store.upload'], 'assign never runs after a failed upload');
+  assert.deepEqual([upload.store.status, upload.store.reason], ['failed', 'hook ios.store.upload failed (exit 1)']);
+});
+
 // ---------------------------------------------------------------------------------------------------- the watch
 
 import { deploy, finishByHand, parseArguments, unknownStatus, verdictLine, watchRun } from '../deploy.mjs';

@@ -5,6 +5,9 @@
 // readback still gets its IPA published (device failed), as Android does; the link is read again on the Mac right
 // before the IPA is sent; the send resumes a broken transfer (--partial-dir) and counts the bytes of failed attempts;
 // a TestFlight upload that fails is reported at stage deliver, with the iPad's own delivery unchanged.
+// v1.3 (TOWE-76): the receipt carries TestFlight as its own status (`store`: checked, assigned or failed, and who
+// uploaded), and an app that declares ios.store.state is asked first whether App Store Connect already has the planned
+// (version, build): if it does, upload is skipped and assign still runs, so a rerun never uploads twice.
 import { copyFileSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -13,7 +16,7 @@ import { exportIpa, inspectIpa } from '../lib/apple.mjs';
 import { hookEnvironment } from '../lib/config.mjs';
 import { createDevicectl, createIpad } from '../lib/devicectl.mjs';
 import { loadDevices } from '../lib/devices.mjs';
-import { hook, runBounded } from '../lib/exec.mjs';
+import { hook, hookOutput, runBounded } from '../lib/exec.mjs';
 import { rememberCheckout } from '../lib/git.mjs';
 import { handoffFolder, receiveHandoff, repoFolder, retried, sendHandoffDelta } from '../lib/handoff.mjs';
 import { compareBuild, compareSemver, ipaName } from '../lib/latest.mjs';
@@ -131,6 +134,54 @@ export function sendIpa({ ipa, name, devices, env, runner, log, sleep }) {
   const stats = parseRsyncStats(out);
   if (failed > 0) log(`HUB_MAC_BYTES_RETRIED ${failed} bytes moved by failed IPA attempts (kept as a partial and resumed)`);
   return { out: (stats.sent ?? statSync(ipa).size) + failed, in: stats.received ?? 0, failed };
+}
+
+// The store hooks the ios lane runs (a seam for tests: the hooks are the app's own tools).
+export const storeHooks = { run: hook, output: hookOutput };
+
+// ios.store.state: one line of JSON on stdout, {"present": true|false, "version": "X.Y.Z", "build": "N", "state": "..."},
+// for the planned HUB_VERSION and HUB_IOS_BUILD. present means App Store Connect already has that exact (version, build):
+// the upload is skipped and assign still runs. An answer about another build, or no answer, is a failure (stage deliver):
+// guessing could upload twice or skip an upload that never happened.
+export function parseStoreState(text, { version, build }) {
+  const line = String(text ?? '').trim().split('\n').filter(Boolean).pop() ?? '';
+  let answer;
+  try { answer = JSON.parse(line); } catch { throw new Error(`hook ios.store.state must print one line of JSON ({"present": true|false, "version", "build"}), got ${JSON.stringify(line.slice(0, 80))}`); }
+  if (!answer || typeof answer !== 'object' || Array.isArray(answer) || typeof answer.present !== 'boolean') throw new Error('hook ios.store.state must answer {"present": true|false, ...}');
+  if (answer.state !== undefined && answer.state !== null && (typeof answer.state !== 'string' || answer.state.length > 60)) throw new Error('hook ios.store.state: state must be a short string');
+  if (answer.present && (String(answer.version) !== String(version) || String(answer.build) !== String(build))) {
+    throw new Error(`hook ios.store.state answered for ${answer.version} (${answer.build}), not the planned ${version} (${build})`);
+  }
+  return { present: answer.present, state: answer.state ?? null };
+}
+
+// The TestFlight step of the ios lane: ios.store.state (when the app declares it), then, on a real run, upload unless
+// App Store Connect already has the build, then assign. `store` is the receipt's TestFlight record, updated in place so
+// a failure receipt carries how far it got. Returns the receipt's one-line note.
+export function testflightStep({ spec, config, store, storeIpa = null, hooks, log = console.log, runHook = storeHooks.run, runOutput = storeHooks.output }) {
+  const built = storeIpa ? `the App Store IPA ${storeIpa.version} (${storeIpa.build}) is built and checked; ` : '';
+  try {
+    let known = null;
+    if (spec.store.state) {
+      known = parseStoreState(runOutput('ios.store.state', spec.store.state, { cwd: config.cwd, env: hooks }), { version: store.version, build: store.build });
+      store.state = known.state;
+      log(`HUB_TESTFLIGHT_STATE ${store.version} (${store.build}) ${known.present ? `is in App Store Connect${known.state ? ` (${known.state})` : ''}` : 'is not in App Store Connect yet'}`);
+    }
+    if (config.dryRun) return `dry run: ${built}${known ? `App Store Connect ${known.present ? 'has' : 'does not have'} ${store.version} (${store.build}); ` : ''}upload and assign were not called`;
+    if (known?.present) {
+      store.uploaded = 'earlier';
+      log(`HUB_TESTFLIGHT_ALREADY_UPLOADED ${store.version} (${store.build}) is in App Store Connect${known.state ? ` (${known.state})` : ''}; upload skipped, assign runs`);
+    } else {
+      runHook('ios.store.upload', spec.store.upload, { cwd: config.cwd, env: hooks });
+      store.uploaded = 'run';
+    }
+    runHook('ios.store.assign', spec.store.assign, { cwd: config.cwd, env: hooks });
+    store.status = 'assigned';
+    return store.uploaded === 'earlier' ? 'already in App Store Connect (ios.store.state); assigned to Owner Testing by the app hooks' : 'uploaded and assigned to Owner Testing by the app hooks';
+  } catch (error) {
+    Object.assign(store, { status: 'failed', reason: firstLine(error.message).replace(/^::error::/, '').slice(0, 300) });
+    throw error;
+  }
 }
 
 export async function ios(config, { env = process.env, home = homedir(), log = console.log, runner = runBounded, sleep, now, linkNow = null } = {}) {
@@ -289,21 +340,15 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
       }
       // Publishing, not the device: a failed upload or assign is reported at stage deliver and the iPad keeps its status.
       track.stage = 'deliver';
-      const built = storeIpa ? `the App Store IPA ${storeIpa.version} (${storeIpa.build}) is built and checked; ` : '';
-      if (config.dryRun) {
-        testflight = `dry run: ${built}upload and assign were not called`;
-      } else {
-        hook('ios.store.upload', spec.store.upload, { cwd: config.cwd, env: hooks });
-        hook('ios.store.assign', spec.store.assign, { cwd: config.cwd, env: hooks });
-        testflight = 'uploaded and assigned to Owner Testing by the app hooks';
-      }
+      track.receipt.store = { status: 'checked', version: config.version, build: storeIpa?.build ?? (config.iosBuild || null), uploaded: null, state: null, reason: null };
+      testflight = testflightStep({ spec, config, store: track.receipt.store, storeIpa, hooks, log });
       notes.push(`TestFlight: ${testflight}`);
       if (storeIpa) log(`HUB_TESTFLIGHT ${config.dryRun ? 'DRY RUN' : 'UPLOADED'} ${storeIpa.bundle} ${storeIpa.version} (${storeIpa.build}) sha256=${short(storeIpa.sha256)}`);
     }
     if (!config.dryRun) {
       try { installCurrent({ hubRef: env.HUB_REF, home, log }); } catch (error) { log(`::warning::could not refresh the catch-up code (${firstLine(error.message)})`); }
     }
-    await writeReceipt(out, buildReceipt({ lane: 'ios', config, env, version: config.version, build: delivery.build, notes, delivery, ipa: ipa ? receiptIpa(ipa) : null, testflight, store_ipa: storeIpa ? receiptStoreIpa(storeIpa) : null, mac_bytes: macBytes }), env);
+    await writeReceipt(out, buildReceipt({ lane: 'ios', config, env, version: config.version, build: delivery.build, notes, delivery, ipa: ipa ? receiptIpa(ipa) : null, testflight, store: track.receipt.store ?? null, store_ipa: storeIpa ? receiptStoreIpa(storeIpa) : null, mac_bytes: macBytes }), env);
     return { out, delivery, ipa, notes, macBytes };
   });
 }
