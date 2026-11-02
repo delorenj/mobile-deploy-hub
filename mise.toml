@@ -94,6 +94,20 @@ flag "--metered <metered>" default="auto"
 '''
 run = 'node tools/deploy.mjs --repo "$usage_repo" --dry-run "$usage_dry_run" --bump "$usage_bump" --platform "$usage_platform" --testflight "$usage_testflight" --play "$usage_play" --dry-handoff "$usage_dry_handoff" --metered "$usage_metered"'
 
+# The one command (TOWE-76): recover a red last real run first, else dry run, then the real run on the same commit, then
+# the completion verdict from the run's completion-out artifact. Exit 0 only when every required target is installed or
+# durably pending (and TestFlight assigned for a store app); 4 owes something and says the command, 1 red, 3 unknown,
+# 5 busy or blocked. No --platform, --testflight or --dry-run: ship never narrows.
+[tasks."ship"]
+description = "Ship one app from here, the way the apps' own `mise run ship` does: mise run ship --repo delorenj/gruvato [--bump minor] [--metered allow] [--abandon RUN_ID]"
+usage = '''
+flag "--repo <repo>"
+flag "--bump <bump>" default=""
+flag "--metered <metered>" default="auto"
+flag "--abandon <abandon>" default=""
+'''
+run = 'node tools/deploy.mjs ship --repo "$usage_repo" --bump "$usage_bump" --metered "$usage_metered" --abandon "$usage_abandon"'
+
 [tasks."deploy:train"]
 description = "Deploy Tower, then Green In Between, then Gruvato, one at a time; stops at the first red run"
 usage = '''

@@ -6,11 +6,14 @@
 //   - no other workflow references the hub at any ref (its reusable workflow or its actions/hub action: a second
 //     caller would run hub code without the gate) or uploads builds (gh release create or upload, altool, TestFlight
 //     uploads, APK/IPA artifacts);
-//   - no mise task tags v*, bumps the version or announces a deploy (the task's run text and the scripts it runs).
+//   - no mise task tags v*, bumps the version or announces a deploy (the task's run text and the scripts it runs);
+//   - a `ship` task, when the app has one, is the hub's own text (templates/mise-ship.toml). v1.3 accepts it and does
+//     not require it yet; a later release requires it once every app carries it.
 // GitHub Free has no rulesets for these private repos, so this (also run by every deploy's gate on its own checkout),
 // the global pre-commit guard and the event's hub_ref are what make a deploy around the hub visible. Exceptions are
 // listed below with the reason, the form they must keep and when they end.
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { callerHash } from './ci/lib/caller.mjs';
@@ -110,6 +113,17 @@ export function checkTasks(repo, mise, readScript) {
   return problems;
 }
 
+// The app-side `ship` task (TOWE-76): the template's text, comment lines and indentation aside. Absent is accepted.
+export const shipTemplateFile = fileURLToPath(new URL('../templates/mise-ship.toml', import.meta.url));
+const taskText = body => String(body ?? '').split('\n').map(line => line.trim()).filter(line => line !== '' && !line.startsWith('#')).join('\n');
+export function checkShipTask(repo, mise, template = readFileSync(shipTemplateFile, 'utf8')) {
+  const found = miseTasks(mise).find(task => task.name === 'ship');
+  if (!found) return [];
+  const expected = miseTasks(template).find(task => task.name === 'ship');
+  if (!expected) throw new Error(`${shipTemplateFile} has no [tasks."ship"] block`);
+  return taskText(found.body) === taskText(expected.body) ? [] : [`${repo} mise task ship: not the hub's ship task (templates/mise-ship.toml); copy it verbatim, only comments may differ`];
+}
+
 export function checkApp({ repo, app, policy, read, list }) {
   const problems = [];
   try {
@@ -128,6 +142,7 @@ export function checkApp({ repo, app, policy, read, list }) {
   let mise = '';
   try { mise = read('mise.toml'); } catch { /* an app without mise tasks has nothing to check */ }
   problems.push(...checkTasks(repo, mise, read));
+  problems.push(...checkShipTask(repo, mise));
   return problems;
 }
 

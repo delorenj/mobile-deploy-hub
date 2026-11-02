@@ -262,3 +262,73 @@ test('frozenTools: the hook\'s scripts and their sibling modules, or a changed c
   assert.equal(frozenTools({ hook: 'ios.store.upload', before, after: before, changed: ['docs/ios.md', 'tools/ci/other.mjs'] }), null, 'only the hook\'s own folder');
   assert.deepEqual(frozenTools({ hook: 'ios.store.upload', before, after: 'node tools/upload.mjs', changed: [] }).touched, ['the ios.store.upload command in the manifest']);
 });
+
+// ---------------------------------------------------------------------------------------------------- the app-side task
+
+import { spawnSync } from 'node:child_process';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { checkApp, checkShipTask, miseTasks, shipTemplateFile } from '../conformance.mjs';
+import { templateFile } from './lib/caller.mjs';
+import { loadPolicy } from './lib/policy.mjs';
+
+const hubRoot = fileURLToPath(new URL('../../', import.meta.url));
+const shipTemplate = readFileSync(shipTemplateFile, 'utf8');
+const runText = /\nrun = '''\n([\s\S]*?)\n'''/.exec(shipTemplate)[1];
+
+test('templates/mise-ship.toml fetches deploy.mjs at the pinned ref exactly as the deploy task does, then runs ship', () => {
+  const [task] = miseTasks(shipTemplate);
+  assert.equal(task.name, 'ship');
+  assert.match(runText, /^ref="\$\(sed -n 's#\^ \*uses: delorenj\/mobile-deploy-hub\/\\\.github\/workflows\/mobile-deploy\\\.yml@\\\(\[A-Za-z0-9\._\/-\]\*\\\)\$#\\1#p' \.github\/workflows\/deploy\.yml\)"$/m);
+  assert.match(runText, /^gh api -H 'Accept: application\/vnd\.github\.raw' "repos\/delorenj\/mobile-deploy-hub\/contents\/tools\/deploy\.mjs\?ref=\$ref" > "\$tool\/deploy\.mjs"$/m);
+  assert.match(runText, /^node "\$tool\/deploy\.mjs" ship --bump "\$usage_bump" --metered "\$usage_metered" --abandon "\$usage_abandon" --hub-ref "\$ref"$/m);
+  assert.doesNotMatch(shipTemplate, /--platform|--testflight|--dry-run/, 'ship never narrows');
+  // What mise hands it, blanks included, parses.
+  assert.equal(parseArguments(['ship', '--bump', '', '--metered', 'auto', '--abandon', '', '--hub-ref', 'v1']).mode, 'ship');
+});
+
+test('the task text, run as mise runs it against a fake gh, fetches the hub\'s deploy.mjs and exits with ship\'s status', () => {
+  const root = mkdtempSync(join(tmpdir(), 'hub-ship-task-'));
+  try {
+    const app = join(root, 'app');
+    const bin = join(root, 'bin');
+    mkdirSync(join(app, '.github/workflows'), { recursive: true });
+    mkdirSync(bin);
+    writeFileSync(join(app, '.github/workflows/deploy.yml'), readFileSync(templateFile, 'utf8'));
+    const busy = JSON.stringify([{ databaseId: 9, headSha: A, event: 'workflow_dispatch', status: 'in_progress', conclusion: null, createdAt: '2026-11-02T19:00:00Z', url: `https://github.com/${repo}/actions/runs/9`, displayTitle: 'Deploy REAL both bump=patch' }]);
+    writeFileSync(join(bin, 'gh'), `#!/bin/sh
+echo "gh $*" >> "${root}/gh.log"
+case "$*" in
+  *"mobile-deploy-hub/contents/tools/deploy.mjs?ref=v1") cat "${hubRoot}tools/deploy.mjs" ;;
+  *"mobile-deploy-hub/contents/tools/ci/policy.json?ref=v1") cat "${hubRoot}tools/ci/policy.json" ;;
+  *"contents/.github/workflows/deploy.yml?ref=main") cat "${app}/.github/workflows/deploy.yml" ;;
+  *"contents/tools/ci/mobile-deploy.json?ref=main") echo '{"schema":2,"android":{},"ios":{}}' ;;
+  "repo view"*) echo ${repo} ;;
+  "run list"*) echo '${busy}' ;;
+  *) echo "fake gh: unexpected $*" >&2; exit 1 ;;
+esac
+`);
+    chmodSync(join(bin, 'gh'), 0o755);
+    const result = spawnSync('sh', ['-c', runText], { cwd: app, encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, usage_bump: '', usage_metered: 'auto', usage_abandon: '' } });
+    assert.equal(result.status, 5, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /^SHIP_BUSY delorenj\/tower-of-lost-things: real run 9 is in_progress/m);
+    const calls = readFileSync(join(root, 'gh.log'), 'utf8');
+    assert.match(calls, /^gh api -H Accept: application\/vnd\.github\.raw repos\/delorenj\/mobile-deploy-hub\/contents\/tools\/deploy\.mjs\?ref=v1$/m, 'the ref deploy.yml pins');
+    assert.doesNotMatch(calls, /workflow run|run rerun/, 'busy dispatches nothing');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('conformance accepts the template ship task and does not yet require it; a ship task that is not the template is refused', () => {
+  const { policy } = loadPolicy();
+  const app = policy.apps[repo];
+  const tower = { schema: 2, project: { slug: 'tower-of-lost-things', name: 'Tower' }, version: { read: 'true', bump: 'true' }, android: { package: app.android.package, export: 'true', artifact: 'a/App.apk', signer_sha256: app.android.signer_sha256 }, ios: { bundle: app.ios.bundle, device: 'true', device_artifact: 'A.xcarchive' } };
+  const deployTask = '[tasks."deploy"]\nrun = \'\'\'\nnode "$tool/deploy.mjs" --dry-run "$usage_dry_run"\n\'\'\'\n';
+  const files = mise => ({ '.github/workflows/deploy.yml': readFileSync(templateFile, 'utf8'), 'tools/ci/mobile-deploy.json': JSON.stringify(tower), 'mise.toml': mise });
+  const open = mise => ({ read: path => { const all = files(mise); if (!(path in all)) throw Object.assign(new Error('404'), { code: 'ENOENT' }); return all[path]; }, list: () => ['.github/workflows/deploy.yml'] });
+  assert.deepEqual(checkApp({ repo, app, policy, ...open(`${deployTask}\n# Tower's own words about shipping\n${shipTemplate.replace(/^# .*\n/gm, '')}`) }), [], 'the template, comments aside');
+  assert.deepEqual(checkApp({ repo, app, policy, ...open(deployTask) }), [], 'not required yet');
+  const edited = shipTemplate.replace('--metered "$usage_metered" ', '');
+  assert.deepEqual(checkShipTask(repo, edited), [`${repo} mise task ship: not the hub's ship task (templates/mise-ship.toml); copy it verbatim, only comments may differ`]);
+  assert.ok(checkApp({ repo, app, policy, ...open(`${deployTask}${edited}`) }).some(problem => /mise task ship: not the hub's ship task/.test(problem)));
+});

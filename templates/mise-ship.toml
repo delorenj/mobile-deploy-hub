@@ -1,0 +1,21 @@
+# The ship task of delorenj/mobile-deploy-hub (templates/mise-ship.toml). Copy this block into the app's mise.toml next
+# to the `deploy` task; only comment lines may differ (hub conformance compares the task's text). It fetches the hub's
+# tools/deploy.mjs at the ref .github/workflows/deploy.yml pins, exactly as `deploy` does, and runs `ship`: it finishes a
+# red last real run first (rerun, same version), else a dry run, then the real run on the same commit, then the
+# completion verdict. One line ends it: SHIP_COMPLETE (0), SHIP_INCOMPLETE with what is owed and the command (4),
+# SHIP_RED (1), SHIP_UNKNOWN (3), SHIP_BLOCKED or SHIP_BUSY (5). It never narrows and never turns TestFlight off.
+[tasks."ship"]
+description = "Ship a new version to every required target through mobile-deploy-hub (dry run, real run on the same commit, completion verdict); exits 0 only when shipped"
+usage = '''
+flag "--bump <bump>" default=""
+flag "--metered <metered>" default="auto"
+flag "--abandon <abandon>" default=""
+'''
+run = '''
+ref="$(sed -n 's#^ *uses: delorenj/mobile-deploy-hub/\.github/workflows/mobile-deploy\.yml@\([A-Za-z0-9._/-]*\)$#\1#p' .github/workflows/deploy.yml)"
+[ -n "$ref" ] || { echo "ship: .github/workflows/deploy.yml has no mobile-deploy-hub uses: line" >&2; exit 1; }
+tool="$(mktemp -d)"
+trap 'rm -rf "$tool"' EXIT
+gh api -H 'Accept: application/vnd.github.raw' "repos/delorenj/mobile-deploy-hub/contents/tools/deploy.mjs?ref=$ref" > "$tool/deploy.mjs"
+node "$tool/deploy.mjs" ship --bump "$usage_bump" --metered "$usage_metered" --abandon "$usage_abandon" --hub-ref "$ref"
+'''
