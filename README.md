@@ -1,5 +1,7 @@
 # Mobile Deploy Hub
 
+Feature list: [docs/features.md](docs/features.md).
+
 One deploy contract for Jarad's mobile apps: Tower of Lost Things (`tower-of-lost-things`, renamed from `pile-of-dumb-things` on 2026-10-09; the S3 build folder moved with it), Green In Between (`green-in-between`) and Gruvato (`gruvato`). The hub is a library: one reusable workflow, one composite action, a Node tool and one policy file. Each app calls it from `.github/workflows/deploy.yml`, a verbatim copy of [`templates/deploy.yml`](templates/deploy.yml) pinned to the floating `@v1`, and the jobs run on the app's own repo-scoped runners (big-chungus for Linux, the Mac for macOS). The hub has no runners, no secrets and no CI of its own. Design: [docs/design-hub-v1.1.md](docs/design-hub-v1.1.md) (v1.0: [docs/design-hub-v3.md](docs/design-hub-v3.md), v2 history: [docs/design-hub-v2.md](docs/design-hub-v2.md)).
 
 ## Deploy
