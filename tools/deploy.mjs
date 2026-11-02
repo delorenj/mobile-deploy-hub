@@ -556,9 +556,12 @@ export async function ship(options, {
     try {
       const runners = JSON.parse(gh(['api', `repos/${repo}/actions/runners`, '--jq', '[.runners[] | {name, status, labels: [.labels[].name]}]']) || '[]');
       const macs = runners.filter(runner => runner.labels.some(label => label.toLowerCase() === 'macos'));
-      if (!macs.some(runner => runner.status === 'online')) {
-        return finish('BLOCKED', `SHIP_BLOCKED ${repo}: ${macs.length === 0 ? 'no macOS runner is registered' : `the Mac runner (${macs.map(runner => runner.name).join(', ')}) is offline`}, so the iPad lane would not run and the iPad (and TestFlight, for a store app) would be owed; bring the Mac online and ship again. No version was spent`);
+      // Only a Mac runner GitHub lists for this repository and shows offline is proof; none listed may be an
+      // organisation's runner this call cannot see, so the gate decides.
+      if (macs.length > 0 && !macs.some(runner => runner.status === 'online')) {
+        return finish('BLOCKED', `SHIP_BLOCKED ${repo}: the Mac runner (${macs.map(runner => runner.name).join(', ')}) is offline, so the iPad lane would not run and the iPad (and TestFlight, for a store app) would be owed; bring the Mac online and ship again. No version was spent`);
       }
+      if (macs.length === 0) log(`SHIP_NOTE ${repo} lists no macOS runner of its own; the gate decides the iPad lane`);
     } catch (error) {
       log(`SHIP_NOTE could not read the runners of ${repo} (${error.message.split('\n')[0]}); the gate decides the iPad lane`);
     }

@@ -69,7 +69,7 @@ export function testflightDelivery(tf, { version, build }) {
   return delivery;
 }
 
-function deviceTarget({ platform, delivery, dryRun, latest, version, androidCode, iosBuild, catchup, runRed }) {
+function deviceTarget({ platform, delivery, dryRun, latest, latestUnread = false, version, androidCode, iosBuild, catchup, runRed }) {
   const target = platform === 'android' ? 'S26' : 'iPad';
   if (!delivery) return { target, platform, status: 'missing', durable: false, why: `this run has no ${target} delivery` };
   const reason = delivery.reason ?? null;
@@ -84,6 +84,7 @@ function deviceTarget({ platform, delivery, dryRun, latest, version, androidCode
   if (names && block.device?.status === 'installed') return { target, platform, status: 'installed', durable: true, why: `installed by ${block.device.by ?? 'the catch-up'} since the run` };
   if (names && block.device?.status === 'failed') return { target, platform, status: 'failed', durable: false, why: `the catch-up gave up on ${version}: ${block.device.reason ?? 'no reason'}`, catchupFailed: true };
   const mode = catchup?.[platform] ?? null;
+  if (!block && latestUnread) return { target, platform, status: 'pending', durable: false, why: 'pending, but latest.json could not be read after deliver, so it cannot be shown durable', unread: true };
   if (!names) {
     const said = block ? `${block.version} (${platform === 'android' ? block.code : block.build})` : 'nothing';
     return { target, platform, status: 'pending', durable: false, why: `pending, but latest.json names ${said} for the ${target}, not ${version} (${build ?? '-'})${runRed ? ': the run did not publish it' : ''}`, unpublished: true };
@@ -103,11 +104,12 @@ function testflightTarget({ tf, dryRun, platform }) {
 const satisfied = (target, dryRun) => (dryRun ? target.status === 'checked' : (target.status === 'installed' || target.status === 'assigned' || (target.status === 'pending' && target.durable === true)));
 
 // The command that pays one owed target.
-function owedCommand(target, { repo, slug, run, runRed, bumped, iosLane, dryRun }) {
+function owedCommand(target, { repo, slug, run, runRed, bumped, iosLane, dryRun, latestUrl }) {
   const rerun = run?.id ? `gh run rerun ${run.id} --repo ${repo} --failed` : null;
   const ship = iosLane === 'skip-metered' && (target.platform === 'ios' || target.platform === 'testflight') ? 'mise run ship --metered allow' : 'mise run ship';
   if (target.catchupFailed) return catchupCommand(target.platform, `retry ${slug} ${target.platform}`);
   if (target.catchupOff) return catchupCommand(target.platform, 'mode live');
+  if (target.unread && latestUrl) return `curl -fsS ${latestUrl}`;
   if (dryRun) return ship;
   if ((target.status === 'failed' || target.unpublished || target.status === 'uploaded') && runRed && bumped && rerun) return rerun;
   return ship;
@@ -115,26 +117,27 @@ function owedCommand(target, { repo, slug, run, runRed, bumped, iosLane, dryRun 
 
 export function completionOf({
   policy, repo, slug, store = false, dryRun = false, platform = 'both', iosLane = 'run', catchup = {}, deliveries = [], testflight = null,
-  latest = null, version = null, androidCode = null, iosBuild = null, failure = null, bumped = false, run = {}, required: givenRequired = null, commit = null,
+  latest = null, latestUnread = false, version = null, androidCode = null, iosBuild = null, failure = null, bumped = false, run = {}, required: givenRequired = null, commit = null,
 }) {
   const app = policy.apps[repo] ?? null;
   const required = givenRequired ?? requiredTargets(policy, app ?? { lanes: [] }, { store });
   const runRed = Boolean(failure);
   const device = platformName => deliveries.find(item => item.platform === platformName && item.device !== 'TestFlight') ?? null;
   const targets = [];
-  if (required.android) targets.push(deviceTarget({ platform: 'android', delivery: device('android'), dryRun, latest, version, androidCode, iosBuild, catchup, runRed }));
-  if (required.ios) targets.push(deviceTarget({ platform: 'ios', delivery: device('ios'), dryRun, latest, version, androidCode, iosBuild, catchup, runRed }));
+  if (required.android) targets.push(deviceTarget({ platform: 'android', delivery: device('android'), dryRun, latest, latestUnread, version, androidCode, iosBuild, catchup, runRed }));
+  if (required.ios) targets.push(deviceTarget({ platform: 'ios', delivery: device('ios'), dryRun, latest, latestUnread, version, androidCode, iosBuild, catchup, runRed }));
   if (required.testflight) targets.push(testflightTarget({ tf: testflight, dryRun, platform }));
 
   const blocked = runRed && failure.job === 'gate' && /HUB_GATE_REFUSED lane_unavailable/.test(failure.reason ?? '');
   const red = runRed || targets.some(target => target.status === 'failed');
   const verdict = red ? 'RED' : targets.every(target => satisfied(target, dryRun)) ? 'COMPLETE' : 'INCOMPLETE';
   const context = { repo, slug: slug ?? app?.slug ?? null, run, runRed, bumped, iosLane, dryRun };
+  context.latestUrl = context.slug ? `${policy.delivery.s3.public}/${context.slug}/latest.json` : null;
   const owed = targets.filter(target => !satisfied(target, dryRun)).map(target => ({ target: target.target, status: target.status, why: target.why, command: owedCommand(target, context) }));
   // A red run that spent its version owes its rerun even when every target is otherwise fine (a deliver step failed).
   if (runRed && bumped && owed.length === 0 && run?.id) owed.push({ target: 'run', status: 'failed', why: `${failure.job} failed at ${failure.stage}: ${failure.reason}`, command: `gh run rerun ${run.id} --repo ${repo} --failed` });
   if (runRed && !bumped && owed.length === 0) owed.push({ target: 'run', status: 'failed', why: `${failure.job} failed at ${failure.stage} before the bump (nothing was spent): ${failure.reason}`, command: blocked ? (iosLane === 'skip-metered' ? 'mise run ship --metered allow' : 'mise run ship') : 'mise run ship' });
-  const clean = targets.map(({ catchupFailed: _a, catchupOff: _b, unpublished: _c, ...rest }) => rest);
+  const clean = targets.map(({ catchupFailed: _a, catchupOff: _b, unpublished: _c, unread: _d, ...rest }) => rest);
   const result = {
     schema: 1, verdict, dry_run: dryRun, repo, slug: context.slug, version, android_code: androidCode === null || androidCode === undefined || androidCode === '' ? null : String(androidCode), ios_build: iosBuild || null,
     commit: commit || null, run: { id: run?.id ?? null, attempt: run?.attempt ?? null, url: run?.url ?? null }, platform, ios_lane: iosLane, bumped: Boolean(bumped), blocked,

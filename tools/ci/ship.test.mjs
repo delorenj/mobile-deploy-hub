@@ -150,6 +150,9 @@ test('the Mac unavailable stops ship before a version is spent: GitHub shows it 
   assert.equal((await offline.go()).status, 5);
   assert.match(offline.last(), /^SHIP_BLOCKED delorenj\/tower-of-lost-things: the Mac runner \(carries-macbook-air\) is offline, .*No version was spent$/);
   assert.deepEqual(offline.state.dispatched, [], 'not even a dry run');
+  const orgRunner = world({ runners: [], outcomes: [dryOk(), { conclusion: 'success', completion: verdict('COMPLETE') }] });
+  assert.equal((await orgRunner.go()).status, 0, 'no Mac runner listed (an organisation runner) is not proof: the gate decides');
+  assert.ok(orgRunner.logs.some(line => /^SHIP_NOTE .*lists no macOS runner of its own; the gate decides/.test(line)));
 
   const skipped = verdict('INCOMPLETE', { dry_run: true, bumped: false, ios_lane: 'skip-metered', owed: [{ target: 'iPad', status: 'skipped', why: 'the Mac was on a metered link and the iPad build would have gone over its data budget', command: 'mise run ship --metered allow' }, { target: 'TestFlight', status: 'skipped', why: 'the Mac was on a metered link', command: 'mise run ship --metered allow' }] });
   const metered = world({ outcomes: [{ conclusion: 'success', completion: skipped }] });

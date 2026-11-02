@@ -121,13 +121,14 @@ export async function announce(config, { env = process.env, home = homedir(), fe
 
   // The completion verdict, written before the event goes out so a dead bus still leaves it (rewritten red below).
   let latest = null;
+  let latestUnread = false;
   if (!config.dryRun) {
-    try { const text = await readObject(policy, latestKey(project.slug), { fetchImpl }); latest = text ? parseLatest(text, { slug: project.slug }) : null; } catch (error) { log(`HUB_COMPLETION_LATEST ${firstLine(error.message)}: a pending device cannot be shown durable`); }
+    try { const text = await readObject(policy, latestKey(project.slug), { fetchImpl }); latest = text ? parseLatest(text, { slug: project.slug }) : null; } catch (error) { latestUnread = true; log(`HUB_COMPLETION_LATEST ${firstLine(error.message)}: a pending device cannot be shown durable`); }
   }
   const run = runOf(env);
   const judge = failure => completionOf({
     policy, repo: env.GITHUB_REPOSITORY ?? '', slug: project.slug, store: Boolean(manifest?.ios?.store), required: gateFacts.completion?.required ?? null,
-    dryRun: config.dryRun, platform: config.platform, iosLane, catchup: gateFacts.catchup ?? {}, deliveries: event.data.deliveries, testflight: tf, latest,
+    dryRun: config.dryRun, platform: config.platform, iosLane, catchup: gateFacts.catchup ?? {}, deliveries: event.data.deliveries, testflight: tf, latest, latestUnread,
     version, androidCode: androidCode ? String(androidCode) : null, iosBuild, failure, bumped: !config.dryRun && receipts.plan?.bump?.committed === true,
     run: { id: run.id, attempt: run.attempt, url: run.url }, commit,
   });

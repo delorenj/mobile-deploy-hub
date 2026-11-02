@@ -106,6 +106,9 @@ test('pending counts only when latest.json names this version for the device and
   assert.equal(older.verdict, 'INCOMPLETE');
   assert.match(older.targets[0].why, /latest\.json names 0\.3\.19 \(25\) for the S26, not 0\.3\.20 \(25\)/);
   assert.equal(judge({ ...base, catchup: { android: 'live', ios: 'live' }, latest: null }).verdict, 'INCOMPLETE', 'no latest.json: nothing durable');
+  const unread = judge({ ...base, catchup: { android: 'live', ios: 'live' }, latest: null, latestUnread: true });
+  assert.match(unread.targets[0].why, /latest\.json could not be read after deliver/);
+  assert.deepEqual(unread.owed.map(o => o.command), ['curl -fsS https://s3.delo.sh/builds/tower-of-lost-things/latest.json'], 'a read failure is checked, not paid with a new version');
   const iosOff = judge({ ...base, deliveries: [lane('android', 'installed', { version: '0.3.20', build: 25 }), lane('ios', 'pending', { version: '0.3.20', build: 25 })], catchup: { android: 'live', ios: 'unknown' }, latest: latestFor('0.3.20', 25) });
   assert.deepEqual(iosOff.owed.map(o => o.command), ["ssh hub-mac '~/.local/share/mise/installs/node/24/bin/node ~/.local/share/mobile-deploy-hub/current/tools/catchup/catchup.mjs mode live'"]);
   // The catch-up got there first: installed. It gave up: RED, with the retry that starts it over.
