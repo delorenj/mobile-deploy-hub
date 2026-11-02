@@ -69,6 +69,9 @@ export function parsePolicy(source) {
       exact(`apps.${repo}.ios`, app.ios, ['bundle'], ['store_bundle']);
       if (!/^[A-Za-z][A-Za-z0-9-]*(\.[A-Za-z][A-Za-z0-9-]*)+$/.test(app.ios.bundle ?? '')) fail(`apps.${repo}.ios.bundle must be a reverse-DNS bundle id`);
       if ('store_bundle' in app.ios && !/^[A-Za-z][A-Za-z0-9-]*(\.[A-Za-z][A-Za-z0-9-]*)+$/.test(app.ios.store_bundle ?? '')) fail(`apps.${repo}.ios.store_bundle must be a reverse-DNS bundle id`);
+      // TestFlight is required for iOS apps: always opt-in to TestFlight distribution
+      exact(`apps.${repo}.ios.testflight`, app.ios, ['enabled']);
+      if (app.ios.enabled !== true) fail(`apps.${repo}.ios.testflight.enabled must be true`);
     }
   }
 

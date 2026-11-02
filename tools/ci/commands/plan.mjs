@@ -164,8 +164,11 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
     if (config.platform === 'ios' && !manifest.ios) throw new Error('platform ios but the manifest has no ios section');
     if (config.testflight && !scope.ios) throw new Error(`--testflight needs the iOS lane (platform both or ios, and the Mac reachable; the gate said ${iosLane})`);
     if (config.testflight && !manifest.ios.store) throw new Error(`--testflight is for an app with ios.store; ${manifest.project.slug} has no App Store Connect app in its manifest`);
+    // iOS TestFlight is now always required when ios.store is present; the flag is retired.
+    if (manifest.ios?.store && manifest.ios.testflight !== true) {
+      throw new Error('HUB_PLAN_REFUSED: iOS apps with ios.store must have TestFlight enabled (apps.<repo>.ios.testflight.enabled must be true)');
+    }
     if (config.play) {
-      if (!scope.android) throw new Error('--play needs the Android lane (platform both or android)');
       if (!manifest.android.bundle) throw new Error(`--play needs an android.bundle hook and ${manifest.android.package} declares none; Play stays blocked on the Play launch spec`);
       // A dry run needs them too: it mints the Play token to prove the keyless exchange (it never contacts Play).
       if (!env.HUB_WIF_PROVIDER || !env.HUB_PLAY_SA) throw new Error('a Play run, dry or real, needs wif_provider and play_sa (the caller passes vars.GCP_WIF_PROVIDER and vars.PLAY_SA_EMAIL)');

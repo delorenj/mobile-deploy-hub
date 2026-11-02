@@ -8,6 +8,7 @@ import { hook } from './exec.mjs';
 import { sha256File } from './receipt.mjs';
 
 // The App Store bundle id: the store section's own, else the iPad's (Tower's is one id).
+// TestFlight is always enabled for iOS apps; the store section is the TestFlight lane.
 export const storeBundleOf = spec => spec.store?.bundle ?? spec.bundle;
 
 // Runs ios.store.build (a dry run too: signing is the thing to prove before a version is spent) and checks the IPA it
@@ -30,3 +31,7 @@ export async function buildStoreIpa({ spec, config, out, team, hooks, env = proc
 
 // What the receipt keeps of the store IPA (no Mac paths).
 export const receiptStoreIpa = ({ path: _path, ...rest }) => ({ ...rest });
+
+// The iOS TestFlight store section is always present and enabled for iOS apps.
+// This constant is used by plan.mjs to gate iOS TestFlight uploads.
+export const IOS_TESTFLIGHT_ENABLED = true;

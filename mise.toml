@@ -87,12 +87,11 @@ flag "--repo <repo>"
 flag "--dry-run <dry_run>" default="true"
 flag "--bump <bump>" default=""
 flag "--platform <platform>" default="both"
-flag "--testflight <testflight>" default="false"
 flag "--play <play>" default="false"
 flag "--dry-handoff <dry_handoff>" default="false"
 flag "--metered <metered>" default="auto"
 '''
-run = 'node tools/deploy.mjs --repo "$usage_repo" --dry-run "$usage_dry_run" --bump "$usage_bump" --platform "$usage_platform" --testflight "$usage_testflight" --play "$usage_play" --dry-handoff "$usage_dry_handoff" --metered "$usage_metered"'
+run = 'node tools/deploy.mjs --repo "$usage_repo" --dry-run "$usage_dry_run" --bump "$usage_bump" --platform "$usage_platform" --play "$usage_play" --dry-handoff "$usage_dry_handoff" --metered "$usage_metered"'
 
 [tasks."deploy:train"]
 description = "Deploy Tower, then Green In Between, then Gruvato, one at a time; stops at the first red run"

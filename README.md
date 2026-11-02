@@ -43,7 +43,7 @@ Apps need no edit for a policy change: their callers pin `@v1`. A caller changes
 
 **Adopting the policy in a new app:**
 
-1. Copy `templates/deploy.yml` verbatim into `.github/workflows/deploy.yml`; it pins `@v1`, and the gate hashes the caller, so never edit it.
+1. Copy `templates/deploy.yml` verbatim into `.github/workflows/… [truncated]
 2. Write `tools/ci/mobile-deploy.json` (schema 2) and register the app's own repo-scoped runners (Linux on big-chungus, macOS on the Mac).
 3. Add the `mise run deploy` task that fetches this repo's [`tools/deploy.mjs`](tools/deploy.mjs) at the pinned ref.
 4. One hub release adds the app to `apps` and its caller hash to `callers.accept`.
