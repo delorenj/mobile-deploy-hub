@@ -383,15 +383,17 @@ export function frozenTools({ hook, before, after, changed }) {
   return touched.length > 0 ? { hook, touched: [...new Set(touched)] } : null;
 }
 
-// The policy's completion rules at the hub ref this app pins (never a copy: ship encodes no rule of its own).
+// The policy's completion rules at the hub ref this app pins (never a copy: ship encodes no rule of its own). `apps` is
+// the policy's completion.apps: the products the contract applies to (empty for a hub that has no completion block).
 export function readShipPolicy(gh, hubRef) {
   try {
     const policy = JSON.parse(gh(['api', '-H', 'Accept: application/vnd.github.raw', `repos/${hubRepo}/contents/tools/ci/policy.json?ref=${hubRef}`]));
     const completion = policy?.completion;
     const reruns = Number.isSafeInteger(completion?.reruns) && completion.reruns >= 0 && completion.reruns <= 3 ? completion.reruns : 0;
-    return { reruns, laneUnavailable: completion?.lane_unavailable === 'skip' ? 'skip' : 'refuse', read: Boolean(completion) };
+    const apps = Array.isArray(completion?.apps) ? completion.apps.filter(app => typeof app === 'string') : [];
+    return { reruns, laneUnavailable: completion?.lane_unavailable === 'skip' ? 'skip' : 'refuse', read: Boolean(completion), apps };
   } catch (error) {
-    return { reruns: 0, laneUnavailable: 'refuse', read: false, why: error.message.split('\n')[0] };
+    return { reruns: 0, laneUnavailable: 'refuse', read: false, apps: [], why: error.message.split('\n')[0] };
   }
 }
 
@@ -448,6 +450,12 @@ export async function ship(options, {
   const hubRef = options.hubRef || hubRefFrom(workflowText) || 'v1';
   const manifestPath = /^\s+manifest:\s*(\S+)\s*$/m.exec(workflowText)?.[1] ?? 'tools/ci/mobile-deploy.json';
   const policy = readShipPolicy(gh, hubRef);
+  // Ship is per product: only a repository the policy's completion.apps lists (at the hub ref its caller pins) ships this
+  // way. Any other app is refused here, before anything is read or dispatched, and keeps `mise run deploy`.
+  if (!policy.apps.includes(repo)) {
+    const why = policy.read ? '' : ` (the completion policy could not be read at ${hubRepo}@${hubRef}${policy.why ? `: ${policy.why}` : ''})`;
+    return finish('BLOCKED', `SHIP_BLOCKED ${repo}: ship is not enabled for ${repo} (policy completion.apps)${why}. Nothing was dispatched; use \`mise run deploy\``);
+  }
   if (!policy.read) log(`SHIP_NOTE could not read the completion policy at ${hubRepo}@${hubRef}${policy.why ? ` (${policy.why})` : ''}: no automatic reruns this time`);
 
   // What a run left behind: from its completion-out (hub v1.3), else from its plan, lane and deliver receipts and the

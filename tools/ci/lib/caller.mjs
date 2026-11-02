@@ -23,6 +23,15 @@ export function normalizeCaller(text) {
 
 export const callerHash = text => createHash('sha256').update(normalizeCaller(text)).digest('hex');
 
+// The template as an app that pins an exact hub release tag (a vX.Y.Z, instead of the floating v1) writes it: the one
+// `mobile-deploy.yml@v1` ref replaced. A product that adopts a hub feature before v1 carries it (Tower, per policy
+// completion.apps, pins v1.2.27 while v1 stays on v1.2.25) copies this text; its hash is in policy callers.accept, which
+// a test derives from the template with this function. Nothing else about the caller may differ.
+export const pinTemplate = (text, tag) => {
+  if (!/^v\d+\.\d+\.\d+$/.test(tag)) throw new Error(`a pinned caller names a release tag (vX.Y.Z), not ${tag}`);
+  return String(text).replace(/(\/mobile-deploy\.yml)@v1(?=\s*$)/m, `$1@${tag}`);
+};
+
 export const refusal = (what, detail) => Object.assign(new Error(`HUB_GATE_REFUSED ${what}: ${detail}`), { refused: what });
 
 // The first line where a caller departs from the current template, so the refusal says what to fix.

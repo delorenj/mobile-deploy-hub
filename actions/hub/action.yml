@@ -14,7 +14,7 @@ inputs:
     description: patch, minor or major (every deploy bumps)
     default: patch
   testflight:
-    description: The gate's derived TestFlight decision (policy completion + the manifest's ios.store); never the caller's input
+    description: The caller's testflight input, to the gate alone; every other job gets the gate's output (for an app in policy completion.apps the gate derives it from policy and the manifest's ios.store and ignores the input)
     default: 'false'
   store_preflight:
     description: The gate's word that preflight-ios runs the app's ios.store.preflight hook (a store app that declares one)
@@ -120,7 +120,7 @@ outputs:
     description: The TestFlight signer and references as JSON (gate)
     value: ${{ steps.hub.outputs.ios_store }}
   testflight:
-    description: true when this run owes TestFlight (gate; policy completion + the manifest's ios.store)
+    description: true when this run does TestFlight (gate: derived for an app in policy completion.apps, else the caller's input)
     value: ${{ steps.hub.outputs.testflight }}
   store_preflight:
     description: true when preflight-ios runs the app's ios.store.preflight hook (gate)

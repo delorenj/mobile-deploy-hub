@@ -28,7 +28,7 @@ import { buildReceipt, setOutputs, writeReceipt } from '../lib/receipt.mjs';
 import { jobWriter, readObject } from '../lib/s3.mjs';
 import { parseVersionInfo } from '../lib/version.mjs';
 import { checkCaller, refusal } from '../lib/caller.mjs';
-import { tagOnlyOf, tagPrefixOf } from '../lib/policy.mjs';
+import { adopts, tagOnlyOf, tagPrefixOf } from '../lib/policy.mjs';
 import { checkDisk, checkSecrets, firstLine, guarded, isoNow, policyBanner, reachIpad, readMacLink, runOf, short } from './common.mjs';
 import { callerReader, checkPins } from './gate.mjs';
 
@@ -53,6 +53,8 @@ export async function preflightIos(config, { env = process.env, home = homedir()
     notes.push(`signing probe passed with ${signer.slice(0, 8)} (the runner can use the private key)`);
     const profile = devProfile(installedProfiles({ env, home }), { team: devices.apple.team, udid: devices.ios.udid, signer, bundle: config.bundle, minDays: devices.apple.profile_min_days });
     notes.push(`profile "${profile.name}" covers the iPad until ${profile.expires_at.slice(0, 10)}`);
+    // The store preflight is the completion contract's (policy completion.apps); another app never runs it.
+    const storePreflightWanted = config.storePreflight && adopts(policy, env.GITHUB_REPOSITORY ?? '');
     if (config.testflight) {
       if (!config.iosStore) throw new Error(`--testflight is for an app with ios.store; ${config.slug || config.bundle} has none`);
       if (config.iosStore.signer_sha1 && !valid.has(config.iosStore.signer_sha1)) throw new Error(`the App Store identity ${config.iosStore.signer_sha1.slice(0, 8)} is not in this Mac's keychain`);
@@ -61,10 +63,10 @@ export async function preflightIos(config, { env = process.env, home = homedir()
         notes.push(`signing probe passed with the App Store identity ${config.iosStore.signer_sha1.slice(0, 8)}`);
       }
       checkSecrets(config.iosStore.secrets ?? [], { config, env, notes });
-      if (config.storePreflight) {
+      if (storePreflightWanted) {
         await storePreflight(config, { env, devices, notes, log });
       }
-    } else if (config.storePreflight) {
+    } else if (storePreflightWanted) {
       throw new Error('store_preflight without testflight: the gate sets both, so these inputs did not come from the gate');
     }
     const ipad = createIpad({ devicectl: createDevicectl({ env }), udid: devices.ios.udid, model: devices.ios.model });
@@ -122,7 +124,7 @@ export async function storePreflight(config, { env, devices, notes, log = consol
 
 // A representative completed event for this app, held to the schema before any version is spent: one device
 // installed, one pending, with the links the notification renders, and TestFlight assigned for a store app.
-export function sampleEvent({ manifest, devices, version, androidCode, commit, env }) {
+export function sampleEvent({ manifest, devices, version, androidCode, commit, env, adopted = false }) {
   const declared = { android: Boolean(manifest.android), ios: Boolean(manifest.ios) };
   const needs = { gate: { result: 'success' }, plan: { result: 'success' }, android: { result: 'success' }, ios: { result: 'success' }, 'ios-export': { result: 'success' }, deliver: { result: 'success' } };
   const receipts = {
@@ -132,18 +134,18 @@ export function sampleEvent({ manifest, devices, version, androidCode, commit, e
   const base = 'https://s3.delo.sh/builds';
   const slug = manifest.project.slug;
   const published = { apk: `${base}/${slug}/${version}/${slug}-${version}-${androidCode ?? 1}.apk`, ota: `itms-services://?action=download-manifest&url=${base}/${slug}/ios/manifest.plist`, page: `${base}/${slug}/index.html` };
-  const extraDeliveries = manifest.ios?.store ? [testflightDelivery({ status: 'assigned', reason: 'uploaded and assigned to Owner Testing' }, { version, build: '1' })] : [];
+  const extraDeliveries = adopted && manifest.ios?.store ? [testflightDelivery({ status: 'assigned', reason: 'uploaded and assigned to Owner Testing' }, { version, build: '1' })] : [];
   return deploymentEvent({ project: manifest.project, declared, devices, needs, receipts, version, androidCode, commit, published, env: { ...env, GITHUB_RUN_ID: env.GITHUB_RUN_ID || '1' }, extraDeliveries });
 }
 
 // bb-emit validates against the live bloodbank checkout, so the contract it enforces must be committed there, and
 // the event this deploy will send must pass it. A real run stops here, before any version is spent; a dry run records
 // the gap and goes on to prove the device lanes, and its announce job still fails on the same check.
-async function eventPreflight({ config, manifest, devices, version, androidCode, commit, env, home, notes }) {
+async function eventPreflight({ config, manifest, devices, version, androidCode, commit, env, home, notes, adopted = false }) {
   const tree = bloodbankTree({ env, home });
   const problems = [];
   if (tree.commit && tree.dirty && tree.dirty.length > 0) problems.push(`the Bloodbank contract files bb-emit validates against are uncommitted in ${basename(tree.root)} (${tree.dirty.slice(0, 4).join(', ')}); commit the schema edit so the contract is reproducible`);
-  const sample = sampleEvent({ manifest, devices, version, androidCode, commit, env });
+  const sample = sampleEvent({ manifest, devices, version, androidCode, commit, env, adopted });
   try {
     bbEmit({ type: sample.type, data: sample.data, correlation: correlationFor(env), check: true, env, home });
     notes.push(`event contract: ${sample.type} with statuses and links passes bb-emit --check${tree.commit ? ` (bloodbank ${short(tree.commit)})` : ''}`);
@@ -189,10 +191,18 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
     const scope = { android: declared.android, ios: declared.ios && iosLane === 'run' };
     if (config.platform === 'android' && !manifest.android) throw new Error('platform android but the manifest has no android section');
     if (config.platform === 'ios' && !manifest.ios) throw new Error('platform ios but the manifest has no ios section');
-    if (config.testflight && !manifest.ios?.store) throw new Error(`TestFlight is for an app with ios.store; ${manifest.project.slug} has no App Store Connect app in its manifest`);
-    // The gate derives TestFlight and refuses a real run whose required iOS lane would not run; what reaches here with the
-    // lane skipped is a dry run (or the skip policy): TestFlight rides the iOS lane, so it is owed, not a red plan.
-    if (config.testflight && !scope.ios) log(`HUB_TESTFLIGHT_SKIPPED the iOS lane does not run (ios_lane=${iosLane}); TestFlight is owed by this version`);
+    // A product the policy's completion.apps lists has TestFlight derived by its gate (the lane the gate skipped is owed,
+    // not a red plan); every other app keeps v1.2.25's rules for the caller's testflight input.
+    const adopted = adopts(policy, env.GITHUB_REPOSITORY ?? '');
+    if (adopted) {
+      if (config.testflight && !manifest.ios?.store) throw new Error(`TestFlight is for an app with ios.store; ${manifest.project.slug} has no App Store Connect app in its manifest`);
+      // The gate derives TestFlight and refuses a real run whose required iOS lane would not run; what reaches here with the
+      // lane skipped is a dry run (or the skip policy): TestFlight rides the iOS lane, so it is owed, not a red plan.
+      if (config.testflight && !scope.ios) log(`HUB_TESTFLIGHT_SKIPPED the iOS lane does not run (ios_lane=${iosLane}); TestFlight is owed by this version`);
+    } else {
+      if (config.testflight && !scope.ios) throw new Error(`--testflight needs the iOS lane (platform both or ios, and the Mac reachable; the gate said ${iosLane})`);
+      if (config.testflight && !manifest.ios.store) throw new Error(`--testflight is for an app with ios.store; ${manifest.project.slug} has no App Store Connect app in its manifest`);
+    }
     if (config.play) {
       if (!scope.android) throw new Error('--play needs the Android lane (platform both or android)');
       if (!manifest.android.bundle) throw new Error(`--play needs an android.bundle hook and ${manifest.android.package} declares none; Play stays blocked on the Play launch spec`);
@@ -245,7 +255,7 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
 
     const current = readVersion();
     track.receipt = { version: current.version, androidCode: current.android_code };
-    const tree = await eventPreflight({ config, manifest, devices, version: current.version, androidCode: current.android_code, commit: env.GITHUB_SHA || '0000000', env, home, notes });
+    const tree = await eventPreflight({ config, manifest, devices, version: current.version, androidCode: current.android_code, commit: env.GITHUB_SHA || '0000000', env, home, notes, adopted });
 
     track.stage = 'version';
     const git = createGit({ cwd: config.cwd, env, token: env.GH_TOKEN });

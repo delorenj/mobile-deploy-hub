@@ -111,15 +111,25 @@ export function parsePolicy(source) {
   positive('catch_up.ios_every_s', policy.catch_up.ios_every_s);
   positive('catch_up.max_failures', policy.catch_up.max_failures);
 
-  // What "shipped" means, for every app at once (TOWE-76): the required targets, what the gate does when a required
-  // lane cannot run, and how many same-version reruns `ship` may do on its own. No per-app switch exists on purpose:
-  // an app is a TestFlight app because its manifest declares ios.store, never because the policy names it.
-  exact('completion', policy.completion, ['required', 'lane_unavailable', 'reruns']);
+  // What "shipped" means (TOWE-76): the required targets, what the gate does when a required lane cannot run, and how
+  // many same-version reruns `ship` may do on its own. Per product (owner direction 2026-11-02: "not across all
+  // products, across all platforms within a product"): `apps` lists the repositories the contract applies to. Every
+  // other app behaves exactly as hub v1.2.25 did (TestFlight follows the caller's input, a skipped iOS lane is
+  // skipped, no store preflight, no completion verdict, `ship` refuses). Inside a listed app there is still no per-app
+  // TestFlight switch: an app is a TestFlight app because its manifest declares ios.store.
+  exact('completion', policy.completion, ['required', 'lane_unavailable', 'reruns', 'apps']);
   exact('completion.required', policy.completion.required, ['devices', 'testflight']);
   if (!completionDevices.includes(policy.completion.required.devices)) fail(`completion.required.devices must be one of ${completionDevices.join(', ')} (every lane the policy gives an app owes its device)`);
   if (!completionTestflight.includes(policy.completion.required.testflight)) fail(`completion.required.testflight must be one of ${completionTestflight.join(', ')} (store: every app whose manifest declares ios.store owes TestFlight)`);
   if (!laneUnavailable.includes(policy.completion.lane_unavailable)) fail(`completion.lane_unavailable must be one of ${laneUnavailable.join(', ')}`);
   if (!Number.isSafeInteger(policy.completion.reruns) || policy.completion.reruns < 0 || policy.completion.reruns > maxReruns) fail(`completion.reruns must be a whole number from 0 to ${maxReruns}`);
+  const adopted = policy.completion.apps;
+  if (!Array.isArray(adopted)) fail('completion.apps must be a list of owner/repo names (the products the completion contract applies to; [] is none)');
+  for (const repo of adopted) {
+    if (typeof repo !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) fail('completion.apps must list owner/repo names');
+    if (!(repo in policy.apps)) fail(`completion.apps names ${repo}, which is not in apps`);
+  }
+  if (new Set(adopted).size !== adopted.length) fail('completion.apps lists a repository twice');
   return policy;
 }
 
@@ -130,6 +140,10 @@ export const completionTestflight = Object.freeze(['store', 'never']);
 // one-line rollback.
 export const laneUnavailable = Object.freeze(['refuse', 'skip']);
 export const maxReruns = 3;
+
+// Whether the completion contract (ship, the gate-derived TestFlight, the lane_unavailable refusal, the store preflight,
+// the completion verdict) applies to this repository. False is hub v1.2.25 behaviour, byte for byte in every job.
+export const adopts = (policy, repo) => Array.isArray(policy?.completion?.apps) && policy.completion.apps.includes(repo);
 
 // The targets one app owes for a run to be complete: its lanes' devices (S26 for android, iPad for ios) and TestFlight
 // when the manifest declares ios.store. `store` is the manifest's say; the rule is the policy's.

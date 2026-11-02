@@ -24,6 +24,7 @@ import { withLock } from '../lib/lock.mjs';
 import { loadManifest } from '../lib/manifest.mjs';
 import { macGatewayLink, parseRsyncStats } from '../lib/metered.mjs';
 import { buildReceipt, sha256File, writeReceipt } from '../lib/receipt.mjs';
+import { adopts } from '../lib/policy.mjs';
 import { buildStoreIpa, receiptStoreIpa } from '../lib/store.mjs';
 import { applyBump, checkAppReceipt, checkDisk, exists, firstLine, guarded, installCurrent, policyBanner, reachIpad, requirePlan, short } from './common.mjs';
 
@@ -158,11 +159,11 @@ export function parseStoreState(text, { version, build }) {
 // The TestFlight step of the ios lane: ios.store.state (when the app declares it), then, on a real run, upload unless
 // App Store Connect already has the build, then assign. `store` is the receipt's TestFlight record, updated in place so
 // a failure receipt carries how far it got. Returns the receipt's one-line note.
-export function testflightStep({ spec, config, store, storeIpa = null, hooks, log = console.log, runHook = storeHooks.run, runOutput = storeHooks.output }) {
+export function testflightStep({ spec, config, store, storeIpa = null, hooks, log = console.log, useState = true, runHook = storeHooks.run, runOutput = storeHooks.output }) {
   const built = storeIpa ? `the App Store IPA ${storeIpa.version} (${storeIpa.build}) is built and checked; ` : '';
   try {
     let known = null;
-    if (spec.store.state) {
+    if (useState && spec.store.state) {
       known = parseStoreState(runOutput('ios.store.state', spec.store.state, { cwd: config.cwd, env: hooks }), { version: store.version, build: store.build });
       store.state = known.state;
       log(`HUB_TESTFLIGHT_STATE ${store.version} (${store.build}) ${known.present ? `is in App Store Connect${known.state ? ` (${known.state})` : ''}` : 'is not in App Store Connect yet'}`);
@@ -186,6 +187,7 @@ export function testflightStep({ spec, config, store, storeIpa = null, hooks, lo
 
 export async function ios(config, { env = process.env, home = homedir(), log = console.log, runner = runBounded, sleep, now, linkNow = null } = {}) {
   const { policy } = policyBanner(log);
+  const adopted = adopts(policy, env.GITHUB_REPOSITORY ?? '');
   const manifest = await loadManifest(config.cwd, config.manifest);
   return guarded('ios', join(config.out, 'ios'), config, env, async track => {
     const spec = manifest.ios ?? (() => { throw new Error('the manifest has no ios section'); })();
@@ -340,15 +342,18 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
       }
       // Publishing, not the device: a failed upload or assign is reported at stage deliver and the iPad keeps its status.
       track.stage = 'deliver';
-      track.receipt.store = { status: 'checked', version: config.version, build: storeIpa?.build ?? (config.iosBuild || null), uploaded: null, state: null, reason: null };
-      testflight = testflightStep({ spec, config, store: track.receipt.store, storeIpa, hooks, log });
+      // The TestFlight record, the ios.store.state check and the receipt's `store` are the completion contract's (policy
+      // completion.apps); any other app uploads and assigns as hub v1.2.25 did and its receipt has no `store`.
+      const record = { status: 'checked', version: config.version, build: storeIpa?.build ?? (config.iosBuild || null), uploaded: null, state: null, reason: null };
+      if (adopted) track.receipt.store = record;
+      testflight = testflightStep({ spec, config, store: record, storeIpa, hooks, log, useState: adopted });
       notes.push(`TestFlight: ${testflight}`);
       if (storeIpa) log(`HUB_TESTFLIGHT ${config.dryRun ? 'DRY RUN' : 'UPLOADED'} ${storeIpa.bundle} ${storeIpa.version} (${storeIpa.build}) sha256=${short(storeIpa.sha256)}`);
     }
     if (!config.dryRun) {
       try { installCurrent({ hubRef: env.HUB_REF, home, log }); } catch (error) { log(`::warning::could not refresh the catch-up code (${firstLine(error.message)})`); }
     }
-    await writeReceipt(out, buildReceipt({ lane: 'ios', config, env, version: config.version, build: delivery.build, notes, delivery, ipa: ipa ? receiptIpa(ipa) : null, testflight, store: track.receipt.store ?? null, store_ipa: storeIpa ? receiptStoreIpa(storeIpa) : null, mac_bytes: macBytes }), env);
+    await writeReceipt(out, buildReceipt({ lane: 'ios', config, env, version: config.version, build: delivery.build, notes, delivery, ipa: ipa ? receiptIpa(ipa) : null, testflight, ...(track.receipt.store ? { store: track.receipt.store } : {}), store_ipa: storeIpa ? receiptStoreIpa(storeIpa) : null, mac_bytes: macBytes }), env);
     return { out, delivery, ipa, notes, macBytes };
   });
 }

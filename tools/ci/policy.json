@@ -32,7 +32,7 @@
   "callers": {
     "workflow": ".github/workflows/deploy.yml",
     "manifest": "tools/ci/mobile-deploy.json",
-    "accept": ["130f1ef2a2f15a3babc52694b86354700e779559a24f97fb84d150936a9b40d2"]
+    "accept": ["130f1ef2a2f15a3babc52694b86354700e779559a24f97fb84d150936a9b40d2", "e3cd67fd8c5155e3719492f0fdbed8fee2c91d1d417459457fd593982e0130c7"]
   },
   "runners": { "linux": ["self-hosted", "Linux"], "mac": ["self-hosted", "macOS"] },
   "devices": { "absent": "pending", "android_wait_s": 180, "ipad_wait_s": 60 },
@@ -43,5 +43,5 @@
   },
   "mac": { "lan_cidr": "192.168.1.0/24", "metered_budget_mib": 150, "queue_limit_min": 15 },
   "catch_up": { "android_every_s": 120, "ios_every_s": 300, "max_failures": 3 },
-  "completion": { "required": { "devices": "lanes", "testflight": "store" }, "lane_unavailable": "refuse", "reruns": 1 }
+  "completion": { "required": { "devices": "lanes", "testflight": "store" }, "lane_unavailable": "refuse", "reruns": 1, "apps": ["delorenj/tower-of-lost-things"] }
 }

@@ -2,7 +2,8 @@
 // status, the download links the deliver jobs published and trigger: deploy. A dry run only checks it.
 // v1.3 (TOWE-76): it also writes the completion verdict (lib/completion.mjs) to $HUB_OUT/completion/completion.json,
 // which the workflow uploads as the completion-out artifact `deploy.mjs ship` reads, and a run that owes TestFlight
-// carries it as a delivery.
+// carries it as a delivery. Both are for the products policy completion.apps lists; any other app's event has the
+// S26 and iPad deliveries only, as in v1.2.25, and no verdict is written.
 import { mkdir, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -13,6 +14,7 @@ import { loadDevices } from '../lib/devices.mjs';
 import { hookOutput, runBounded } from '../lib/exec.mjs';
 import { latestKey, parseLatest } from '../lib/latest.mjs';
 import { loadManifest } from '../lib/manifest.mjs';
+import { adopts } from '../lib/policy.mjs';
 import { readObject } from '../lib/s3.mjs';
 import { parseVersionInfo } from '../lib/version.mjs';
 import { firstLine, parseNeeds, policyBanner, readReceipts, runOf, semver } from './common.mjs';
@@ -104,7 +106,8 @@ export async function announce(config, { env = process.env, home = homedir(), fe
   const iosLane = planOutputs.ios_lane || needs.gate?.outputs?.ios_lane || gateFacts.ios_lane || config.iosLane || 'run';
   // TestFlight is the gate's derived decision (config.testflight is its output), a delivery of its own in the event.
   const iosBuild = receipts.plan?.build || planOutputs.ios_build || '';
-  const tf = testflightOf({ testflight: config.testflight, iosLane, needs, receipts, dryRun: config.dryRun });
+  const adopted = adopts(policy, env.GITHUB_REPOSITORY ?? '');
+  const tf = adopted ? testflightOf({ testflight: config.testflight, iosLane, needs, receipts, dryRun: config.dryRun }) : null;
   const extraDeliveries = tf ? [testflightDelivery(tf, { version, build: receipts.ios?.store?.build ?? receipts.ios?.delivery?.build ?? iosBuild })] : [];
   // What the deliver jobs published: the APK half (deliver-android), the IPA half (deliver-ios), or one deliver (v1.1).
   const published = { apk: null, apk_bytes: null, ota: null, ipa_bytes: null, page: null, manifest: null, any: false };
@@ -122,7 +125,7 @@ export async function announce(config, { env = process.env, home = homedir(), fe
   // The completion verdict, written before the event goes out so a dead bus still leaves it (rewritten red below).
   let latest = null;
   let latestUnread = false;
-  if (!config.dryRun) {
+  if (adopted && !config.dryRun) {
     try { const text = await readObject(policy, latestKey(project.slug), { fetchImpl }); latest = text ? parseLatest(text, { slug: project.slug }) : null; } catch (error) { latestUnread = true; log(`HUB_COMPLETION_LATEST ${firstLine(error.message)}: a pending device cannot be shown durable`); }
   }
   const run = runOf(env);
@@ -132,14 +135,14 @@ export async function announce(config, { env = process.env, home = homedir(), fe
     version, androidCode: androidCode ? String(androidCode) : null, iosBuild, failure, bumped: !config.dryRun && receipts.plan?.bump?.committed === true,
     run: { id: run.id, attempt: run.attempt, url: run.url }, commit,
   });
-  await writeCompletion(config.out, judge(event.failure), log);
+  if (adopted) await writeCompletion(config.out, judge(event.failure), log);
 
   const correlation = correlationFor(env);
   try {
     bbEmit({ type: event.type, data: event.data, correlation, check: true, env, home });
     if (!config.dryRun) bbEmit({ type: event.type, data: event.data, correlation, check: false, env, home });
   } catch (error) {
-    await writeCompletion(config.out, judge(event.failure ?? { job: 'announce', stage: 'deliver', reason: firstLine(error.message).slice(0, 300) }), log);
+    if (adopted) await writeCompletion(config.out, judge(event.failure ?? { job: 'announce', stage: 'deliver', reason: firstLine(error.message).slice(0, 300) }), log);
     throw error;
   }
   if (config.dryRun) {

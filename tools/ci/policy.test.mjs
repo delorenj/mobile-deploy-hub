@@ -11,7 +11,7 @@ test('loadPolicy parses the repo\'s own policy.json, completion block included',
   const { policy, sha256, short } = loadPolicy();
   assert.match(sha256, /^[0-9a-f]{64}$/);
   assert.equal(short, sha256.slice(0, 8));
-  assert.deepEqual(policy.completion, { required: { devices: 'lanes', testflight: 'store' }, lane_unavailable: 'refuse', reruns: 1 });
+  assert.deepEqual(policy.completion, { required: { devices: 'lanes', testflight: 'store' }, lane_unavailable: 'refuse', reruns: 1, apps: ['delorenj/tower-of-lost-things'] });
   // Every app keeps the shape the gate, deliver and the catch-up read: no per-app TestFlight switch anywhere.
   for (const [repo, app] of Object.entries(policy.apps)) {
     assert.ok(!('testflight' in app), `${repo} has no testflight key: TestFlight is the manifest's ios.store under the one rule`);

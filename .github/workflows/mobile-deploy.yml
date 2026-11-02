@@ -18,11 +18,13 @@ name: Mobile Deploy
 # runs-on is the policy's self-hosted labels, written here: a caller's linux_runner or mac_runner input can never put
 # a job on a billed hosted runner (the gate still refuses any non-default value).
 #
-# v1.3 (TOWE-76, policy `completion`): TestFlight is the gate's decision, never the caller's. The gate derives it (a store
-# app owes TestFlight whenever its iOS lane is in scope, dry runs included) and every job reads needs.gate.outputs.testflight;
-# no job reads inputs.testflight. A real run whose required iOS lane would not run is refused at the gate, before plan.
-# A store app that declares ios.store.preflight checks its tree out in preflight-ios and runs that hook before the bump.
-# announce writes the completion verdict (COMPLETE, INCOMPLETE or RED, and what is owed) as the completion-out artifact.
+# v1.3 (TOWE-76, policy `completion`), per product: for the apps policy completion.apps lists, TestFlight is the gate's
+# decision, never the caller's. The gate derives it (a store app owes TestFlight whenever its iOS lane is in scope, dry
+# runs included); a real run whose required iOS lane would not run is refused at the gate, before plan; a store app that
+# declares ios.store.preflight checks its tree out in preflight-ios and runs that hook before the bump; announce writes
+# the completion verdict (COMPLETE, INCOMPLETE or RED, and what is owed) as the completion-out artifact.
+# For every other app the gate hands the caller's testflight input through unchanged (v1.2.25 behaviour). Either way
+# the gate is the one place that reads inputs.testflight: every other job reads needs.gate.outputs.testflight.
 #
 # `uses:` takes no expressions, so every `delorenj/mobile-deploy-hub/actions/hub@<tag>` below names one exact hub
 # version: a run and its reruns use one version, whatever `v1` points at later. `mise run release` flips them all in
@@ -43,7 +45,7 @@ on:
         type: string
         default: patch
       testflight:
-        description: Kept for the v1 caller interface and read by no job; the gate derives TestFlight (every app with ios.store owes it)
+        description: Also upload to TestFlight Owner Testing (apps with ios.store); read by the gate alone, which derives it itself for the apps policy completion.apps lists
         type: boolean
         default: false
       play:
@@ -133,6 +135,7 @@ jobs:
           manifest: ${{ inputs.manifest }}
           platform: ${{ inputs.platform }}
           bump: ${{ inputs.bump }}
+          testflight: ${{ inputs.testflight }}
           play: ${{ inputs.play }}
           channel: ${{ inputs.android_channel }}
           build: ${{ inputs.build }}

@@ -11,6 +11,9 @@
 // input reaches no job: every later job reads the gate's `testflight` output. A real run whose required iOS lane would
 // not run (the Mac offline, or a metered link over budget) is refused here, before plan spends a version, when the
 // policy says lane_unavailable: refuse. An explicit --platform android still runs; its completion verdict is INCOMPLETE.
+// This holds only for the products policy completion.apps lists (per product, never across all of them). For every other
+// app the gate is v1.2.25's: the caller's testflight input is passed on as it came, a skipped iOS lane is skipped (never
+// refused) and there is no store preflight.
 import { readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -22,7 +25,7 @@ import { attempt } from '../lib/exec.mjs';
 import { latestKey, parseLatest } from '../lib/latest.mjs';
 import { loadManifest } from '../lib/manifest.mjs';
 import { macEstimate, tailscaleStatus } from '../lib/metered.mjs';
-import { appFor, requiredTargets } from '../lib/policy.mjs';
+import { adopts, appFor, requiredTargets } from '../lib/policy.mjs';
 import { buildReceipt, setOutputs, writeReceipt } from '../lib/receipt.mjs';
 import { jobWriter, probe, readObject } from '../lib/s3.mjs';
 import { guarded, policyBanner, readCatchupMode, readMacLink, releaseRef } from './common.mjs';
@@ -185,20 +188,27 @@ export async function gate(config, {
 
     // TestFlight is the policy's and the manifest's, never the caller's: a store app owes it whenever its iOS lane is in
     // the run's scope. The Mac's store preflight hook runs only for such a run, and only when the app declares one.
-    const required = requiredTargets(policy, app, { store: Boolean(manifest.ios?.store) });
-    const testflight = scope.ios && required.testflight;
-    const storePreflight = testflight && Boolean(manifest.ios?.store?.preflight);
-    log(`HUB_TESTFLIGHT ${testflight ? 'owed' : 'not owed'}: ${testflightWhy({ policy, manifest, required, scope, storePreflight, platform: config.platform })}`);
-    const completion = { required, testflight, store_preflight: storePreflight, lane_unavailable: policy.completion.lane_unavailable };
-    track.receipt = { gate: { ios_lane: iosLane, mac_link: scope.ios ? link.link : 'unknown', s26, catchup, completion } };
+    // Only for a product the policy's completion.apps lists; any other app keeps the caller's input (v1.2.25).
+    const adopted = adopts(policy, env.GITHUB_REPOSITORY ?? '');
+    let testflight = config.testflight;
+    let storePreflight = false;
+    let completion = null;
+    if (adopted) {
+      const required = requiredTargets(policy, app, { store: Boolean(manifest.ios?.store) });
+      testflight = scope.ios && required.testflight;
+      storePreflight = testflight && Boolean(manifest.ios?.store?.preflight);
+      log(`HUB_TESTFLIGHT ${testflight ? 'owed' : 'not owed'}: ${testflightWhy({ policy, manifest, required, scope, storePreflight, platform: config.platform })}`);
+      completion = { required, testflight, store_preflight: storePreflight, lane_unavailable: policy.completion.lane_unavailable };
+      track.receipt = { gate: { ios_lane: iosLane, mac_link: scope.ios ? link.link : 'unknown', s26, catchup, completion } };
 
-    // A required lane that would not run is a refusal on a real run, before any version is spent (policy completion).
-    if (!config.dryRun && scope.ios && iosLane !== 'run' && policy.completion.lane_unavailable === 'refuse') {
-      const owed = `the iPad${testflight ? ' and TestFlight' : ''}`;
-      const why = iosLane === 'skip-metered'
-        ? `the Mac is on a metered link and the iPad build would go over its ${policy.mac.metered_budget_mib} MiB budget, so ${owed} would not be delivered; pass --metered allow to build it anyway`
-        : `the Mac is offline (${link.reason}), so ${owed} would not be delivered; bring the Mac back, or narrow with --platform android (the completion verdict is then INCOMPLETE)`;
-      throw refusal('lane_unavailable', `${why}. Nothing was spent (policy completion.lane_unavailable: refuse)`);
+      // A required lane that would not run is a refusal on a real run, before any version is spent (policy completion).
+      if (!config.dryRun && scope.ios && iosLane !== 'run' && policy.completion.lane_unavailable === 'refuse') {
+        const owed = `the iPad${testflight ? ' and TestFlight' : ''}`;
+        const why = iosLane === 'skip-metered'
+          ? `the Mac is on a metered link and the iPad build would go over its ${policy.mac.metered_budget_mib} MiB budget, so ${owed} would not be delivered; pass --metered allow to build it anyway`
+          : `the Mac is offline (${link.reason}), so ${owed} would not be delivered; bring the Mac back, or narrow with --platform android (the completion verdict is then INCOMPLETE)`;
+        throw refusal('lane_unavailable', `${why}. Nothing was spent (policy completion.lane_unavailable: refuse)`);
+      }
     }
 
     // The write path, before any version is spent: put and delete builds/.probe/<run> as the writer.
@@ -225,9 +235,9 @@ export async function gate(config, {
     await setOutputs(outputs, env);
     await writeReceipt(out, buildReceipt({
       lane: 'gate', config, env, notes: [`caller ${caller.hash.slice(0, 12)} accepted`, `mac ${link.link}: ${link.reason}`, `s26 ${s26}`, `s3 ${s3}`, `catch-up big-chungus=${catchup.android} mac=${catchup.ios ?? 'n/a'}`],
-      gate: { ios_lane: iosLane, mac_link: outputs.mac_link, mac_addr: link.addr, s26, s3, caller: caller.hash, catchup, completion, latest: latest ? { version: latest.version, mac_bytes: latest.mac_bytes ?? null } : null },
+      gate: { ios_lane: iosLane, mac_link: outputs.mac_link, mac_addr: link.addr, s26, s3, caller: caller.hash, catchup, ...(completion ? { completion } : {}), latest: latest ? { version: latest.version, mac_bytes: latest.mac_bytes ?? null } : null },
     }), env);
-    log(`HUB_GATE ok policy=${loaded.short} mac=${scope.ios ? link.link : 'n/a'} s26=${s26} s3=${s3} ios_lane=${iosLane} testflight=${testflight}`);
+    log(`HUB_GATE ok policy=${loaded.short} mac=${scope.ios ? link.link : 'n/a'} s26=${s26} s3=${s3} ios_lane=${iosLane}${adopted ? ` testflight=${testflight}` : ''}`);
     return outputs;
   });
 }

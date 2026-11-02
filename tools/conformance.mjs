@@ -8,7 +8,8 @@
 //     uploads, APK/IPA artifacts);
 //   - no mise task tags v*, bumps the version or announces a deploy (the task's run text and the scripts it runs);
 //   - a `ship` task, when the app has one, is the hub's own text (templates/mise-ship.toml). v1.3 accepts it and does
-//     not require it yet; a later release requires it once every app carries it.
+//     not require it yet; a later release requires it once every app carries it. Only for the products policy
+//     completion.apps lists: any other app's `ship` task is not looked at (it behaves as before v1.3).
 // GitHub Free has no rulesets for these private repos, so this (also run by every deploy's gate on its own checkout),
 // the global pre-commit guard and the event's hub_ref are what make a deploy around the hub visible. Exceptions are
 // listed below with the reason, the form they must keep and when they end.
@@ -18,7 +19,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { callerHash } from './ci/lib/caller.mjs';
 import { parseManifest } from './ci/lib/manifest.mjs';
-import { loadPolicy } from './ci/lib/policy.mjs';
+import { adopts, loadPolicy } from './ci/lib/policy.mjs';
 
 // A workflow exception holds only while the file keeps its documented form (`when`); a hub reference is never excepted.
 // The trigger keys of a workflow's top-level `on:` block (two-space indented), or null for another form.
@@ -142,7 +143,8 @@ export function checkApp({ repo, app, policy, read, list }) {
   let mise = '';
   try { mise = read('mise.toml'); } catch { /* an app without mise tasks has nothing to check */ }
   problems.push(...checkTasks(repo, mise, read));
-  problems.push(...checkShipTask(repo, mise));
+  // The ship task is the completion contract's: only a product policy completion.apps lists is held to it.
+  if (adopts(policy, repo)) problems.push(...checkShipTask(repo, mise));
   return problems;
 }
 

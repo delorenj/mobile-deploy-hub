@@ -130,20 +130,21 @@ test('lane_unavailable: skip is the v1.2 rollback: the real run goes on with the
   } finally { await f.cleanup(); }
 });
 
-test('no workflow job reads inputs.testflight: every job that needs TestFlight reads the gate\'s output, announce included', () => {
+test('only the gate reads inputs.testflight: every other job that needs TestFlight reads the gate\'s output, announce included', () => {
   const workflow = readFileSync(join(repoRoot, '.github/workflows/mobile-deploy.yml'), 'utf8');
   const code = workflow.split('\n').filter(line => !/^\s*#/.test(line)).join('\n');
-  assert.doesNotMatch(code, /inputs\.testflight/, 'no expression reads the caller\'s testflight');
+  // Per product (policy completion.apps): the gate gets the caller's input so an app outside the list keeps it as v1.2.25 did.
+  assert.equal(code.match(/inputs\.testflight/g).length, 1, 'one expression reads the caller\'s testflight: the gate\'s');
   const jobs = code.slice(code.indexOf('\njobs:\n')).split(/\n {2}(?=[\w-]+:\n)/).slice(1);
   const byName = Object.fromEntries(jobs.map(body => [body.split(':')[0], body]));
   for (const name of ['preflight-ios', 'plan', 'ios-export', 'ios', 'announce']) assert.match(byName[name], /\n {10}testflight: \$\{\{ needs\.gate\.outputs\.testflight \}\}\n/, name);
-  assert.doesNotMatch(byName.gate, /\n {10}testflight: /, 'the gate derives it, it is not handed one');
+  assert.match(byName.gate, /\n {10}testflight: \$\{\{ inputs\.testflight \}\}\n/, 'the gate alone is handed the caller\'s input, and decides');
   assert.match(byName.gate, /\n {6}testflight: \$\{\{ steps\.hub\.outputs\.testflight \}\}\n {6}store_preflight: \$\{\{ steps\.hub\.outputs\.store_preflight \}\}\n/);
   for (const [name, body] of Object.entries(byName)) if (/testflight:/.test(body) && name !== 'gate') assert.match(body, /needs: (gate|\[gate,)/, `${name} needs the gate to read its output`);
   // The caller surface is untouched: the template still passes testflight, and its hash is still accepted.
   assert.match(template, /^ {6}testflight: \$\{\{ inputs\.testflight \}\}$/m);
   assert.ok(policy.callers.accept.includes(callerHash(template)));
-  assert.match(code, /testflight:\n\s+description: [^\n]*read by no job[^\n]*\n\s+type: boolean\n\s+default: false\n/);
+  assert.match(code, /testflight:\n\s+description: [^\n]*read by the gate alone[^\n]*\n\s+type: boolean\n\s+default: false\n/);
   // announce uploads the verdict ship reads.
   assert.match(byName.announce, /name: completion-out\n\s+path: \$\{\{ runner\.temp \}\}\/hub-out\/completion\/completion\.json\n/);
 });
