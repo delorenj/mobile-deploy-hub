@@ -23,6 +23,7 @@ import { manifestPlist, resizeIcon } from '../lib/ota.mjs';
 import { appPage, indexPage } from '../lib/pages.mjs';
 import { appFor } from '../lib/policy.mjs';
 import { buildReceipt, sha256File, writeReceipt } from '../lib/receipt.mjs';
+import { notesKey, persistedNotes, validateNotes } from '../lib/release-notes.mjs';
 import { jobWriter, publishPages, pruneVersions, readObject } from '../lib/s3.mjs';
 import { catchupNote, firstLine, guarded, installCurrent, isoNow, parseNeeds, policyBanner, publicCopy, pruneStaging, readReceipts, requirePlan, runOf, stagingDir } from './common.mjs';
 
@@ -107,6 +108,9 @@ export async function deliver(config, { env = process.env, home = homedir(), fet
     const uploads = [];
     const candidates = { android: null, ios: null };
     const notes = [];
+    const releaseNotes = receipts.plan?.release_notes
+      ? validateNotes(receipts.plan.release_notes, { current: config.version, commit })
+      : validateNotes({ schema: 1, version: config.version, commit, previous_version: null, previous_commit: null, status: 'missing', entries: [] }); // old plan receipts
 
     // A lane that succeeded always leaves a receipt for this version; one this job cannot read (an artifact that did
     // not download, or expired before a rerun) would publish nothing and still look green.
@@ -223,6 +227,12 @@ export async function deliver(config, { env = process.env, home = homedir(), fet
       const merged = mergeLatest({ current, candidates, top, stamp, log });
       pointer = merged.pointer;
       if (merged.latest && merged.moved) {
+        const key = notesKey(slug, config.version);
+        const saved = merged.latest.version === config.version ? await readObject(policy, key, { fetchImpl }) : null;
+        // A version already published (including the other platform's earlier delivery) owns its notes.
+        // An old release without notes stays missing; never silently rewrite its record from newer sources.
+        const canonical = persistedNotes(saved, releaseNotes, { current: config.version, commit });
+        if (!saved && merged.latest.version === config.version) s3.putText(`${JSON.stringify(canonical, null, 2)}\n`, key);
         // 1. versioned objects, for the blocks this run moves (an older run's bytes are not uploaded over a newer pointer)
         for (const upload of uploads) if (pointer[upload.platform] === 'replaced') s3.put(upload.file, upload.key);
         s3.putText(`${JSON.stringify(publicCopy({ run, correlation, hub_ref: env.HUB_REF || null, receipts }), null, 2)}\n`, versionKey(slug, config.version, `receipt${config.scope === 'both' ? '' : `-${config.scope}`}.json`));
@@ -233,7 +243,7 @@ export async function deliver(config, { env = process.env, home = homedir(), fet
         }
         // 3. the pointer, 4. the pages
         s3.putText(serializeLatest(merged.latest), latestKey(slug));
-        await publishPages({ s3, policy, slug, latest: merged.latest, fetchImpl, env });
+        await publishPages({ s3, policy, slug, latest: merged.latest, currentNotes: merged.latest.version === config.version ? canonical : null, fetchImpl, env });
         // 5. retention
         const removed = pruneVersions({ s3, policy, slug, latest: merged.latest });
         if (removed.length > 0) notes.push(`pruned ${removed.length} old objects`);

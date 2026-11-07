@@ -13,6 +13,7 @@ import { loadDevices } from '../lib/devices.mjs';
 import { hookOutput, runBounded } from '../lib/exec.mjs';
 import { latestKey, parseLatest } from '../lib/latest.mjs';
 import { loadManifest } from '../lib/manifest.mjs';
+import { notesKey, notesText, validateNotes } from '../lib/release-notes.mjs';
 import { readObject } from '../lib/s3.mjs';
 import { parseVersionInfo } from '../lib/version.mjs';
 import { firstLine, parseNeeds, policyBanner, readReceipts, runOf, semver } from './common.mjs';
@@ -118,6 +119,17 @@ export async function announce(config, { env = process.env, home = homedir(), fe
   const lost = lostMac === undefined ? findLostMac({ env, needs, policy }) : lostMac;
   if (lost) log(`HUB_MAC_LOST ${lost.job}: ${lost.reason}`);
   const event = deploymentEvent({ project, declared, platform: config.platform, devices, needs, receipts, version, androidCode: androidCode ? String(androidCode) : '', commit, iosLane, published: published.page ? published : null, env, lostMac: lost, extraDeliveries });
+  // The page and Release both reference this immutable per-version record. Notification text stays a short
+  // operational status (the Bloodbank schema caps it); its page button opens the full authored notes.
+  if (published.page && !config.dryRun) {
+    try {
+      const raw = await readObject(policy, notesKey(project.slug, version), { fetchImpl });
+      if (raw) {
+        const canonical = validateNotes(JSON.parse(raw), { current: version, commit });
+        if (canonical.status === 'authored') log(`HUB_RELEASE_NOTES ${notesText(canonical).split('\n')[0]}: ${published.page}`);
+      }
+    } catch (error) { log(`::warning::release notes unavailable for notification (${firstLine(error.message)}); the build page remains the canonical link`); }
+  }
 
   // The completion verdict, written before the event goes out so a dead bus still leaves it (rewritten red below).
   let latest = null;

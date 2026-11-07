@@ -21,7 +21,9 @@ import { loadPolicy, tagOf } from '../lib/policy.mjs';
 import { uploadBundle } from '../lib/play.mjs';
 import { dropApk, s26OnLan } from '../lib/quickdrop.mjs';
 import { buildReceipt, sha256File, writeReceipt } from '../lib/receipt.mjs';
-import { applyBump, checkAppReceipt, exists, guarded, policyBanner, requirePlan, semver, stagingDir } from './common.mjs';
+import { notesKey, notesText, validateNotes } from '../lib/release-notes.mjs';
+import { readObject } from '../lib/s3.mjs';
+import { applyBump, checkAppReceipt, exists, guarded, policyBanner, readReceipts, requirePlan, semver, stagingDir } from './common.mjs';
 
 // Away is the code findPhone attaches, never its wording: the message names the reason (absent, unauthorized, offline).
 const notOnAdb = error => error?.code === 'HUB_PHONE_AWAY';
@@ -204,12 +206,17 @@ async function releaseLane(config, { env }) {
   // The commit the APK was built from: the bump commit, never the commit before it.
   const sha = config.buildSha || env.GITHUB_SHA || 'HEAD';
   const digest = await sha256File(join(out, basename(spec.artifact)));
-  const notes = [`Android sideload build ${config.version}${config.androidCode ? ` (versionCode ${config.androidCode})` : ''}.`, `Commit ${sha}, run ${env.GITHUB_RUN_ID ?? 'local'}.`, `${basename(spec.artifact)} sha256 ${digest}.`, `Debug-signed with the pinned key, so it installs over the previous build. Phones: the build page https://s3.delo.sh/builds/${manifest.project.slug}/index.html (Install APK).`].join('\n');
+  const planNotes = readReceipts(env.HUB_RECEIPTS || join(config.out, 'receipts')).plan?.release_notes;
+  const policy = loadPolicy().policy;
+  const saved = await readObject(policy, notesKey(manifest.project.slug, config.version));
+  const canonical = saved ? validateNotes(JSON.parse(saved), { current: config.version, commit: sha }) : planNotes ? validateNotes(planNotes, { current: config.version, commit: sha }) : null;
+  const notes = canonical ? `${notesText(canonical)}\n\nBuild: ${basename(spec.artifact)} sha256 ${digest}.\nBuild page: https://s3.delo.sh/builds/${manifest.project.slug}/index.html` : `No author-written release notes were supplied for this build.\nCommit ${sha}; run ${env.GITHUB_RUN_ID ?? 'local'}.\nBuild page: https://s3.delo.sh/builds/${manifest.project.slug}/index.html`;
   const existing = spawnSync('gh', ['release', 'view', tag, '--repo', repo], { env, stdio: 'ignore' });
   if (existing.status === 0) {
     // The plan never reuses a version, so the Release of this tag came from an earlier attempt of this deploy
     // ("Re-run failed jobs"). Its assets are replaced by this attempt's.
     run('gh', ['release', 'upload', tag, ...assets, '--repo', repo, '--clobber'], { env, cwd: config.cwd });
+    run('gh', ['release', 'edit', tag, '--repo', repo, '--notes', notes], { env, cwd: config.cwd });
     console.log(`HUB_RELEASE_UPDATED ${tag} ${repo}: an earlier attempt published it; assets replaced by this attempt's`);
     return { tag, repo, assets, updated: true };
   }

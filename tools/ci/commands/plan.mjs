@@ -24,6 +24,7 @@ import { bumpTransaction, createGit } from '../lib/git.mjs';
 import { compareBuild, compareSemver, inflightKey, latestKey, parseLatest } from '../lib/latest.mjs';
 import { withLock } from '../lib/lock.mjs';
 import { loadManifest } from '../lib/manifest.mjs';
+import { authoredNotes } from '../lib/release-notes.mjs';
 import { buildReceipt, setOutputs, writeReceipt } from '../lib/receipt.mjs';
 import { jobWriter, readObject } from '../lib/s3.mjs';
 import { parseVersionInfo } from '../lib/version.mjs';
@@ -267,6 +268,9 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
         let base = null;
         try { base = readFileSync(join(config.cwd, config.manifest), 'utf8'); } catch { /* reported below */ }
         if (base !== dispatchedManifest) throw refusal('manifest', `${config.manifest} changed on main since the dispatched commit ${short(env.GITHUB_SHA ?? '')}; dispatch the deploy again so the gate checks it. Nothing was bumped`);
+        // Validate optional author input before the version commit/tag is pushed; an invalid file must never
+        // consume a version. The final snapshot uses the actual bump SHA after the transaction succeeds.
+        authoredNotes(config.cwd, { current: bumped.version, previous: latest?.version ?? null, previousCommit: latest?.commit ?? null, commit: env.GITHUB_SHA || '0000000' });
         if (phone && bumped.android_code !== undefined && bumped.android_code <= phone.versionCode) {
           throw new Error(`the S26 already has ${manifest.android.package} versionCode ${phone.versionCode}, at or above the planned ${bumped.android_code}; Android would refuse the update. Bump past it (--bump minor) or find out what installed that build`);
         }
@@ -287,6 +291,9 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
       message: ({ current: from, bumped, level }) => `chore(release): v${bumped.version}\n\nVersion ${from.version} -> ${bumped.version} (${level}) by mobile-deploy-hub, ${runUrl}.`,
     });
     const next = result.next;
+    // Capture the exact published-version range from the checkout at the build revision. The receipt survives
+    // same-version reruns, even after the app's main branch has moved on.
+    const releaseNotes = authoredNotes(config.cwd, { current: next.version, previous: latest?.version ?? null, previousCommit: latest?.commit ?? null, commit: result.sha });
 
     // The Mac once more, right before the iPad lane: the S26 wait and the bump can take minutes, and a Mac that left in
     // between (a closed lid, a dropped hotspot) would hold the iPad job, and announce, in GitHub's queue for 24 hours.
@@ -341,6 +348,7 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
       bump, devices: { s26: phone, s26_state: s26, ipad: declared.ios && iosLane === 'run' ? { version: config.ipadVersion, build: config.ipadBuild || null } : null, ios_lane: laneNow },
       published: latest ? { android: latest.android ? { version: latest.android.version, code: latest.android.code } : null, ios: latest.ios ? { version: latest.ios.version, build: latest.ios.build } : null } : null,
       bloodbank: { commit: tree.commit, clean: tree.dirty ? tree.dirty.length === 0 : null },
+      release_notes: releaseNotes,
     }), env);
     log(`HUB_PLAN version=${result.current.version} next=${next.version} android_code=${next.android_code ?? '-'} platform=${config.platform} bump=${config.bump} dry_run=${config.dryRun} s26=${s26} ios_lane=${laneNow} build_sha=${short(result.sha)}`);
     return { ...outputs, schema: 2, run_android: scope.android, run_ios: scope.ios };

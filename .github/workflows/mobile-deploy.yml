@@ -302,6 +302,11 @@ jobs:
           dry_run: ${{ inputs.dry_run }}
           android_code: ${{ needs.plan.outputs.android_code }}
           play_token: ${{ steps.auth.outputs.access_token }}
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: plan-out
+          path: ${{ runner.temp }}/hub-out/receipts/plan
       - name: Publish the APK to a private Release
         if: ${{ !inputs.dry_run && needs.plan.outputs.release_lane == 'true' }}
         uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.26

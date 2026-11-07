@@ -3,7 +3,14 @@
 // builds/index.html lists every app; builds/<slug>/index.html is one app's page: Install APK, Install on iPad, each
 // device's state, sizes, commit, run and the APK history. builds/index.json carries the same as data.
 const html = text => String(text ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-const attr = url => html(url);
+const attr = url => html(safeUrl(url));
+const safeUrl = url => {
+  try {
+    const parsed = new URL(url, 'https://s3.delo.sh/');
+    if ((parsed.protocol === 'https:' && parsed.username === '' && parsed.password === '' && !/[\s"<>]/.test(url)) || (parsed.protocol === 'itms-services:' && /^itms-services:\/\/\?action=download-manifest&url=https:\/\/[^\s"<>]+$/.test(url))) return url;
+  } catch { /* not a URL */ }
+  return '#';
+};
 
 export function megabytes(bytes) {
   if (!Number.isFinite(bytes) || bytes <= 0) return '';
@@ -48,7 +55,11 @@ p, li { margin: 4px 0; }
 .status-failed { color: var(--bad); }
 ul { padding-left: 20px; }
 a { color: var(--accent); }
-code { font-size: 0.85rem; }
+code { font-size: 0.85rem; overflow-wrap: anywhere; }
+details { border-top: 1px solid var(--line); padding: 10px 0; }
+summary { cursor: pointer; }
+h3 { font-size: 1rem; margin-bottom: 6px; }
+h4 { font-size: .9rem; margin-bottom: 4px; }
 `;
 
 function page(title, body) {
@@ -87,16 +98,25 @@ function deviceItems(latest) {
 
 const short = sha => String(sha ?? '').slice(0, 7);
 
+function noteSections(note) {
+  if (!note) return '<p class="muted">No author-written release notes were published for this older build.</p>';
+  const provenance = `<p class="muted">Source <code>${html(note.previous_commit ?? 'unknown')}..${html(note.commit)}</code>; ${html(note.previous_version ?? 'first published build')} → ${html(note.version)}</p>`;
+  if (note.status === 'missing') return `${provenance}<p>No author-written release notes were supplied for this build.</p>`;
+  const sections = note.entries.map(entry => `<div><h3>${html(entry.version)} · ${entry.kind === 'app' ? 'App-visible' : 'Backend / maintenance'}</h3>${[['whats_new', "What's new"], ['try', 'What to try'], ['limitations', 'Known limitations']].map(([field, label]) => entry[field].length ? `<h4>${label}</h4><ul>${entry[field].map(line => `<li>${html(line)}</li>`).join('')}</ul>` : '').join('')}</div>`).join('');
+  return `${provenance}${sections}<p class="muted">Explicitly authored entries in this range; unannotated changes may also exist.</p>`;
+}
+
 // The device states come from latest.json, which deliver and the catch-up both keep current; the page never carries
 // a per-run list that a catch-up re-render would lose.
-export function appPage({ latest, history = [] }) {
+export function appPage({ latest, history = [], releaseNotes = {} }) {
   const runLink = latest.run?.url ? `<a href="${attr(latest.run.url)}">run ${html(latest.run.id)}</a>` : `run ${html(latest.run?.id ?? '-')}`;
   const sizes = [
     latest.android ? `APK ${megabytes(latest.android.bytes)}` : null,
     latest.ios?.bytes ? `IPA ${megabytes(latest.ios.bytes)}` : null,
   ].filter(Boolean).join(', ');
-  const older = history.length > 0
-    ? `<h2>Android history</h2>\n<ul>\n${history.map(item => `<li><a href="${attr(item.url)}">${html(item.version)} (${html(item.code)})</a>${item.bytes ? ` <span class="muted">${megabytes(item.bytes)}</span>` : ''}</li>`).join('\n')}\n</ul>`
+  const olderItems = history.filter(item => item.version !== latest.version);
+  const older = olderItems.length > 0
+    ? `<h2>Build history</h2>\n${olderItems.map(item => `<details><summary>${html(item.version)} (${html(item.code)})${item.bytes ? ` · ${megabytes(item.bytes)}` : ''}</summary>${noteSections(releaseNotes[item.version])}<a href="${attr(item.url)}">Download retained APK</a></details>`).join('\n')}`
     : '';
   const body = `<h1>${html(latest.name)}</h1>
 <p class="muted">Newest deploy ${html(latest.version)}, commit <code>${html(short(latest.commit))}</code>, ${runLink}${latest.hub_ref ? `, hub ${html(latest.hub_ref)}` : ''}</p>
@@ -107,6 +127,7 @@ ${deviceItems(latest)}
 </ul>
 ${sizes ? `<p class="muted">${html(sizes)}</p>` : ''}
 </div>
+<section class="card"><h2>Release notes · ${html(latest.version)}</h2>${noteSections(releaseNotes[latest.version])}</section>
 ${older}
 <p class="muted">Updated ${html(latest.updated_at)}. Builds older than the newest five APKs, and every IPA but the newest, are removed.</p>`;
   return page(`${latest.name} builds`, body);

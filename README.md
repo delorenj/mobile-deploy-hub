@@ -110,6 +110,8 @@ A dry run never commits to the remote, tags, installs, publishes, uploads or emi
 
 ## The build directory
 
+App authors can add optional, structured, tracked [release notes](docs/release-notes.md) for the next planned version. The hub snapshots the full range since the previous published build and publishes one canonical per-version record to the build page and private Release; existing apps without notes keep working with an honest missing-notes label.
+
 MinIO bucket `builds` (public read, written only from big-chungus over `127.0.0.1:9012` by the MinIO user `mobile-deploy-hub`, whose keys are the DeLoSecrets item "MinIO builds writer (mobile-deploy-hub)", read with `op read` at call time into the `mc` child's environment only):
 
 ```

@@ -12,6 +12,7 @@ import { attempt } from './exec.mjs';
 import { compareBuild, compareSemver, latestKey, pageKey, parseLatest, publicUrl, serializeLatest } from './latest.mjs';
 import { withLock } from './lock.mjs';
 import { appPage, indexData, indexPage } from './pages.mjs';
+import { notesKey, validateNotes } from './release-notes.mjs';
 
 // DeLoSecrets item "MinIO builds writer (mobile-deploy-hub)", by UUID (titles are not unique in the vault).
 export const writerItem = 'op://DeLoSecrets/dfch6zwvscl3ootrcbkwbfelka';
@@ -176,9 +177,15 @@ export function historyOf(listing, policy, slug) {
 // The app page, then (under the s3-index lock, shared by every app) index.json and index.html from every app's
 // latest.json. deliver and the catch-up reporter both call this after they write latest.json, so the page always
 // shows latest.json's device states (a per-run list would vanish on a catch-up re-render).
-export async function publishPages({ s3, policy, slug, latest, fetchImpl = fetch, env = process.env }) {
+export async function publishPages({ s3, policy, slug, latest, currentNotes = null, fetchImpl = fetch, env = process.env }) {
   const history = historyOf(s3.list(`${slug}/`), policy, slug);
-  s3.putText(appPage({ latest, history }), pageKey(slug));
+  const versions = [...new Set([latest.version, ...history.map(item => item.version)])];
+  const releaseNotes = {};
+  for (const version of versions) {
+    const raw = version === latest.version && currentNotes ? JSON.stringify(currentNotes) : await readObject(policy, notesKey(slug, version), { fetchImpl });
+    if (raw) releaseNotes[version] = validateNotes(JSON.parse(raw), { current: version });
+  }
+  s3.putText(appPage({ latest, history, releaseNotes }), pageKey(slug));
   await withLock('s3-index', async () => {
     const apps = [];
     for (const app of Object.values(policy.apps)) {
