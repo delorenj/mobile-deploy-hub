@@ -165,6 +165,21 @@ test('the gate passes a well-formed run and reads the state of things: metered M
   } finally { await f.cleanup(); }
 });
 
+test('released policy keeps TestFlight opt-in and lets unavailable iOS lanes skip on real runs', async () => {
+  const manifest = towerManifest({ ios: { ...towerManifest().ios, export: 'true', archive: 'App.tgz', receipt: 'app.json', store: { archive: 'Store.tgz', receipt: 'store.json', upload: 'true', assign: 'true', signer_sha1: 'F8A5C5309FC1B6C7DD7662A28EA822BE3309C351' } } });
+  const f = await gateFixture({ manifest });
+  try {
+    assert.equal((await gate(f.configure(['--dry-run', 'false']), f.deps())).testflight, false);
+    assert.equal((await gate(f.configure(['--dry-run', 'false', '--testflight', 'true']), f.deps())).testflight, true);
+    const offline = f.deps({ tailscale: () => peer('', false) });
+    const skipped = await gate(f.configure(['--dry-run', 'false', '--testflight', 'true']), offline);
+    assert.deepEqual([skipped.ios_lane, skipped.testflight], ['skip-offline', false]);
+    const receipt = JSON.parse(readFileSync(join(f.root, 'out/gate/hub-receipt-gate.json'), 'utf8'));
+    assert.deepEqual(receipt.gate.completion.required, { android: false, ios: false, testflight: false });
+    assert.equal(receipt.gate.completion.lane_unavailable, 'skip');
+  } finally { await f.cleanup(); }
+});
+
 test('an S26 that adb lists but cannot use (unauthorized) is away, not a red gate: away is the code, not the wording', async () => {
   const f = await gateFixture();
   try {

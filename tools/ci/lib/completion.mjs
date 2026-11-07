@@ -1,6 +1,6 @@
-// The completion verdict (hub v1.3, TOWE-76, policy `completion`): one pure function that says whether a run shipped.
-// A green GitHub run is not "shipped". Shipped means every target the policy requires of this app holds the version,
-// or durably owes it:
+// The completion verdict (TOWE-76) judges only targets required by the loaded policy. With the deployed policy's
+// absent `completion` block, no device or TestFlight target is mandatory; the stricter contract below is deferred.
+// An explicit future completion block can require each lane's device and store TestFlight:
 //
 //   - a device lane (S26 for android, iPad for ios) is installed, or pending where pending is durable: latest.json
 //     (read after deliver) names this exact version for that device as pending, and the catch-up on the device's host

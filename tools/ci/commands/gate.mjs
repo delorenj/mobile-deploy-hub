@@ -6,11 +6,9 @@
 // catch-up's mode on both hosts, the build directory) and decides the iPad lane: run it, or skip it because the Mac is
 // offline or a metered link would go over the data budget.
 //
-// hub v1.3 (TOWE-76, policy `completion`): the gate also decides TestFlight. A store app (its manifest declares
-// ios.store) owes TestFlight whenever its iOS lane is in the run's scope, dry runs included, and the caller's testflight
-// input reaches no job: every later job reads the gate's `testflight` output. A real run whose required iOS lane would
-// not run (the Mac offline, or a metered link over budget) is refused here, before plan spends a version, when the
-// policy says lane_unavailable: refuse. An explicit --platform android still runs; its completion verdict is INCOMPLETE.
+// The gate owns the TestFlight decision for downstream jobs. With no completion block, the caller opts in as in
+// v1.2.25 and unavailable lanes skip. An explicit future completion block can require store TestFlight and refuse
+// unavailable lanes before plan spends a version.
 import { readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -107,11 +105,12 @@ export function checkConformance({ policy, app, config, env }) {
 }
 
 // Why the gate did or did not put TestFlight in this run, for the log.
-function testflightWhy({ policy, manifest, required, scope, storePreflight, platform }) {
+function testflightWhy({ policy, manifest, required, scope, iosLane, storePreflight, platform }) {
   if (!manifest.ios?.store) return 'the manifest declares no ios.store';
-  if (!required.testflight) return `policy completion.required.testflight is ${policy.completion.required.testflight}`;
-  if (!scope.ios) return `--platform ${platform} leaves the iOS lane out (the completion verdict will owe TestFlight)`;
-  return `a store app (ios.store)${storePreflight ? ', with the ios.store.preflight hook on the Mac' : ''}; the caller's testflight input is not read`;
+  if (!scope.ios) return `--platform ${platform} leaves the iOS lane out`;
+  if (iosLane !== 'run') return `the iOS lane is ${iosLane}; TestFlight is skipped with it`;
+  if (!required.testflight) return `policy completion.required.testflight is ${policy.completion.required.testflight}; the caller did not request TestFlight`;
+  return `a store app (ios.store)${storePreflight ? ', with the ios.store.preflight hook on the Mac' : ''}; ${policy.completion.required.testflight === 'store' ? 'the caller\'s testflight input is not read' : 'the caller requested TestFlight'}`;
 }
 
 async function quickS26({ env, home, devices, adbFactory }) {
@@ -183,12 +182,15 @@ export async function gate(config, {
       if (catchup[platform] === 'watch' && !config.dryRun) log(`::warning::the catch-up on ${host} is in watch mode: a pending ${platform === 'android' ? 'S26' : 'iPad'} is not installed when it comes back until \`catchup.mjs mode live\` runs there`);
     }
 
-    // TestFlight is the policy's and the manifest's, never the caller's: a store app owes it whenever its iOS lane is in
-    // the run's scope. The Mac's store preflight hook runs only for such a run, and only when the app declares one.
+    // An explicit strict completion block can require store TestFlight; otherwise the caller opts in as in v1.2.25.
+    // Downstream jobs always read this gate output, not the original input.
     const required = requiredTargets(policy, app, { store: Boolean(manifest.ios?.store) });
-    const testflight = scope.ios && required.testflight;
+    if (config.testflight && !manifest.ios?.store && policy.completion.required.testflight === 'never') throw refusal('testflight', `--testflight is for an app with ios.store; ${app.slug} has no App Store Connect app in its manifest`);
+    if (policy.completion.required.testflight === 'never' && config.testflight && !scope.ios) throw refusal('testflight', `--testflight needs the iOS lane (platform both or ios)`);
+    const testflight = scope.ios && (policy.completion.required.testflight === 'store' ? required.testflight : iosLane === 'run' && Boolean(config.testflight));
+    if (testflight) required.testflight = true;
     const storePreflight = testflight && Boolean(manifest.ios?.store?.preflight);
-    log(`HUB_TESTFLIGHT ${testflight ? 'owed' : 'not owed'}: ${testflightWhy({ policy, manifest, required, scope, storePreflight, platform: config.platform })}`);
+    log(`HUB_TESTFLIGHT ${testflight ? 'owed' : 'not owed'}: ${testflightWhy({ policy, manifest, required, scope, iosLane, storePreflight, platform: config.platform })}`);
     const completion = { required, testflight, store_preflight: storePreflight, lane_unavailable: policy.completion.lane_unavailable };
     track.receipt = { gate: { ios_lane: iosLane, mac_link: scope.ios ? link.link : 'unknown', s26, catchup, completion } };
 

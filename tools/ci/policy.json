@@ -42,6 +42,5 @@
     "release": true
   },
   "mac": { "lan_cidr": "192.168.1.0/24", "metered_budget_mib": 150, "queue_limit_min": 15 },
-  "catch_up": { "android_every_s": 120, "ios_every_s": 300, "max_failures": 3 },
-  "completion": { "required": { "devices": "lanes", "testflight": "store" }, "lane_unavailable": "refuse", "reruns": 1 }
+  "catch_up": { "android_every_s": 120, "ios_every_s": 300, "max_failures": 3 }
 }

@@ -42,13 +42,11 @@ What it is: one shared deploy pipeline (a reusable GitHub workflow, a composite 
 
 - **`hub-device`:** FIFO leases on the shared S26 and S24 (`lease`, `release`, `run`, `status`), plus a throwaway emulator pool with identity-checked teardown.
 
-## Built but not live (hub `main`, v1.2.26; rolled back 2026-11-02)
+## Implemented but not activated by the current policy (hub `main`)
 
-- `mise run ship`: dry run, then real run on the same commit, then a completion verdict (every platform on the new version or durably pending, else `SHIP_INCOMPLETE`/`SHIP_RED`).
-- TestFlight required for App Store apps (gate-derived).
-- A real run refused before the version is spent when a platform cannot build.
-- Store preflight before the bump.
-- No duplicate App Store upload on rerun.
+- `mise run ship`: dry run, then real run on the same commit, then a completion verdict. With the deployed v1.2.25 policy's absent `completion` block, it does **not** require device arrival, TestFlight, or automatic reruns.
+- The optional strict `completion` contract has tests for requiring every lane's device, TestFlight for App Store apps, refusing unavailable required lanes before the bump, and one same-version rerun. It is deferred to a separate policy decision/release, not part of the authored release-notes adoption.
+- Store preflight (when TestFlight is requested) and duplicate App Store upload avoidance on rerun.
 
 ## Not built
 

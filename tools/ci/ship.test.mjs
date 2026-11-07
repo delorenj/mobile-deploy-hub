@@ -14,6 +14,8 @@ const A = 'a'.repeat(40);
 const B = 'b'.repeat(40);
 const C = '3832680b'.padEnd(40, 'c');
 const policyText = readFileSync(policyFile, 'utf8');
+// The old ship contract remains testable without activating it in the released policy.
+const strictPolicyText = JSON.stringify({ ...JSON.parse(policyText), completion: { required: { devices: 'lanes', testflight: 'store' }, lane_unavailable: 'refuse', reruns: 1 } });
 const workflowText = '    uses: delorenj/mobile-deploy-hub/.github/workflows/mobile-deploy.yml@v1\n    with:\n      manifest: tools/ci/mobile-deploy.json\n';
 const appManifest = upload => ({ schema: 2, android: {}, ios: { store: { upload, assign: 'node tools/testflight.mjs assign "$HUB_OUT/ios/testflight-export.json"' } } });
 
@@ -25,7 +27,7 @@ const verdict = (kind, extra = {}) => ({
 });
 const dryOk = () => ({ conclusion: 'success', completion: verdict('COMPLETE', { dry_run: true, bumped: false }) });
 
-function world({ main = A, runs = [], outcomes = [], runners = [{ name: 'carries-macbook-air', status: 'online', labels: ['self-hosted', 'macOS'] }], files = {}, compare = [], policy = policyText } = {}) {
+function world({ main = A, runs = [], outcomes = [], runners = [{ name: 'carries-macbook-air', status: 'online', labels: ['self-hosted', 'macOS'] }], files = {}, compare = [], policy = strictPolicyText } = {}) {
   let clock = Date.parse('2026-11-02T20:00:00Z');
   let nextId = 41_600_000_000;
   const state = { main, runs: runs.map(run => ({ run_attempt: 1, event: 'workflow_dispatch', url: `https://github.com/${repo}/actions/runs/${run.databaseId}`, ...run })), calls: [], dispatched: [], reruns: [], pulls: 0 };
@@ -182,7 +184,7 @@ test('red after the bump -> rerun (same version) -> complete; reruns are capped 
   assert.match(stubborn.last(), /^SHIP_RED delorenj\/tower-of-lost-things 0\.3\.20 run (\d+) \S+: ios failed at build: rsync IPA .*still red after 1 automatic rerun \(same version, same commit\)\. Owed: gh run rerun \1 --repo delorenj\/tower-of-lost-things --failed$/);
   assert.equal(stubborn.state.reruns.length, 1, 'policy completion.reruns is 1');
 
-  const none = world({ policy: JSON.stringify({ ...JSON.parse(policyText), completion: { ...JSON.parse(policyText).completion, reruns: 0 } }), outcomes: [dryOk(), { conclusion: 'failure', completion: red }] });
+  const none = world({ policy: JSON.stringify({ ...JSON.parse(strictPolicyText), completion: { ...JSON.parse(strictPolicyText).completion, reruns: 0 } }), outcomes: [dryOk(), { conclusion: 'failure', completion: red }] });
   assert.equal((await none.go()).status, 1);
   assert.match(none.last(), /the policy allows no automatic rerun/);
   assert.deepEqual(none.state.reruns, []);

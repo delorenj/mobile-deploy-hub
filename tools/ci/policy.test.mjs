@@ -1,5 +1,5 @@
-// The policy's completion block (hub v1.3, TOWE-76): the repo's own policy.json parses (a test that would have caught
-// the broken TOWE-76 attempt, whose parser refused the live file), and every bad completion block is refused.
+// The deployed policy has no completion block. Validate the parser's compatible defaults and separately test the
+// deferred stricter contract without enabling it in policy.json.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -7,23 +7,23 @@ import { loadPolicy, maxReruns, parsePolicy, policyFile, requiredTargets } from 
 
 const source = readFileSync(policyFile, 'utf8');
 
-test('loadPolicy parses the repo\'s own policy.json, completion block included', () => {
+test('loadPolicy parses the repo policy with compatible completion defaults', () => {
   const { policy, sha256, short } = loadPolicy();
   assert.match(sha256, /^[0-9a-f]{64}$/);
   assert.equal(short, sha256.slice(0, 8));
-  assert.deepEqual(policy.completion, { required: { devices: 'lanes', testflight: 'store' }, lane_unavailable: 'refuse', reruns: 1 });
+  assert.deepEqual(policy.completion, { required: { devices: 'never', testflight: 'never' }, lane_unavailable: 'skip', reruns: 0 });
   // Every app keeps the shape the gate, deliver and the catch-up read: no per-app TestFlight switch anywhere.
   for (const [repo, app] of Object.entries(policy.apps)) {
     assert.ok(!('testflight' in app), `${repo} has no testflight key: TestFlight is the manifest's ios.store under the one rule`);
     if (app.ios) assert.deepEqual(Object.keys(app.ios).filter(key => !['bundle', 'store_bundle'].includes(key)), [], `${repo}.ios keeps bundle and store_bundle only`);
   }
-  assert.equal(parsePolicy(source).completion.reruns, 1);
+  assert.equal(parsePolicy(source).completion.reruns, 0);
 });
 
 test('a bad completion block is refused, whatever it gets wrong', () => {
   const base = JSON.parse(source);
+  base.completion = { required: { devices: 'lanes', testflight: 'store' }, lane_unavailable: 'refuse', reruns: 1 };
   const cases = {
-    'no completion block': p => { delete p.completion; },
     'completion is not an object': p => { p.completion = 'refuse'; },
     'unknown completion key': p => { p.completion.pending_stale_h = 24; },
     'no required': p => { delete p.completion.required; },
@@ -53,8 +53,19 @@ test('a bad completion block is refused, whatever it gets wrong', () => {
   }
 });
 
-test('required targets: every lane\'s device, and TestFlight for a store app with an iOS lane, by one rule', () => {
+test('released v1.2.25 has no completion block; the parser defaults to skip, opt-in and no reruns', () => {
+  assert.equal(Object.hasOwn(JSON.parse(source), 'completion'), false);
   const { policy } = loadPolicy();
+  for (const app of Object.values(policy.apps)) {
+    assert.deepEqual(requiredTargets(policy, app, { store: true }), { android: false, ios: false, testflight: false });
+  }
+  assert.equal(policy.completion.lane_unavailable, 'skip');
+  assert.equal(policy.completion.reruns, 0);
+});
+
+test('required targets: every lane\'s device, and TestFlight for a store app with an iOS lane, by one rule', () => {
+  const { policy: released } = loadPolicy();
+  const policy = { ...released, completion: { required: { devices: 'lanes', testflight: 'store' }, lane_unavailable: 'refuse', reruns: 1 } };
   const tower = policy.apps['delorenj/tower-of-lost-things'];
   assert.deepEqual(requiredTargets(policy, tower, { store: true }), { android: true, ios: true, testflight: true });
   assert.deepEqual(requiredTargets(policy, tower, { store: false }), { android: true, ios: true, testflight: false }, 'no ios.store, no TestFlight');

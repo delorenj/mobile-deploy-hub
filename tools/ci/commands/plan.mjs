@@ -191,9 +191,9 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
     if (config.platform === 'android' && !manifest.android) throw new Error('platform android but the manifest has no android section');
     if (config.platform === 'ios' && !manifest.ios) throw new Error('platform ios but the manifest has no ios section');
     if (config.testflight && !manifest.ios?.store) throw new Error(`TestFlight is for an app with ios.store; ${manifest.project.slug} has no App Store Connect app in its manifest`);
-    // The gate derives TestFlight and refuses a real run whose required iOS lane would not run; what reaches here with the
-    // lane skipped is a dry run (or the skip policy): TestFlight rides the iOS lane, so it is owed, not a red plan.
-    if (config.testflight && !scope.ios) log(`HUB_TESTFLIGHT_SKIPPED the iOS lane does not run (ios_lane=${iosLane}); TestFlight is owed by this version`);
+    // The gate decides TestFlight from the caller opt-in (or an explicit completion policy). When iOS skips,
+    // its gate output is false under the current policy, so no TestFlight work is attempted in plan.
+    if (config.testflight && !scope.ios) log(`HUB_TESTFLIGHT_SKIPPED the iOS lane does not run (ios_lane=${iosLane}); TestFlight cannot run on this lane`);
     if (config.play) {
       if (!scope.android) throw new Error('--play needs the Android lane (platform both or android)');
       if (!manifest.android.bundle) throw new Error(`--play needs an android.bundle hook and ${manifest.android.package} declares none; Play stays blocked on the Play launch spec`);

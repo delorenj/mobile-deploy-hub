@@ -1,6 +1,5 @@
-// TestFlight is the gate's (hub v1.3, TOWE-76): the gate derives it from the policy and the manifest, outputs it and
-// refuses a real run whose required lane would not run, before plan; no workflow job reads inputs.testflight; a store
-// app's ios.store.preflight hook runs in preflight-ios from the dispatched commit, before the bump.
+// TestFlight follows the caller's opt-in with the deployed policy. The explicit strict completion fixture below
+// exercises the deferred policy-derived TestFlight and pre-bump lane refusal without activating them.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -20,7 +19,9 @@ import { sampleLatest } from './test-fixtures.mjs';
 
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 const template = readFileSync(templateFile, 'utf8');
-const { policy } = loadPolicy();
+const { policy: releasedPolicy } = loadPolicy();
+const policy = { ...releasedPolicy, completion: { required: { devices: 'lanes', testflight: 'store' }, lane_unavailable: 'refuse', reruns: 1 } };
+const strictPolicyText = JSON.stringify(policy);
 const pin = policy.apps['delorenj/tower-of-lost-things'];
 
 function manifest({ store = true, preflight = false, state = false } = {}) {
@@ -42,7 +43,7 @@ const offline = () => peer('', false);
 const metered = () => peer('76.98.73.87:11349');
 const heavyLatest = JSON.stringify(sampleLatest({ mac_bytes: 400 * 1024 * 1024 }));
 
-async function fixture({ app = manifest(), policyText = null } = {}) {
+async function fixture({ app = manifest(), policyText = strictPolicyText } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'hub-gate13-'));
   const checkout = join(root, 'app');
   await mkdir(join(checkout, '.github/workflows'), { recursive: true });
@@ -72,13 +73,13 @@ async function fixture({ app = manifest(), policyText = null } = {}) {
 
 const real = ['--dry-run', 'false'];
 
-test('the gate derives TestFlight from the policy and the manifest, for real and dry runs, whatever the caller passed', async () => {
+test('strict completion requires TestFlight for store apps even when the caller passes false', async () => {
   const table = [
     // [name, manifest, flags, tailscale, latest] -> [ios_lane, testflight, store_preflight]
     ['store app, dry, Mac home', manifest(), [], home, null, ['run', 'true', 'false']],
     ['store app, real, Mac home', manifest(), real, home, null, ['run', 'true', 'false']],
     ['the caller said testflight=false', manifest(), [...real, '--testflight', 'false'], home, null, ['run', 'true', 'false']],
-    ['the caller said testflight=true on a non-store app', manifest({ store: false }), ['--testflight', 'true'], home, null, ['run', 'false', 'false']],
+    ['non-store app without TestFlight', manifest({ store: false }), [], home, null, ['run', 'false', 'false']],
     ['store app with ios.store.preflight', manifest({ preflight: true }), real, home, null, ['run', 'true', 'true']],
     ['no ios.store', manifest({ store: false }), real, home, null, ['run', 'false', 'false']],
     ['--platform android narrows TestFlight out (INCOMPLETE later)', manifest(), [...real, '--platform', 'android'], offline, null, ['skip-platform', 'false', 'false']],
@@ -130,21 +131,33 @@ test('lane_unavailable: skip is the v1.2 rollback: the real run goes on with the
   } finally { await f.cleanup(); }
 });
 
-test('no workflow job reads inputs.testflight: every job that needs TestFlight reads the gate\'s output, announce included', () => {
+test('released policy skips an unavailable lane, does not require devices, and leaves TestFlight opt-in', async () => {
+  const f = await fixture({ policyText: JSON.stringify(releasedPolicy) });
+  try {
+    const defaultRun = await f.run(real);
+    assert.deepEqual([defaultRun.ios_lane, defaultRun.testflight], ['run', false]);
+    assert.deepEqual(f.receipt().gate.completion.required, { android: false, ios: false, testflight: false });
+    const optedIn = await f.run([...real, '--testflight', 'true']);
+    assert.deepEqual([optedIn.ios_lane, optedIn.testflight], ['run', true]);
+    const unavailable = await f.run([...real, '--testflight', 'true'], { tailscale: offline });
+    assert.deepEqual([unavailable.ios_lane, unavailable.testflight], ['skip-offline', false]);
+    assert.equal(f.receipt().gate.completion.lane_unavailable, 'skip');
+  } finally { await f.cleanup(); }
+});
+
+test('only the gate reads inputs.testflight; every downstream job reads the gate output, announce included', () => {
   const workflow = readFileSync(join(repoRoot, '.github/workflows/mobile-deploy.yml'), 'utf8');
   const code = workflow.split('\n').filter(line => !/^\s*#/.test(line)).join('\n');
-  assert.doesNotMatch(code, /inputs\.testflight/, 'no expression reads the caller\'s testflight');
   const jobs = code.slice(code.indexOf('\njobs:\n')).split(/\n {2}(?=[\w-]+:\n)/).slice(1);
   const byName = Object.fromEntries(jobs.map(body => [body.split(':')[0], body]));
+  assert.equal((code.match(/\$\{\{ inputs\.testflight \}\}/g) ?? []).length, 1, 'the caller opt-in reaches only the gate');
   for (const name of ['preflight-ios', 'plan', 'ios-export', 'ios', 'announce']) assert.match(byName[name], /\n {10}testflight: \$\{\{ needs\.gate\.outputs\.testflight \}\}\n/, name);
-  assert.doesNotMatch(byName.gate, /\n {10}testflight: /, 'the gate derives it, it is not handed one');
+  assert.match(byName.gate, /\n {10}testflight: \$\{\{ inputs\.testflight \}\}\n/, 'the gate receives the caller opt-in');
   assert.match(byName.gate, /\n {6}testflight: \$\{\{ steps\.hub\.outputs\.testflight \}\}\n {6}store_preflight: \$\{\{ steps\.hub\.outputs\.store_preflight \}\}\n/);
   for (const [name, body] of Object.entries(byName)) if (/testflight:/.test(body) && name !== 'gate') assert.match(body, /needs: (gate|\[gate,)/, `${name} needs the gate to read its output`);
-  // The caller surface is untouched: the template still passes testflight, and its hash is still accepted.
   assert.match(template, /^ {6}testflight: \$\{\{ inputs\.testflight \}\}$/m);
   assert.ok(policy.callers.accept.includes(callerHash(template)));
-  assert.match(code, /testflight:\n\s+description: [^\n]*read by no job[^\n]*\n\s+type: boolean\n\s+default: false\n/);
-  // announce uploads the verdict ship reads.
+  assert.match(code, /testflight:\n\s+description: [^\n]*[Oo]pt-in[^\n]*\n\s+type: boolean\n\s+default: false\n/);
   assert.match(byName.announce, /name: completion-out\n\s+path: \$\{\{ runner\.temp \}\}\/hub-out\/completion\/completion\.json\n/);
 });
 

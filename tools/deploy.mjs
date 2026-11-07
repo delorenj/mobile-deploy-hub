@@ -17,10 +17,9 @@
 // note (the S26 delivery will be pending; the iPad lane skipped), and a red last real run earns an offer of
 // `gh run rerun <id> --failed`.
 //
-// `ship` (hub v1.3, TOWE-76) is the one deploy command, and its exit says whether the app shipped: every target the hub
-// policy's `completion` block requires (the S26, the iPad, TestFlight for a store app) holds the version or durably owes
-// it. It encodes no rule of its own: it reads the policy at the hub ref and the completion-out artifact the run's
-// announce job writes (tools/ci/lib/completion.mjs). `deploy` stays the primitive for dry runs and narrowed runs.
+// `ship` (TOWE-76) judges the targets configured in the pinned hub policy's optional `completion` block.
+// With no block, the deployed v1.2.25 defaults apply: no required devices or TestFlight, unavailable lanes skip,
+// and red runs require an explicit same-version rerun. `deploy` remains the primitive for narrowed runs.
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { homedir, hostname, tmpdir } from 'node:os';
@@ -39,7 +38,8 @@ export const meteredModes = Object.freeze(['auto', 'allow']);
 // Jarad's order, the hub policy's apps (a hub test keeps the two equal).
 export const train = Object.freeze(['delorenj/tower-of-lost-things', 'delorenj/green-in-between', 'delorenj/gruvato', 'AutomaticAI-io/navi', 'delorenj/earshot']);
 const usage = 'Usage: deploy.mjs [train] [--dry-run true|false] [--bump patch|minor|major] [--platform both|android|ios] [--testflight true|false] [--play true|false] [--dry-handoff true|false] [--metered auto|allow] [--workflow deploy.yml] [--hub-ref REF] [--repo owner/repo] [--print]\n       deploy.mjs ship [--bump patch|minor|major] [--metered auto|allow] [--abandon RUN_ID] [--workflow deploy.yml] [--hub-ref REF] [--repo owner/repo]';
-// What ship never takes: it never narrows a run, never skips its dry run and never turns TestFlight off.
+// What ship never takes: it never narrows a run or skips its dry run. TestFlight is opt-in via deploy on the
+// deployed policy; a future explicit completion block may require it for store apps.
 const notForShip = Object.freeze(['--dry-run', '--platform', '--testflight', '--play', '--dry-handoff', '--print']);
 
 function flag(name, value, fallback) {
@@ -383,13 +383,14 @@ export function frozenTools({ hook, before, after, changed }) {
   return touched.length > 0 ? { hook, touched: [...new Set(touched)] } : null;
 }
 
-// The policy's completion rules at the hub ref this app pins (never a copy: ship encodes no rule of its own).
+// The policy's completion rules at the hub ref this app pins. An absent block means the v1.2.25 skip/no-rerun
+// contract, not a strict refusal.
 export function readShipPolicy(gh, hubRef) {
   try {
     const policy = JSON.parse(gh(['api', '-H', 'Accept: application/vnd.github.raw', `repos/${hubRepo}/contents/tools/ci/policy.json?ref=${hubRef}`]));
     const completion = policy?.completion;
     const reruns = Number.isSafeInteger(completion?.reruns) && completion.reruns >= 0 && completion.reruns <= 3 ? completion.reruns : 0;
-    return { reruns, laneUnavailable: completion?.lane_unavailable === 'skip' ? 'skip' : 'refuse', read: Boolean(completion) };
+    return { reruns, laneUnavailable: completion?.lane_unavailable === 'refuse' ? 'refuse' : 'skip', read: true };
   } catch (error) {
     return { reruns: 0, laneUnavailable: 'refuse', read: false, why: error.message.split('\n')[0] };
   }
@@ -570,7 +571,7 @@ export async function ship(options, {
   // One dispatch on main, the run it started, and its verdict.
   const dispatchAndWatch = async ({ dryRun, sha }) => {
     const after = newestId(listRuns());
-    log(`SHIP_DISPATCH ${repo} ${dryRun ? 'dry run (dry_handoff)' : 'REAL run'} bump=${options.bump} metered=${options.metered} main=${short(sha)} hub=${hubRef} (TestFlight: the gate's)`);
+    log(`SHIP_DISPATCH ${repo} ${dryRun ? 'dry run (dry_handoff)' : 'REAL run'} bump=${options.bump} metered=${options.metered} main=${short(sha)} hub=${hubRef} (TestFlight: caller opt-in or explicit completion policy)`);
     gh(dispatchArguments({ workflow: options.workflow, dryRun, bump: options.bump, platform: 'both', testflight: false, play: false, dryHandoff: dryRun, metered: options.metered, repo }));
     if (!dryRun) state.realDispatched = true;
     let started = [];
