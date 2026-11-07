@@ -69,6 +69,7 @@ export function notesText(doc) {
   validateNotes(doc);
   const range = doc.previous_version ? `${doc.previous_version} → ${doc.version}` : `first published build → ${doc.version}`;
   const lines = [`Release notes for ${doc.version}`, `Source ${doc.previous_commit ?? 'unknown'}..${doc.commit} (${range})`, ''];
+  if (doc.entries.length && !doc.entries.some(entry => entry.version === doc.version)) lines.push('No author-written release notes were supplied for this build. Earlier authored entries in the published range follow.');
   if (doc.status === 'missing') lines.push('No author-written release notes were supplied for this build. See the source range and run for details.');
   else {
     for (const entry of doc.entries) {

@@ -34,7 +34,27 @@ test('authored input covers the full published range without inventing missing v
   } finally { rmSync(root, { recursive: true, force: true }); rmSync(other, { recursive: true, force: true }); }
 });
 
-test('invalid notes and dishonest maintenance claims are rejected; absent authors are safe', () => {
+test('earlier authored entries do not conceal missing notes for the current build', () => {
+  const root = mkdtempSync(join(tmpdir(), 'hub-notes-gap-'));
+  try {
+    mkdirSync(join(root, 'tools/ci'), { recursive: true });
+    writeFileSync(join(root, 'tools/ci/release-notes.json'), JSON.stringify({ schema: 1, releases: {
+      '1.1.0': { kind: 'app', whats_new: ['Earlier feature'], try: [], limitations: [] },
+    } }));
+    const notes = authoredNotes(root, { current: '1.2.0', previous: '1.0.0', previousCommit: prev, commit: sha });
+    assert.deepEqual(notes.entries.map(entry => entry.version), ['1.1.0']);
+    assert.equal(notes.status, 'authored');
+    assert.match(notesText(notes), /No author-written release notes were supplied for this build/);
+    assert.match(notesText(notes), /Earlier feature/);
+    const latest = { ...sampleLatest(), version: '1.2.0' };
+    const rendered = appPage({ latest, releaseNotes: { '1.2.0': notes } });
+    assert.match(rendered, /No author-written release notes were supplied for this build/);
+    assert.match(rendered, /Earlier feature/);
+    assert.doesNotThrow(() => validateNotes(notes));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+ test('invalid notes and dishonest maintenance claims are rejected; absent authors are safe', () => {
   const root = mkdtempSync(join(tmpdir(), 'hub-notes-invalid-'));
   try {
     assert.equal(authoredNotes(root, { current: '1.2.0', commit: sha }).status, 'missing');

@@ -101,9 +101,10 @@ const short = sha => String(sha ?? '').slice(0, 7);
 function noteSections(note) {
   if (!note) return '<p class="muted">No author-written release notes were published for this older build.</p>';
   const provenance = `<p class="muted">Source <code>${html(note.previous_commit ?? 'unknown')}..${html(note.commit)}</code>; ${html(note.previous_version ?? 'first published build')} → ${html(note.version)}</p>`;
+  const missingCurrent = !note.entries.some(entry => entry.version === note.version) ? '<p>No author-written release notes were supplied for this build. Earlier authored entries in the published range follow.</p>' : '';
   if (note.status === 'missing') return `${provenance}<p>No author-written release notes were supplied for this build.</p>`;
   const sections = note.entries.map(entry => `<div><h3>${html(entry.version)} · ${entry.kind === 'app' ? 'App-visible' : 'Backend / maintenance'}</h3>${[['whats_new', "What's new"], ['try', 'What to try'], ['limitations', 'Known limitations']].map(([field, label]) => entry[field].length ? `<h4>${label}</h4><ul>${entry[field].map(line => `<li>${html(line)}</li>`).join('')}</ul>` : '').join('')}</div>`).join('');
-  return `${provenance}${sections}<p class="muted">Explicitly authored entries in this range; unannotated changes may also exist.</p>`;
+  return `${provenance}${missingCurrent}${sections}<p class="muted">Explicitly authored entries in this range; unannotated changes may also exist.</p>`;
 }
 
 // The device states come from latest.json, which deliver and the catch-up both keep current; the page never carries
