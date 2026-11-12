@@ -35,6 +35,7 @@ const flags = Object.freeze({
   '--version': 'version',
   '--android-code': 'androidCode',
   '--ios-build': 'iosBuild',
+  '--ios-version': 'iosVersion',
   '--bump': 'bump',
   '--testflight': 'testflight',
   '--store-preflight': 'storePreflight',
@@ -68,6 +69,7 @@ const environment = Object.freeze({
   version: 'HUB_VERSION',
   androidCode: 'HUB_ANDROID_CODE',
   iosBuild: 'HUB_IOS_BUILD',
+  iosVersion: 'HUB_IOS_VERSION',
   bump: 'HUB_BUMP',
   testflight: 'HUB_TESTFLIGHT',
   storePreflight: 'HUB_STORE_PREFLIGHT',
@@ -171,6 +173,9 @@ export function parseConfig(argv, env = process.env) {
     version: matching('version', raw.version, /^\d+\.\d+\.\d+$/, 'X.Y.Z'),
     androidCode,
     iosBuild: matching('ios build', raw.iosBuild, /^[1-9]\d{0,8}$|^\d+\.\d+(\.\d+)?$/, 'a build number'),
+    // The iOS marketing version: the plan derives it (the app's TestFlight train, policy.json) and later jobs read the
+    // plan's output; set on the plan itself it is an explicit override for a local run. Empty means the deploy's version.
+    iosVersion: matching('ios version', raw.iosVersion, /^\d+\.\d+\.\d+$/, 'X.Y.Z'),
     buildSha: matching('build sha', raw.buildSha, /^[0-9a-f]{40}$/, 'a 40-character commit sha'),
     bumpPatch,
     ipadVersion: matching('ipad version', raw.ipadVersion, /^[0-9A-Za-z.+-]{1,40}$/, 'a version'),
@@ -232,6 +237,8 @@ export function hookEnvironment(config, base = process.env, extra = {}) {
     HUB_VERSION: config.version ?? '',
     HUB_ANDROID_CODE: config.androidCode ?? '',
     HUB_IOS_BUILD: config.iosBuild ?? '',
+    // The iOS marketing version of this deploy (the app's train); the deploy's own version when it has none.
+    HUB_IOS_VERSION: config.iosVersion || config.version || '',
     HUB_TESTFLIGHT: String(config.testflight ?? false),
     ...extra,
   };

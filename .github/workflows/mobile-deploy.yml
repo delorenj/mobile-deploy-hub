@@ -204,6 +204,7 @@ jobs:
       version: ${{ steps.hub.outputs.version }}
       android_code: ${{ steps.hub.outputs.android_code }}
       ios_build: ${{ steps.hub.outputs.ios_build }}
+      ios_version: ${{ steps.hub.outputs.ios_version }}
       build_sha: ${{ steps.hub.outputs.build_sha }}
       bump_patch: ${{ steps.hub.outputs.bump_patch }}
       run_android: ${{ steps.hub.outputs.run_android }}
@@ -356,6 +357,7 @@ jobs:
           dry_handoff: ${{ inputs.dry_handoff }}
           version: ${{ needs.plan.outputs.version }}
           ios_build: ${{ needs.plan.outputs.ios_build }}
+          ios_version: ${{ needs.plan.outputs.ios_version }}
           build_sha: ${{ needs.plan.outputs.build_sha }}
           bump_patch: ${{ needs.plan.outputs.bump_patch }}
           mac_link: ${{ needs.gate.outputs.mac_link }}
@@ -401,6 +403,7 @@ jobs:
           strict: ${{ inputs.strict }}
           version: ${{ needs.plan.outputs.version }}
           ios_build: ${{ needs.plan.outputs.ios_build }}
+          ios_version: ${{ needs.plan.outputs.ios_version }}
           build_sha: ${{ needs.plan.outputs.build_sha }}
           bump_patch: ${{ needs.plan.outputs.bump_patch }}
           mac_link: ${{ needs.gate.outputs.mac_link }}

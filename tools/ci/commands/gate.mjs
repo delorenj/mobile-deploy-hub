@@ -20,7 +20,7 @@ import { attempt } from '../lib/exec.mjs';
 import { latestKey, parseLatest } from '../lib/latest.mjs';
 import { loadManifest } from '../lib/manifest.mjs';
 import { macEstimate, tailscaleStatus } from '../lib/metered.mjs';
-import { appFor, requiredTargets } from '../lib/policy.mjs';
+import { appFor, groupsLabel, requiredTargets, testflightPolicyOf } from '../lib/policy.mjs';
 import { buildReceipt, setOutputs, writeReceipt } from '../lib/receipt.mjs';
 import { jobWriter, probe, readObject } from '../lib/s3.mjs';
 import { guarded, policyBanner, readCatchupMode, readMacLink, releaseRef } from './common.mjs';
@@ -190,8 +190,10 @@ export async function gate(config, {
     const testflight = scope.ios && (policy.completion.required.testflight === 'store' ? required.testflight : iosLane === 'run' && Boolean(config.testflight));
     if (testflight) required.testflight = true;
     const storePreflight = testflight && Boolean(manifest.ios?.store?.preflight);
-    log(`HUB_TESTFLIGHT ${testflight ? 'owed' : 'not owed'}: ${testflightWhy({ policy, manifest, required, scope, iosLane, storePreflight, platform: config.platform })}`);
-    const completion = { required, testflight, store_preflight: storePreflight, lane_unavailable: policy.completion.lane_unavailable };
+    // Where a store build goes and how its iOS version moves are the policy's (the app's testflight block), not the manifest's.
+    const tfPolicy = testflightPolicyOf(app);
+    log(`HUB_TESTFLIGHT ${testflight ? 'owed' : 'not owed'}: ${testflightWhy({ policy, manifest, required, scope, iosLane, storePreflight, platform: config.platform })}${testflight ? `; beta groups ${groupsLabel(tfPolicy.groups)}, iOS version train ${tfPolicy.train}` : ''}`);
+    const completion = { required, testflight, store_preflight: storePreflight, lane_unavailable: policy.completion.lane_unavailable, ...(testflight ? { groups: tfPolicy.groups, train: tfPolicy.train } : {}) };
     track.receipt = { gate: { ios_lane: iosLane, mac_link: scope.ios ? link.link : 'unknown', s26, catchup, completion } };
 
     // A required lane that would not run is a refusal on a real run, before any version is spent (policy completion).

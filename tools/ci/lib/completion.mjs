@@ -5,8 +5,9 @@
 //   - a device lane (S26 for android, iPad for ios) is installed, or pending where pending is durable: latest.json
 //     (read after deliver) names this exact version for that device as pending, and the catch-up on the device's host
 //     is live. Anything else (skipped, a pending nobody will install, failed) is owed;
-//   - TestFlight, for a store app (its manifest declares ios.store), is uploaded and assigned to Owner Testing within
-//     the run. Slice 2 adds a durable store pass; until then an upload that only processes is owed too.
+//   - TestFlight, for a store app (its manifest declares ios.store), is uploaded and assigned to the beta groups the policy
+//     names for the app (Owner Testing unless its testflight block says otherwise) within the run. Whether a build in an
+//     external group may be installed yet is Apple's beta review, recorded beside it (store.review), never judged here. Slice 2 adds a durable store pass; until then an upload that only processes is owed too.
 //
 // COMPLETE: every required target is satisfied. INCOMPLETE: the run is not red, and something is owed (each owed
 // target names the exact command that pays it). RED: the run failed, or a required target failed.
@@ -14,7 +15,7 @@
 // A dry run is judged the same way on what it proved: a required target whose lane built and checked is `checked`, one
 // whose lane would not run is `skipped` (INCOMPLETE: a real run would leave it owed, so `ship` stops before spending a
 // version). The announce job writes the verdict as the completion-out artifact; `deploy.mjs ship` reads it.
-import { requiredTargets } from './policy.mjs';
+import { defaultGroups, groupsLabel, requiredTargets } from './policy.mjs';
 
 export const verdicts = Object.freeze(['COMPLETE', 'INCOMPLETE', 'RED']);
 export const targetStatuses = Object.freeze(['installed', 'pending', 'assigned', 'uploaded', 'checked', 'skipped', 'missing', 'failed']);
@@ -46,12 +47,16 @@ export function testflightOf({ testflight, iosLane = 'run', needs = {}, receipts
   }
   const store = ios.store;
   if (store && typeof store === 'object') {
-    if (store.status === 'assigned') return { status: 'assigned', reason: store.uploaded === 'earlier' ? 'already in App Store Connect; assigned to Owner Testing' : 'uploaded and assigned to Owner Testing', build: store.build ?? null };
+    if (store.status === 'assigned') {
+      const to = groupsLabel(Array.isArray(store.groups) && store.groups.length > 0 ? store.groups : defaultGroups);
+      const review = typeof store.review?.state === 'string' ? ` (beta review: ${store.review.state})` : '';
+      return { status: 'assigned', reason: `${store.uploaded === 'earlier' ? 'already in App Store Connect; assigned to' : 'uploaded and assigned to'} ${to}${review}`, build: store.build ?? null };
+    }
     if (store.status === 'failed') return { status: 'failed', reason: store.reason ?? ios.reason ?? 'the TestFlight step failed', build: store.build ?? null };
     if (store.status === 'checked' && dryRun) return { status: 'checked', reason: ios.testflight ?? 'dry run: upload and assign were not called', build: store.build ?? null };
   }
   if (typeof ios.testflight === 'string') {
-    if (/uploaded and assigned|assigned to Owner Testing/.test(ios.testflight)) return { status: 'assigned', reason: ios.testflight };
+    if (/uploaded and assigned|; assigned to /.test(ios.testflight)) return { status: 'assigned', reason: ios.testflight };
     if (/^dry run/.test(ios.testflight) && dryRun) return { status: 'checked', reason: ios.testflight };
   }
   if (ios.outcome === 'failure') return { status: 'failed', reason: ios.stage === 'deliver' ? (ios.reason ?? 'the TestFlight step failed') : `the ios lane stopped at ${ios.stage ?? 'an unknown stage'} before TestFlight (${ios.reason ?? 'no reason'})` };
@@ -60,9 +65,9 @@ export function testflightOf({ testflight, iosLane = 'run', needs = {}, receipts
 
 // The TestFlight delivery the event carries next to the S26 and the iPad (the Bloodbank delivery shape: assigned is
 // installed for testers, a dry run's check is pending).
-export function testflightDelivery(tf, { version, build }) {
+export function testflightDelivery(tf, { version, build, groups = defaultGroups }) {
   const status = { assigned: 'installed', failed: 'failed', skipped: 'skipped' }[tf.status] ?? 'pending';
-  const delivery = { platform: 'ios', target: 'TestFlight Owner Testing', device: 'TestFlight', version, build: build === null || build === undefined || build === '' ? null : String(build), sha256: null, verified: tf.status === 'assigned', status };
+  const delivery = { platform: 'ios', target: `TestFlight ${groupsLabel(groups)}`.slice(0, 120), device: 'TestFlight', version, build: build === null || build === undefined || build === '' ? null : String(build), sha256: null, verified: tf.status === 'assigned', status };
   if (status === 'installed') delivery.by = 'deploy';
   else if (tf.reason) delivery.reason = String(tf.reason).slice(0, 300);
   if (status === 'failed') delivery.stage = 'deliver';

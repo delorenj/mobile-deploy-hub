@@ -17,7 +17,7 @@ What it is: one shared deploy pipeline (a reusable GitHub workflow, a composite 
   - the Mac builds and signs (development);
   - `devicectl` install, with readback;
   - over-the-air install link (`manifest.plist`).
-- **TestFlight:** upload and assign to Owner Testing. Opt-in with `--testflight true` in the live hub (v1.2.25).
+- **TestFlight:** upload and assign to the app's beta groups (policy `testflight.groups`, default Owner Testing). Opt-in with `--testflight true` in the live hub (v1.2.25).
 - **Play internal track:** upload with `--play`, keyless via Workload Identity Federation.
 - **Away devices are `pending`, not failures:** a catch-up job installs the build when the device comes back. It runs every 2 min for the S26 (big-chungus) and every 5 min for the iPad (the Mac), and never while the app is on screen.
 - **Mac awareness:** home, metered or offline is decided at the gate. The iPad lane is skipped when the Mac is offline or a metered link would exceed its data budget. A watchdog cancels an iPad job stuck waiting for its runner.
@@ -47,9 +47,11 @@ What it is: one shared deploy pipeline (a reusable GitHub workflow, a composite 
 - `mise run ship`: dry run, then real run on the same commit, then a completion verdict. With the deployed v1.2.25 policy's absent `completion` block, it does **not** require device arrival, TestFlight, or automatic reruns.
 - The optional strict `completion` contract has tests for requiring every lane's device, TestFlight for App Store apps, refusing unavailable required lanes before the bump, and one same-version rerun. It is deferred to a separate policy decision/release, not part of the authored release-notes adoption.
 - Store preflight (when TestFlight is requested) and duplicate App Store upload avoidance on rerun.
+- **Per-app TestFlight policy (JIMB-466, hub `main`; reaches apps with the next `v1` release):** the `apps.<repo>.testflight` block names the beta `groups` an app's `assign` hook gives each build to (default Owner Testing, passed to hooks as `HUB_TESTFLIGHT_GROUPS`) and the `train` of its iOS marketing version (`patch`, the default, or `minor`: `0.3.7` ships to TestFlight as `0.3.0` while the build number keeps climbing, so Apple's per-version Beta App Review is not repeated for patch deploys). The plan prints `HUB_TESTFLIGHT_PLAN` and records `ios_version` and the groups in its receipt; the iOS hooks see `HUB_IOS_VERSION`. An optional `ios.store.review` hook records Apple's beta review state in the store receipt and the completion reason. README, "TestFlight groups, the iOS version train and the 90-day clock", has the contracts and the 90-day build-expiry rebuild cadence.
 
 ## Not built
 
 - A status CLI (`mhub status`) listing every managed app's platforms, versions and TestFlight/App Store review state.
-- Durable TestFlight tracking after the run (processing to valid to assigned, review status).
+- Durable TestFlight tracking after the run (processing to valid to assigned, review status in `latest.json`, the event and the completion verdict: "uploaded" is not yet told apart from "testers can install" there; the review state is in the run's receipt only).
+- A Candybar job that rebuilds an app's TestFlight build before its 90-day expiry (the cadence is documented; the clock is not created by the hub).
 - Catch-up heartbeats, so "pending" proves the catch-up is actually running.

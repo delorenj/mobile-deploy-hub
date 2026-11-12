@@ -29,8 +29,8 @@ import { buildReceipt, setOutputs, writeReceipt } from '../lib/receipt.mjs';
 import { jobWriter, readObject } from '../lib/s3.mjs';
 import { parseVersionInfo } from '../lib/version.mjs';
 import { checkCaller, refusal } from '../lib/caller.mjs';
-import { tagOnlyOf, tagPrefixOf } from '../lib/policy.mjs';
-import { checkDisk, checkSecrets, firstLine, guarded, isoNow, policyBanner, reachIpad, readMacLink, runOf, short } from './common.mjs';
+import { defaultGroups, groupsLabel, iosVersionOf, tagOnlyOf, tagPrefixOf, testflightPolicyOf } from '../lib/policy.mjs';
+import { checkDisk, checkSecrets, firstLine, guarded, isoNow, policyBanner, reachIpad, readMacLink, runOf, short, testflightHookEnv } from './common.mjs';
 import { callerReader, checkPins } from './gate.mjs';
 
 // ---------------------------------------------------------------------------------------------------- preflight-ios
@@ -63,7 +63,7 @@ export async function preflightIos(config, { env = process.env, home = homedir()
       }
       checkSecrets(config.iosStore.secrets ?? [], { config, env, notes });
       if (config.storePreflight) {
-        await storePreflight(config, { env, devices, notes, log });
+        await storePreflight(config, { env, devices, notes, log, extra: testflightHookEnv(policy, env) });
       }
     } else if (config.storePreflight) {
       throw new Error('store_preflight without testflight: the gate sets both, so these inputs did not come from the gate');
@@ -105,7 +105,7 @@ export async function preflightIos(config, { env = process.env, home = homedir()
 // The app's own store preflight (ios.store.preflight), on the Mac, from the dispatched commit: the store toolchain the
 // upload hook will need (its Xcode pin, its signing) is proven before plan spends a version. The job checks the tree out
 // only for this; the checkout must be the commit the gate checked.
-export async function storePreflight(config, { env, devices, notes, log = console.log }) {
+export async function storePreflight(config, { env, devices, notes, log = console.log, extra = {} }) {
   if (env.GITHUB_ACTIONS === 'true' && /^[0-9a-f]{40}$/.test(env.GITHUB_SHA ?? '')) {
     const head = attempt('git', ['rev-parse', 'HEAD'], { cwd: config.cwd, env, timeout: 15_000 });
     const at = head.ok ? head.stdout.trim() : '';
@@ -114,7 +114,7 @@ export async function storePreflight(config, { env, devices, notes, log = consol
   const manifest = await loadManifest(config.cwd, config.manifest);
   const command = manifest.ios?.store?.preflight;
   if (!command) throw new Error(`the gate said ${config.manifest} has ios.store.preflight, and the checkout's copy has none`);
-  hook('ios.store.preflight', command, { cwd: config.cwd, env: hookEnvironment(config, env, { HUB_TEAM: devices.apple.team }) });
+  hook('ios.store.preflight', command, { cwd: config.cwd, env: hookEnvironment(config, env, { HUB_TEAM: devices.apple.team, ...extra }) });
   notes.push('ios.store.preflight passed: the store toolchain is ready before any version is spent');
   log('HUB_STORE_PREFLIGHT ok (the app\'s ios.store.preflight hook, before the bump)');
 }
@@ -123,7 +123,7 @@ export async function storePreflight(config, { env, devices, notes, log = consol
 
 // A representative completed event for this app, held to the schema before any version is spent: one device
 // installed, one pending, with the links the notification renders, and TestFlight assigned for a store app.
-export function sampleEvent({ manifest, devices, version, androidCode, commit, env }) {
+export function sampleEvent({ manifest, devices, version, androidCode, commit, env, groups = defaultGroups }) {
   const declared = { android: Boolean(manifest.android), ios: Boolean(manifest.ios) };
   const needs = { gate: { result: 'success' }, plan: { result: 'success' }, android: { result: 'success' }, ios: { result: 'success' }, 'ios-export': { result: 'success' }, deliver: { result: 'success' } };
   const receipts = {
@@ -133,18 +133,18 @@ export function sampleEvent({ manifest, devices, version, androidCode, commit, e
   const base = 'https://s3.delo.sh/builds';
   const slug = manifest.project.slug;
   const published = { apk: `${base}/${slug}/${version}/${slug}-${version}-${androidCode ?? 1}.apk`, ota: `itms-services://?action=download-manifest&url=${base}/${slug}/ios/manifest.plist`, page: `${base}/${slug}/index.html` };
-  const extraDeliveries = manifest.ios?.store ? [testflightDelivery({ status: 'assigned', reason: 'uploaded and assigned to Owner Testing' }, { version, build: '1' })] : [];
+  const extraDeliveries = manifest.ios?.store ? [testflightDelivery({ status: 'assigned', reason: `uploaded and assigned to ${groupsLabel(groups)}` }, { version, build: '1', groups })] : [];
   return deploymentEvent({ project: manifest.project, declared, devices, needs, receipts, version, androidCode, commit, published, env: { ...env, GITHUB_RUN_ID: env.GITHUB_RUN_ID || '1' }, extraDeliveries });
 }
 
 // bb-emit validates against the live bloodbank checkout, so the contract it enforces must be committed there, and
 // the event this deploy will send must pass it. A real run stops here, before any version is spent; a dry run records
 // the gap and goes on to prove the device lanes, and its announce job still fails on the same check.
-async function eventPreflight({ config, manifest, devices, version, androidCode, commit, env, home, notes }) {
+async function eventPreflight({ config, manifest, devices, version, androidCode, commit, env, home, notes, groups }) {
   const tree = bloodbankTree({ env, home });
   const problems = [];
   if (tree.commit && tree.dirty && tree.dirty.length > 0) problems.push(`the Bloodbank contract files bb-emit validates against are uncommitted in ${basename(tree.root)} (${tree.dirty.slice(0, 4).join(', ')}); commit the schema edit so the contract is reproducible`);
-  const sample = sampleEvent({ manifest, devices, version, androidCode, commit, env });
+  const sample = sampleEvent({ manifest, devices, version, androidCode, commit, env, groups });
   try {
     bbEmit({ type: sample.type, data: sample.data, correlation: correlationFor(env), check: true, env, home });
     notes.push(`event contract: ${sample.type} with statuses and links passes bb-emit --check${tree.commit ? ` (bloodbank ${short(tree.commit)})` : ''}`);
@@ -214,7 +214,7 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
     }, env);
 
     const notes = [];
-    const hooks = hookEnvironment(config, env, { HUB_TEAM: devices.apple.team });
+    const hooks = hookEnvironment(config, env, { HUB_TEAM: devices.apple.team, ...testflightHookEnv(policy, env) });
     const readVersion = () => parseVersionInfo(hookOutput('version.read', manifest.version.read, { cwd: config.cwd, env: hooks }), { needAndroid: scope.android });
 
     // The newest published builds: the planned Android code must be above them too.
@@ -246,7 +246,7 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
 
     const current = readVersion();
     track.receipt = { version: current.version, androidCode: current.android_code };
-    const tree = await eventPreflight({ config, manifest, devices, version: current.version, androidCode: current.android_code, commit: env.GITHUB_SHA || '0000000', env, home, notes });
+    const tree = await eventPreflight({ config, manifest, devices, version: current.version, androidCode: current.android_code, commit: env.GITHUB_SHA || '0000000', env, home, notes, groups: testflightPolicyOf(app).groups });
 
     track.stage = 'version';
     const git = createGit({ cwd: config.cwd, env, token: env.GH_TOKEN });
@@ -291,6 +291,11 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
       message: ({ current: from, bumped, level }) => `chore(release): v${bumped.version}\n\nVersion ${from.version} -> ${bumped.version} (${level}) by mobile-deploy-hub, ${runUrl}.`,
     });
     const next = result.next;
+    // The iOS marketing version and the beta groups of this deploy (policy testflight block): the lanes read them as
+    // HUB_IOS_VERSION and HUB_TESTFLIGHT_GROUPS. Without a block: the deploy's version, Owner Testing.
+    const iosVersion = iosVersionOf(app, next.version, config.iosVersion);
+    const store = testflightPolicyOf(app);
+    log(`HUB_TESTFLIGHT_PLAN ios_version=${iosVersion} (train ${config.iosVersion ? 'explicit' : store.train}, deploy ${next.version}) build=${next.ios_build ?? '-'} groups=${groupsLabel(store.groups)}`);
     // Capture the exact published-version range from the checkout at the build revision. The receipt survives
     // same-version reruns, even after the app's main branch has moved on.
     const releaseNotes = authoredNotes(config.cwd, { current: next.version, previous: latest?.version ?? null, previousCommit: latest?.commit ?? null, commit: result.sha });
@@ -328,6 +333,7 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
       android_code: next.android_code ?? '',
       ios_build: next.ios_build ?? '',
       previous_version: result.current.version,
+      ios_version: iosVersion,
       tag: result.tag,
       build_sha: result.sha,
       base_sha: result.base,
@@ -345,12 +351,13 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
     notes.push(result.committed ? `bumped ${result.current.version} -> ${next.version}, pushed ${result.tag} at ${short(result.sha)}` : `dry run: would bump ${result.current.version} -> ${next.version} (${result.files.length > 0 ? result.files.join(', ') : `tag ${result.tag} only`}); ${result.files.length > 0 ? 'commit, ' : ''}tag and git push --dry-run rehearsed, then rewound: nothing reached the remote`);
     await writeReceipt(join(config.out, 'plan'), buildReceipt({
       lane: 'plan', config: { ...config, buildSha: result.sha }, env, version: next.version, androidCode: next.android_code, build: next.ios_build, notes,
-      bump, devices: { s26: phone, s26_state: s26, ipad: declared.ios && iosLane === 'run' ? { version: config.ipadVersion, build: config.ipadBuild || null } : null, ios_lane: laneNow },
+      bump, ios_version: iosVersion, testflight: { train: config.iosVersion ? 'explicit' : store.train, groups: store.groups },
+      devices: { s26: phone, s26_state: s26, ipad: declared.ios && iosLane === 'run' ? { version: config.ipadVersion, build: config.ipadBuild || null } : null, ios_lane: laneNow },
       published: latest ? { android: latest.android ? { version: latest.android.version, code: latest.android.code } : null, ios: latest.ios ? { version: latest.ios.version, build: latest.ios.build } : null } : null,
       bloodbank: { commit: tree.commit, clean: tree.dirty ? tree.dirty.length === 0 : null },
       release_notes: releaseNotes,
     }), env);
-    log(`HUB_PLAN version=${result.current.version} next=${next.version} android_code=${next.android_code ?? '-'} platform=${config.platform} bump=${config.bump} dry_run=${config.dryRun} s26=${s26} ios_lane=${laneNow} build_sha=${short(result.sha)}`);
+    log(`HUB_PLAN version=${result.current.version} next=${next.version} android_code=${next.android_code ?? '-'} platform=${config.platform} bump=${config.bump} dry_run=${config.dryRun} s26=${s26} ios_lane=${laneNow} ios_version=${iosVersion} groups=${store.groups.join(',')} build_sha=${short(result.sha)}`);
     return { ...outputs, schema: 2, run_android: scope.android, run_ios: scope.ios };
   });
 }

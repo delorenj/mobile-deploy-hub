@@ -193,7 +193,7 @@ test('the ios lane builds and checks the store IPA through the hook; a hook that
 
 // ---------------------------------------------------------------------------------------------------- state before upload
 
-import { parseStoreState, testflightStep } from './commands/ios.mjs';
+import { parseStoreReview, parseStoreState, reviewStates, testflightStep } from './commands/ios.mjs';
 
 // The ios lane's TestFlight step with the app's hooks faked: `state` answers ios.store.state, `fail` names a hook to fail.
 function storeRig({ state = null, fail = null, dryRun = false } = {}) {
@@ -245,6 +245,90 @@ test('an unclear answer from ios.store.state fails the step (stage deliver) inst
   assert.throws(() => upload.step(), /hook ios\.store\.upload failed/);
   assert.deepEqual(upload.calls, ['ios.store.state', 'ios.store.upload'], 'assign never runs after a failed upload');
   assert.deepEqual([upload.store.status, upload.store.reason], ['failed', 'hook ios.store.upload failed (exit 1)']);
+});
+
+test('the receipt names the policy\'s beta groups and the step says where the build went (JIMB-466)', () => {
+  const several = storeRig({ state: { present: false } });
+  several.store.groups = ['Owner Testing', 'Client Review'];
+  assert.equal(several.step(), 'uploaded and assigned to Owner Testing, Client Review by the app hooks');
+  const later = storeRig({ state: { present: true, version: '1.2.3', build: '55', state: 'VALID' } });
+  later.store.groups = ['Client Review'];
+  assert.equal(later.step(), 'already in App Store Connect (ios.store.state); assigned to Client Review by the app hooks');
+  assert.equal(storeRig().step(), 'uploaded and assigned to Owner Testing by the app hooks', 'no groups in the record: the v1.3 wording, unchanged');
+});
+
+// ios.store.review: where Apple's beta review stands, read after assign.
+function reviewRig({ answer = '{"state":"WAITING_FOR_REVIEW"}\n', fail = false, dryRun = false, review = true } = {}) {
+  const spec = parseManifest(macOnly(m => { if (review) m.ios.store.review = 'node tools/testflight.mjs review'; })).ios;
+  const calls = [];
+  const logs = [];
+  const runHook = name => { calls.push(name); };
+  const runOutput = name => { calls.push(name); if (fail) throw new Error(`hook ${name} failed (exit 1)`); return answer; };
+  const store = { status: 'checked', version: '0.3.0', build: '3007', groups: ['Owner Testing', 'Client Review'], uploaded: null, state: null, review: null, reason: null };
+  const step = () => testflightStep({ spec, config: { dryRun, cwd: '/tmp' }, store, hooks: {}, log: line => logs.push(line), runHook, runOutput });
+  return { step, calls, logs, store };
+}
+
+test('a beta review state is read after assign and recorded; it is never a gate', () => {
+  const waiting = reviewRig();
+  assert.equal(waiting.step(), 'uploaded and assigned to Owner Testing, Client Review by the app hooks; beta review WAITING_FOR_REVIEW');
+  assert.deepEqual(waiting.calls, ['ios.store.upload', 'ios.store.assign', 'ios.store.review'], 'review is asked after assign, never before');
+  assert.deepEqual(waiting.store.review, { state: 'WAITING_FOR_REVIEW' });
+  assert.equal(waiting.store.status, 'assigned');
+  assert.ok(waiting.logs.includes('HUB_TESTFLIGHT_REVIEW WAITING_FOR_REVIEW'));
+  const detail = reviewRig({ answer: 'noise\n{"state":"REJECTED","detail":"guideline 2.1: sign-in did not work"}\n' });
+  detail.step();
+  assert.deepEqual(detail.store.review, { state: 'REJECTED', detail: 'guideline 2.1: sign-in did not work' });
+  assert.ok(detail.logs.includes('HUB_TESTFLIGHT_REVIEW REJECTED: guideline 2.1: sign-in did not work'));
+  // A rejected review is information: the hub still finished its job (the build is uploaded and assigned).
+  assert.equal(detail.store.status, 'assigned');
+  // A hook that fails or answers nonsense leaves UNKNOWN and a warning; the deploy does not go red after its upload.
+  const multiline = JSON.stringify({ state: 'APPROVED', detail: 'a\nb' });
+  for (const rig of [reviewRig({ fail: true }), reviewRig({ answer: 'processing...\n' }), reviewRig({ answer: '{"state":"MAYBE"}\n' }), reviewRig({ answer: `${multiline}\n` })]) {
+    assert.match(rig.step(), /; beta review UNKNOWN$/);
+    assert.equal(rig.store.review.state, 'UNKNOWN');
+    assert.equal(rig.store.status, 'assigned');
+    assert.ok(rig.logs.some(line => line.startsWith('::warning::beta review state unknown')));
+  }
+  // An app without the hook, and a dry run (no build is uploaded to ask about), behave as before.
+  const none = reviewRig({ review: false });
+  assert.equal(none.step(), 'uploaded and assigned to Owner Testing, Client Review by the app hooks');
+  assert.deepEqual(none.calls, ['ios.store.upload', 'ios.store.assign']);
+  assert.equal(none.store.review, null);
+  const dry = reviewRig({ dryRun: true });
+  dry.step();
+  assert.deepEqual(dry.calls, [], 'a dry run calls neither upload, assign nor review');
+});
+
+test('parseStoreReview takes the last line, one of the known states, and a one-line detail', () => {
+  assert.deepEqual(parseStoreReview('{"state":"NOT_REQUIRED"}'), { state: 'NOT_REQUIRED' });
+  assert.deepEqual(parseStoreReview('x\n{"state":"IN_REVIEW","detail":"submitted 2026-11-11"}\n'), { state: 'IN_REVIEW', detail: 'submitted 2026-11-11' });
+  for (const state of reviewStates) assert.equal(parseStoreReview(JSON.stringify({ state })).state, state);
+  assert.throws(() => parseStoreReview(''), /must print one line of JSON/);
+  assert.throws(() => parseStoreReview('[]'), /must answer a state of/);
+  assert.throws(() => parseStoreReview('{"state":"UNKNOWN"}'), /must answer a state of/, 'UNKNOWN is the hub\'s own word for a hook that failed, not an answer');
+  assert.throws(() => parseStoreReview(`{"state":"APPROVED","detail":"${'x'.repeat(201)}"}`), /one short line/);
+  assert.throws(() => parseStoreReview('{"state":"APPROVED","detail":7}'), /one short line/);
+});
+
+test('ios.store.review is a manifest key like preflight and state: a plain non-empty string', () => {
+  assert.equal(parseManifest(macOnly(m => { m.ios.store.review = 'node tools/testflight.mjs review'; })).ios.store.review, 'node tools/testflight.mjs review');
+  assert.throws(() => parseManifest(macOnly(m => { m.ios.store.review = ''; })), /ios\.store\.review/);
+  assert.throws(() => parseManifest(macOnly(m => { m.ios.store.review = ['x']; })), /ios\.store\.review/);
+});
+
+test('a Mac-only store IPA is held to the iOS train version when the plan names one', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hub-store-train-'));
+  try {
+    const spec = parseManifest(macOnly()).ios;
+    writeFileSync(join(root, 'Game-store.ipa'), 'ipa bytes');
+    const seen = [];
+    const inspect = args => { seen.push(args.version); return { app: join(root, 'x'), bundle: args.bundle, version: args.version, build: args.build, signer: sha1, profile: { uuid: 'u', name: 'p', expires_at: '2099-01-01T00:00:00Z', xcode_managed: false } }; };
+    const build = config => buildStoreIpa({ spec, config: { cwd: root, iosBuild: '3007', ...config }, out: root, team, hooks: {}, log: () => {}, runHook: () => {}, inspect });
+    await build({ version: '0.3.7', iosVersion: '0.3.0' });
+    await build({ version: '0.3.7', iosVersion: '' });
+    assert.deepEqual(seen, ['0.3.0', '0.3.7'], 'the train version when there is one, the deploy\'s otherwise');
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 // ---------------------------------------------------------------------------------------------------- the watch

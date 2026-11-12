@@ -8,6 +8,10 @@
 // v1.3 (TOWE-76): the receipt carries TestFlight as its own status (`store`: checked, assigned or failed, and who
 // uploaded), and an app that declares ios.store.state is asked first whether App Store Connect already has the planned
 // (version, build): if it does, upload is skipped and assign still runs, so a rerun never uploads twice.
+// JIMB-466: the receipt's `store` also names the beta groups the policy gave the app (HUB_TESTFLIGHT_GROUPS, Owner Testing
+// by default) and the iOS marketing version of its train (HUB_IOS_VERSION), and an app that declares ios.store.review is
+// asked, after assign, where Apple's beta review stands (waiting, in review, approved, rejected), so "uploaded" and
+// "testers can install" are told apart in the receipt.
 import { copyFileSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -25,7 +29,8 @@ import { loadManifest } from '../lib/manifest.mjs';
 import { macGatewayLink, parseRsyncStats } from '../lib/metered.mjs';
 import { buildReceipt, sha256File, writeReceipt } from '../lib/receipt.mjs';
 import { buildStoreIpa, receiptStoreIpa } from '../lib/store.mjs';
-import { applyBump, checkAppReceipt, checkDisk, exists, firstLine, guarded, installCurrent, policyBanner, reachIpad, requirePlan, short } from './common.mjs';
+import { defaultGroups, groupsLabel, testflightPolicyOf } from '../lib/policy.mjs';
+import { applyBump, checkAppReceipt, checkDisk, exists, firstLine, guarded, installCurrent, policyBanner, reachIpad, requirePlan, short, testflightHookEnv } from './common.mjs';
 
 // ---------------------------------------------------------------------------------------------------- ios-export (Linux)
 
@@ -46,7 +51,7 @@ async function checkExport(out, archiveName, receiptName, { config, spec, distri
 }
 
 export async function iosExport(config, { env = process.env, log = console.log, runner = runBounded } = {}) {
-  policyBanner(log);
+  const { policy } = policyBanner(log);
   const manifest = await loadManifest(config.cwd, config.manifest);
   return guarded('ios-export', join(config.out, 'ios'), config, env, async track => {
     const spec = manifest.ios ?? (() => { throw new Error('the manifest has no ios section'); })();
@@ -58,7 +63,7 @@ export async function iosExport(config, { env = process.env, log = console.log, 
     track.receipt = { version: config.version };
     track.stage = 'build';
     applyBump(config, env);
-    const hooks = hookEnvironment(config, env, { HUB_TEAM: devices.apple.team });
+    const hooks = hookEnvironment(config, env, { HUB_TEAM: devices.apple.team, ...testflightHookEnv(policy, env) });
     if (spec.prepare) hook('ios.prepare', spec.prepare, { cwd: config.cwd, env: hooks });
     hook('ios.export', spec.export, { cwd: config.cwd, env: hooks });
     const artifacts = await checkExport(out, spec.archive, spec.receipt, { config, spec, distribution: 'private' });
@@ -155,10 +160,24 @@ export function parseStoreState(text, { version, build }) {
   return { present: answer.present, state: answer.state ?? null };
 }
 
+// ios.store.review: one line of JSON on stdout, {"state": "...", "detail"?: "..."}, read after assign. NOT_REQUIRED: only
+// internal groups, no review. NOT_SUBMITTED: an external group holds the build and nothing has submitted it yet. Then
+// Apple's own: WAITING_FOR_REVIEW, IN_REVIEW, APPROVED, REJECTED. UNKNOWN is the hub's own for a hook that failed.
+export const reviewStates = Object.freeze(['NOT_REQUIRED', 'NOT_SUBMITTED', 'WAITING_FOR_REVIEW', 'IN_REVIEW', 'APPROVED', 'REJECTED']);
+export function parseStoreReview(text) {
+  const line = String(text ?? '').trim().split('\n').filter(Boolean).pop() ?? '';
+  let answer;
+  try { answer = JSON.parse(line); } catch { throw new Error(`hook ios.store.review must print one line of JSON ({"state": ...}), got ${JSON.stringify(line.slice(0, 80))}`); }
+  if (!answer || typeof answer !== 'object' || Array.isArray(answer) || !reviewStates.includes(answer.state)) throw new Error(`hook ios.store.review must answer a state of ${reviewStates.join(', ')}`);
+  if (answer.detail !== undefined && (typeof answer.detail !== 'string' || answer.detail.length > 200 || /[\r\n]/.test(answer.detail))) throw new Error('hook ios.store.review: detail must be one short line');
+  return { state: answer.state, ...(answer.detail ? { detail: answer.detail } : {}) };
+}
+
 // The TestFlight step of the ios lane: ios.store.state (when the app declares it), then, on a real run, upload unless
 // App Store Connect already has the build, then assign. `store` is the receipt's TestFlight record, updated in place so
 // a failure receipt carries how far it got. Returns the receipt's one-line note.
 export function testflightStep({ spec, config, store, storeIpa = null, hooks, log = console.log, runHook = storeHooks.run, runOutput = storeHooks.output }) {
+  const to = groupsLabel(Array.isArray(store.groups) && store.groups.length > 0 ? store.groups : defaultGroups);
   const built = storeIpa ? `the App Store IPA ${storeIpa.version} (${storeIpa.build}) is built and checked; ` : '';
   try {
     let known = null;
@@ -177,7 +196,18 @@ export function testflightStep({ spec, config, store, storeIpa = null, hooks, lo
     }
     runHook('ios.store.assign', spec.store.assign, { cwd: config.cwd, env: hooks });
     store.status = 'assigned';
-    return store.uploaded === 'earlier' ? 'already in App Store Connect (ios.store.state); assigned to Owner Testing by the app hooks' : 'uploaded and assigned to Owner Testing by the app hooks';
+    // Where Apple's beta review stands is information, never a gate: a hook that cannot say leaves "unknown" and a warning.
+    if (spec.store.review) {
+      try {
+        store.review = parseStoreReview(runOutput('ios.store.review', spec.store.review, { cwd: config.cwd, env: hooks }));
+        log(`HUB_TESTFLIGHT_REVIEW ${store.review.state}${store.review.detail ? `: ${store.review.detail}` : ''}`);
+      } catch (error) {
+        store.review = { state: 'UNKNOWN', detail: firstLine(error.message).replace(/^::error::/, '').slice(0, 200) };
+        log(`::warning::beta review state unknown (${store.review.detail}); the build is assigned`);
+      }
+    }
+    const review = store.review ? `; beta review ${store.review.state}` : '';
+    return `${store.uploaded === 'earlier' ? 'already in App Store Connect (ios.store.state); assigned to' : 'uploaded and assigned to'} ${to} by the app hooks${review}`;
   } catch (error) {
     Object.assign(store, { status: 'failed', reason: firstLine(error.message).replace(/^::error::/, '').slice(0, 300) });
     throw error;
@@ -203,7 +233,7 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
 
     track.stage = 'build';
     applyBump(config, env);
-    const hooks = hookEnvironment(config, env, { HUB_TEAM: devices.apple.team });
+    const hooks = hookEnvironment(config, env, { HUB_TEAM: devices.apple.team, ...testflightHookEnv(policy, env) });
     const handoff = Boolean(spec.export) && (!config.dryRun || config.dryHandoff);
     if (handoff) {
       let exportReceipt;
@@ -340,7 +370,8 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
       }
       // Publishing, not the device: a failed upload or assign is reported at stage deliver and the iPad keeps its status.
       track.stage = 'deliver';
-      track.receipt.store = { status: 'checked', version: config.version, build: storeIpa?.build ?? (config.iosBuild || null), uploaded: null, state: null, reason: null };
+      // The store build's marketing version is the app's train (HUB_IOS_VERSION), the deploy's own version without one.
+      track.receipt.store = { status: 'checked', version: config.iosVersion || config.version, build: storeIpa?.build ?? (config.iosBuild || null), groups: testflightPolicyOf(policy.apps[env.GITHUB_REPOSITORY ?? '']).groups, uploaded: null, state: null, review: null, reason: null };
       testflight = testflightStep({ spec, config, store: track.receipt.store, storeIpa, hooks, log });
       notes.push(`TestFlight: ${testflight}`);
       if (storeIpa) log(`HUB_TESTFLIGHT ${config.dryRun ? 'DRY RUN' : 'UPLOADED'} ${storeIpa.bundle} ${storeIpa.version} (${storeIpa.build}) sha256=${short(storeIpa.sha256)}`);

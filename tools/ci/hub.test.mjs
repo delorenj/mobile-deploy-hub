@@ -7,6 +7,8 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { commands, credentialVariables, hookEnvironment, isCredentialVariable, jobControlFiles, parseConfig } from './lib/config.mjs';
 import { parseManifest } from './lib/manifest.mjs';
+import { loadPolicy } from './lib/policy.mjs';
+import { testflightHookEnv } from './commands/common.mjs';
 import { findApksigner, parseSigners, signerEnvironment, verifySigner } from './lib/android.mjs';
 import { highestVersionCode, uploadBundle } from './lib/play.mjs';
 import { buildReceipt, hubRef, setOutputs, summaryMarkdown, writeReceipt } from './lib/receipt.mjs';
@@ -123,6 +125,13 @@ test('environment sets the config and flags override it', () => {
   assert.equal(parseConfig(['gate'], { HUB_METERED: 'allow' }).metered, 'allow');
 });
 
+test('the iOS marketing version is X.Y.Z, from the environment or a flag, and empty means the deploy\'s version', () => {
+  assert.equal(parseConfig(['plan'], {}).iosVersion, '');
+  assert.equal(parseConfig(['ios'], { HUB_IOS_VERSION: '0.3.0' }).iosVersion, '0.3.0');
+  assert.equal(parseConfig(['plan', '--ios-version', '0.4.0'], { HUB_IOS_VERSION: '0.3.0' }).iosVersion, '0.4.0', 'a flag overrides the environment, like every input');
+  for (const bad of ['0.3', 'v0.3.0', '0.3.0; rm -rf /', '1.2.3.4', 'latest']) assert.throws(() => parseConfig(['ios'], { HUB_IOS_VERSION: bad }), /ios version/, bad);
+});
+
 test('the output folder defaults under RUNNER_TEMP', () => {
   assert.equal(parseConfig(['plan'], { RUNNER_TEMP: '/runner/_temp' }).out, '/runner/_temp/hub-out');
 });
@@ -158,6 +167,26 @@ test('hooks see the HUB_ variables and never a store, GitHub or OIDC token', () 
   for (const name of credentialVariables) assert.equal(env[name], undefined, name);
   assert.deepEqual([...credentialVariables].sort(), ['ACTIONS_ID_TOKEN_REQUEST_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_URL', 'ACTIONS_RUNTIME_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN', 'PLAY_TOKEN']);
   assert.ok(!JSON.stringify(env).includes('secret-'), 'no credential value survives anywhere in the hook environment');
+});
+
+test('hooks see the iOS marketing version (the train) and the beta groups, and the version itself without a train', () => {
+  const out = join(tmpdir(), `hub-hook-ios-${process.pid}`);
+  const { policy } = loadPolicy();
+  const trained = parseConfig(['ios', '--version', '0.3.7', '--ios-version', '0.3.0', '--ios-build', '3007', '--out', out], {});
+  const env = hookEnvironment(trained, { PATH: '/bin' }, testflightHookEnv(policy, { GITHUB_REPOSITORY: 'AutomaticAI-io/navi' }));
+  assert.deepEqual([env.HUB_VERSION, env.HUB_IOS_VERSION, env.HUB_IOS_BUILD, env.HUB_TESTFLIGHT_GROUPS], ['0.3.7', '0.3.0', '3007', 'Owner Testing']);
+  const plain = hookEnvironment(parseConfig(['ios', '--version', '0.3.7', '--out', out], {}), { PATH: '/bin' });
+  assert.equal(plain.HUB_IOS_VERSION, '0.3.7', 'no train: the iOS version is the deploy\'s');
+  assert.equal(hookEnvironment(parseConfig(['plan', '--out', out], {}), { PATH: '/bin' }).HUB_IOS_VERSION, '', 'before the plan there is no version to name');
+  // The groups travel comma-separated, from the policy for the repository, never from an input; an unlisted repo gets the default.
+  const withGroups = structuredClone(policy);
+  withGroups.apps['AutomaticAI-io/navi'].testflight = { groups: ['Owner Testing', 'Client Review'], train: 'minor' };
+  assert.deepEqual(testflightHookEnv(withGroups, { GITHUB_REPOSITORY: 'AutomaticAI-io/navi' }), { HUB_TESTFLIGHT_GROUPS: 'Owner Testing,Client Review' });
+  assert.deepEqual(testflightHookEnv(policy, { GITHUB_REPOSITORY: 'delorenj/tower-of-lost-things' }), { HUB_TESTFLIGHT_GROUPS: 'Owner Testing' });
+  assert.deepEqual(testflightHookEnv(policy, {}), { HUB_TESTFLIGHT_GROUPS: 'Owner Testing' }, 'a local run');
+  assert.deepEqual(testflightHookEnv(policy, { GITHUB_REPOSITORY: 'someone/else' }), { HUB_TESTFLIGHT_GROUPS: 'Owner Testing' });
+  const spoofed = hookEnvironment(trained, { PATH: '/bin', HUB_TESTFLIGHT_GROUPS: 'Evil Group', HUB_IOS_VERSION: '9.9.9' }, testflightHookEnv(policy, { GITHUB_REPOSITORY: 'AutomaticAI-io/navi' }));
+  assert.deepEqual([spoofed.HUB_TESTFLIGHT_GROUPS, spoofed.HUB_IOS_VERSION], ['Owner Testing', '0.3.0'], 'neither value is taken from the runner environment');
 });
 
 test('hooks get throwaway job-control files and never an mc alias with keys', async () => {

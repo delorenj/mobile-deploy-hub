@@ -10,7 +10,7 @@ import { freeGiB } from '../lib/apple.mjs';
 import { createGit } from '../lib/git.mjs';
 import { compareSemver } from '../lib/latest.mjs';
 import { macLink, macProbeOver, runnerStatusOver, tailscaleStatus } from '../lib/metered.mjs';
-import { loadPolicy } from '../lib/policy.mjs';
+import { loadPolicy, testflightPolicyOf } from '../lib/policy.mjs';
 import { buildReceipt, writeReceipt } from '../lib/receipt.mjs';
 
 export const semver = /^\d+\.\d+\.\d+$/;
@@ -26,6 +26,13 @@ export function policyBanner(log = console.log, file = undefined) {
   const loaded = loadPolicy(file);
   log(`HUB_POLICY sha256=${loaded.short}`);
   return loaded;
+}
+
+// The policy's TestFlight settings for this repository as hook environment: the beta groups the app's assign hook gives
+// each build to, comma-separated (HUB_TESTFLIGHT_GROUPS). Always set; an app with no testflight block gets Owner Testing,
+// which is what its hooks did before the block existed. Read from the policy at the pinned tag, never from an input.
+export function testflightHookEnv(policy, env) {
+  return { HUB_TESTFLIGHT_GROUPS: testflightPolicyOf(policy.apps[env.GITHUB_REPOSITORY ?? '']).groups.join(',') };
 }
 
 // A lane writes its receipt on failure too: the stage it reached and a one-line reason, for announce.

@@ -762,6 +762,27 @@ test('a dry run end to end: the plan bumps nothing on origin, the S26 gets nothi
   } finally { await f.cleanup(); }
 });
 
+test('the plan names the iOS marketing version and the beta groups: the deploy\'s version and Owner Testing unless the policy or a local run says otherwise', async () => {
+  const f = await gitFixture();
+  try {
+    const host = await laneHost(f);
+    await host.installApk('io.example.app 0.2.1 4');
+    const logs = [];
+    const planned = await plan(host.configure('plan'), { env: host.env, home: f.root, fetchImpl: noLatest, log: line => logs.push(line) });
+    assert.equal(planned.version, '0.2.2');
+    assert.equal(planned.ios_version, '0.2.2', 'an app with no testflight block: the iOS version is the deploy\'s, as before');
+    assert.equal(host.outputs().ios_version, '0.2.2');
+    assert.ok(logs.some(line => /^HUB_TESTFLIGHT_PLAN ios_version=0\.2\.2 \(train patch, deploy 0\.2\.2\) build=.* groups=Owner Testing$/.test(line)), logs.filter(line => /HUB_TESTFLIGHT/.test(line)).join('\n'));
+    const receipt = readJson(join(f.out, 'plan/hub-receipt-plan.json'));
+    assert.equal(receipt.ios_version, '0.2.2');
+    assert.deepEqual(receipt.testflight, { train: 'patch', groups: ['Owner Testing'] });
+    // A local run may name the marketing version itself (HUB_IOS_VERSION / --ios-version); the build number is untouched.
+    const explicit = await quiet(() => plan(host.configure('plan', ['--ios-version', '0.3.0']), { env: host.env, home: f.root, fetchImpl: noLatest }));
+    assert.deepEqual([explicit.version, explicit.ios_version], ['0.2.2', '0.3.0']);
+    assert.deepEqual(readJson(join(f.out, 'plan/hub-receipt-plan.json')).testflight, { train: 'explicit', groups: ['Owner Testing'] });
+  } finally { await f.cleanup(); }
+});
+
 test('a real run end to end: bump pushed, APK installed in place and read back, event sent', async () => {
   const f = await gitFixture();
   try {

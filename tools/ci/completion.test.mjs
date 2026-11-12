@@ -158,6 +158,21 @@ test('the event carries TestFlight as a delivery: assigned reads as assigned, a 
   assert.equal(testflightDelivery({ status: 'checked', reason: 'dry run' }, { version: '0.3.20', build: null }).status, 'pending');
 });
 
+test('the wording reads the policy\'s beta groups, not the literal Owner Testing (JIMB-466)', () => {
+  const of = receipts => testflightOf({ testflight: true, receipts, needs: { ios: { result: 'success' } } });
+  const groups = ['Owner Testing', 'Client Review'];
+  assert.equal(of({ ios: { outcome: 'success', store: { status: 'assigned', uploaded: 'run', build: '3007', groups } } }).reason, 'uploaded and assigned to Owner Testing, Client Review');
+  assert.equal(of({ ios: { outcome: 'success', store: { status: 'assigned', uploaded: 'earlier', build: '3007', groups } } }).reason, 'already in App Store Connect; assigned to Owner Testing, Client Review');
+  assert.equal(of({ ios: { outcome: 'success', store: { status: 'assigned', uploaded: 'run', build: '25' } } }).reason, 'uploaded and assigned to Owner Testing', 'a v1.3 receipt without groups reads as before');
+  assert.match(of({ ios: { outcome: 'success', store: { status: 'assigned', uploaded: 'run', groups, review: { state: 'WAITING_FOR_REVIEW' } } } }).reason, /assigned to Owner Testing, Client Review \(beta review: WAITING_FOR_REVIEW\)$/, 'uploaded is told apart from testers can install');
+  assert.equal(of({ ios: { outcome: 'success', testflight: 'uploaded and assigned to Owner Testing, Client Review by the app hooks' } }).status, 'assigned', 'a note naming several groups');
+  assert.equal(of({ ios: { outcome: 'success', testflight: 'already in App Store Connect (ios.store.state); assigned to Client Review by the app hooks' } }).status, 'assigned');
+  assert.equal(testflightDelivery({ status: 'assigned' }, { version: '0.3.0', build: '3007', groups }).target, 'TestFlight Owner Testing, Client Review');
+  assert.equal(testflightDelivery({ status: 'assigned' }, { version: '0.3.0', build: '3007' }).target, 'TestFlight Owner Testing', 'the default is unchanged for every other app');
+  const many = Array.from({ length: 8 }, (_, i) => `A beta group with a long name ${i} ${'x'.repeat(30)}`);
+  assert.ok(testflightDelivery({ status: 'assigned' }, { version: '0.3.0', build: '1', groups: many }).target.length <= 120, 'the Bloodbank schema caps the target at 120');
+});
+
 // ---------------------------------------------------------------------------------------------------- announce writes it
 
 async function announceFixture({ receipts, needs, latest, dryRun = false, testflight = true }) {

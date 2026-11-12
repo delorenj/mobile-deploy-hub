@@ -21,6 +21,32 @@ const labels = (where, value) => {
   if (!value.includes('self-hosted')) fail(`${where} must be self-hosted runners (private repos: no billed hosted minutes)`);
 };
 
+// The TestFlight block an app may carry (JIMB-466). It never switches TestFlight on or off: an app is a TestFlight app
+// because its manifest declares ios.store, under the one rule. The block only says WHERE a store build goes and how
+// its iOS marketing version moves, and an app without it behaves exactly as before:
+//   groups  the beta groups the app's assign hook gives each build to, by name (internal and external alike; the
+//           hub only passes them on, as HUB_TESTFLIGHT_GROUPS, and records them in the receipt). Default Owner Testing.
+//   train   how the iOS marketing version moves. patch (default): it is the deploy's version, as always. minor: it
+//           moves only on a minor or major bump (0.3.7 ships as 0.3.0) while the build number keeps climbing, so Apple's
+//           Beta App Review, which is per marketing version, is not repeated for every patch deploy. Android keeps its
+//           patch versions either way.
+export const defaultGroups = Object.freeze(['Owner Testing']);
+export const trains = Object.freeze(['patch', 'minor']);
+// A group name is one line of plain words: it travels comma-separated in HUB_TESTFLIGHT_GROUPS, so no comma.
+export const groupName = /^[A-Za-z0-9][A-Za-z0-9 ._()&'-]{0,63}$/;
+
+function testflight(where, block, app) {
+  exact(where, block, [], ['groups', 'train']);
+  if (!app.lanes.includes('ios')) fail(`${where} is for an app with an iOS lane`);
+  if ('groups' in block) {
+    const groups = block.groups;
+    if (!Array.isArray(groups) || groups.length === 0 || groups.length > 8) fail(`${where}.groups must list 1 to 8 beta group names`);
+    for (const name of groups) if (typeof name !== 'string' || !groupName.test(name) || name !== name.trim()) fail(`${where}.groups has a bad group name ${JSON.stringify(name)} (letters, digits, spaces and . _ ( ) & ' -; no comma; at most 64 characters)`);
+    if (new Set(groups.map(name => name.toLowerCase())).size !== groups.length) fail(`${where}.groups names a group twice`);
+  }
+  if ('train' in block && !trains.includes(block.train)) fail(`${where}.train must be one of ${trains.join(', ')}`);
+}
+
 export function parsePolicy(source) {
   let policy;
   try { policy = JSON.parse(source); } catch (error) { fail(`not valid JSON (${error.message})`); }
@@ -52,7 +78,8 @@ export function parsePolicy(source) {
     // v1.2: an app that shares its repository's tags with other things names its own tag prefix (a monorepo's
     // `navi-v1.2.3` beside the repository's `v2.0.0`), and an app whose main takes only reviewed pull requests keeps
     // its version in those tags alone (`version: "tag"`): the bump pushes the tag and commits nothing.
-    exact(`apps.${repo}`, app, ['slug', 'lanes', ...app.lanes], ['tag_prefix', 'version']);
+    exact(`apps.${repo}`, app, ['slug', 'lanes', ...app.lanes], ['tag_prefix', 'version', 'testflight']);
+    if ('testflight' in app) testflight(`apps.${repo}.testflight`, app.testflight, app);
     if ('tag_prefix' in app && !/^[a-z][a-z0-9-]*v$/.test(app.tag_prefix ?? '')) fail(`apps.${repo}.tag_prefix must be lowercase and end in "v" (v, navi-v)`);
     if ('version' in app && !['commit', 'tag'].includes(app.version)) fail(`apps.${repo}.version must be "commit" or "tag"`);
     if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(app.slug ?? '')) fail(`apps.${repo}.slug must be a pjangler slug`);
@@ -157,6 +184,25 @@ export function loadPolicy(file = policyFile) {
 export const tagPrefixOf = app => app?.tag_prefix ?? 'v';
 export const tagOf = (app, version) => `${tagPrefixOf(app)}${version}`;
 export const tagOnlyOf = app => app?.version === 'tag';
+
+// What the policy says about this app's TestFlight builds, defaults filled in (an unlisted repo, a local run and an app
+// with no block all get the v1.2 behaviour: Owner Testing, the deploy's own version).
+export function testflightPolicyOf(app) {
+  const block = app?.testflight ?? {};
+  return { groups: [...(block.groups ?? defaultGroups)], train: block.train ?? 'patch' };
+}
+
+// The iOS marketing version of a deploy. An explicit one (HUB_IOS_VERSION on a local run) wins; else the app's train:
+// patch is the deploy's version, minor is X.Y.0 of it, so it changes only when a minor or major bump moves X or Y.
+export function iosVersionOf(app, version, explicit = '') {
+  if (explicit) return explicit;
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version ?? '');
+  if (!match) throw new Error(`cannot derive an iOS version from "${version}" (expected X.Y.Z)`);
+  return testflightPolicyOf(app).train === 'minor' ? `${match[1]}.${match[2]}.0` : version;
+}
+
+// The comma-separated list the app's assign hook reads (HUB_TESTFLIGHT_GROUPS).
+export const groupsLabel = groups => groups.join(', ');
 
 // The app a repository deploys, or a refusal: only the repositories the policy lists deploy through the hub.
 export function appFor(policy, repo) {

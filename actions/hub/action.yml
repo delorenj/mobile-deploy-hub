@@ -72,6 +72,9 @@ inputs:
   ios_build:
     description: iOS build announced by the plan job
     default: ''
+  ios_version:
+    description: The iOS marketing version announced by the plan job (the app's TestFlight train; the deploy's version without one)
+    default: ''
   build_sha:
     description: The commit the lanes build (the bump commit on a real run)
     default: ''
@@ -143,6 +146,9 @@ outputs:
   ios_build:
     description: iOS build from the version hook
     value: ${{ steps.hub.outputs.ios_build }}
+  ios_version:
+    description: The iOS marketing version of this deploy (plan; the app's TestFlight train)
+    value: ${{ steps.hub.outputs.ios_version }}
   build_sha:
     description: The commit the lanes check out
     value: ${{ steps.hub.outputs.build_sha }}
@@ -204,6 +210,7 @@ runs:
         HUB_VERSION: ${{ inputs.version }}
         HUB_ANDROID_CODE: ${{ inputs.android_code }}
         HUB_IOS_BUILD: ${{ inputs.ios_build }}
+        HUB_IOS_VERSION: ${{ inputs.ios_version }}
         HUB_BUILD_SHA: ${{ inputs.build_sha }}
         HUB_BUMP_PATCH: ${{ inputs.bump_patch }}
         HUB_IPAD_VERSION: ${{ inputs.ipad_version }}

@@ -106,7 +106,7 @@ export async function announce(config, { env = process.env, home = homedir(), fe
   // TestFlight is the gate's derived decision (config.testflight is its output), a delivery of its own in the event.
   const iosBuild = receipts.plan?.build || planOutputs.ios_build || '';
   const tf = testflightOf({ testflight: config.testflight, iosLane, needs, receipts, dryRun: config.dryRun });
-  const extraDeliveries = tf ? [testflightDelivery(tf, { version, build: receipts.ios?.store?.build ?? receipts.ios?.delivery?.build ?? iosBuild })] : [];
+  const extraDeliveries = tf ? [testflightDelivery(tf, { version: receipts.ios?.store?.version ?? version, build: receipts.ios?.store?.build ?? receipts.ios?.delivery?.build ?? iosBuild, ...(Array.isArray(receipts.ios?.store?.groups) && receipts.ios.store.groups.length > 0 ? { groups: receipts.ios.store.groups } : {}) })] : [];
   // What the deliver jobs published: the APK half (deliver-android), the IPA half (deliver-ios), or one deliver (v1.1).
   const published = { apk: null, apk_bytes: null, ota: null, ipa_bytes: null, page: null, manifest: null, any: false };
   for (const job of ['deliver', 'deliver-android', 'deliver-ios']) {
