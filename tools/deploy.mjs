@@ -6,7 +6,7 @@
 //   node deploy.mjs [--dry-run true|false] [--bump patch|minor|major] [--platform both|android|ios]
 //                   [--testflight true|false] [--play true|false] [--dry-handoff true|false] [--metered auto|allow]
 //                   [--workflow deploy.yml] [--hub-ref REF] [--repo owner/repo] [--print]
-//   node deploy.mjs train [--dry-run true|false] [...]     Tower, Green In Between, Gruvato, Navi, then Earshot; stops at a red run
+//   node deploy.mjs train [--dry-run true|false] [...]     Tower, Green In Between, Gruvato, Navi, Earshot, then Shortwave; stops at a red run
 //   node deploy.mjs ship [--bump patch|minor|major] [--metered auto|allow] [--abandon RUN_ID] [--hub-ref REF] [--repo owner/repo]
 //                                                           one command: recover a red last real run, else dry run, then the
 //                                                           real run on the same commit, then the completion verdict
@@ -36,7 +36,7 @@ export const phone = Object.freeze({ serial: 'R5GL43A7PCH', model: 'SM-S948U', h
 export const levels = Object.freeze(['patch', 'minor', 'major']);
 export const meteredModes = Object.freeze(['auto', 'allow']);
 // Jarad's order, the hub policy's apps (a hub test keeps the two equal).
-export const train = Object.freeze(['delorenj/tower-of-lost-things', 'delorenj/green-in-between', 'delorenj/gruvato', 'AutomaticAI-io/navi', 'delorenj/earshot']);
+export const train = Object.freeze(['delorenj/tower-of-lost-things', 'delorenj/green-in-between', 'delorenj/gruvato', 'AutomaticAI-io/navi', 'delorenj/earshot', 'delorenj/shortwave']);
 const usage = 'Usage: deploy.mjs [train] [--dry-run true|false] [--bump patch|minor|major] [--platform both|android|ios] [--testflight true|false] [--play true|false] [--dry-handoff true|false] [--metered auto|allow] [--workflow deploy.yml] [--hub-ref REF] [--repo owner/repo] [--print]\n       deploy.mjs ship [--bump patch|minor|major] [--metered auto|allow] [--abandon RUN_ID] [--workflow deploy.yml] [--hub-ref REF] [--repo owner/repo]';
 // What ship never takes: it never narrows a run or skips its dry run. TestFlight is opt-in via deploy on the
 // deployed policy; a future explicit completion block may require it for store apps.
@@ -334,7 +334,7 @@ export function pullBump(git, options, log, prefix = 'DEPLOY') {
   }
 }
 
-// Tower, Green In Between, Gruvato, Navi, then Earshot, one at a time; the first red run stops the train.
+// Tower, Green In Between, Gruvato, Navi, Earshot, then Shortwave, one at a time; the first red run stops the train.
 export async function deployTrain(options, deps, { apps = train, log = deps.log ?? console.log } = {}) {
   const results = [];
   for (const repo of apps) {

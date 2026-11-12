@@ -2,7 +2,7 @@
 
 Repo: https://github.com/delorenj/mobile-deploy-hub (public). Local checkout: `~/code/mobile-deploy-hub`. pjangler project `mobile-deploy-hub`, Plane board `MOBI`. Full reference: [README.md](../README.md); design of record: [design-hub-v1.1.md](design-hub-v1.1.md).
 
-What it is: one shared deploy pipeline (a reusable GitHub workflow, a composite action, Node tools and one policy file) that every mobile app calls. The apps are Tower of Lost Things, Green In Between, Gruvato, Navi and Earshot. Each app carries only a thin caller (`.github/workflows/deploy.yml`), a manifest (`tools/ci/mobile-deploy.json`) and the `mise run deploy` task.
+What it is: one shared deploy pipeline (a reusable GitHub workflow, a composite action, Node tools and one policy file) that every mobile app calls. The apps are Tower of Lost Things, Green In Between, Gruvato, Navi, Earshot and Shortwave. Each app carries only a thin caller (`.github/workflows/deploy.yml`), a manifest (`tools/ci/mobile-deploy.json`) and the `mise run deploy` task.
 
 ## Deploying
 

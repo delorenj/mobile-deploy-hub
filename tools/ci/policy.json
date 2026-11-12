@@ -28,6 +28,10 @@
     "delorenj/earshot": {
       "slug": "earshot", "lanes": ["android"],
       "android": { "package": "sh.delo.earshot", "signer_sha256": "edcb667da42bd67c7de3d31cb22c38e223d81c159d0987d186cda24e951d6eac" }
+    },
+    "delorenj/shortwave": {
+      "slug": "shortwave", "lanes": ["android"],
+      "android": { "package": "sh.delo.shortwave", "signer_sha256": "0c6ee7934add5f9d98d2c9365c9f1ff3b255f4feb822db9aea2de6f2760b1e9f" }
     }
   },
   "callers": {
