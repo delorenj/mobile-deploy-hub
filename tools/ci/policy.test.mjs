@@ -82,7 +82,7 @@ test('only Navi carries a testflight block; every other app keeps Owner Testing 
   const { policy } = loadPolicy();
   for (const [repo, app] of Object.entries(policy.apps)) {
     const settings = testflightPolicyOf(app);
-    if (repo === 'AutomaticAI-io/navi') assert.deepEqual(settings, { groups: ['Owner Testing'], train: 'minor' });
+    if (repo === 'AutomaticAI-io/navi') assert.deepEqual(settings, { groups: ['Owner Testing', 'Client Review'], train: 'minor' });
     else {
       assert.ok(!('testflight' in app), `${repo} has no block, so nothing about its TestFlight changed`);
       assert.deepEqual(settings, { groups: ['Owner Testing'], train: 'patch' }, repo);

@@ -174,7 +174,7 @@ test('hooks see the iOS marketing version (the train) and the beta groups, and t
   const { policy } = loadPolicy();
   const trained = parseConfig(['ios', '--version', '0.3.7', '--ios-version', '0.3.0', '--ios-build', '3007', '--out', out], {});
   const env = hookEnvironment(trained, { PATH: '/bin' }, testflightHookEnv(policy, { GITHUB_REPOSITORY: 'AutomaticAI-io/navi' }));
-  assert.deepEqual([env.HUB_VERSION, env.HUB_IOS_VERSION, env.HUB_IOS_BUILD, env.HUB_TESTFLIGHT_GROUPS], ['0.3.7', '0.3.0', '3007', 'Owner Testing']);
+  assert.deepEqual([env.HUB_VERSION, env.HUB_IOS_VERSION, env.HUB_IOS_BUILD, env.HUB_TESTFLIGHT_GROUPS], ['0.3.7', '0.3.0', '3007', 'Owner Testing,Client Review']);
   const plain = hookEnvironment(parseConfig(['ios', '--version', '0.3.7', '--out', out], {}), { PATH: '/bin' });
   assert.equal(plain.HUB_IOS_VERSION, '0.3.7', 'no train: the iOS version is the deploy\'s');
   assert.equal(hookEnvironment(parseConfig(['plan', '--out', out], {}), { PATH: '/bin' }).HUB_IOS_VERSION, '', 'before the plan there is no version to name');
@@ -186,7 +186,7 @@ test('hooks see the iOS marketing version (the train) and the beta groups, and t
   assert.deepEqual(testflightHookEnv(policy, {}), { HUB_TESTFLIGHT_GROUPS: 'Owner Testing' }, 'a local run');
   assert.deepEqual(testflightHookEnv(policy, { GITHUB_REPOSITORY: 'someone/else' }), { HUB_TESTFLIGHT_GROUPS: 'Owner Testing' });
   const spoofed = hookEnvironment(trained, { PATH: '/bin', HUB_TESTFLIGHT_GROUPS: 'Evil Group', HUB_IOS_VERSION: '9.9.9' }, testflightHookEnv(policy, { GITHUB_REPOSITORY: 'AutomaticAI-io/navi' }));
-  assert.deepEqual([spoofed.HUB_TESTFLIGHT_GROUPS, spoofed.HUB_IOS_VERSION], ['Owner Testing', '0.3.0'], 'neither value is taken from the runner environment');
+  assert.deepEqual([spoofed.HUB_TESTFLIGHT_GROUPS, spoofed.HUB_IOS_VERSION], ['Owner Testing,Client Review', '0.3.0'], 'neither value is taken from the runner environment');
 });
 
 test('hooks get throwaway job-control files and never an mc alias with keys', async () => {
