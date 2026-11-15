@@ -8,8 +8,9 @@
 //   5. red: v1 moves back to where it was (or goes away if it was new) and the release says so. Green: the run ids go
 //      into the annotation of vX.Y.Z.
 import { spawnSync } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { deploy, finishByHand, parseArguments, realGh, realGit, unknownStatus } from './deploy.mjs';
 import { conformance } from './conformance.mjs';
@@ -41,7 +42,25 @@ export function remoteTag(name) {
   return object ? { object, commit: commit ?? object } : null;
 }
 
-export async function release(version, { log = console.log, dryRuns = true } = {}) {
+export function validateReleaseCompletion(completion, repo, id = null) {
+  if (!completion || completion.schema !== 1 || completion.verdict !== 'COMPLETE' || completion.repo !== repo || completion.dry_run !== true || completion.bumped !== false || !Array.isArray(completion.required) || !Array.isArray(completion.targets) || !Array.isArray(completion.owed) || completion.owed.length > 0 || (id !== null && String(completion.run?.id) !== String(id))) throw new Error(`completion-out is missing, invalid or not COMPLETE for ${repo}`);
+  if (completion.required.length === 0 || new Set(completion.required).size !== completion.required.length || completion.targets.length !== completion.required.length || completion.required.some(name => !completion.targets.some(target => target.target === name && target.status === 'checked'))) throw new Error(`completion-out does not prove every required target checked for ${repo}`);
+  if (completion.failure || completion.blocked) throw new Error(`completion-out reports a failure or blocked run for ${repo}`);
+  const declared = loadPolicy().policy.apps[repo]?.lanes ?? [];
+  const minimum = declared.map(lane => lane === 'android' ? 'S26' : 'iPad');
+  if (minimum.some(name => !completion.required.includes(name))) throw new Error(`completion-out omits a policy-required target for ${repo}`);
+  return completion;
+}
+
+export function releaseCompletion(gh, repo, id) {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-release-completion-'));
+  try {
+    gh(['run', 'download', String(id), '--repo', repo, '-n', 'completion-out', '-D', dir]);
+    return validateReleaseCompletion(JSON.parse(readFileSync(join(dir, 'completion.json'), 'utf8')), repo, id);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+export async function release(version, { log = console.log, dryRuns = true, dispatch = deploy, gh = realGh } = {}) {
   if (!/^\d+\.\d+\.\d+$/.test(version ?? '')) throw new Error('usage: mise run release -- X.Y.Z');
   const tag = `v${version}`;
   const major = `v${version.split('.')[0]}`;
@@ -81,17 +100,21 @@ export async function release(version, { log = console.log, dryRuns = true } = {
   for (const repo of Object.keys(loadPolicy().policy.apps)) {
     log(`RELEASE_DRY_RUN ${repo} at ${major} (${tag})`);
     try {
-      const result = await deploy({ ...parseArguments(['--dry-run', 'true', '--dry-handoff', 'true', '--repo', repo, '--hub-ref', major]) }, { gh: realGh, git: realGit, log });
+      const result = await dispatch({ ...parseArguments(['--dry-run', 'true', '--dry-handoff', 'true', '--repo', repo, '--hub-ref', major]) }, { gh, git: realGit, log });
       runs.push({ repo, id: result.run?.databaseId ?? null, url: result.run?.url ?? null, status: result.status });
       if (result.status === unknownStatus) { unknown = { repo, id: result.run?.databaseId, url: result.run?.url }; break; }
-      if (result.status !== 0) { red = repo; break; }
+      if (result.status !== 0 || !result.run?.databaseId) { red = repo; break; }
+      const completion = releaseCompletion(gh, repo, result.run.databaseId);
+      runs.at(-1).verdict = completion.verdict;
     } catch (error) {
-      runs.push({ repo, id: null, url: null, status: 1, error: error.message.split('\n')[0] });
+      if (runs.at(-1)?.repo !== repo) runs.push({ repo, id: null, url: null, status: 1 });
+      runs.at(-1).status = 1;
+      runs.at(-1).error = error.message.split('\n')[0];
       red = repo;
       break;
     }
   }
-  const lines = runs.map(item => `${item.repo}: ${item.status === 0 ? 'green' : item.status === unknownStatus ? 'UNKNOWN' : 'RED'} ${item.id ?? ''} ${item.url ?? item.error ?? ''}`.trim());
+  const lines = runs.map(item => `${item.repo}: ${item.status === 0 && item.verdict === 'COMPLETE' ? 'COMPLETE' : item.status === unknownStatus ? 'UNKNOWN' : 'RED'} ${item.id ?? ''} ${item.url ?? item.error ?? ''}`.trim());
   if (unknown) {
     // No verdict is not red: v1 stays where it is, the release stays unproven, and a person finishes the watch.
     git(['tag', '-f', '-a', tag, commit, '-m', `mobile-deploy-hub ${tag}\n\nRelease dry runs: UNKNOWN at ${unknown.repo} (GitHub gave no verdict); ${major} was moved and not rolled back.\n${lines.join('\n')}`]);
@@ -110,7 +133,7 @@ export async function release(version, { log = console.log, dryRuns = true } = {
     }
     git(['tag', '-f', '-a', tag, commit, '-m', `mobile-deploy-hub ${tag}\n\nRelease dry runs: RED at ${red}; ${major} not moved.\n${lines.join('\n')}`]);
     git(['push', '-q', '-f', 'origin', `refs/tags/${tag}`]);
-    throw new Error(`the release dry run of ${red} is red; ${major} is back where it was. Fix it and release the next patch`);
+    throw new Error(`the release dry run of ${red} is red or lacks a valid COMPLETE completion-out; ${major} is back where it was. Fix it and release the next patch`);
   }
   git(['tag', '-f', '-a', tag, commit, '-m', `mobile-deploy-hub ${tag}\n\nRelease dry runs (strict, --dry-handoff true, at ${major}), all green:\n${lines.join('\n')}`]);
   git(['push', '-q', '-f', 'origin', `refs/tags/${tag}`]);

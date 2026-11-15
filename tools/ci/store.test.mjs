@@ -186,6 +186,7 @@ test('the ios lane builds and checks the store IPA through the hook; a hook that
     assert.deepEqual(calls.at(-2), ['ios.store.build', 'build-store']);
     assert.deepEqual(calls.at(-1), ['inspect', 'io.example.game', '1.2.3', '55', sha1, team]);
     assert.equal(built.bytes, 9);
+    assert.equal(built.verified, true);
     assert.equal(built.sha256, createHash('sha256').update('ipa bytes').digest('hex'));
     assert.equal(built.name, 'Game-store.ipa');
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -193,17 +194,17 @@ test('the ios lane builds and checks the store IPA through the hook; a hook that
 
 // ---------------------------------------------------------------------------------------------------- state before upload
 
-import { parseStoreReview, parseStoreState, reviewStates, testflightStep } from './commands/ios.mjs';
+import { parseStoreAssignment, parseStoreReview, parseStoreState, reviewStates, testflightStep } from './commands/ios.mjs';
 
 // The ios lane's TestFlight step with the app's hooks faked: `state` answers ios.store.state, `fail` names a hook to fail.
-function storeRig({ state = null, fail = null, dryRun = false } = {}) {
+function storeRig({ state = null, fail = null, dryRun = false, strict = false, assignment = null } = {}) {
   const spec = parseManifest(macOnly(m => { if (state !== null) m.ios.store.state = 'node tools/testflight.mjs state'; })).ios;
   const calls = [];
   const logs = [];
   const runHook = name => { calls.push(name); if (name === fail) throw new Error(`hook ${name} failed (exit 1)`); };
-  const runOutput = name => { calls.push(name); if (name === fail) throw new Error(`hook ${name} failed (exit 1)`); return typeof state === 'function' ? state() : `${JSON.stringify(state)}\n`; };
+  const runOutput = name => { calls.push(name); if (name === fail) throw new Error(`hook ${name} failed (exit 1)`); return name === 'ios.store.assign' ? `${JSON.stringify(assignment)}\n` : typeof state === 'function' ? state() : `${JSON.stringify(state)}\n`; };
   const store = { status: 'checked', version: '1.2.3', build: '55', uploaded: null, state: null, reason: null };
-  const step = () => testflightStep({ spec, config: { dryRun, cwd: '/tmp' }, store, hooks: {}, log: line => logs.push(line), runHook, runOutput });
+  const step = () => testflightStep({ spec, config: { dryRun, strict, cwd: '/tmp' }, store, hooks: {}, log: line => logs.push(line), runHook, runOutput });
   return { step, calls, logs, store };
 }
 
@@ -216,7 +217,7 @@ test('a build App Store Connect already has is not uploaded again: upload is ski
 });
 
 test('a build App Store Connect does not have is uploaded, then assigned; an app without ios.store.state behaves as before', () => {
-  const absent = storeRig({ state: { present: false } });
+  const absent = storeRig({ state: { present: false, version: '1.2.3', build: '55' } });
   assert.match(absent.step(), /^uploaded and assigned to Owner Testing/);
   assert.deepEqual(absent.calls, ['ios.store.state', 'ios.store.upload', 'ios.store.assign']);
   assert.deepEqual([absent.store.status, absent.store.uploaded], ['assigned', 'run']);
@@ -225,8 +226,34 @@ test('a build App Store Connect does not have is uploaded, then assigned; an app
   assert.deepEqual(plain.calls, ['ios.store.upload', 'ios.store.assign']);
 });
 
+test('an assign failure after upload is recovered on the exact build without a second upload', () => {
+  const first = storeRig({ state: { present: false, version: '1.2.3', build: '55' }, fail: 'ios.store.assign' });
+  assert.throws(() => first.step(), /hook ios.store.assign failed/);
+  assert.deepEqual(first.calls, ['ios.store.state', 'ios.store.upload', 'ios.store.assign']);
+  assert.equal(first.store.uploaded, 'run');
+  assert.equal(first.store.status, 'failed');
+  const retry = storeRig({ state: { present: true, version: '1.2.3', build: '55', state: 'VALID' } });
+  retry.step();
+  assert.deepEqual(retry.calls, ['ios.store.state', 'ios.store.assign']);
+  assert.equal(retry.store.uploaded, 'earlier');
+  assert.equal(retry.store.status, 'assigned');
+});
+
+test('strict store delivery trusts only a verified exact-build assignment receipt', () => {
+  const state = { present: true, version: '1.2.3', build: '55', state: 'VALID' };
+  const ok = storeRig({ strict: true, state, assignment: { assigned: true, version: '1.2.3', build: '55', build_id: 'asc-build-55', groups: ['Owner Testing'] } });
+  ok.step();
+  assert.equal(ok.store.status, 'assigned');
+  assert.equal(ok.store.build_id, 'asc-build-55');
+  assert.deepEqual(ok.calls, ['ios.store.state', 'ios.store.assign']);
+  const missing = storeRig({ strict: true, state, assignment: null });
+  assert.throws(() => missing.step(), /did not confirm the exact build/);
+  assert.equal(missing.store.status, 'failed');
+  assert.throws(() => parseStoreAssignment('{"assigned":true,"version":"1.2.3","build":"56","build_id":"asc-build-56","groups":["Owner Testing"]}', { version: '1.2.3', build: '55', groups: ['Owner Testing'] }), /did not confirm/);
+});
+
 test('a dry run asks App Store Connect (proving the hook) and never uploads or assigns', () => {
-  const rig = storeRig({ state: { present: false }, dryRun: true });
+  const rig = storeRig({ state: { present: false, version: '1.2.3', build: '55' }, dryRun: true });
   assert.match(rig.step(), /^dry run: App Store Connect does not have 1\.2\.3 \(55\); upload and assign were not called$/);
   assert.deepEqual(rig.calls, ['ios.store.state']);
   assert.equal(rig.store.status, 'checked');
@@ -234,21 +261,22 @@ test('a dry run asks App Store Connect (proving the hook) and never uploads or a
 
 test('an unclear answer from ios.store.state fails the step (stage deliver) instead of guessing, and a failed hook is recorded', () => {
   const other = storeRig({ state: { present: true, version: '1.2.3', build: '54' } });
-  assert.throws(() => other.step(), /answered for 1\.2\.3 \(54\), not the planned 1\.2\.3 \(55\)/);
+  assert.throws(() => other.step(), /answered for 1\.2\.3 \(54\), not the exported 1\.2\.3 \(55\)/);
   assert.deepEqual(other.calls, ['ios.store.state']);
   assert.equal(other.store.status, 'failed');
   const garbage = storeRig({ state: () => 'processing...\n' });
   assert.throws(() => garbage.step(), /must print one line of JSON/);
   assert.throws(() => parseStoreState('{"version":"1.2.3"}', { version: '1.2.3', build: '55' }), /must answer \{"present": true\|false/);
-  assert.deepEqual(parseStoreState('log line\n{"present":false}\n', { version: '1.2.3', build: '55' }), { present: false, state: null }, 'the last line is the answer');
-  const upload = storeRig({ state: { present: false }, fail: 'ios.store.upload' });
+  assert.throws(() => parseStoreState('log line\n{"present":false}\n', { version: '1.2.3', build: '55' }), /answered for undefined/);
+  assert.deepEqual(parseStoreState('log line\n{"present":false,"version":"1.2.3","build":"55"}\n', { version: '1.2.3', build: '55' }), { present: false, state: null }, 'the last line is the answer');
+  const upload = storeRig({ state: { present: false, version: '1.2.3', build: '55' }, fail: 'ios.store.upload' });
   assert.throws(() => upload.step(), /hook ios\.store\.upload failed/);
   assert.deepEqual(upload.calls, ['ios.store.state', 'ios.store.upload'], 'assign never runs after a failed upload');
   assert.deepEqual([upload.store.status, upload.store.reason], ['failed', 'hook ios.store.upload failed (exit 1)']);
 });
 
 test('the receipt names the policy\'s beta groups and the step says where the build went (JIMB-466)', () => {
-  const several = storeRig({ state: { present: false } });
+  const several = storeRig({ state: { present: false, version: '1.2.3', build: '55' } });
   several.store.groups = ['Owner Testing', 'Client Review'];
   assert.equal(several.step(), 'uploaded and assigned to Owner Testing, Client Review by the app hooks');
   const later = storeRig({ state: { present: true, version: '1.2.3', build: '55', state: 'VALID' } });
@@ -259,11 +287,11 @@ test('the receipt names the policy\'s beta groups and the step says where the bu
 
 // ios.store.review: where Apple's beta review stands, read after assign.
 function reviewRig({ answer = '{"state":"WAITING_FOR_REVIEW"}\n', fail = false, dryRun = false, review = true } = {}) {
-  const spec = parseManifest(macOnly(m => { if (review) m.ios.store.review = 'node tools/testflight.mjs review'; })).ios;
+  const spec = parseManifest(macOnly(m => { if (review) m.ios.store.review = 'node tools/testflight.mjs review'; m.ios.store.state = 'node tools/testflight.mjs state'; })).ios;
   const calls = [];
   const logs = [];
   const runHook = name => { calls.push(name); };
-  const runOutput = name => { calls.push(name); if (fail) throw new Error(`hook ${name} failed (exit 1)`); return answer; };
+  const runOutput = name => { calls.push(name); if (name === 'ios.store.review' && fail) throw new Error(`hook ${name} failed (exit 1)`); return name === 'ios.store.state' ? '{"present":false,"version":"0.3.0","build":"3007"}\n' : answer; };
   const store = { status: 'checked', version: '0.3.0', build: '3007', groups: ['Owner Testing', 'Client Review'], uploaded: null, state: null, review: null, reason: null };
   const step = () => testflightStep({ spec, config: { dryRun, cwd: '/tmp' }, store, hooks: {}, log: line => logs.push(line), runHook, runOutput });
   return { step, calls, logs, store };
@@ -272,7 +300,7 @@ function reviewRig({ answer = '{"state":"WAITING_FOR_REVIEW"}\n', fail = false, 
 test('a beta review state is read after assign and recorded; it is never a gate', () => {
   const waiting = reviewRig();
   assert.equal(waiting.step(), 'uploaded and assigned to Owner Testing, Client Review by the app hooks; beta review WAITING_FOR_REVIEW');
-  assert.deepEqual(waiting.calls, ['ios.store.upload', 'ios.store.assign', 'ios.store.review'], 'review is asked after assign, never before');
+  assert.deepEqual(waiting.calls, ['ios.store.state', 'ios.store.upload', 'ios.store.assign', 'ios.store.review'], 'review is asked after assign, never before');
   assert.deepEqual(waiting.store.review, { state: 'WAITING_FOR_REVIEW' });
   assert.equal(waiting.store.status, 'assigned');
   assert.ok(waiting.logs.includes('HUB_TESTFLIGHT_REVIEW WAITING_FOR_REVIEW'));
@@ -293,11 +321,11 @@ test('a beta review state is read after assign and recorded; it is never a gate'
   // An app without the hook, and a dry run (no build is uploaded to ask about), behave as before.
   const none = reviewRig({ review: false });
   assert.equal(none.step(), 'uploaded and assigned to Owner Testing, Client Review by the app hooks');
-  assert.deepEqual(none.calls, ['ios.store.upload', 'ios.store.assign']);
+  assert.deepEqual(none.calls, ['ios.store.state', 'ios.store.upload', 'ios.store.assign']);
   assert.equal(none.store.review, null);
   const dry = reviewRig({ dryRun: true });
   dry.step();
-  assert.deepEqual(dry.calls, [], 'a dry run calls neither upload, assign nor review');
+  assert.deepEqual(dry.calls, ['ios.store.state'], 'a dry run reads state but calls neither upload, assign nor review');
 });
 
 test('parseStoreReview takes the last line, one of the known states, and a one-line detail', () => {

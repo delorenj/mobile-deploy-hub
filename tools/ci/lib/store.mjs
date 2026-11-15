@@ -26,7 +26,7 @@ export async function buildStoreIpa({ spec, config, out, team, hooks, env = proc
   const facts = inspect({ ipa, into: join(out, 'store-check'), bundle, version: config.iosVersion || config.version, build: config.iosBuild, team, signer: spec.store.signer_sha1, env, ...(runner ? { runner } : {}) });
   const sha256 = await sha256File(ipa);
   log(`HUB_STORE_IPA_OK ${facts.bundle} ${facts.version} (${facts.build}) signer=${facts.signer.slice(0, 8)} profile=${facts.profile.name} bytes=${bytes}`);
-  return { path: ipa, name: spec.store.artifact, bytes, sha256, bundle: facts.bundle, version: facts.version, build: facts.build, signer: facts.signer, profile: facts.profile };
+  return { verified: true, path: ipa, name: spec.store.artifact, bytes, sha256, bundle: facts.bundle, version: facts.version, build: facts.build, signer: facts.signer, profile: facts.profile };
 }
 
 // What the receipt keeps of the store IPA (no Mac paths).

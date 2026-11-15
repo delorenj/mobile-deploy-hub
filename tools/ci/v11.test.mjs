@@ -170,7 +170,7 @@ test('the gate passes a well-formed run and reads the state of things: metered M
 });
 
 test('active policy requires TestFlight even with the input false and refuses an unavailable Mac on real runs', async () => {
-  const manifest = towerManifest({ ios: { ...towerManifest().ios, export: 'true', archive: 'App.tgz', receipt: 'app.json', store: { archive: 'Store.tgz', receipt: 'store.json', upload: 'true', assign: 'true', signer_sha1: 'F8A5C5309FC1B6C7DD7662A28EA822BE3309C351' } } });
+  const manifest = towerManifest({ ios: { ...towerManifest().ios, export: 'true', archive: 'App.tgz', receipt: 'app.json', store: { archive: 'Store.tgz', receipt: 'store.json', upload: 'true', assign: 'true', preflight: 'true', state: 'true', signer_sha1: 'F8A5C5309FC1B6C7DD7662A28EA822BE3309C351' } } });
   const f = await gateFixture({ manifest });
   try {
     assert.equal((await gate(f.configure(['--dry-run', 'false', '--testflight', 'false']), f.deps())).testflight, true);

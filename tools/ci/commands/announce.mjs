@@ -140,7 +140,11 @@ export async function announce(config, { env = process.env, home = homedir(), fe
   const run = runOf(env);
   const judge = failure => completionOf({
     policy, repo: env.GITHUB_REPOSITORY ?? '', slug: project.slug, store: Boolean(manifest?.ios?.store), required: gateFacts.completion?.required ?? null,
-    dryRun: config.dryRun, platform: config.platform, iosLane, catchup: gateFacts.catchup ?? {}, deliveries: event.data.deliveries, testflight: tf, latest, latestUnread,
+    dryRun: config.dryRun, platform: config.platform, iosLane, catchup: gateFacts.catchup ?? {}, deliveries: config.dryRun ? event.data.deliveries.map(delivery => {
+      const lane = delivery.platform === 'android' ? receipts.android : receipts.ios;
+      const proof = delivery.platform === 'android' ? lane?.apk : lane?.ipa;
+      return delivery.device === 'TestFlight' ? delivery : { ...delivery, verified: Boolean(proof?.verified || (delivery.platform === 'android' && lane?.delivery?.sha256 && lane?.delivery?.build != null)), sha256: delivery.sha256 ?? proof?.sha256 ?? null, build: delivery.build ?? lane?.delivery?.build ?? null };
+    }) : event.data.deliveries, testflight: tf, latest, latestUnread,
     version, androidCode: androidCode ? String(androidCode) : null, iosBuild, failure, bumped: !config.dryRun && receipts.plan?.bump?.committed === true,
     run: { id: run.id, attempt: run.attempt, url: run.url }, commit,
   });

@@ -23,7 +23,7 @@ const { policy } = loadPolicy();
 const strictPolicyText = readFileSync(new URL('./policy.json', import.meta.url), 'utf8');
 const pin = policy.apps['delorenj/tower-of-lost-things'];
 
-function manifest({ store = true, preflight = false, state = false } = {}) {
+function manifest({ store = true, preflight = true, state = true } = {}) {
   return {
     schema: 2,
     project: { slug: 'tower-of-lost-things', name: 'Tower of Lost Things' },
@@ -75,16 +75,16 @@ const real = ['--dry-run', 'false'];
 test('strict completion requires TestFlight for store apps even when the caller passes false', async () => {
   const table = [
     // [name, manifest, flags, tailscale, latest] -> [ios_lane, testflight, store_preflight]
-    ['store app, dry, Mac home', manifest(), [], home, null, ['run', 'true', 'false']],
-    ['store app, real, Mac home', manifest(), real, home, null, ['run', 'true', 'false']],
-    ['the caller said testflight=false', manifest(), [...real, '--testflight', 'false'], home, null, ['run', 'true', 'false']],
+    ['store app, dry, Mac home', manifest(), [], home, null, ['run', 'true', 'true']],
+    ['store app, real, Mac home', manifest(), real, home, null, ['run', 'true', 'true']],
+    ['the caller said testflight=false', manifest(), [...real, '--testflight', 'false'], home, null, ['run', 'true', 'true']],
     ['non-store app without TestFlight', manifest({ store: false }), [], home, null, ['run', 'false', 'false']],
     ['store app with ios.store.preflight', manifest({ preflight: true }), real, home, null, ['run', 'true', 'true']],
     ['no ios.store', manifest({ store: false }), real, home, null, ['run', 'false', 'false']],
     ['--platform android narrows TestFlight out on a dry run (INCOMPLETE later)', manifest(), ['--platform', 'android'], offline, null, ['skip-platform', 'false', 'false']],
-    ['a dry run with the Mac offline still owes TestFlight', manifest(), [], offline, null, ['skip-offline', 'true', 'false']],
-    ['a dry run over the metered budget still owes TestFlight', manifest(), [], metered, heavyLatest, ['skip-metered', 'true', 'false']],
-    ['a real run over budget with --metered allow', manifest(), [...real, '--metered', 'allow'], metered, heavyLatest, ['run', 'true', 'false']],
+    ['a dry run with the Mac offline still owes TestFlight', manifest(), [], offline, null, ['skip-offline', 'true', 'true']],
+    ['a dry run over the metered budget still owes TestFlight', manifest(), [], metered, heavyLatest, ['skip-metered', 'true', 'true']],
+    ['a real run over budget with --metered allow', manifest(), [...real, '--metered', 'allow'], metered, heavyLatest, ['run', 'true', 'true']],
   ];
   for (const [name, app, flags, tailscale, latest, expected] of table) {
     const f = await fixture({ app });
@@ -95,6 +95,17 @@ test('strict completion requires TestFlight for store apps even when the caller 
       assert.equal(result.testflight, expected[1] === 'true', name);
       assert.deepEqual(f.receipt().gate.completion.required, { android: true, ios: true, testflight: Boolean(app.ios.store) }, name);
       assert.ok(f.logs.some(line => line.startsWith(`HUB_TESTFLIGHT ${expected[1] === 'true' ? 'owed' : 'not owed'}: `)), `${name}\n${f.logs.join('\n')}`);
+    } finally { await f.cleanup(); }
+  }
+});
+
+test('strict store gate refuses missing state or preflight before plan spends a version', async () => {
+  for (const app of [manifest({ state: false }), manifest({ preflight: false }), manifest({ state: false, preflight: false })]) {
+    const f = await fixture({ app });
+    try {
+      await assert.rejects(f.run(real), /HUB_GATE_REFUSED store_hooks: strict store delivery requires ios.store.preflight and ios.store.state/);
+      assert.equal(f.outputs().store_preflight, undefined);
+      assert.deepEqual(f.writes, []);
     } finally { await f.cleanup(); }
   }
 });
@@ -174,7 +185,7 @@ test('only the gate reads inputs.testflight; every downstream job reads the gate
 
 test('the manifest accepts ios.store.preflight and ios.store.state as optional hooks, strictly', () => {
   assert.equal(parseManifest(JSON.stringify(manifest({ preflight: true, state: true }))).ios.store.preflight, 'node tools/ios.mjs store-preflight');
-  assert.equal(parseManifest(JSON.stringify(manifest())).ios.store.state, undefined, 'apps without the hooks behave as before');
+  assert.equal(parseManifest(JSON.stringify(manifest({ preflight: false, state: false }))).ios.store.state, undefined, 'legacy manifests still parse; strict gate refuses them');
   for (const key of ['preflight', 'state']) {
     const bad = manifest();
     bad.ios.store[key] = ['node', 'x'];

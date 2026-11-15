@@ -21,7 +21,7 @@ const devices = loadDevices({});
 
 // A delivery as deliveriesFrom gives it (the S26 or the iPad).
 const lane = (platform, status, { version, build, reason = null } = {}) => ({
-  platform, target: platform === 'android' ? 'SM-S948U' : 'iPad14,5', device: platform === 'android' ? 'S26' : 'iPad', version, build: String(build), sha256: null, verified: status === 'installed', status, ...(reason ? { reason } : {}),
+  platform, target: platform === 'android' ? 'SM-S948U' : 'iPad14,5', device: platform === 'android' ? 'S26' : 'iPad', version, build: String(build), sha256: 'a'.repeat(64), verified: true, status, ...(reason ? { reason } : {}),
 });
 
 // latest.json after deliver: both blocks naming (version, code/build) with the given device states.
@@ -123,6 +123,10 @@ test('a dry run is judged on what it proved: every required lane checked is COMP
   const ok = judge({ dryRun: true, version: '0.3.20', androidCode: '25', deliveries: checked, testflight: { status: 'checked', reason: 'dry run: upload and assign were not called' } });
   assert.equal(ok.verdict, 'COMPLETE');
   assert.deepEqual(ok.targets.map(t => t.status), ['checked', 'checked', 'checked']);
+  const noIpa = judge({ dryRun: true, version: '0.3.20', androidCode: '25', deliveries: [checked[0], { ...checked[1], verified: false, sha256: null, build: null, reason: 'dry run without dry_handoff: the IPA was not built' }], testflight: { status: 'checked', reason: 'dry run: upload and assign were not called' } });
+  assert.equal(noIpa.verdict, 'INCOMPLETE');
+  assert.deepEqual(noIpa.targets.map(t => t.status), ['checked', 'skipped', 'checked']);
+  assert.match(noIpa.owed[0].why, /IPA was not built/);
   const metered = judge({ dryRun: true, version: '0.3.20', androidCode: '25', iosLane: 'skip-metered', deliveries: [checked[0], lane('ios', 'skipped', { version: '0.3.20', build: 25, reason: 'the Mac was on a metered link and the iPad build would have gone over its data budget' })], testflight: testflightOf({ testflight: true, iosLane: 'skip-metered', dryRun: true }) });
   assert.equal(metered.verdict, 'INCOMPLETE');
   assert.deepEqual(metered.owed.map(o => [o.target, o.command]), [['iPad', 'mise run ship --metered allow'], ['TestFlight', 'mise run ship --metered allow']]);
@@ -138,7 +142,9 @@ test('testflightOf reads the v1.3 store record, the older note, and a lane that 
   assert.match(of({ ios: { outcome: 'success', store: { status: 'assigned', uploaded: 'earlier' } } }).reason, /already in App Store Connect/);
   assert.deepEqual(of({ ios: { outcome: 'failure', stage: 'deliver', store: { status: 'failed', reason: 'hook ios.store.assign failed (exit 1)' } } }), { status: 'failed', reason: 'hook ios.store.assign failed (exit 1)', build: null });
   assert.equal(of({ ios: { outcome: 'success', testflight: 'uploaded and assigned to Owner Testing by the app hooks' } }).status, 'assigned', 'an older receipt\'s note');
-  assert.equal(of({ ios: { outcome: 'success', store: { status: 'checked' }, testflight: 'dry run: upload and assign were not called' } }, { dryRun: true }).status, 'checked');
+  assert.equal(of({ ios: { outcome: 'success', store: { status: 'skipped' }, testflight: 'dry run: store Xcode project was not handed to the Mac' } }, { dryRun: true }).status, 'skipped');
+  assert.equal(of({ ios: { outcome: 'success', store: { status: 'checked' }, testflight: 'dry run: upload and assign were not called' } }, { dryRun: true }).status, 'missing');
+  assert.equal(of({ ios: { outcome: 'success', store: { status: 'checked', proof: true, build: '25' }, testflight: 'dry run: upload and assign were not called' } }, { dryRun: true }).status, 'checked');
   assert.equal(of({ ios: { outcome: 'failure', stage: 'install', reason: 'readback: no app' } }).status, 'failed');
   assert.equal(of({}, { needs: { ios: { result: 'skipped' } } }).status, 'skipped');
   assert.equal(of({}, { iosLane: 'skip-lost' }).status, 'skipped');

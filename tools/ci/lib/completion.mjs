@@ -52,11 +52,11 @@ export function testflightOf({ testflight, iosLane = 'run', needs = {}, receipts
       return { status: 'assigned', reason: `${store.uploaded === 'earlier' ? 'already in App Store Connect; assigned to' : 'uploaded and assigned to'} ${to}${review}`, build: store.build ?? null };
     }
     if (store.status === 'failed') return { status: 'failed', reason: store.reason ?? ios.reason ?? 'the TestFlight step failed', build: store.build ?? null };
-    if (store.status === 'checked' && dryRun) return { status: 'checked', reason: ios.testflight ?? 'dry run: upload and assign were not called', build: store.build ?? null };
+    if (store.status === 'skipped') return { status: 'skipped', reason: ios.testflight ?? 'store build was not checked on the Mac', build: store.build ?? null };
+    if (store.status === 'checked' && dryRun && store.proof === true) return { status: 'checked', reason: ios.testflight ?? 'dry run: upload and assign were not called', build: store.build ?? null };
   }
   if (typeof ios.testflight === 'string') {
     if (/uploaded and assigned|; assigned to /.test(ios.testflight)) return { status: 'assigned', reason: ios.testflight };
-    if (/^dry run/.test(ios.testflight) && dryRun) return { status: 'checked', reason: ios.testflight };
   }
   if (ios.outcome === 'failure') return { status: 'failed', reason: ios.stage === 'deliver' ? (ios.reason ?? 'the TestFlight step failed') : `the ios lane stopped at ${ios.stage ?? 'an unknown stage'} before TestFlight (${ios.reason ?? 'no reason'})` };
   return { status: 'missing', reason: 'the ios lane did not record TestFlight' };
@@ -79,7 +79,12 @@ function deviceTarget({ platform, delivery, dryRun, latest, latestUnread = false
   const reason = delivery.reason ?? null;
   if (delivery.status === 'failed') return { target, platform, status: 'failed', durable: false, why: reason ?? `the ${target} refused the build` };
   if (delivery.status === 'skipped') return { target, platform, status: 'skipped', durable: false, why: reason ?? `the ${target} lane did not run` };
-  if (dryRun) return { target, platform, status: 'checked', durable: null, why: reason ?? 'built and checked (dry run)' };
+  if (dryRun) {
+    const built = delivery.verified === true && /^[0-9a-f]{64}$/.test(delivery.sha256 ?? '') && delivery.build !== null && delivery.build !== undefined && String(delivery.build) !== '';
+    return built
+      ? { target, platform, status: 'checked', durable: null, why: reason ?? 'built and checked (dry run)' }
+      : { target, platform, status: 'skipped', durable: false, why: reason ?? `dry run did not prove a checked ${target} artifact and build` };
+  }
   if (delivery.status === 'installed') return { target, platform, status: 'installed', durable: true, why: 'installed and read back in the run' };
   // pending: durable only when latest.json names this version for this device and the catch-up there is live.
   const block = latest?.[platform] ?? null;

@@ -154,8 +154,8 @@ export function parseStoreState(text, { version, build }) {
   try { answer = JSON.parse(line); } catch { throw new Error(`hook ios.store.state must print one line of JSON ({"present": true|false, "version", "build"}), got ${JSON.stringify(line.slice(0, 80))}`); }
   if (!answer || typeof answer !== 'object' || Array.isArray(answer) || typeof answer.present !== 'boolean') throw new Error('hook ios.store.state must answer {"present": true|false, ...}');
   if (answer.state !== undefined && answer.state !== null && (typeof answer.state !== 'string' || answer.state.length > 60)) throw new Error('hook ios.store.state: state must be a short string');
-  if (answer.present && (String(answer.version) !== String(version) || String(answer.build) !== String(build))) {
-    throw new Error(`hook ios.store.state answered for ${answer.version} (${answer.build}), not the planned ${version} (${build})`);
+  if (String(answer.version) !== String(version) || String(answer.build) !== String(build)) {
+    throw new Error(`hook ios.store.state answered for ${answer.version} (${answer.build}), not the exported ${version} (${build})`);
   }
   return { present: answer.present, state: answer.state ?? null };
 }
@@ -173,6 +173,16 @@ export function parseStoreReview(text) {
   return { state: answer.state, ...(answer.detail ? { detail: answer.detail } : {}) };
 }
 
+export function parseStoreAssignment(text, { version, build, groups }) {
+  const line = String(text ?? '').trim().split('\n').filter(Boolean).pop() ?? '';
+  let answer;
+  try { answer = JSON.parse(line); } catch { throw new Error('hook ios.store.assign must print a final JSON assignment receipt'); }
+  if (answer?.assigned !== true || String(answer.version) !== String(version) || String(answer.build) !== String(build) || !Array.isArray(answer.groups) || new Set(answer.groups).size !== groups.length || answer.groups.length !== groups.length || groups.some(group => !answer.groups.includes(group)) || typeof answer.build_id !== 'string' || !answer.build_id) {
+    throw new Error('hook ios.store.assign did not confirm the exact build and required groups');
+  }
+  return { build_id: answer.build_id, groups: answer.groups };
+}
+
 // The TestFlight step of the ios lane: ios.store.state (when the app declares it), then, on a real run, upload unless
 // App Store Connect already has the build, then assign. `store` is the receipt's TestFlight record, updated in place so
 // a failure receipt carries how far it got. Returns the receipt's one-line note.
@@ -180,11 +190,14 @@ export function testflightStep({ spec, config, store, storeIpa = null, hooks, lo
   const to = groupsLabel(Array.isArray(store.groups) && store.groups.length > 0 ? store.groups : defaultGroups);
   const built = storeIpa ? `the App Store IPA ${storeIpa.version} (${storeIpa.build}) is built and checked; ` : '';
   try {
+    if (!config.dryRun && config.strict === true && (!/^[1-9]\d*$/.test(String(store.build ?? '')) || !/^\d+\.\d+\.\d+$/.test(String(store.version ?? '')))) throw new Error('TestFlight has no exact exported (version, build); upload refused');
     let known = null;
     if (spec.store.state) {
       known = parseStoreState(runOutput('ios.store.state', spec.store.state, { cwd: config.cwd, env: hooks }), { version: store.version, build: store.build });
       store.state = known.state;
       log(`HUB_TESTFLIGHT_STATE ${store.version} (${store.build}) ${known.present ? `is in App Store Connect${known.state ? ` (${known.state})` : ''}` : 'is not in App Store Connect yet'}`);
+    } else if (!config.dryRun && config.strict === true) {
+      throw new Error('ios.store.state is required before a real TestFlight upload; without exact-build reconciliation a retry could upload twice');
     }
     if (config.dryRun) return `dry run: ${built}${known ? `App Store Connect ${known.present ? 'has' : 'does not have'} ${store.version} (${store.build}); ` : ''}upload and assign were not called`;
     if (known?.present) {
@@ -194,7 +207,10 @@ export function testflightStep({ spec, config, store, storeIpa = null, hooks, lo
       runHook('ios.store.upload', spec.store.upload, { cwd: config.cwd, env: hooks });
       store.uploaded = 'run';
     }
-    runHook('ios.store.assign', spec.store.assign, { cwd: config.cwd, env: hooks });
+    if (config.strict === true) {
+      const assigned = parseStoreAssignment(runOutput('ios.store.assign', spec.store.assign, { cwd: config.cwd, env: hooks }), { version: store.version, build: store.build, groups: Array.isArray(store.groups) && store.groups.length ? store.groups : defaultGroups });
+      store.build_id = assigned.build_id;
+    } else runHook('ios.store.assign', spec.store.assign, { cwd: config.cwd, env: hooks });
     store.status = 'assigned';
     // Where Apple's beta review stands is information, never a gate: a hook that cannot say leaves "unknown" and a warning.
     if (spec.store.review) {
@@ -242,6 +258,12 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
       const names = [spec.archive, spec.receipt, ...(config.testflight ? [spec.store.archive, spec.store.receipt] : [])];
       await receiveHandoff({ names, expected, archives: exportReceipt.handoff?.archives ?? [], base: devices.mac.handoff_dir, into: out, env, home, runner, log });
       if (exportReceipt.handoff?.mac_bytes) { macBytes.in += exportReceipt.handoff.mac_bytes.in ?? 0; macBytes.out += exportReceipt.handoff.mac_bytes.out ?? 0; }
+    }
+    const storeReceipt = config.testflight && spec.export && handoff ? JSON.parse(readFileSync(join(out, spec.store.receipt), 'utf8')) : null;
+    if (storeReceipt) {
+      if (storeReceipt.version !== (config.iosVersion || config.version) || !/^[1-9]\d*$/.test(String(storeReceipt.build ?? ''))) {
+        throw new Error(`the App Store export must name iOS version ${config.iosVersion || config.version} and a positive exact build; got ${storeReceipt.version} (${storeReceipt.build})`);
+      }
     }
     const canBuild = !spec.export || handoff;
     let ipa = null;
@@ -371,8 +393,13 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
       // Publishing, not the device: a failed upload or assign is reported at stage deliver and the iPad keeps its status.
       track.stage = 'deliver';
       // The store build's marketing version is the app's train (HUB_IOS_VERSION), the deploy's own version without one.
-      track.receipt.store = { status: 'checked', version: config.iosVersion || config.version, build: storeIpa?.build ?? (config.iosBuild || null), groups: testflightPolicyOf(policy.apps[env.GITHUB_REPOSITORY ?? '']).groups, uploaded: null, state: null, review: null, reason: null };
-      testflight = testflightStep({ spec, config, store: track.receipt.store, storeIpa, hooks, log });
+      track.receipt.store = { status: 'checked', version: config.iosVersion || config.version, build: storeIpa?.build ?? (storeReceipt?.build ?? (config.iosBuild || null)), groups: testflightPolicyOf(policy.apps[env.GITHUB_REPOSITORY ?? '']).groups, uploaded: null, state: null, review: null, reason: null };
+      const storeHooks = { ...hooks, HUB_IOS_BUILD: String(track.receipt.store.build ?? '') };
+      if (config.dryRun && !canBuild) track.receipt.store.status = 'skipped';
+      testflight = config.dryRun && !canBuild
+        ? 'dry run: store Xcode project was not handed to the Mac; no signed build was checked, upload and assign were not called'
+        : testflightStep({ spec, config, store: track.receipt.store, storeIpa, hooks: storeHooks, log });
+      if (config.dryRun && canBuild && spec.store.build && storeIpa?.verified === true && /^[0-9a-f]{64}$/.test(storeIpa.sha256 ?? '') && String(storeIpa.build) === String(track.receipt.store.build) && track.receipt.store.status === 'checked' && spec.store.state) track.receipt.store.proof = true;
       notes.push(`TestFlight: ${testflight}`);
       if (storeIpa) log(`HUB_TESTFLIGHT ${config.dryRun ? 'DRY RUN' : 'UPLOADED'} ${storeIpa.bundle} ${storeIpa.version} (${storeIpa.build}) sha256=${short(storeIpa.sha256)}`);
     }

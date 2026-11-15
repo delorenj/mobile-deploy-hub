@@ -192,6 +192,9 @@ export async function gate(config, {
     const testflight = scope.ios && (policy.completion.required.testflight === 'store' ? required.testflight : iosLane === 'run' && Boolean(config.testflight));
     if (testflight) required.testflight = true;
     const storePreflight = testflight && Boolean(manifest.ios?.store?.preflight);
+    if (policy.completion.required.testflight === 'store' && required.testflight && (!manifest.ios?.store?.preflight || !manifest.ios?.store?.state)) {
+      throw refusal('store_hooks', 'strict store delivery requires ios.store.preflight and ios.store.state; without both, signing/ASC cannot be checked before the bump or an upload reconciled on retry');
+    }
     // Where a store build goes and how its iOS version moves are the policy's (the app's testflight block), not the manifest's.
     const tfPolicy = testflightPolicyOf(app);
     log(`HUB_TESTFLIGHT ${testflight ? 'owed' : 'not owed'}: ${testflightWhy({ policy, manifest, required, scope, iosLane, storePreflight, platform: config.platform })}${testflight ? `; beta groups ${groupsLabel(tfPolicy.groups)}, iOS version train ${tfPolicy.train}` : ''}`);

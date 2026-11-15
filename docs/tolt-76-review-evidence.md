@@ -1,0 +1,21 @@
+# TOLT-76 strict Store retry and release review evidence
+
+This branch is a review candidate, not a hub release. No version was bumped, tag moved, application uploaded, or device installed by these checks.
+
+## Reproduced blockers and guardrails
+
+- The old Tower upload path selected a new build from the current ASC list inside `upload`, after Linux had already exported a build. If assignment failed after a successful upload, a retry could restamp the old receipt and upload another build. Tower now uses the exported version/build as immutable identity. The hub queries `ios.store.state` before calling upload, and an exact present build skips upload and retries assignment. Tower refuses build-selection drift and records an exclusive durable upload attempt before invoking native upload, so an Apple-accepted upload not yet visible in ASC cannot be repeated on that Mac. A previously attempted but still invisible build requires reconciliation rather than a second upload.
+- Strict Store delivery refuses missing `ios.store.preflight` or `ios.store.state` at the gate, before `plan` spends a version. Tower's Mac preflight checks ASC access, the Owner Testing group, pinned Xcode/SDK, profile identity/expiry, and the distribution signer; the hub also probes signing and declared secrets. A strict assignment is marked `assigned` only after the hook prints an exact-build/group receipt; Tower prints it only after ASC confirms group membership. Tester invitations are reported separately and cannot be inferred from assignment.
+- Dry device targets need a verified built artifact with SHA-256 and build before they become `checked`. A TestFlight dry check requires the verified signed Store IPA and successful state query; an unhanded Xcode project is `skipped`. A mere `dry run` message is not evidence.
+- `release.mjs` downloads `completion-out` for each watched run and requires the same repo and run, `COMPLETE`, dry and unbumped, all required targets checked, and no owed targets. Missing, unreadable, or incomplete evidence follows the red rollback path, not the successful workflow-exit path.
+
+## Local checks and live read-only observation
+
+- `mise run check` in the hub: 335 tests passed, 0 failed (Node suite); `actionlint` passed. No release command was run.
+- Tower's focused `node --test tests/testflight.test.mjs tests/hub-manifest.test.mjs tests/native-launch-preparation.test.mjs` passed. Assignment tests use injected ASC responses and do not POST to Apple.
+- A Tower full check initially found one stale characterization in `tests/native-launch-preparation.test.mjs` that required the now-prohibited receipt restamp. It was updated to assert immutable-build selection. The re-run Node suite passed 1128 tests, 0 failed, 4 skipped; the subsequent Godot project check had not finished at the time of this evidence note.
+- Read-only ASC GET observation on 2026-11-15: the first builds page returned six builds (10, 9, 8, 7, 6, 5) and no next link; build 10 was VALID, unexpired and APP_STORE_ELIGIBLE, with beta review APPROVED. The build's betaGroups endpoint returned HTTP 403, so this does **not** establish group membership or tester access. The known Owner Testing group lookup and group-builds listing each returned HTTP 200, but no tester result is claimed. The exact-build query for 0.3.22 (10) returned build 10; build 27 was not in the six-build page. These were GET requests only. A later run must validate its own exported exact build; these observations do not license an upload.
+
+## What remains
+
+Independent spec and quality re-review on the pushed hub and Tower branches; complete six-app strict dry runs only through the ordinary hub release workflow after review/approval. The current remote `v1` points at the `v1.2.32` code commit (`febf02d`), so a release operator would first recheck remote refs, select an unused next hub patch version (currently `v1.2.33`), land reviewed source to hub main, then invoke `mise run release -- 1.2.33` on clean origin/main. That command checks conformance, creates the exact tag, moves `v1`, and watches all six strict `--dry-handoff true` app dry runs and their `completion-out` artifacts; it rolls `v1` back on a red or incomplete proof. Release approval and any subsequent actual app shipment remain separate. No normal release or application shipment is authorized by this evidence.
