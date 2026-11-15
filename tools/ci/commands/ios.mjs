@@ -230,6 +230,23 @@ export function testflightStep({ spec, config, store, storeIpa = null, hooks, lo
   }
 }
 
+export function dryStoreProof({ spec, config, store, storeIpa }) {
+  if (!config.dryRun || store.status !== 'checked' || !spec.store.build || !spec.store.state) return false;
+  return storeIpa?.verified === true && /^[0-9a-f]{64}$/.test(storeIpa.sha256 ?? '') && String(storeIpa.build) === String(store.build);
+}
+
+export function dryStoreResult({ spec, config, store, storeIpa, testflight }) {
+  if (dryStoreProof({ spec, config, store, storeIpa })) store.proof = true;
+  if (config.dryRun && spec.export && store.status === 'checked') {
+    // A Linux export is only an Xcode project. Tower's native Store IPA is produced by its upload hook,
+    // which a dry run must never call. The private iPad IPA and an ASC state query cannot prove Store signing.
+    store.status = 'skipped';
+    store.reason = 'the Linux Store export has no signed App Store IPA or native Store preflight proof; upload was not called';
+    return `dry run: ${store.reason}`;
+  }
+  return testflight;
+}
+
 export async function ios(config, { env = process.env, home = homedir(), log = console.log, runner = runBounded, sleep, now, linkNow = null } = {}) {
   const { policy } = policyBanner(log);
   const manifest = await loadManifest(config.cwd, config.manifest);
@@ -399,7 +416,7 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
       testflight = config.dryRun && !canBuild
         ? 'dry run: store Xcode project was not handed to the Mac; no signed build was checked, upload and assign were not called'
         : testflightStep({ spec, config, store: track.receipt.store, storeIpa, hooks: storeHooks, log });
-      if (config.dryRun && canBuild && spec.store.build && storeIpa?.verified === true && /^[0-9a-f]{64}$/.test(storeIpa.sha256 ?? '') && String(storeIpa.build) === String(track.receipt.store.build) && track.receipt.store.status === 'checked' && spec.store.state) track.receipt.store.proof = true;
+      testflight = dryStoreResult({ spec, config, store: track.receipt.store, storeIpa, testflight });
       notes.push(`TestFlight: ${testflight}`);
       if (storeIpa) log(`HUB_TESTFLIGHT ${config.dryRun ? 'DRY RUN' : 'UPLOADED'} ${storeIpa.bundle} ${storeIpa.version} (${storeIpa.build}) sha256=${short(storeIpa.sha256)}`);
     }

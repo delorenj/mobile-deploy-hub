@@ -194,7 +194,32 @@ test('the ios lane builds and checks the store IPA through the hook; a hook that
 
 // ---------------------------------------------------------------------------------------------------- state before upload
 
-import { parseStoreAssignment, parseStoreReview, parseStoreState, reviewStates, testflightStep } from './commands/ios.mjs';
+import { dryStoreResult, parseStoreAssignment, parseStoreReview, parseStoreState, reviewStates, testflightStep } from './commands/ios.mjs';
+import { testflightOf } from './lib/completion.mjs';
+
+test('Linux-export dry handoff with a private IPA and a successful ASC state query does not prove a signed Store IPA', () => {
+  const spec = parseManifest(macOnly(m => {
+    m.ios.export = 'linux-export'; m.ios.archive = 'private.tgz'; m.ios.receipt = 'private.json';
+    delete m.ios.store.build; delete m.ios.store.artifact;
+    m.ios.store.archive = 'store.tgz'; m.ios.store.receipt = 'store.json'; m.ios.store.state = 'asc-state';
+  })).ios;
+  const store = { status: 'checked', version: '1.2.3', build: '55' };
+  const state = { present: false, version: '1.2.3', build: '55' };
+  const calls = [];
+  assert.match(testflightStep({ spec, config: { dryRun: true, strict: true }, store, hooks: {}, runOutput: name => { calls.push(name); return JSON.stringify(state); }, runHook: name => calls.push(name) }), /upload and assign were not called/);
+  assert.deepEqual(calls, ['ios.store.state']);
+  const result = dryStoreResult({ spec, config: { dryRun: true }, store, storeIpa: null, testflight: 'dry run: upload and assign were not called' });
+  assert.match(result, /no signed App Store IPA/);
+  assert.deepEqual([store.status, store.proof], ['skipped', undefined]);
+  assert.equal(testflightOf({ testflight: true, dryRun: true, receipts: { ios: { store } } })?.status, 'skipped');
+  const spurious = { status: 'checked', version: '1.2.3', build: '55' };
+  dryStoreResult({ spec, config: { dryRun: true }, store: spurious, storeIpa: { verified: true, sha256: 'a'.repeat(64), build: '55' }, testflight: 'checked' });
+  assert.deepEqual([spurious.status, spurious.proof], ['skipped', undefined], 'a private IPA cannot masquerade as the Store build');
+  const mac = parseManifest(macOnly(m => { m.ios.store.state = 'asc-state'; })).ios;
+  const macStore = { status: 'checked', version: '1.2.3', build: '55' };
+  assert.equal(dryStoreResult({ spec: mac, config: { dryRun: true }, store: macStore, storeIpa: { verified: true, sha256: 'a'.repeat(64), build: '55' }, testflight: 'checked' }), 'checked');
+  assert.equal(macStore.proof, true, 'a verified exact-build Mac Store IPA remains eligible');
+});
 
 // The ios lane's TestFlight step with the app's hooks faked: `state` answers ios.store.state, `fail` names a hook to fail.
 function storeRig({ state = null, fail = null, dryRun = false, strict = false, assignment = null } = {}) {

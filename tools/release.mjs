@@ -46,8 +46,13 @@ export function validateReleaseCompletion(completion, repo, id = null) {
   if (!completion || completion.schema !== 1 || completion.verdict !== 'COMPLETE' || completion.repo !== repo || completion.dry_run !== true || completion.bumped !== false || !Array.isArray(completion.required) || !Array.isArray(completion.targets) || !Array.isArray(completion.owed) || completion.owed.length > 0 || (id !== null && String(completion.run?.id) !== String(id))) throw new Error(`completion-out is missing, invalid or not COMPLETE for ${repo}`);
   if (completion.required.length === 0 || new Set(completion.required).size !== completion.required.length || completion.targets.length !== completion.required.length || completion.required.some(name => !completion.targets.some(target => target.target === name && target.status === 'checked'))) throw new Error(`completion-out does not prove every required target checked for ${repo}`);
   if (completion.failure || completion.blocked) throw new Error(`completion-out reports a failure or blocked run for ${repo}`);
-  const declared = loadPolicy().policy.apps[repo]?.lanes ?? [];
-  const minimum = declared.map(lane => lane === 'android' ? 'S26' : 'iPad');
+  const policy = loadPolicy().policy;
+  const app = policy.apps[repo];
+  if (!app) throw new Error(`completion-out names an app outside policy: ${repo}`);
+  const minimum = app.lanes.map(lane => lane === 'android' ? 'S26' : 'iPad');
+  // Every iOS app in this strict release must prove the Store target. The artifact's own required list
+  // cannot opt an iOS app out; a manifest without ios.store fails the ordinary strict gate instead.
+  if (app.lanes.includes('ios') && policy.completion.required.testflight === 'store') minimum.push('TestFlight');
   if (minimum.some(name => !completion.required.includes(name))) throw new Error(`completion-out omits a policy-required target for ${repo}`);
   return completion;
 }

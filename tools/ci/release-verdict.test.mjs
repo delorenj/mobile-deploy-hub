@@ -14,6 +14,11 @@ test('release requires a COMPLETE artifact for the exact app and every required 
     assert.throws(() => validateReleaseCompletion(altered, repo), /completion-out|failure or blocked/);
   }
   assert.throws(() => validateReleaseCompletion({ ...complete(), required: ['TestFlight'], targets: [{ target: 'TestFlight', status: 'checked' }] }, repo), /policy-required/);
+  const withoutStore = { ...complete(), required: ['S26', 'iPad'], targets: complete().targets.slice(0, 2) };
+  assert.throws(() => validateReleaseCompletion(withoutStore, repo, 123), /policy-required/, 'a Tower COMPLETE artifact cannot omit TestFlight from both required and targets');
+  assert.throws(() => validateReleaseCompletion({ ...withoutStore, repo: 'delorenj/green-in-between' }, 'delorenj/green-in-between'), /policy-required/, 'the rule applies to other iOS apps');
+  const androidOnly = { ...withoutStore, repo: 'delorenj/earshot', required: ['S26'], targets: withoutStore.targets.slice(0, 1) };
+  assert.equal(validateReleaseCompletion(androidOnly, 'delorenj/earshot').verdict, 'COMPLETE');
 });
 
 test('release reads completion-out from the watched run; missing or unreadable output is not green', () => {
