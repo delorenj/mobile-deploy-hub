@@ -1,5 +1,5 @@
-// TestFlight follows the caller's opt-in with the deployed policy. The explicit strict completion fixture below
-// exercises the deferred policy-derived TestFlight and pre-bump lane refusal without activating them.
+// Strict TestFlight is derived from the active completion policy and each manifest's ios.store.
+// The gate refuses an unavailable required lane before any version bump.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -19,9 +19,8 @@ import { sampleLatest } from './test-fixtures.mjs';
 
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 const template = readFileSync(templateFile, 'utf8');
-const { policy: releasedPolicy } = loadPolicy();
-const policy = { ...releasedPolicy, completion: { required: { devices: 'lanes', testflight: 'store' }, lane_unavailable: 'refuse', reruns: 1 } };
-const strictPolicyText = JSON.stringify(policy);
+const { policy } = loadPolicy();
+const strictPolicyText = readFileSync(new URL('./policy.json', import.meta.url), 'utf8');
 const pin = policy.apps['delorenj/tower-of-lost-things'];
 
 function manifest({ store = true, preflight = false, state = false } = {}) {
@@ -82,7 +81,7 @@ test('strict completion requires TestFlight for store apps even when the caller 
     ['non-store app without TestFlight', manifest({ store: false }), [], home, null, ['run', 'false', 'false']],
     ['store app with ios.store.preflight', manifest({ preflight: true }), real, home, null, ['run', 'true', 'true']],
     ['no ios.store', manifest({ store: false }), real, home, null, ['run', 'false', 'false']],
-    ['--platform android narrows TestFlight out (INCOMPLETE later)', manifest(), [...real, '--platform', 'android'], offline, null, ['skip-platform', 'false', 'false']],
+    ['--platform android narrows TestFlight out on a dry run (INCOMPLETE later)', manifest(), ['--platform', 'android'], offline, null, ['skip-platform', 'false', 'false']],
     ['a dry run with the Mac offline still owes TestFlight', manifest(), [], offline, null, ['skip-offline', 'true', 'false']],
     ['a dry run over the metered budget still owes TestFlight', manifest(), [], metered, heavyLatest, ['skip-metered', 'true', 'false']],
     ['a real run over budget with --metered allow', manifest(), [...real, '--metered', 'allow'], metered, heavyLatest, ['run', 'true', 'false']],
@@ -100,12 +99,22 @@ test('strict completion requires TestFlight for store apps even when the caller 
   }
 });
 
+test('a real run cannot use --platform to bypass a required lane before plan', async () => {
+  for (const platform of ['android', 'ios']) {
+    const f = await fixture();
+    try {
+      await assert.rejects(f.run([...real, '--platform', platform]), /HUB_GATE_REFUSED platform: the completion policy requires every declared lane/);
+      assert.deepEqual(f.writes, [], 'no S3 probe or version bump');
+      assert.equal(f.outputs().ios_lane, undefined, 'plan never starts');
+    } finally { await f.cleanup(); }
+  }
+});
+
 test('a real run whose required iOS lane would not run is refused at the gate, before plan and before anything is written', async () => {
   const cases = [
-    ['Mac offline', manifest(), real, offline, null, /HUB_GATE_REFUSED lane_unavailable: the Mac is offline \(.*\), so the iPad and TestFlight would not be delivered; bring the Mac back, or narrow with --platform android .*Nothing was spent/],
+    ['Mac offline', manifest(), real, offline, null, /HUB_GATE_REFUSED lane_unavailable: the Mac is offline \(.*\), so the iPad and TestFlight would not be delivered; bring the Mac back\. Nothing was spent/],
     ['metered over budget', manifest(), real, metered, heavyLatest, /HUB_GATE_REFUSED lane_unavailable: the Mac is on a metered link .*150 MiB budget, so the iPad and TestFlight would not be delivered; pass --metered allow/],
     ['no store app: the iPad alone', manifest({ store: false }), real, offline, null, /HUB_GATE_REFUSED lane_unavailable: the Mac is offline .*so the iPad would not be delivered/],
-    ['--platform ios with the Mac offline', manifest(), [...real, '--platform', 'ios'], offline, null, /HUB_GATE_REFUSED lane_unavailable/],
   ];
   for (const [name, app, flags, tailscale, latest, refusal] of cases) {
     const f = await fixture({ app });
@@ -131,8 +140,10 @@ test('lane_unavailable: skip is the v1.2 rollback: the real run goes on with the
   } finally { await f.cleanup(); }
 });
 
-test('released policy skips an unavailable lane, does not require devices, and leaves TestFlight opt-in', async () => {
-  const f = await fixture({ policyText: JSON.stringify(releasedPolicy) });
+test('legacy policy without completion skips an unavailable lane and leaves TestFlight opt-in', async () => {
+  const legacy = structuredClone(policy);
+  delete legacy.completion;
+  const f = await fixture({ policyText: JSON.stringify(legacy) });
   try {
     const defaultRun = await f.run(real);
     assert.deepEqual([defaultRun.ios_lane, defaultRun.testflight], ['run', false]);

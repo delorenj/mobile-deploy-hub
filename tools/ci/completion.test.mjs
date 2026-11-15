@@ -14,9 +14,7 @@ import { loadPolicy } from './lib/policy.mjs';
 import { announce } from './commands/announce.mjs';
 import { device, sampleLatest } from './test-fixtures.mjs';
 
-const { policy: releasedPolicy } = loadPolicy();
-// Exercise the deferred contract explicitly; the released policy intentionally has no completion block.
-const policy = { ...releasedPolicy, completion: { required: { devices: 'lanes', testflight: 'store' }, lane_unavailable: 'refuse', reruns: 1 } };
+const { policy } = loadPolicy();
 const repo = 'delorenj/tower-of-lost-things';
 const slug = 'tower-of-lost-things';
 const devices = loadDevices({});

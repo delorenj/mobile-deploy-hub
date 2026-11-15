@@ -6,9 +6,8 @@
 // catch-up's mode on both hosts, the build directory) and decides the iPad lane: run it, or skip it because the Mac is
 // offline or a metered link would go over the data budget.
 //
-// The gate owns the TestFlight decision for downstream jobs. With no completion block, the caller opts in as in
-// v1.2.25 and unavailable lanes skip. An explicit future completion block can require store TestFlight and refuse
-// unavailable lanes before plan spends a version.
+// The gate owns the TestFlight decision for downstream jobs. The completion block requires store TestFlight and
+// refuses unavailable lanes before plan spends a version; a legacy block-free policy remains parseable for rollback.
 import { readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -182,9 +181,12 @@ export async function gate(config, {
       if (catchup[platform] === 'watch' && !config.dryRun) log(`::warning::the catch-up on ${host} is in watch mode: a pending ${platform === 'android' ? 'S26' : 'iPad'} is not installed when it comes back until \`catchup.mjs mode live\` runs there`);
     }
 
-    // An explicit strict completion block can require store TestFlight; otherwise the caller opts in as in v1.2.25.
+    // An explicit completion block requires store TestFlight; a legacy block-free policy still lets the caller opt in.
     // Downstream jobs always read this gate output, not the original input.
     const required = requiredTargets(policy, app, { store: Boolean(manifest.ios?.store) });
+    if (!config.dryRun && config.platform !== 'both' && policy.completion.required.devices === 'lanes') {
+      throw refusal('platform', `the completion policy requires every declared lane; --platform ${config.platform} cannot spend a version without ${app.lanes.join(' and ')} (use --platform both)`);
+    }
     if (config.testflight && !manifest.ios?.store && policy.completion.required.testflight === 'never') throw refusal('testflight', `--testflight is for an app with ios.store; ${app.slug} has no App Store Connect app in its manifest`);
     if (policy.completion.required.testflight === 'never' && config.testflight && !scope.ios) throw refusal('testflight', `--testflight needs the iOS lane (platform both or ios)`);
     const testflight = scope.ios && (policy.completion.required.testflight === 'store' ? required.testflight : iosLane === 'run' && Boolean(config.testflight));
@@ -201,7 +203,7 @@ export async function gate(config, {
       const owed = `the iPad${testflight ? ' and TestFlight' : ''}`;
       const why = iosLane === 'skip-metered'
         ? `the Mac is on a metered link and the iPad build would go over its ${policy.mac.metered_budget_mib} MiB budget, so ${owed} would not be delivered; pass --metered allow to build it anyway`
-        : `the Mac is offline (${link.reason}), so ${owed} would not be delivered; bring the Mac back, or narrow with --platform android (the completion verdict is then INCOMPLETE)`;
+        : `the Mac is offline (${link.reason}), so ${owed} would not be delivered; bring the Mac back`;
       throw refusal('lane_unavailable', `${why}. Nothing was spent (policy completion.lane_unavailable: refuse)`);
     }
 

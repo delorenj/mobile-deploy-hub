@@ -1,6 +1,5 @@
-// The completion verdict (TOWE-76) judges only targets required by the loaded policy. With the deployed policy's
-// absent `completion` block, no device or TestFlight target is mandatory; the stricter contract below is deferred.
-// An explicit future completion block can require each lane's device and store TestFlight:
+// The completion verdict (TOWE-76) judges targets required by the loaded policy. This source policy requires each
+// lane's device and TestFlight for store apps; the block-free legacy policy still parses for rollback:
 //
 //   - a device lane (S26 for android, iPad for ios) is installed, or pending where pending is durable: latest.json
 //     (read after deliver) names this exact version for that device as pending, and the catch-up on the device's host
@@ -63,8 +62,8 @@ export function testflightOf({ testflight, iosLane = 'run', needs = {}, receipts
   return { status: 'missing', reason: 'the ios lane did not record TestFlight' };
 }
 
-// The TestFlight delivery the event carries next to the S26 and the iPad (the Bloodbank delivery shape: assigned is
-// installed for testers, a dry run's check is pending).
+// The TestFlight delivery the event carries next to the S26 and iPad. The event schema's `installed` here means
+// assigned by the upload hook, not that Apple has processed the build or that internal/external testers can install.
 export function testflightDelivery(tf, { version, build, groups = defaultGroups }) {
   const status = { assigned: 'installed', failed: 'failed', skipped: 'skipped' }[tf.status] ?? 'pending';
   const delivery = { platform: 'ios', target: `TestFlight ${groupsLabel(groups)}`.slice(0, 120), device: 'TestFlight', version, build: build === null || build === undefined || build === '' ? null : String(build), sha256: null, verified: tf.status === 'assigned', status };

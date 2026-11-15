@@ -14,8 +14,8 @@ const A = 'a'.repeat(40);
 const B = 'b'.repeat(40);
 const C = '3832680b'.padEnd(40, 'c');
 const policyText = readFileSync(policyFile, 'utf8');
-// The old ship contract remains testable without activating it in the released policy.
-const strictPolicyText = JSON.stringify({ ...JSON.parse(policyText), completion: { required: { devices: 'lanes', testflight: 'store' }, lane_unavailable: 'refuse', reruns: 1 } });
+// The one-line policy rollback is still testable without making it the active policy.
+const strictPolicyText = policyText;
 const workflowText = '    uses: delorenj/mobile-deploy-hub/.github/workflows/mobile-deploy.yml@v1\n    with:\n      manifest: tools/ci/mobile-deploy.json\n';
 const appManifest = upload => ({ schema: 2, android: {}, ios: { store: { upload, assign: 'node tools/testflight.mjs assign "$HUB_OUT/ios/testflight-export.json"' } } });
 

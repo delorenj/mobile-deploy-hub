@@ -1,5 +1,5 @@
-// The deployed policy has no completion block. Validate the parser's compatible defaults and separately test the
-// deferred stricter contract without enabling it in policy.json.
+// The active strict completion policy requires every declared device lane and TestFlight for store apps.
+// Its beta-group/version-train settings remain per-app distribution metadata, not an enable switch.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -7,18 +7,19 @@ import { defaultGroups, iosVersionOf, loadPolicy, maxReruns, parsePolicy, policy
 
 const source = readFileSync(policyFile, 'utf8');
 
-test('loadPolicy parses the repo policy with compatible completion defaults', () => {
+test('loadPolicy parses the strict source completion policy', () => {
   const { policy, sha256, short } = loadPolicy();
   assert.match(sha256, /^[0-9a-f]{64}$/);
   assert.equal(short, sha256.slice(0, 8));
-  assert.deepEqual(policy.completion, { required: { devices: 'never', testflight: 'never' }, lane_unavailable: 'skip', reruns: 0 });
+  assert.equal(Object.hasOwn(JSON.parse(source), 'completion'), true, 'the rule must be on disk, not only a parser default');
+  assert.deepEqual(policy.completion, { required: { devices: 'lanes', testflight: 'store' }, lane_unavailable: 'refuse', reruns: 1 });
   // Every app keeps the shape the gate, deliver and the catch-up read: no per-app TestFlight switch anywhere. The optional
   // testflight block (JIMB-466) only says where a store build goes and how its iOS version moves; it has no `enabled`.
   for (const [repo, app] of Object.entries(policy.apps)) {
     assert.deepEqual(Object.keys(app.testflight ?? {}).filter(key => !['groups', 'train'].includes(key)), [], `${repo}.testflight has groups and train only: TestFlight is the manifest's ios.store under the one rule`);
     if (app.ios) assert.deepEqual(Object.keys(app.ios).filter(key => !['bundle', 'store_bundle'].includes(key)), [], `${repo}.ios keeps bundle and store_bundle only`);
   }
-  assert.equal(parsePolicy(source).completion.reruns, 0);
+  assert.equal(parsePolicy(source).completion.reruns, 1);
 });
 
 test('a bad completion block is refused, whatever it gets wrong', () => {
@@ -54,14 +55,22 @@ test('a bad completion block is refused, whatever it gets wrong', () => {
   }
 });
 
-test('released v1.2.25 has no completion block; the parser defaults to skip, opt-in and no reruns', () => {
-  assert.equal(Object.hasOwn(JSON.parse(source), 'completion'), false);
-  const { policy } = loadPolicy();
+test('an omitted completion block still parses with the compatible rollback defaults', () => {
+  const rollback = JSON.parse(source);
+  delete rollback.completion;
+  const policy = parsePolicy(JSON.stringify(rollback));
   for (const app of Object.values(policy.apps)) {
     assert.deepEqual(requiredTargets(policy, app, { store: true }), { android: false, ios: false, testflight: false });
   }
-  assert.equal(policy.completion.lane_unavailable, 'skip');
-  assert.equal(policy.completion.reruns, 0);
+  assert.deepEqual(policy.completion, { required: { devices: 'never', testflight: 'never' }, lane_unavailable: 'skip', reruns: 0 });
+});
+
+test('live required targets apply to every store manifest regardless of beta groups or app name', () => {
+  const { policy } = loadPolicy();
+  for (const [repo, app] of Object.entries(policy.apps)) {
+    assert.deepEqual(requiredTargets(policy, app, { store: true }), { android: app.lanes.includes('android'), ios: app.lanes.includes('ios'), testflight: app.lanes.includes('ios') }, repo);
+    assert.equal(requiredTargets(policy, app, { store: false }).testflight, false, repo);
+  }
 });
 
 test('required targets: every lane\'s device, and TestFlight for a store app with an iOS lane, by one rule', () => {
