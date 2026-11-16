@@ -23,7 +23,9 @@ same-run history was completely enumerated within the probe's bounds (at most
 1000 attempts and 1000 pages per attempt). The JSON lists attempt, job id/name,
 status/conclusion and step number/name/status/conclusion. Missing/denied reads,
 invalid identities, inconsistent totals, missing pages, duplicates and malformed
-job/step records fail the read proof. Failure is logged as
+job/step records fail the read proof. An explicitly empty complete list can pass
+transport, but cannot supply the operational evidence of an earlier Mac job.
+Failure is logged as
 `HUB_IOS_HISTORY_TRANSPORT_REFUSED`; provider error bodies and token values are
 not logged or persisted.
 

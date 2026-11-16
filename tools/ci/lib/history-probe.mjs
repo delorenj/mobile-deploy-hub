@@ -23,7 +23,7 @@ export function readHistory({ env = process.env, request = path => {
     let total;
     for (let page = 1; page <= 1000; page++) {
       const listing = request(`${base}/attempts/${number}/jobs?per_page=100&page=${page}`);
-      if (!Number.isSafeInteger(listing?.total_count) || listing.total_count < 1 || !Array.isArray(listing.jobs) || !listing.jobs.length || listing.jobs.length > 100 || (total !== undefined && total !== listing.total_count)) throw new Error('Actions history job listing is incomplete');
+      if (!Number.isSafeInteger(listing?.total_count) || listing.total_count < 0 || !Array.isArray(listing.jobs) || (!listing.jobs.length && listing.total_count !== 0) || listing.jobs.length > 100 || (total !== undefined && total !== listing.total_count)) throw new Error('Actions history job listing is incomplete');
       total = listing.total_count;
       for (const listed of listing.jobs) {
         const validJob = job => Number.isSafeInteger(job?.id) && job.id > 0 && job.run_attempt === number && String(job.run_id) === runId && typeof job.name === 'string' && typeof job.status === 'string' && (job.conclusion === null || typeof job.conclusion === 'string');

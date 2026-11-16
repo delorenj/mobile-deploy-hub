@@ -33,6 +33,12 @@ test('transport proof enumerates every prior attempt and all pages, names and st
   assert.equal(Object.hasOwn(result, 'eligible'), false);
 });
 
+test('empty but complete prior listing is transport evidence only, not no-upload evidence', () => {
+  const { result } = read({ ...responses(), [page()]: { total_count: 0, jobs: [] } });
+  assert.deepEqual(result.prior, [{ attempt: 1, jobs: [] }]);
+  assert.equal(result.proof, 'transport-only');
+});
+
 test('optional steps omitted by jobs list are read from job detail, not assumed empty', () => {
   const listed = job(); delete listed.steps;
   const data = { ...responses(), [page()]: { total_count: 1, jobs: [listed] }, '/repos/owner/app/actions/jobs/44': job() };
@@ -59,7 +65,7 @@ test('wrong repository, run and current attempt cannot establish read proof', ()
 
 test('missing, malformed, duplicate, oversized and truncated job lists fail closed', () => {
   const duplicate = job();
-  const invalid = [null, {}, { total_count: 0, jobs: [] }, { total_count: -1, jobs: [job()] }, { total_count: 1.5, jobs: [job()] }, { total_count: '1', jobs: [job()] }, { total_count: 1, jobs: null }, { total_count: 1, jobs: [] }, { total_count: 2, jobs: [job()] }, { total_count: 1, jobs: [job(), job(45)] }, { total_count: 2, jobs: [duplicate, duplicate] }, { total_count: 101, jobs: Array.from({ length: 101 }, (_, i) => job(i + 1)) }];
+  const invalid = [null, {}, { total_count: -1, jobs: [job()] }, { total_count: 1.5, jobs: [job()] }, { total_count: '1', jobs: [job()] }, { total_count: 1, jobs: null }, { total_count: 1, jobs: [] }, { total_count: 2, jobs: [job()] }, { total_count: 1, jobs: [job(), job(45)] }, { total_count: 2, jobs: [duplicate, duplicate] }, { total_count: 101, jobs: Array.from({ length: 101 }, (_, i) => job(i + 1)) }];
   for (const listing of invalid) assert.throws(() => read({ ...responses(), [page()]: listing }), /incomplete|ambiguous/);
   for (const change of [{ id: -1 }, { id: '44' }, { run_id: 456 }, { run_attempt: 2 }, { name: null }, { status: null }, { conclusion: undefined }]) {
     assert.throws(() => read({ ...responses(), [page()]: { total_count: 1, jobs: [{ ...job(), ...change }] } }), /identity is ambiguous/);
