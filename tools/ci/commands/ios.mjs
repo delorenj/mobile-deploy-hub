@@ -173,10 +173,18 @@ export function parseStoreReview(text) {
   return { state: answer.state, ...(answer.detail ? { detail: answer.detail } : {}) };
 }
 
+// The job token only crosses into the TestFlight upload hook. A missing token on
+// an Actions run cannot fall back to a saved runner login, even on a first attempt.
+export function uploadHookEnvironment(config, env, hooks) {
+  if (!config.testflight || config.dryRun) return hooks;
+  if (env.GITHUB_RUN_ID && !env.GH_TOKEN) throw new Error('iOS TestFlight requires the ephemeral job token; no saved gh login fallback');
+  return env.GH_TOKEN ? { ...hooks, GH_TOKEN: env.GH_TOKEN } : hooks;
+}
+
 // The TestFlight step of the ios lane: ios.store.state (when the app declares it), then, on a real run, upload unless
 // App Store Connect already has the build, then assign. `store` is the receipt's TestFlight record, updated in place so
 // a failure receipt carries how far it got. Returns the receipt's one-line note.
-export function testflightStep({ spec, config, store, storeIpa = null, hooks, log = console.log, runHook = storeHooks.run, runOutput = storeHooks.output }) {
+export function testflightStep({ spec, config, store, storeIpa = null, hooks, uploadHooks = hooks, log = console.log, runHook = storeHooks.run, runOutput = storeHooks.output }) {
   const to = groupsLabel(Array.isArray(store.groups) && store.groups.length > 0 ? store.groups : defaultGroups);
   const built = storeIpa ? `the App Store IPA ${storeIpa.version} (${storeIpa.build}) is built and checked; ` : '';
   try {
@@ -191,7 +199,7 @@ export function testflightStep({ spec, config, store, storeIpa = null, hooks, lo
       store.uploaded = 'earlier';
       log(`HUB_TESTFLIGHT_ALREADY_UPLOADED ${store.version} (${store.build}) is in App Store Connect${known.state ? ` (${known.state})` : ''}; upload skipped, assign runs`);
     } else {
-      runHook('ios.store.upload', spec.store.upload, { cwd: config.cwd, env: hooks });
+      runHook('ios.store.upload', spec.store.upload, { cwd: config.cwd, env: uploadHooks });
       store.uploaded = 'run';
     }
     runHook('ios.store.assign', spec.store.assign, { cwd: config.cwd, env: hooks });
@@ -221,6 +229,7 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
     const spec = manifest.ios ?? (() => { throw new Error('the manifest has no ios section'); })();
     const devices = loadDevices(env);
     requirePlan(config);
+    uploadHookEnvironment(config, env, {}); // refuse before build or any device/store side effect
     // Before anything can fail: the next run's checkout on this Mac fetches a delta, not the whole tree (lib/git.mjs).
     rememberCheckout({ cwd: config.cwd, env, log });
     const out = join(config.out, 'ios');
@@ -234,6 +243,7 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
     track.stage = 'build';
     applyBump(config, env);
     const hooks = hookEnvironment(config, env, { HUB_TEAM: devices.apple.team, ...testflightHookEnv(policy, env) });
+    const uploadHooks = uploadHookEnvironment(config, env, hooks);
     const handoff = Boolean(spec.export) && (!config.dryRun || config.dryHandoff);
     if (handoff) {
       let exportReceipt;
@@ -372,7 +382,7 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
       track.stage = 'deliver';
       // The store build's marketing version is the app's train (HUB_IOS_VERSION), the deploy's own version without one.
       track.receipt.store = { status: 'checked', version: config.iosVersion || config.version, build: storeIpa?.build ?? (config.iosBuild || null), groups: testflightPolicyOf(policy.apps[env.GITHUB_REPOSITORY ?? '']).groups, uploaded: null, state: null, review: null, reason: null };
-      testflight = testflightStep({ spec, config, store: track.receipt.store, storeIpa, hooks, log });
+      testflight = testflightStep({ spec, config, store: track.receipt.store, storeIpa, hooks, uploadHooks, log });
       notes.push(`TestFlight: ${testflight}`);
       if (storeIpa) log(`HUB_TESTFLIGHT ${config.dryRun ? 'DRY RUN' : 'UPLOADED'} ${storeIpa.bundle} ${storeIpa.version} (${storeIpa.build}) sha256=${short(storeIpa.sha256)}`);
     }

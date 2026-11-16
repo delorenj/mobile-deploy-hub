@@ -100,7 +100,7 @@ inputs:
     description: Play access token from google-github-actions/auth, play step only
     default: ''
   github_token:
-    description: Token with contents write, plan (the bump push) and release steps only
+    description: Ephemeral job token; plan and release use contents write, ios uses actions read for upload-history reconciliation
     default: ''
 
 outputs:

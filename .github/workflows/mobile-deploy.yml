@@ -380,6 +380,7 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: read
+      actions: read
     steps:
       # The app tree is needed here too: ios.device and the store hooks are the app's own tools.
       - uses: actions/checkout@v4
@@ -407,6 +408,7 @@ jobs:
           build_sha: ${{ needs.plan.outputs.build_sha }}
           bump_patch: ${{ needs.plan.outputs.bump_patch }}
           mac_link: ${{ needs.gate.outputs.mac_link }}
+          github_token: ${{ github.token }}
       - uses: actions/upload-artifact@v4
         if: ${{ always() }}
         with:
