@@ -210,6 +210,10 @@ hub-device run emulator [--profile default|playstore --for 1h --why TEXT --wait 
 
 ## Hosts and checks
 
+For the iOS job's ephemeral token boundary and the authorized new TestFlight
+**dry-run + rerun** procedure, see [iOS history transport proof](docs/ios-history-transport.md).
+That diagnostic proves authenticated history access only, not upload eligibility.
+
 ```sh
 mise run check          # actionlint on the workflow, then node --test 'tools/**/*.test.mjs' (the catch-up included)
 mise run conformance    # every app still deploys only through the hub (gh api); every deploy's gate runs it on its own checkout too
