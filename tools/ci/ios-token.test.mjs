@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { hookEnvironment } from './lib/config.mjs';
 import { testflightStep, uploadHookEnvironment } from './commands/ios.mjs';
+import { readHistory } from './lib/history-probe.mjs';
 
 const root = fileURLToPath(new URL('../..', import.meta.url));
 const workflow = readFileSync(join(root, '.github/workflows/mobile-deploy.yml'), 'utf8');
@@ -74,6 +75,28 @@ function historyCase(mode) {
   const step = () => testflightStep({ spec, config, store, hooks: normal, uploadHooks: uploadHookEnvironment(config, { ...base, GH_TOKEN: token }, normal), runOutput, runHook });
   return { step, calls, store };
 }
+
+test('dry-run history probe reads earlier attempt jobs and relevant iOS step without upload', () => {
+  const env = { ...base, GH_TOKEN: 'ephemeral' };
+  const path = '/repos/owner/app/actions/runs/123';
+  const get = endpoint => {
+    if (endpoint === path) return { id: 123, repository: { full_name: 'owner/app' }, run_attempt: 2 };
+    if (endpoint === `${path}/attempts/1/jobs?per_page=100&page=1`) return {
+      total_count: 1, jobs: [{ id: 44, run_id: 123, run_attempt: 1, name: 'deploy / ios', status: 'completed', conclusion: 'failure', runner_name: 'mac-runner', steps: [{ name: 'Build, check, outbox, install on the iPad (or pending)', status: 'completed', conclusion: 'failure' }] }],
+    };
+    throw new Error('unexpected read');
+  };
+  assert.deepEqual(readHistory({ env, request: get }), {
+    repository: 'owner/app', run_id: '123', run_attempt: 2,
+    prior: [{ attempt: 1, job_id: 44, conclusion: 'failure', runner: 'mac-runner', step_count: 1 }],
+  });
+  for (const change of [
+    { ...env, GH_TOKEN: undefined },
+    { ...env, GITHUB_RUN_ID: '999' },
+  ]) assert.throws(() => readHistory({ env: change, request: get }), /requires|unexpected read/);
+  assert.throws(() => readHistory({ env, request: () => { throw new Error('denied'); } }), /denied/);
+  assert.throws(() => readHistory({ env, request: endpoint => endpoint === path ? get(endpoint) : { total_count: 2, jobs: get(endpoint).jobs } }), /incomplete/);
+});
 
 test('history-read hook proceeds only with complete history; absent, denied and incomplete refuse before assign', () => {
   const positive = historyCase('allowed');

@@ -22,6 +22,7 @@ import { createDevicectl, createIpad } from '../lib/devicectl.mjs';
 import { loadDevices } from '../lib/devices.mjs';
 import { hook, hookOutput, runBounded } from '../lib/exec.mjs';
 import { rememberCheckout } from '../lib/git.mjs';
+import { readHistory } from '../lib/history-probe.mjs';
 import { handoffFolder, receiveHandoff, repoFolder, retried, sendHandoffDelta } from '../lib/handoff.mjs';
 import { compareBuild, compareSemver, ipaName } from '../lib/latest.mjs';
 import { withLock } from '../lib/lock.mjs';
@@ -244,6 +245,12 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
     applyBump(config, env);
     const hooks = hookEnvironment(config, env, { HUB_TEAM: devices.apple.team, ...testflightHookEnv(policy, env) });
     const uploadHooks = uploadHookEnvironment(config, env, hooks);
+    // A dry run never invokes ios.store.upload. On a rerun, read its GitHub
+    // history with the exact upload-hook token and runner identity instead.
+    if (config.dryRun && config.testflight && Number(env.GITHUB_RUN_ATTEMPT) > 1) {
+      const history = readHistory({ env: uploadHookEnvironment({ ...config, dryRun: false }, env, hooks) });
+      log(`HUB_IOS_HISTORY_READ ${JSON.stringify(history)}`);
+    }
     const handoff = Boolean(spec.export) && (!config.dryRun || config.dryHandoff);
     if (handoff) {
       let exportReceipt;
