@@ -43,7 +43,17 @@ const groups = {
   versionLocalization: Object.keys(limits.versionLocalization),
   review: [...Object.keys(limits.review), 'demoAccountRequired'],
   ageRating: Object.keys(ageRatingQuestions),
+  price: ['baseTerritory', 'customerPrice'],
+  availability: ['territories', 'availableInNewTerritories'],
 };
+
+// Price and availability are App Store Connect pricing calls, which only the Admin key may read or write.
+export const adminGroups = Object.freeze(['price', 'availability']);
+const territoryId = /^[A-Z]{3}$/;
+const money = /^\d+(\.\d{1,2})?$/;
+// "4.9" and "4.90" are the same price; the file and Apple's price points both go through this.
+export const moneyText = value => (Number.isFinite(Number(value)) && value !== null && value !== '' ? Number(value).toFixed(2) : null);
+const sortedTerritories = list => [...new Set(list)].sort();
 
 // The `op://` references a file may hold in place of a personal value (a review phone number). They are resolved at push
 // time and never written back.
@@ -83,6 +93,18 @@ export function parseListing(source) {
       if (!allowed.includes(String(file.ageRating[question]))) fail(`ageRating.${question} must be one of ${allowed.join(', ')}`);
     }
   }
+  if (file.price !== undefined) {
+    const { baseTerritory, customerPrice } = file.price;
+    if (typeof baseTerritory !== 'string' || !territoryId.test(baseTerritory)) fail('price.baseTerritory must be a three-letter territory code like USA');
+    if (typeof customerPrice !== 'string' || !money.test(customerPrice)) fail('price.customerPrice must be text like "0.00" or "4.99" (0.00 is Free)');
+  }
+  if (file.availability !== undefined) {
+    const { territories, availableInNewTerritories } = file.availability;
+    if (!Array.isArray(territories) || !territories.length || territories.some(t => typeof t !== 'string' || !territoryId.test(t))) fail('availability.territories must be a list of three-letter territory codes like ["USA","CAN"]');
+    if (new Set(territories).size !== territories.length) fail('availability.territories lists a territory twice');
+    if (typeof availableInNewTerritories !== 'boolean') fail('availability.availableInNewTerritories must be true or false');
+  }
+  if (file.price && file.availability && !file.availability.territories.includes(file.price.baseTerritory)) fail(`price.baseTerritory ${file.price.baseTerritory} must be one of availability.territories`);
   if (file.review && 'demoAccountRequired' in file.review && typeof file.review.demoAccountRequired !== 'boolean') fail('review.demoAccountRequired must be true or false');
   if (file.exportCompliance !== undefined && (!isObject(file.exportCompliance) || typeof file.exportCompliance.usesNonExemptEncryption !== 'boolean' || Object.keys(file.exportCompliance).length !== 1)) fail('exportCompliance must be {"usesNonExemptEncryption": true|false}');
   return file;
@@ -113,11 +135,13 @@ export function normalizeField(key, value) {
 export function desiredState(file) {
   const out = {};
   for (const group of Object.keys(groups)) if (isObject(file[group])) out[group] = Object.fromEntries(Object.entries(file[group]).map(([k, v]) => [k, v === null ? null : normalizeField(k, v)]));
+  if (out.price?.customerPrice != null) out.price.customerPrice = moneyText(out.price.customerPrice);
+  if (out.availability?.territories) out.availability.territories = sortedTerritories(out.availability.territories);
   if (out.ageRating) out.ageRating = Object.fromEntries(Object.entries(out.ageRating).map(([k, v]) => [k, ageRatingQuestions[k] === bool ? v === true || v === 'true' : v]));
   return out;
 }
 
-const same = (a, b) => (a ?? null) === (b ?? null) || (a === '' && b == null) || (a == null && b === '');
+const same = (a, b) => (Array.isArray(a) && Array.isArray(b) ? sortedTerritories(a).join() === sortedTerritories(b).join() : false) || (a ?? null) === (b ?? null) || (a === '' && b == null) || (a == null && b === '');
 
 // One entry per field whose value differs: {group, field, from, to}.
 export function diffState(desired, actual) {
@@ -137,8 +161,11 @@ const clip = value => { const text = JSON.stringify(value ?? null); return text.
 export const formatChange = ({ group, field, from, to }) => SECRET_FIELDS.has(field) ? `${group}.${field}: ${from ? 'set' : 'empty'} -> (hidden)` : `${group}.${field}: ${clip(from)} -> ${clip(to)}`;
 
 // The API calls that make `actual` match `changes`. `ids` is what the readback found: app, info, infoLocalization,
-// version, versionLocalization, ageRating, review (null when the resource does not exist yet).
-export function planCalls(changes, ids) {
+// version, versionLocalization, ageRating, review (null when the resource does not exist yet), plus for price and
+// availability the price point to use (`pricePoint`), the app's availability (`availability`, null when none) and its
+// territory availabilities (`territoryAvailabilities`, {USA: id}). `desired` is the whole wanted state: a price or an
+// availability is written whole, never one field at a time. Their calls carry `admin: true`.
+export function planCalls(changes, ids, desired = {}) {
   const by = group => Object.fromEntries(changes.filter(c => c.group === group).map(c => [c.field, c.to]));
   const calls = [];
   const attributes = (type, id, attrs, label) => calls.push({ label, method: 'PATCH', path: `/v1/${type}/${id}`, body: { data: { type, id, attributes: attrs } } });
@@ -166,7 +193,45 @@ export function planCalls(changes, ids) {
     if (ids.review) attributes('appStoreReviewDetails', ids.review, review, 'review contact and notes');
     else calls.push({ label: 'review contact and notes', method: 'POST', path: '/v1/appStoreReviewDetails', body: { data: { type: 'appStoreReviewDetails', attributes: review, relationships: { appStoreVersion: { data: { type: 'appStoreVersions', id: ids.version } } } } } });
   }
+  if (changes.some(c => c.group === 'price')) {
+    const { baseTerritory } = desired.price;
+    if (!ids.pricePoint) throw new Error(`no price point for ${baseTerritory} ${desired.price.customerPrice}`);
+    calls.push({ label: 'price', admin: true, method: 'POST', path: '/v1/appPriceSchedules', body: priceScheduleBody(ids.app, baseTerritory, ids.pricePoint) });
+  }
+  if (changes.some(c => c.group === 'availability')) {
+    const want = desired.availability;
+    if (ids.availability && changes.some(c => c.group === 'availability' && c.field === 'availableInNewTerritories')) throw new Error('Apple does not let the API change availableInNewTerritories once an app has availability; change it in App Store Connect (Pricing and Availability), then pull');
+    if (!ids.availability) calls.push({ label: 'availability', admin: true, method: 'POST', path: '/v2/appAvailabilities', body: availabilityBody(ids.app, want, ids.allTerritories) });
+    else {
+      const have = changes.find(c => c.group === 'availability' && c.field === 'territories').from ?? [];
+      const flips = [...want.territories.filter(t => !have.includes(t)).map(t => [t, true]), ...have.filter(t => !want.territories.includes(t)).map(t => [t, false])];
+      for (const [territory, available] of flips) {
+        const id = ids.territoryAvailabilities?.[territory];
+        if (!id) throw new Error(`App Store Connect does not know the territory ${territory}`);
+        calls.push({ label: `availability ${territory}`, admin: true, method: 'PATCH', path: `/v1/territoryAvailabilities/${id}`, body: { data: { type: 'territoryAvailabilities', id, attributes: { available } } } });
+      }
+    }
+  }
   return calls;
+}
+
+// A new price schedule replaces the current one: the base territory, and one manual price that starts now.
+export const priceScheduleBody = (appId, baseTerritory, pricePoint) => ({
+  data: { type: 'appPriceSchedules', relationships: { app: { data: { type: 'apps', id: appId } }, baseTerritory: { data: { type: 'territories', id: baseTerritory } }, manualPrices: { data: [{ type: 'appPrices', id: '${price-1}' }] } } },
+  included: [{ type: 'appPrices', id: '${price-1}', attributes: { startDate: null }, relationships: { appPricePoint: { data: { type: 'appPricePoints', id: pricePoint } } } }],
+});
+
+// The whole availability. Apple wants every territory it has in the request: the listed ones available, every other one
+// not, and whether territories Apple opens later join. `all` is Apple's territory list (GET /v1/territories).
+export function availabilityBody(appId, { territories, availableInNewTerritories }, all) {
+  if (!all?.length) throw new Error('availability needs the list of App Store territories');
+  const unknown = territories.filter(t => !all.includes(t));
+  if (unknown.length) throw new Error(`App Store Connect does not know the territory ${unknown.join(', ')}`);
+  const id = t => `\${t-${t}}`;
+  return {
+    data: { type: 'appAvailabilities', attributes: { availableInNewTerritories }, relationships: { app: { data: { type: 'apps', id: appId } }, territoryAvailabilities: { data: all.map(t => ({ type: 'territoryAvailabilities', id: id(t) })) } } },
+    included: all.map(t => ({ type: 'territoryAvailabilities', id: id(t), attributes: { available: territories.includes(t) }, relationships: { territory: { data: { type: 'territories', id: t } } } })),
+  };
 }
 
 // ---- screenshots ----
@@ -222,7 +287,7 @@ export function snapshotToListing(actual, { locale, previous = {} } = {}) {
       if (group === 'review' && key.startsWith('contact')) continue;
       if (group === 'review' && key.startsWith('demoAccount') && key !== 'demoAccountRequired') continue;
       const value = values[key];
-      if (value === undefined || value === null || value === '') continue;
+      if (value === undefined || value === null || value === '' || (Array.isArray(value) && !value.length)) continue;
       out[key] = value;
     }
     if (Object.keys(out).length) file[group] = out;

@@ -246,13 +246,22 @@ mise run listing push ~/code/tolt/tower-of-lost-things                 # print a
 mise run listing push ~/code/tolt/tower-of-lost-things --apply true    # write it, read it back, fail if anything differs
 ```
 
-The app is found from the hub policy: the checkout's `owner/name` (its git remote, or `--repo`) names an `apps` entry, and that entry's `ios.store_bundle` (else `ios.bundle`) is the App Store bundle id. Keys come from 1Password at call time: the App Manager key by default, and the Admin key for the one write Apple keeps to Admin (content rights), which the tool switches to by itself. `HUB_ASC_KEY=admin` runs everything as Admin. No value is written anywhere.
+The app is found from the hub policy: the checkout's `owner/name` (its git remote, or `--repo`) names an `apps` entry, and that entry's `ios.store_bundle` (else `ios.bundle`) is the App Store bundle id. Keys come from 1Password at call time: the App Manager key by default, and the Admin key for the writes Apple keeps to Admin (content rights, price, availability), which the tool switches to by itself. `HUB_ASC_KEY=admin` runs everything as Admin. No value is written anywhere.
 
-`listing.json` covers: app name, subtitle, privacy policy URL; promotional text, description, keywords, what's new, support and marketing URL; copyright; primary and secondary category with subcategories; content rights; every age rating question (the file must answer all of them, Kids age band included); App Review contact, notes and demo account; and an `exportCompliance` check. A field the file leaves out is not managed. A value of `op://...` is read from 1Password at push time (review phone number), and `pull` keeps such references instead of writing the value; `pull` never writes review contact fields. `schema`, `locale` and the field names are checked strictly, with Apple's length limits, so a bad file fails before any call.
+`listing.json` covers: app name, subtitle, privacy policy URL; promotional text, description, keywords, what's new, support and marketing URL; copyright; primary and secondary category with subcategories; content rights; price and availability; every age rating question (the file must answer all of them, Kids age band included); App Review contact, notes and demo account; and an `exportCompliance` check. A field the file leaves out is not managed. A value of `op://...` is read from 1Password at push time (review phone number), and `pull` keeps such references instead of writing the value; `pull` never writes review contact fields. `schema`, `locale` and the field names are checked strictly, with Apple's length limits, so a bad file fails before any call.
+
+**Price and availability** are two more optional groups, written whole and only when the file has them:
+
+```json
+"price": { "baseTerritory": "USA", "customerPrice": "0.00" },
+"availability": { "territories": ["USA", "CAN", "AUS", "NZL"], "availableInNewTerritories": false }
+```
+
+`customerPrice` is the base territory's price as text (`"0.00"` is Free); the tool looks up Apple's price point for it, and Apple works out the other territories. `territories` is every country the app is on sale in (three-letter codes, and the base territory must be one of them); `availableInNewTerritories: false` keeps it out of countries Apple opens later. Apple lets only the **Admin** key read or write these, so the tool switches to it by itself for these calls and only when the file has the groups; a diff or push of a file without them never uses the Admin key. A first push writes the whole record; later, a change to the territory list flips just the territories that differ and a price change writes a new price schedule. Apple's API cannot change `availableInNewTerritories` once an app has availability, so the tool stops with a message and that one switch is changed in App Store Connect (Pricing and Availability). Both are read back after a push and must match. `pull` reads them only for a file that already has them.
 
 Screenshots are PNGs under `store/apple/screenshots/<DISPLAY_TYPE>/NN-name.png` (`APP_IPHONE_67` takes 1290x2796 or 1320x2868, `APP_IPAD_PRO_3GEN_129` takes 2048x2732 or 2064x2752), kept out of git and made by the app's own script. A push compares file checksums and order with what Apple holds, and replaces a whole set only when it differs, so a second push writes nothing.
 
-It never touches builds, TestFlight groups, price, availability or review submission. `exportCompliance` is only compared with the latest build's `usesNonExemptEncryption` and reported. App Privacy (the nutrition label) has no public API; keep the exact answers beside the listing as `store/apple/app-privacy.md`.
+It never touches builds, TestFlight groups, in-app purchases or review submission. `exportCompliance` is only compared with the latest build's `usesNonExemptEncryption` and reported. App Privacy (the nutrition label) has no public API; keep the exact answers beside the listing as `store/apple/app-privacy.md`.
 
 ## Hosts and checks
 

@@ -7,11 +7,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { token, ascClient } from './lib/asc.mjs';
 import {
-  ageRatingQuestions, checkScreenshots, desiredState, diffState, formatChange, md5, normalizeField, parseListing, planCalls,
+  ageRatingQuestions, availabilityBody, checkScreenshots, desiredState, diffState, formatChange, md5, normalizeField, parseListing, planCalls,
   pngSize, repoFromRemote, resolveRefs, screenshotDiff, snapshotToListing, storeBundleFor,
 } from './lib/listing.mjs';
 import { loadPolicy } from './lib/policy.mjs';
-import { pull, push } from '../listing.mjs';
+import { findPricePoint, pull, push, readAvailability, readPrice } from '../listing.mjs';
 
 const allNo = Object.fromEntries(Object.entries(ageRatingQuestions).map(([k, v]) => [k, v.includes('true') ? false : v[0]]));
 const base = (change = f => f) => change({
@@ -142,12 +142,32 @@ function fakeAsc() {
     verLoc: { id: 'VL', attributes: { locale: 'en-US', description: null, keywords: null, supportUrl: null, promotionalText: null, marketingUrl: null, whatsNew: null } },
     age: { id: 'AGE', attributes: { ...allNo, advertising: true } },
     review: null, sets: {}, shots: {}, writes: [],
+    price: null, avail: null, adminWrites: [],
   };
   let n = 0;
   const data = r => ({ type: 'x', id: r.id, attributes: r.attributes });
-  const client = {
+  const point = (territory, p, customerPrice) => ({ type: 'appPricePoints', id: Buffer.from(JSON.stringify({ s: 'APP', t: territory, p })).toString('base64url'), attributes: { customerPrice } });
+  const territoryCodes = ['USA', 'CAN', 'AUS', 'NZL', 'GBR', 'FRA'];
+  const notFound = () => Object.assign(new Error('ASC 404'), { status: 404 });
+  const build = which => ({
+    which,
     async get(path) {
       const [p] = path.split('?');
+      if (/appPriceSchedule|appPricePoints|ppAvailab|territoryAvailabilities/.test(p) && which !== 'admin') throw Object.assign(new Error('ASC 403'), { status: 403 });
+      if (p === '/v1/apps/APP/appPriceSchedule') { if (!db.price) throw notFound(); return { data: { id: 'SCH', relationships: { baseTerritory: { data: { id: db.price.base } } } } }; }
+      if (p === '/v1/appPriceSchedules/SCH/manualPrices') {
+        if (!db.price.point) throw notFound();
+        const old = { id: 'OLDP', attributes: { startDate: '2020-01-01', endDate: '2021-01-01' }, relationships: { appPricePoint: { data: { id: point(db.price.base, 'old', '9.99').id } } } };
+        return { data: [old, { id: 'P1', attributes: { startDate: null, endDate: null }, relationships: { appPricePoint: { data: { id: db.price.point.id } } } }], included: [point(db.price.base, 'old', '9.99'), db.price.point] };
+      }
+      if (p === '/v1/apps/APP/appPricePoints') {
+        const t = /filter\[territory\]=(\w+)/.exec(path)?.[1] ?? 'USA';
+        if (path.includes('page=2')) return { data: [point(t, '10599', '0.99'), point(t, '10600', '4.99')] };
+        return { data: [point(t, '10000', '0.0')], links: { next: `/v1/apps/APP/appPricePoints?page=2&filter[territory]=${t}` } };
+      }
+      if (p === '/v1/territories') return { data: territoryCodes.map(id => ({ type: 'territories', id })) };
+      if (p === '/v1/apps/APP/appAvailabilityV2') { if (!db.avail) throw notFound(); return { data: { id: 'AV', attributes: { availableInNewTerritories: db.avail.newT } } }; }
+      if (p === '/v2/appAvailabilities/AV/territoryAvailabilities') return { data: territoryCodes.map(t => ({ id: `TA-${t}`, attributes: { available: !!db.avail.territories[t] }, relationships: { territory: { data: { id: t } } } })) };
       if (p === '/v1/apps') return { data: [data(db.app)] };
       if (p === '/v1/apps/APP/appStoreVersions') return { data: [data(db.version)] };
       if (p === '/v1/apps/APP/appInfos') return { data: [data(db.info)] };
@@ -168,6 +188,7 @@ function fakeAsc() {
     async patch(path, body) {
       db.writes.push(`PATCH ${path}`);
       const d = body.data;
+      if (/^\/v1\/territoryAvailabilities\//.test(path)) { if (which !== 'admin') throw new Error('403'); db.adminWrites.push(path); db.avail.territories[path.split('/').pop().slice(3)] = d.attributes.available; return { data: d }; }
       const target = { '/v1/apps/APP': db.app, '/v1/appStoreVersions/VER': db.version, '/v1/appInfoLocalizations/IL': db.infoLoc, '/v1/appStoreVersionLocalizations/VL': db.verLoc, '/v1/ageRatingDeclarations/AGE': db.age }[path];
       if (target) Object.assign(target.attributes, d.attributes);
       else if (path === '/v1/appInfos/INFO') for (const [k, v] of Object.entries(d.relationships)) db.info.cats[k] = v.data?.id ?? null;
@@ -179,6 +200,23 @@ function fakeAsc() {
     async post(path, body) {
       db.writes.push(`POST ${path}`);
       const d = body.data;
+      if (path === '/v1/appPriceSchedules') {
+        if (which !== 'admin') throw new Error('403');
+        db.adminWrites.push(path);
+        const included = body.included[0];
+        db.price = { base: d.relationships.baseTerritory.data.id, point: point(d.relationships.baseTerritory.data.id, 'x', null) };
+        db.price.point.id = included.relationships.appPricePoint.data.id;
+        const decoded = JSON.parse(Buffer.from(db.price.point.id, 'base64url').toString());
+        db.price.point.attributes.customerPrice = { 10000: '0.0', 10600: '4.99' }[decoded.p] ?? '0.99';
+        return { data: { id: 'SCH' } };
+      }
+      if (path === '/v2/appAvailabilities') {
+        if (which !== 'admin') throw new Error('403');
+        db.adminWrites.push(path);
+        if (body.included.length !== territoryCodes.length) throw Object.assign(new Error('ASC 409: every territory must be included'), { status: 409 });
+        db.avail = { newT: d.attributes.availableInNewTerritories, territories: Object.fromEntries(body.included.filter(i => i.attributes.available).map(i => [i.relationships.territory.data.id, true])) };
+        return { data: { id: 'AV' } };
+      }
       if (path === '/v1/appStoreReviewDetails') { db.review = { id: 'REV', attributes: d.attributes }; return { data: { id: 'REV' } }; }
       if (path === '/v1/appScreenshotSets') { const id = `SET${++n}`; db.sets[id] = { id, type: d.attributes.screenshotDisplayType, shots: [] }; return { data: { id } }; }
       if (path === '/v1/appScreenshots') {
@@ -190,8 +228,8 @@ function fakeAsc() {
     },
     async delete(path) { db.writes.push(`DELETE ${path}`); const id = path.split('/').pop(); delete db.shots[id]; for (const s of Object.values(db.sets)) s.shots = s.shots.filter(x => x !== id); },
     async putParts() {},
-  };
-  return { db, client };
+  });
+  return { db, client: build('manager'), adminClient: build('admin') };
 }
 
 function appDir({ shots = false } = {}) {
@@ -255,4 +293,118 @@ test('pull writes a listing without the contact fields and keeps the op:// phone
   assert.equal(file.ageRating.advertising, false);
   assert.equal(JSON.parse(readFileSync(join(dir, 'store/apple/listing.json'), 'utf8')).locale, 'en-US');
   assert.ok(md5(Buffer.from('a')).length === 32);
+});
+
+// ---- price and availability (Admin key only) ----
+
+const priced = f => { f.price = { baseTerritory: 'USA', customerPrice: '0.00' }; f.availability = { territories: ['USA', 'CAN', 'AUS', 'NZL'], availableInNewTerritories: false }; return f; };
+
+const pricingOnly = d => ({ price: d.price, availability: d.availability });
+
+test('parseListing checks price and availability', () => {
+  assert.ok(parseListing(base(priced)));
+  const bad = (change, pattern) => assert.throws(() => parseListing(base(f => change(priced(f)))), pattern);
+  bad(f => { f.price.customerPrice = 'free'; return f; }, /customerPrice must be text like/);
+  bad(f => { f.price.customerPrice = 0; return f; }, /customerPrice must be text like/);
+  bad(f => { f.price.baseTerritory = 'us'; return f; }, /baseTerritory must be a three-letter/);
+  bad(f => { delete f.price.baseTerritory; return f; }, /baseTerritory/);
+  bad(f => { f.availability.territories = []; return f; }, /territories must be a list/);
+  bad(f => { f.availability.territories = ['USA', 'USA']; return f; }, /twice/);
+  bad(f => { f.availability.availableInNewTerritories = 'no'; return f; }, /true or false/);
+  bad(f => { f.availability.territories = ['CAN']; return f; }, /baseTerritory USA must be one of availability.territories/);
+  bad(f => { f.price.tier = 1; return f; }, /price.tier is not a field/);
+});
+
+test('price and availability: desired state is normalized and the diff compares territories as a set', () => {
+  const desired = pricingOnly(desiredState(base(f => { priced(f); f.price.customerPrice = '4.9'; f.availability.territories = ['NZL', 'USA', 'CAN']; return f; })));
+  assert.deepEqual(desired.price, { baseTerritory: 'USA', customerPrice: '4.90' });
+  assert.deepEqual(desired.availability.territories, ['CAN', 'NZL', 'USA']);
+  assert.deepEqual(diffState(desired, { price: { baseTerritory: 'USA', customerPrice: '4.90' }, availability: { territories: ['USA', 'CAN', 'NZL'], availableInNewTerritories: false } }), []);
+  const changes = diffState(desired, { price: { baseTerritory: null, customerPrice: null }, availability: { territories: ['USA'], availableInNewTerritories: null } });
+  assert.deepEqual(changes.map(c => `${c.group}.${c.field}`), ['price.baseTerritory', 'price.customerPrice', 'availability.territories', 'availability.availableInNewTerritories']);
+  assert.match(formatChange(changes[2]), /availability.territories: \["USA"\] -> \["CAN","NZL","USA"\]/);
+});
+
+test('planCalls writes a price schedule and an availability whole, and flips single territories when only those change', () => {
+  const desired = pricingOnly(desiredState(base(priced)));
+  const fresh = planCalls(diffState(desired, { price: { baseTerritory: null, customerPrice: null }, availability: { territories: [], availableInNewTerritories: null } }), { app: 'APP', pricePoint: 'PT', allTerritories: ['AUS', 'CAN', 'FRA', 'GBR', 'NZL', 'USA'] }, desired);
+  assert.deepEqual(fresh.map(c => `${c.method} ${c.path}`), ['POST /v1/appPriceSchedules', 'POST /v2/appAvailabilities']);
+  assert.ok(fresh.every(c => c.admin));
+  const price = fresh[0].body;
+  assert.equal(price.data.relationships.baseTerritory.data.id, 'USA');
+  assert.equal(price.included[0].relationships.appPricePoint.data.id, 'PT');
+  assert.equal(price.data.relationships.manualPrices.data[0].id, price.included[0].id);
+  const avail = fresh[1].body;
+  assert.equal(avail.data.attributes.availableInNewTerritories, false);
+  assert.deepEqual(avail.included.map(i => `${i.relationships.territory.data.id}:${i.attributes.available}`), ['AUS:true', 'CAN:true', 'FRA:false', 'GBR:false', 'NZL:true', 'USA:true'], 'every territory is sent, the wanted ones available');
+  assert.deepEqual(avail.data.relationships.territoryAvailabilities.data.map(d => d.id), avail.included.map(i => i.id));
+  assert.deepEqual(availabilityBody('APP', desired.availability, ['AUS', 'CAN', 'FRA', 'GBR', 'NZL', 'USA']), avail);
+  assert.throws(() => availabilityBody('APP', desired.availability, ['USA']), /does not know the territory AUS, CAN, NZL/);
+  // existing availability, only the territory list differs: one PATCH per territory that flips
+  const have = { territories: ['USA', 'GBR'], availableInNewTerritories: false };
+  const flips = planCalls(diffState({ availability: desired.availability }, { availability: have }), { app: 'APP', availability: 'AV', territoryAvailabilities: { USA: 'TA-USA', GBR: 'TA-GBR', CAN: 'TA-CAN', AUS: 'TA-AUS', NZL: 'TA-NZL' } }, { availability: desired.availability });
+  assert.deepEqual(flips.map(c => `${c.path} ${c.body.data.attributes.available}`), ['/v1/territoryAvailabilities/TA-AUS true', '/v1/territoryAvailabilities/TA-CAN true', '/v1/territoryAvailabilities/TA-NZL true', '/v1/territoryAvailabilities/TA-GBR false']);
+  assert.throws(() => planCalls(diffState({ availability: desired.availability }, { availability: have }), { app: 'APP', availability: 'AV', territoryAvailabilities: {} }, { availability: desired.availability }), /does not know the territory/);
+  // existing availability, new-territories flag differs: Apple has no call for it, so the plan says so
+  assert.throws(() => planCalls(diffState({ availability: desired.availability }, { availability: { ...desired.availability, availableInNewTerritories: true } }), { app: 'APP', availability: 'AV' }, { availability: desired.availability }), /change it in App Store Connect/);
+});
+
+test('reading price and availability: none yet, the price in force, price points across pages', async () => {
+  const { db, adminClient } = fakeAsc();
+  assert.deepEqual(await readPrice(adminClient, 'APP'), { baseTerritory: null, customerPrice: null });
+  assert.deepEqual((await readAvailability(adminClient, 'APP')).state, { territories: [], availableInNewTerritories: null });
+  db.price = { base: 'USA', point: null };
+  assert.deepEqual(await readPrice(adminClient, 'APP'), { baseTerritory: 'USA', customerPrice: null }, 'a stub schedule with no prices reads as unpriced');
+  db.price = { base: 'USA', point: { type: 'appPricePoints', id: Buffer.from(JSON.stringify({ t: 'USA', p: '10000' })).toString('base64url'), attributes: { customerPrice: '0.0' } } };
+  assert.deepEqual(await readPrice(adminClient, 'APP', '2026-11-18'), { baseTerritory: 'USA', customerPrice: '0.00' }, 'an ended price is ignored');
+  assert.equal(JSON.parse(Buffer.from(await findPricePoint(adminClient, 'APP', 'USA', '0.00'), 'base64url')).p, '10000');
+  assert.equal(JSON.parse(Buffer.from(await findPricePoint(adminClient, 'APP', 'CAN', '4.99'), 'base64url')).p, '10600', 'found on the second page');
+  await assert.rejects(findPricePoint(adminClient, 'APP', 'USA', '7.77'), /no USA price point costs 7.77/);
+});
+
+test('push --apply sets price and availability through the Admin key only, reads them back, and is idempotent', async () => {
+  const { db, client, adminClient } = fakeAsc();
+  const dir = appDir();
+  writeFileSync(join(dir, 'store/apple/listing.json'), JSON.stringify(base(priced)));
+  const dry = quiet();
+  await push({ dir, repo, client, adminClient, read, log: dry.log });
+  assert.deepEqual(db.writes, [], 'a dry run writes nothing');
+  assert.ok(dry.lines.some(l => l.includes('price.customerPrice: null -> "0.00"')));
+  assert.ok(dry.lines.some(l => l.includes('availability.territories: [] -> ["AUS","CAN","NZL","USA"]')));
+  const out = quiet();
+  const result = await push({ dir, repo, apply: true, client, adminClient, read, log: out.log });
+  assert.equal(result.clean, true);
+  assert.deepEqual(db.adminWrites, ['/v1/appPriceSchedules', '/v2/appAvailabilities']);
+  assert.equal(db.price.base, 'USA');
+  assert.deepEqual(Object.keys(db.avail.territories).sort(), ['AUS', 'CAN', 'NZL', 'USA']);
+  assert.equal(db.avail.newT, false);
+  assert.ok(out.lines.some(l => l.includes('read back price: {"baseTerritory":"USA","customerPrice":"0.00"}')));
+  assert.ok(out.lines.some(l => l.includes('read back availability: {"territories":["AUS","CAN","NZL","USA"],"availableInNewTerritories":false}')));
+  const before = db.writes.length;
+  const again = quiet();
+  assert.equal((await push({ dir, repo, apply: true, client, adminClient, read, log: again.log })).clean, true);
+  assert.equal(db.writes.length, before);
+  // widening later: only the new territory flips
+  writeFileSync(join(dir, 'store/apple/listing.json'), JSON.stringify(base(f => { priced(f); f.availability.territories.push('GBR'); return f; })));
+  await push({ dir, repo, apply: true, client, adminClient, read, log: () => {} });
+  assert.equal(db.adminWrites.at(-1), '/v1/territoryAvailabilities/TA-GBR');
+  assert.equal(db.avail.territories.GBR, true);
+});
+
+test('a listing without price or availability never touches the Admin key for them', async () => {
+  const { db, client } = fakeAsc();
+  const guard = { which: 'admin', get() { throw new Error('admin used'); } };
+  await push({ dir: appDir(), repo, client, adminClient: guard, read, log: () => {} });
+  assert.deepEqual(db.writes, []);
+});
+
+test('pull keeps price and availability only when the file already manages them', async () => {
+  const { client, adminClient, db } = fakeAsc();
+  const dir = appDir();
+  writeFileSync(join(dir, 'store/apple/listing.json'), JSON.stringify(base(priced)));
+  await push({ dir, repo, apply: true, client, adminClient, read, log: () => {} });
+  const file = await pull({ dir, repo, client, adminClient, log: () => {} });
+  assert.deepEqual(file.price, { baseTerritory: 'USA', customerPrice: '0.00' });
+  assert.deepEqual(file.availability, { territories: ['AUS', 'CAN', 'NZL', 'USA'], availableInNewTerritories: false });
+  void db;
 });

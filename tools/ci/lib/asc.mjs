@@ -26,7 +26,7 @@ export function token({ id, issuer, key }, now = Math.floor(Date.now() / 1000)) 
 
 export class AscError extends Error {
   constructor(status, method, path, body) {
-    const detail = (() => { try { return JSON.parse(body).errors?.map(e => `${e.code}: ${e.detail}`).join('; '); } catch { return ''; } })();
+    const detail = (() => { try { return JSON.parse(body).errors?.slice(0, 3).map(e => `${e.code}: ${e.detail ?? e.title}`).join('; ').slice(0, 600); } catch { return ''; } })();
     super(`ASC ${method} ${path} -> ${status}${detail ? ` (${detail})` : ''}`);
     this.status = status;
   }
@@ -49,7 +49,7 @@ export function ascClient({ which = process.env.HUB_ASC_KEY || 'manager', read =
       });
       if (response.ok) return response.status === 204 ? null : response.json();
       if ((response.status === 429 || response.status >= 500) && attempt < 3) { await new Promise(r => setTimeout(r, 1000 * 2 ** attempt)); continue; }
-      throw new AscError(response.status, method, path, (await response.text()).slice(0, 600));
+      throw new AscError(response.status, method, path, (await response.text()).slice(0, 20000));
     }
   }
   return {

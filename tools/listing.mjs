@@ -6,14 +6,15 @@
 // The app is found from the hub policy: the repo's `owner/name` (from its git remote, or --repo) names an apps entry,
 // and its ios.store_bundle (else ios.bundle) is the App Store bundle id. Screenshots are PNGs under
 // store/apple/screenshots/<DISPLAY_TYPE>/ (kept out of git; the app's own script makes them). Keys come from 1Password at call
-// time; HUB_ASC_KEY=admin picks the Admin key. This never touches builds, TestFlight, pricing or review submission.
+// time; HUB_ASC_KEY=admin picks the Admin key. Price and availability are written only when the file has them, and only the
+// Admin key may read or write those. This never touches builds, TestFlight, in-app purchases or review submission.
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ascClient, opRead } from './ci/lib/asc.mjs';
 import {
-  categoryKeys, checkScreenshots, desiredState, diffState, formatChange, md5, parseListing, planCalls,
+  adminGroups, categoryKeys, checkScreenshots, desiredState, diffState, formatChange, md5, moneyText, parseListing, planCalls,
   repoFromRemote, resolveRefs, screenshotDiff, snapshotToListing, storeBundleFor,
 } from './ci/lib/listing.mjs';
 import { loadPolicy } from './ci/lib/policy.mjs';
@@ -22,8 +23,66 @@ const editable = ['PREPARE_FOR_SUBMISSION', 'DEVELOPER_REJECTED', 'REJECTED', 'M
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const attrs = r => r?.attributes ?? {};
 
-// Everything the listing covers, read back from App Store Connect, in the shape the diff reads.
-export async function readActual(client, bundle, { versionString, locale }) {
+const getOrNull = async (client, path) => { try { return await client.get(path); } catch (error) { if (error.status === 404) return null; throw error; } };
+
+// Every page of a list call, following Apple's `links.next`. Returns {data, included}.
+async function getAll(client, path) {
+  const out = { data: [], included: [] };
+  for (let next = path; next;) {
+    const page = await client.get(next);
+    out.data.push(...page.data);
+    out.included.push(...(page.included ?? []));
+    next = page.links?.next ?? null;
+  }
+  return out;
+}
+
+// A price point id is base64url JSON like {"s":"<app>","t":"USA","p":"10000"}; the territory is in it.
+const pointTerritory = id => { try { return JSON.parse(Buffer.from(id, 'base64url').toString()).t ?? null; } catch { return null; } };
+
+// The price in force now: the manual price in the base territory that has started and not ended.
+export async function readPrice(client, appId, today = new Date().toISOString().slice(0, 10)) {
+  const none = { baseTerritory: null, customerPrice: null };
+  const schedule = await getOrNull(client, `/v1/apps/${appId}/appPriceSchedule?include=baseTerritory`);
+  if (!schedule) return none;
+  const baseTerritory = schedule.data.relationships?.baseTerritory?.data?.id ?? schedule.included?.find(i => i.type === 'territories')?.id ?? null;
+  // A schedule Apple made for a never-priced app has a base territory but no prices; its manualPrices call is a 404.
+  const prices = await getAll(client, `/v1/appPriceSchedules/${schedule.data.id}/manualPrices?include=appPricePoint&limit=200`).catch(error => { if (error.status === 404) return { data: [], included: [] }; throw error; });
+  const points = Object.fromEntries(prices.included.filter(i => i.type === 'appPricePoints').map(i => [i.id, i]));
+  const current = prices.data
+    .map(p => ({ start: attrs(p).startDate ?? '', end: attrs(p).endDate ?? null, point: points[p.relationships?.appPricePoint?.data?.id] }))
+    .filter(p => p.point && (!baseTerritory || pointTerritory(p.point.id) === baseTerritory) && !(p.end && p.end <= today) && p.start <= today)
+    .sort((a, b) => b.start.localeCompare(a.start))[0];
+  return { baseTerritory, customerPrice: current ? moneyText(attrs(current.point).customerPrice) : null };
+}
+
+// The price point of a territory that costs `customerPrice` (an id Apple made up, so it is looked up, never built).
+export async function findPricePoint(client, appId, territory, customerPrice) {
+  const points = await getAll(client, `/v1/apps/${appId}/appPricePoints?filter[territory]=${territory}&limit=200`);
+  const hit = points.data.find(p => moneyText(attrs(p).customerPrice) === customerPrice);
+  if (!hit) throw new Error(`no ${territory} price point costs ${customerPrice}`);
+  return hit.id;
+}
+
+// The territories the app is on sale in, whether new territories join, and the ids needed to flip one.
+export async function readAvailability(client, appId) {
+  const found = await getOrNull(client, `/v1/apps/${appId}/appAvailabilityV2`);
+  if (!found) return { state: { territories: [], availableInNewTerritories: null }, ids: { availability: null, territoryAvailabilities: {} } };
+  const all = await getAll(client, `/v2/appAvailabilities/${found.data.id}/territoryAvailabilities?include=territory&limit=200`);
+  const territoryAvailabilities = {};
+  const territories = [];
+  for (const t of all.data) {
+    const code = t.relationships?.territory?.data?.id;
+    if (!code) continue;
+    territoryAvailabilities[code] = t.id;
+    if (attrs(t).available) territories.push(code);
+  }
+  return { state: { territories: territories.sort(), availableInNewTerritories: attrs(found.data).availableInNewTerritories ?? null }, ids: { availability: found.data.id, territoryAvailabilities } };
+}
+
+// Everything the listing covers, read back from App Store Connect, in the shape the diff reads. Price and availability
+// are read (through `adminFor()`, the Admin client) only when `want` asks for them.
+export async function readActual(client, bundle, { versionString, locale, want = {}, adminFor }) {
   const found = await client.get(`/v1/apps?filter[bundleId]=${encodeURIComponent(bundle)}&fields[apps]=name,bundleId,contentRightsDeclaration`);
   const app = found.data[0];
   if (!app) throw new Error(`no App Store Connect app has bundle id ${bundle}`);
@@ -49,6 +108,8 @@ export async function readActual(client, bundle, { versionString, locale }) {
     ageRating: attrs(age),
   };
   const ids = { app: app.id, info: infoRef.id, infoLocalization: infoLoc?.id, version: version.id, versionLocalization: verLoc?.id, ageRating: age.id, review: review?.id, locale };
+  if (want.price) state.price = await readPrice(adminFor(), app.id);
+  if (want.availability) { const read = await readAvailability(adminFor(), app.id); state.availability = read.state; Object.assign(ids, read.ids); }
   return { state, ids, latestBuild: builds[0] ? { version: attrs(builds[0]).version, usesNonExemptEncryption: attrs(builds[0]).usesNonExemptEncryption } : null };
 }
 
@@ -111,11 +172,17 @@ function appContext(dir, repoFlag) {
 
 const readFileOrNull = file => (existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : null);
 
-export async function pull({ dir, repo, client = ascClient(), log = console.log }) {
+// The Admin client price and availability go through: the one in hand when it is Admin, else made on first use.
+const adminFrom = (client, adminClient) => () => (client.which === 'admin' ? client : (adminClient ??= ascClient({ which: 'admin' })));
+
+// A pull reads price and availability only for a file that already has them, so a pull stays App Manager-only until the
+// app's file asks for pricing.
+export async function pull({ dir, repo, client = ascClient(), adminClient, log = console.log }) {
   const ctx = appContext(dir, repo);
   const previous = readFileOrNull(ctx.file) ?? {};
   const locale = previous.locale ?? 'en-US';
-  const { state, latestBuild } = await readActual(client, ctx.bundle, { versionString: previous.version?.versionString, locale });
+  const want = Object.fromEntries(adminGroups.map(g => [g, g in previous]));
+  const { state, latestBuild } = await readActual(client, ctx.bundle, { versionString: previous.version?.versionString, locale, want, adminFor: adminFrom(client, adminClient) });
   const file = snapshotToListing(state, { locale, previous });
   parseListing(file);
   mkdirSync(join(ctx.root, 'store/apple'), { recursive: true });
@@ -132,7 +199,9 @@ export async function push({ dir, repo, apply = false, screenshots, client = asc
   const ctx = appContext(dir, repo);
   const file = parseListing(readFileSync(ctx.file, 'utf8'));
   const desired = desiredState(resolveRefs(file, read));
-  const actual = await readActual(client, ctx.bundle, { versionString: file.version?.versionString, locale: file.locale });
+  const want = Object.fromEntries(adminGroups.map(g => [g, g in desired]));
+  const adminFor = adminFrom(client, adminClient);
+  const actual = await readActual(client, ctx.bundle, { versionString: file.version?.versionString, locale: file.locale, want, adminFor });
   const changes = diffState(desired, actual.state);
 
   const local = localScreenshots(screenshots ?? ctx.shots);
@@ -149,16 +218,18 @@ export async function push({ dir, repo, apply = false, screenshots, client = asc
   if (!apply) { log('dry run: pass --apply to write'); return { changes, applied: false, clean: false }; }
 
   if (!actual.ids.versionLocalization && shotChanges.length && !changes.some(c => c.group === 'versionLocalization')) throw new Error('the version has no localization to attach screenshots to');
-  const calls = planCalls(changes, actual.ids);
+  if (changes.some(c => c.group === 'availability')) actual.ids.allTerritories = (await getAll(adminFor(), '/v1/territories?limit=200')).data.map(t => t.id);
+  if (changes.some(c => c.group === 'price')) actual.ids.pricePoint = await findPricePoint(adminFor(), actual.ids.app, desired.price.baseTerritory, desired.price.customerPrice);
+  const calls = planCalls(changes, actual.ids, desired);
   for (const call of calls) {
-    const via = adminOnly.has(call.label) && client.which !== 'admin' ? (adminClient ??= ascClient({ which: 'admin' })) : client;
+    const via = call.admin || adminOnly.has(call.label) ? adminFor() : client;
     const result = await (call.method === 'POST' ? via.post(call.path, call.body) : via.patch(call.path, call.body));
     if (call.method === 'POST' && call.path.endsWith('appStoreVersionLocalizations')) actual.ids.versionLocalization = result.data.id;
     log(`  wrote ${call.label}`);
   }
   if (shotChanges.length) await applyScreenshots(client, actual.ids.versionLocalization, local, remote, shotChanges, log);
 
-  const after = await readActual(client, ctx.bundle, { versionString: file.version?.versionString, locale: file.locale });
+  const after = await readActual(client, ctx.bundle, { versionString: file.version?.versionString, locale: file.locale, want, adminFor });
   const left = diffState(desired, after.state);
   const shotsLeft = screenshotDiff(local, Object.keys(local).length ? await readScreenshots(client, after.ids.versionLocalization) : {});
   if (left.length || shotsLeft.length) {
@@ -166,6 +237,7 @@ export async function push({ dir, repo, apply = false, screenshots, client = asc
     for (const s of shotsLeft) log(`  STILL DIFFERENT screenshots.${s.type}`);
     throw new Error('readback does not match the listing');
   }
+  for (const g of adminGroups) if (g in desired) log(`  read back ${g}: ${JSON.stringify(after.state[g])}`);
   log(`verified: ${changes.length} field(s) and ${shotChanges.length} screenshot set(s) read back equal`);
   return { changes, applied: true, clean: true };
 }
