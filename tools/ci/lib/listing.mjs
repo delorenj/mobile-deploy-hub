@@ -131,9 +131,10 @@ export function diffState(desired, actual) {
   return changes;
 }
 
-const SECRET_FIELDS = new Set(['demoAccountPassword']);
+// Personal or secret values never reach a log: the diff says only that they change.
+const SECRET_FIELDS = new Set(['demoAccountPassword', 'demoAccountName', 'contactEmail', 'contactPhone']);
 const clip = value => { const text = JSON.stringify(value ?? null); return text.length > 70 ? `${text.slice(0, 67)}...` : text; };
-export const formatChange = ({ group, field, from, to }) => SECRET_FIELDS.has(field) ? `${group}.${field}: (hidden)` : `${group}.${field}: ${clip(from)} -> ${clip(to)}`;
+export const formatChange = ({ group, field, from, to }) => SECRET_FIELDS.has(field) ? `${group}.${field}: ${from ? 'set' : 'empty'} -> (hidden)` : `${group}.${field}: ${clip(from)} -> ${clip(to)}`;
 
 // The API calls that make `actual` match `changes`. `ids` is what the readback found: app, info, infoLocalization,
 // version, versionLocalization, ageRating, review (null when the resource does not exist yet).

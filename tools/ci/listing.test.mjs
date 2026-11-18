@@ -69,7 +69,8 @@ test('diffState reports only fields that differ, treats null and empty as the sa
   const fields = diffState(desired, actual).map(c => `${c.group}.${c.field}`);
   assert.deepEqual(fields, ['info.primarySubcategoryOne', 'infoLocalization.subtitle', 'infoLocalization.privacyPolicyUrl', 'version.copyright',
     'versionLocalization.keywords', 'versionLocalization.supportUrl', 'review.contactFirstName', 'review.contactPhone', 'review.demoAccountRequired', 'review.notes', 'ageRating.advertising']);
-  assert.equal(formatChange({ group: 'review', field: 'demoAccountPassword', from: null, to: 'hunter2' }), 'review.demoAccountPassword: (hidden)');
+  assert.equal(formatChange({ group: 'review', field: 'contactPhone', from: '+1', to: '+2' }), 'review.contactPhone: set -> (hidden)');
+  assert.equal(formatChange({ group: 'review', field: 'demoAccountPassword', from: null, to: 'hunter2' }), 'review.demoAccountPassword: empty -> (hidden)');
   assert.deepEqual(diffState(desired, { ...actual, ...Object.fromEntries(Object.entries(desired).map(([g, f]) => [g, f])) }), []);
 });
 
