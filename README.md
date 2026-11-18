@@ -97,6 +97,21 @@ What the hooks see (all of them, from `plan` onward): `HUB_VERSION` (the deploy)
 
 **The 90-day expiry.** A TestFlight build stops being installable 90 days after its upload, for internal and external testers alike, and Apple does not warn the app. Anything that testers rely on must be rebuilt and re-uploaded before then. The rule of thumb is a deploy at least every 60 days (at least one patch deploy per `X.Y.0` train, which costs no new beta review); the hub does not create that clock. It is a recurring job, so it belongs to a Candybar manifest in the app's own repo that runs `mise run deploy --dry-run false` (or states why it did not), not a cron entry or a hub timer. Until the app has one, the receipt's `store.version`/`store.build` and the `HUB_TESTFLIGHT_STATE` line of the last deploy say how old the newest build is.
 
+### Separate bundle ids for the iPad build and TestFlight
+
+An app that ships both to the iPad (the `devicectl` development install) and to TestFlight must not use one bundle id for both. One id is one app slot on the iPad, so the TestFlight app can install an older build over the hub's, and the catch-up repair and TestFlight's auto-update can keep displacing each other (Tower, 2026-11-02). The rule, checked by the `gate` job before any version is spent:
+
+- **Which apps it covers.** An app with an iOS lane that has a store lane, meaning its manifest declares `ios.store` (the hub's one definition of a TestFlight app) or its policy entry carries a `testflight` block. Either signal is enough; the manifest is the one that catches Tower and Gruvato, which have no `testflight` block. The policy parser applies the `testflight` half too, so a policy edit cannot add such an app on a shared id.
+- **What it demands.** `apps.<repo>.ios.store_bundle` is pinned and differs from `apps.<repo>.ios.bundle`. Green In Between is the model: device `io.lasertoast.greeninbetween.spike`, store `io.lasertoast.greeninbetween`. A shared id (no `store_bundle`, or one equal to `bundle`) refuses with `HUB_GATE_REFUSED bundle split`.
+- **Direction.** The device bundle is the one that changes and takes the suffix. `store_bundle` keeps the App Store Connect record id, which Apple never lets change. What the policy can check is that `store_bundle` is not the device bundle plus a suffix (that is the wrong way round, and the parser refuses it); any other pair of different ids passes.
+- **Staged.** `shared_bundle_allowlist` names the apps that have not migrated yet, each with `since` (the date it was listed) and a one-line `reason`. Today: Tower, Gruvato and Navi, listed 2026-11-18, pending MOBI-16 (an owner decision per app). For a listed app the gate logs one `::warning::HUB_POLICY shared_bundle ...` line and goes on. An app leaves the list in the same hub release that pins its new `store_bundle` and device bundle; from then on a shared id refuses. A listed app that already has a separate store bundle only warns that its entry can be removed, and a test fails if the policy ships such an entry.
+
+```json
+"shared_bundle_allowlist": { "delorenj/gruvato": { "since": "2026-11-18", "reason": "Not migrated: the iPad dev build and TestFlight share sh.delo.gruvato (MOBI-16, owner decision)." } }
+```
+
+The catch-up repair (TOLT-152) stays as the safety net for the apps still on the list.
+
 **Changing a rule, once, for every app:**
 
 1. Edit `tools/ci/policy.json` and its test in this repo.

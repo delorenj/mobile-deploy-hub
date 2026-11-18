@@ -34,6 +34,11 @@
       "android": { "package": "sh.delo.shortwave", "signer_sha256": "0c6ee7934add5f9d98d2c9365c9f1ff3b255f4feb822db9aea2de6f2760b1e9f" }
     }
   },
+  "shared_bundle_allowlist": {
+    "delorenj/tower-of-lost-things": { "since": "2026-11-18", "reason": "Not migrated: the iPad dev build and TestFlight share io.automaticai.towerofdumbthings (MOBI-16, owner decision)." },
+    "delorenj/gruvato": { "since": "2026-11-18", "reason": "Not migrated: the iPad dev build and TestFlight share sh.delo.gruvato (MOBI-16, owner decision)." },
+    "AutomaticAI-io/navi": { "since": "2026-11-18", "reason": "Not migrated: the iPad dev build and TestFlight share io.automaticai.ipm.navi (MOBI-16, owner decision)." }
+  },
   "callers": {
     "workflow": ".github/workflows/deploy.yml",
     "manifest": "tools/ci/mobile-deploy.json",

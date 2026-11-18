@@ -7,5 +7,6 @@ Agent rules for this repo.
 - Changing a rule is a hub release: edit `policy.json`, update its test, then `mise run release` (conformance, tag `vX.Y.Z`, move `v1`, one strict dry run per app). Never special-case an app; apps inherit the policy through the `@v1` pin.
 - Apps adopt the policy by copying `templates/deploy.yml` verbatim; the gate refuses any caller whose hash is not in `callers.accept`. Every command refuses a run another workflow started, and no app workflow but `deploy.yml` may name the hub (conformance, every gate and the global pre-commit guard check it).
 - What a device may receive is pinned in `policy.json` (`apps.<repo>.android.package`, `.signer_sha256`, `.ios.bundle`); a new signing key is a hub release.
+- An app with an iPad device lane and a TestFlight lane pins `ios.store_bundle` different from `ios.bundle` (the device bundle takes the suffix); apps not yet migrated sit on `shared_bundle_allowlist` and warn (README, "Separate bundle ids").
 - Installs are always in place, with readback; the hub never uninstalls, clears data or downgrades.
 - Design of record: `docs/design-hub-v1.1.md` (v1.0.0 history in `docs/design-hub-v3.md`).

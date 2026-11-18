@@ -223,6 +223,7 @@ test('an Android-only app never puts the Mac in scope, whatever platform the run
   };
   const androidOnly = structuredClone(policy);
   androidOnly.apps['AutomaticAI-io/navi'] = { slug: 'navi', lanes: ['android'], tag_prefix: 'navi-v', version: 'tag', android: navi.android };
+  delete androidOnly.shared_bundle_allowlist['AutomaticAI-io/navi']; // the allowlist names iOS apps only
   const f = await gateFixture({ manifest, repo: 'AutomaticAI-io/navi' });
   try {
     const policyPath = join(f.root, 'policy.json');
@@ -231,6 +232,46 @@ test('an Android-only app never puts the Mac in scope, whatever platform the run
     const result = await gate(f.configure(['--platform', 'both']), f.deps({ policyFile: policyPath, tailscale: () => { asked = true; return peer('192.168.1.23:41641'); } }));
     assert.deepEqual([result.ios_lane, result.slug], ['skip-platform', 'navi']);
     assert.equal(asked, false, 'the Mac is not even probed');
+  } finally { await f.cleanup(); }
+});
+
+// MOBI-15: the live policy against the gate, every app, each with the manifest its pins imply (an iOS app declares ios.store).
+function pinnedManifest(app) {
+  const store = { archive: 'Store.tgz', receipt: 'store.json', upload: 'true', assign: 'true', signer_sha1: 'F8A5C5309FC1B6C7DD7662A28EA822BE3309C351', ...(app.ios?.store_bundle ? { bundle: app.ios.store_bundle } : {}) };
+  return {
+    schema: 2,
+    project: { slug: app.slug, name: app.slug },
+    version: { read: 'node v.mjs', bump: 'node v.mjs bump' },
+    ...(app.android ? { android: { package: app.android.package, export: 'true', artifact: 'a/App.apk', signer_sha256: app.android.signer_sha256 } } : {}),
+    ...(app.ios ? { ios: { bundle: app.ios.bundle, device: 'true', device_artifact: 'App.xcarchive', export: 'true', archive: 'App.tgz', receipt: 'app.json', store } } : {}),
+  };
+}
+
+test('the current policy passes the gate for all six apps, with one shared-bundle warning each for Tower, Gruvato and Navi', async () => {
+  assert.equal(Object.keys(policy.apps).length, 6);
+  const warned = [];
+  for (const [repo, app] of Object.entries(policy.apps)) {
+    const f = await gateFixture({ manifest: pinnedManifest(app), repo });
+    try {
+      const result = await gate(f.configure(['--platform', 'both']), f.deps({ env: { ...f.env, HUB_GATE_ADB_WAIT_MS: '1' } }));
+      assert.equal(result.slug, app.slug, repo);
+      const shared = f.logs.filter(line => /^::warning::HUB_POLICY shared_bundle /.test(line));
+      if (shared.length > 0) warned.push(repo);
+      assert.equal(shared.length, repo in policy.shared_bundle_allowlist ? 1 : 0, `${repo}: ${f.logs.join('\n')}`);
+    } finally { await f.cleanup(); }
+  }
+  assert.deepEqual(warned.sort(), Object.keys(policy.shared_bundle_allowlist).sort());
+});
+
+test('the gate refuses a shared-id app that is not allowlisted, before anything is spent', async () => {
+  const strict = structuredClone(policy);
+  delete strict.shared_bundle_allowlist['delorenj/gruvato'];
+  const f = await gateFixture({ manifest: pinnedManifest(strict.apps['delorenj/gruvato']), repo: 'delorenj/gruvato' });
+  try {
+    const policyPath = join(f.root, 'policy.json');
+    await writeFile(policyPath, JSON.stringify(strict));
+    await assert.rejects(() => gate(f.configure(), f.deps({ policyFile: policyPath })), /HUB_GATE_REFUSED bundle split: delorenj\/gruvato .*\(sh\.delo\.gruvato\)/);
+    assert.deepEqual(f.s3.writes, [], 'refused before the write probe');
   } finally { await f.cleanup(); }
 });
 

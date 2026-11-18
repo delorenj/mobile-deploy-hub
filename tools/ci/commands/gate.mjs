@@ -20,7 +20,7 @@ import { attempt } from '../lib/exec.mjs';
 import { latestKey, parseLatest } from '../lib/latest.mjs';
 import { loadManifest } from '../lib/manifest.mjs';
 import { macEstimate, tailscaleStatus } from '../lib/metered.mjs';
-import { appFor, groupsLabel, requiredTargets, testflightPolicyOf } from '../lib/policy.mjs';
+import { appFor, bundleSplitOf, groupsLabel, requiredTargets, testflightPolicyOf } from '../lib/policy.mjs';
 import { buildReceipt, setOutputs, writeReceipt } from '../lib/receipt.mjs';
 import { jobWriter, probe, readObject } from '../lib/s3.mjs';
 import { guarded, policyBanner, readCatchupMode, readMacLink, releaseRef } from './common.mjs';
@@ -93,6 +93,18 @@ export function checkPins({ app, manifest }) {
   }
 }
 
+// MOBI-15: an app with an iPad development build and a store/TestFlight build gives them different bundle ids, or the
+// TestFlight app can replace the hub's build on the iPad. A shared id refuses, unless the repository is on the policy's
+// dated shared_bundle_allowlist (not migrated yet): that logs one warning and the deploy goes on. An allowlisted app
+// that is already split only warns that its entry can go (a refusal there could break a deploy for no gain).
+export function checkBundleSplit({ policy, repo, app, manifest, log = () => {} }) {
+  const verdict = bundleSplitOf(policy, repo, app, manifest);
+  if (verdict.status === 'refused') throw refusal('bundle split', `${repo} ships to the iPad and to TestFlight on one bundle id (${verdict.device}), so TestFlight can replace the hub's build on the iPad; pin ios.store_bundle to the App Store Connect id and give the device bundle a suffix (tools/ci/policy.json; README "Deploy policy")`);
+  if (verdict.status === 'allowlisted') log(`::warning::HUB_POLICY shared_bundle ${repo} uses ${verdict.device} for both the iPad and TestFlight builds (allowlisted ${verdict.allowed.since}: ${verdict.allowed.reason}); TestFlight can replace the hub's build on the iPad until its device bundle gets a suffix`);
+  if (verdict.status === 'stale-allowlist') log(`::warning::HUB_POLICY shared_bundle ${repo} already has a separate store bundle (${verdict.store}); its shared_bundle_allowlist entry (${verdict.allowed.since}) can be removed`);
+  return verdict;
+}
+
 // The app's own conformance on the gate's checkout (design A3, run on every deploy since v1.1.3, dry runs included):
 // no other workflow references the hub or uploads builds, and no mise task bumps, tags or announces.
 export function checkConformance({ policy, app, config, env }) {
@@ -138,6 +150,7 @@ export async function gate(config, {
     const devices = loadDevices(env);
     const { app, caller } = checkRun({ policy, config, env, read: callerReader(config, env) });
     const manifest = await checkManifest({ policy, app, config });
+    checkBundleSplit({ policy, repo: env.GITHUB_REPOSITORY ?? '', app, manifest, log });
     checkConformance({ policy, app, config, env });
     // A lane the policy does not give the app is never in scope: an Android-only app must not queue a job on
     // the Mac, whose runner is not registered to its repository and would hold the run for 24 hours.

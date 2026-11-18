@@ -47,10 +47,61 @@ function testflight(where, block, app) {
   if ('train' in block && !trains.includes(block.train)) fail(`${where}.train must be one of ${trains.join(', ')}`);
 }
 
+// MOBI-15, the bundle-split rule. An app whose iPad development build (devicectl) and TestFlight build share one bundle id
+// has one app slot on the iPad, so TestFlight can put an older build over the hub's (Tower, 2026-11-02). The rule: an app
+// with an iOS device lane AND a store lane pins ios.store_bundle, and it differs from ios.bundle. The device (dev) bundle
+// is the one that changes and takes the suffix; store_bundle keeps the App Store Connect record id, which Apple never
+// lets change (Green In Between: device io.lasertoast.greeninbetween.spike, store io.lasertoast.greeninbetween).
+//
+// How the hub knows an app has a store lane, two signals, either one is enough:
+//   1. the app's manifest declares ios.store (the hub's one definition of "a TestFlight app", see the testflight block
+//      note above). Only the gate sees the manifest, so the gate carries this half.
+//   2. the policy's own testflight block (it only exists for an app that ships to TestFlight). The parser carries this
+//      half, so a policy edit that adds such an app without a split bundle never reaches a release.
+// Staged: shared_bundle_allowlist names, by repository, each app that has not migrated yet, with the date it was listed
+// and why. The gate logs one HUB_POLICY warning for it and goes on. The entry leaves when the migration lands.
+export const bundleDate = /^\d{4}-\d{2}-\d{2}$/;
+
+function bundleSplitRules(policy) {
+  if (!('shared_bundle_allowlist' in policy)) policy.shared_bundle_allowlist = {};
+  const list = policy.shared_bundle_allowlist;
+  if (!isObject(list)) fail('shared_bundle_allowlist must be an object keyed by owner/repo');
+  for (const [repo, entry] of Object.entries(list)) {
+    const where = `shared_bundle_allowlist.${repo}`;
+    if (!policy.apps[repo]?.lanes.includes('ios')) fail(`${where} must name an app in apps with an iOS lane`);
+    exact(where, entry, ['since', 'reason']);
+    const day = new Date(`${entry.since}T00:00:00Z`);
+    if (typeof entry.since !== 'string' || !bundleDate.test(entry.since) || Number.isNaN(day.getTime()) || day.toISOString().slice(0, 10) !== entry.since) fail(`${where}.since must be the date it was listed (YYYY-MM-DD)`);
+    if (typeof entry.reason !== 'string' || entry.reason.trim() === '' || entry.reason.length > 300 || /[\r\n]/.test(entry.reason)) fail(`${where}.reason must be one line of plain words (at most 300 characters)`);
+  }
+  for (const [repo, app] of Object.entries(policy.apps)) {
+    if (!app.ios) continue;
+    const { bundle, store_bundle: store } = app.ios;
+    if (typeof store === 'string' && store.startsWith(`${bundle}.`)) fail(`apps.${repo}.ios.store_bundle ${store} is the device bundle plus a suffix: the device bundle takes the suffix, and store_bundle keeps the App Store Connect id`);
+    if ('testflight' in app && (store ?? bundle) === bundle && !(repo in list)) fail(`apps.${repo} ships to TestFlight (testflight block) on its device bundle ${bundle}: pin ios.store_bundle to the App Store id and give the device bundle a suffix, or list the repository in shared_bundle_allowlist`);
+  }
+}
+
+// What the rule says about one app. `manifest` is the app's loaded manifest when the gate has it. status:
+//   no-store-lane   nothing to split: no ios.store in the manifest and no testflight block
+//   split           the store bundle differs from the device bundle: the rule is met
+//   refused         shared id, not allowlisted
+//   allowlisted     shared id, allowlisted: a warning
+//   stale-allowlist allowlisted but already split: the entry can go
+export function bundleSplitOf(policy, repo, app, manifest = null) {
+  const device = app?.ios?.bundle ?? null;
+  const allowed = policy.shared_bundle_allowlist?.[repo] ?? null;
+  const store = device ? (app.ios.store_bundle ?? device) : null;
+  const storeLane = Boolean(device) && (Boolean(manifest?.ios?.store) || Boolean(app.testflight));
+  const shared = storeLane && store === device;
+  const status = !storeLane ? 'no-store-lane' : shared ? (allowed ? 'allowlisted' : 'refused') : (allowed ? 'stale-allowlist' : 'split');
+  return { status, device, store, allowed, repo };
+}
+
 export function parsePolicy(source) {
   let policy;
   try { policy = JSON.parse(source); } catch (error) { fail(`not valid JSON (${error.message})`); }
-  exact('policy', policy, ['schema', 'bump', 'event', 'manifest_schema', 'apps', 'callers', 'runners', 'devices', 'delivery', 'mac', 'catch_up'], ['completion']);
+  exact('policy', policy, ['schema', 'bump', 'event', 'manifest_schema', 'apps', 'callers', 'runners', 'devices', 'delivery', 'mac', 'catch_up'], ['completion', 'shared_bundle_allowlist']);
   if (policy.schema !== 1) fail('schema must be 1');
 
   exact('bump', policy.bump, ['levels', 'default']);
@@ -98,6 +149,8 @@ export function parsePolicy(source) {
       if ('store_bundle' in app.ios && !/^[A-Za-z][A-Za-z0-9-]*(\.[A-Za-z][A-Za-z0-9-]*)+$/.test(app.ios.store_bundle ?? '')) fail(`apps.${repo}.ios.store_bundle must be a reverse-DNS bundle id`);
     }
   }
+
+  bundleSplitRules(policy);
 
   exact('callers', policy.callers, ['workflow', 'manifest', 'accept']);
   if (!/^\.github\/workflows\/[\w.-]+\.ya?ml$/.test(policy.callers.workflow ?? '')) fail('callers.workflow must be a file in .github/workflows');
