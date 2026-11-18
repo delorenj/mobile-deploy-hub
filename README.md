@@ -231,7 +231,7 @@ mise run listing push ~/code/tolt/tower-of-lost-things                 # print a
 mise run listing push ~/code/tolt/tower-of-lost-things --apply true    # write it, read it back, fail if anything differs
 ```
 
-The app is found from the hub policy: the checkout's `owner/name` (its git remote, or `--repo`) names an `apps` entry, and that entry's `ios.store_bundle` (else `ios.bundle`) is the App Store bundle id. Keys come from 1Password at call time (App Manager key by default, `HUB_ASC_KEY=admin` for the few calls that need Admin); no value is written anywhere.
+The app is found from the hub policy: the checkout's `owner/name` (its git remote, or `--repo`) names an `apps` entry, and that entry's `ios.store_bundle` (else `ios.bundle`) is the App Store bundle id. Keys come from 1Password at call time: the App Manager key by default, and the Admin key for the one write Apple keeps to Admin (content rights), which the tool switches to by itself. `HUB_ASC_KEY=admin` runs everything as Admin. No value is written anywhere.
 
 `listing.json` covers: app name, subtitle, privacy policy URL; promotional text, description, keywords, what's new, support and marketing URL; copyright; primary and secondary category with subcategories; content rights; every age rating question (the file must answer all of them, Kids age band included); App Review contact, notes and demo account; and an `exportCompliance` check. A field the file leaves out is not managed. A value of `op://...` is read from 1Password at push time (review phone number), and `pull` keeps such references instead of writing the value; `pull` never writes review contact fields. `schema`, `locale` and the field names are checked strictly, with Apple's length limits, so a bad file fails before any call.
 

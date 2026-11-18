@@ -219,8 +219,10 @@ test('push --apply writes the listing, reads it back equal, and a second push is
   const { db, client } = fakeAsc();
   const dir = appDir({ shots: true });
   const out = quiet();
-  const result = await push({ dir, repo, apply: true, client, read, log: out.log });
+  const admin = { which: 'admin', calls: [], patch: async (path, body) => { admin.calls.push(path); return client.patch(path, body); }, post: client.post };
+  const result = await push({ dir, repo, apply: true, client, adminClient: admin, read, log: out.log });
   assert.equal(result.clean, true);
+  assert.deepEqual(admin.calls, ['/v1/apps/APP'], 'content rights, and only it, goes through the Admin key');
   assert.equal(db.app.attributes.contentRightsDeclaration, 'DOES_NOT_USE_THIRD_PARTY_CONTENT');
   assert.equal(db.age.attributes.advertising, false);
   assert.equal(db.review.attributes.contactPhone, '+15551234567');
@@ -229,7 +231,7 @@ test('push --apply writes the listing, reads it back equal, and a second push is
   assert.ok(out.lines.some(l => l.startsWith('verified:')));
   const before = db.writes.length;
   const again = quiet();
-  const second = await push({ dir, repo, apply: true, client, read, log: again.log });
+  const second = await push({ dir, repo, apply: true, client, adminClient: admin, read, log: again.log });
   assert.equal(second.clean, true);
   assert.equal(db.writes.length, before, 'idempotent: no write on the second run');
   assert.ok(again.lines.some(l => l.includes('nothing to write')));
@@ -246,7 +248,7 @@ test('push refuses a screenshot of the wrong size before any call', async () => 
 test('pull writes a listing without the contact fields and keeps the op:// phone', async () => {
   const { client } = fakeAsc();
   const dir = appDir();
-  await push({ dir, repo, apply: true, client, read, log: () => {} });
+  await push({ dir, repo, apply: true, client, adminClient: client, read, log: () => {} });
   const file = await pull({ dir, repo, client, log: () => {} });
   assert.equal(file.review.contactPhone, 'op://v/i/phone');
   assert.equal(file.review.contactFirstName, undefined);

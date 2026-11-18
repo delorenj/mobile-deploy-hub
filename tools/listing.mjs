@@ -124,7 +124,11 @@ export async function pull({ dir, repo, client = ascClient(), log = console.log 
   return file;
 }
 
-export async function push({ dir, repo, apply = false, screenshots, client = ascClient(), read = opRead, log = console.log }) {
+// Apple lets only the Admin key write an app's content rights declaration (the App Manager key gets a 409), so that
+// one call goes through an Admin client, made only when it is needed.
+const adminOnly = new Set(['content rights']);
+
+export async function push({ dir, repo, apply = false, screenshots, client = ascClient(), adminClient, read = opRead, log = console.log }) {
   const ctx = appContext(dir, repo);
   const file = parseListing(readFileSync(ctx.file, 'utf8'));
   const desired = desiredState(resolveRefs(file, read));
@@ -147,7 +151,8 @@ export async function push({ dir, repo, apply = false, screenshots, client = asc
   if (!actual.ids.versionLocalization && shotChanges.length && !changes.some(c => c.group === 'versionLocalization')) throw new Error('the version has no localization to attach screenshots to');
   const calls = planCalls(changes, actual.ids);
   for (const call of calls) {
-    const result = await (call.method === 'POST' ? client.post(call.path, call.body) : client.patch(call.path, call.body));
+    const via = adminOnly.has(call.label) && client.which !== 'admin' ? (adminClient ??= ascClient({ which: 'admin' })) : client;
+    const result = await (call.method === 'POST' ? via.post(call.path, call.body) : via.patch(call.path, call.body));
     if (call.method === 'POST' && call.path.endsWith('appStoreVersionLocalizations')) actual.ids.versionLocalization = result.data.id;
     log(`  wrote ${call.label}`);
   }
