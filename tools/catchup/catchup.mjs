@@ -14,6 +14,12 @@
 // the signer, on iOS the bundle: a latest.json that disagrees with the policy is refused, whoever wrote it), and every
 // install is read back. One event per status change, none for a device the deploy itself installed.
 //
+// v1.2.35 (TOLT-152): a build the deploy installed can be replaced later by another channel with the same bundle id (a
+// TestFlight build over the development build is the known case). The iPad pass also reads each app whose ios block
+// is not pending; a device holding an OLDER build than latest.json is repaired in place, once, by the same install a
+// pending build gets (the "displaced" repair). A newer or missing app is never touched, watch mode only logs, and a
+// device that keeps being displaced is repaired at most iosRepairsPerDay times per day per app.
+//
 // v1.1.3: a deploy in flight holds every pending build of that app at or below its version, on both passes (an older
 // build is never installed minutes before the deploy installs a newer one); a device in use waits for the next pass
 // (the S26 while the app is on top with the screen on; the iPad while the app runs, for up to 45 minutes, since
@@ -50,6 +56,9 @@ const reasonPattern = /^[\w .,:;()+=#@%<>-]{1,300}$/;
 const inflightStaleMs = 6 * 3600_000;
 // How long the iPad pass waits while the app runs (devicectl cannot tell a game on screen from a suspended one).
 export const iosBusyCapMs = 45 * 60_000;
+// The flap guard: a device displaced again and again (a TestFlight auto-update fighting the hub) is repaired this many
+// times per UTC day per app, then only logged.
+export const iosRepairsPerDay = 3;
 
 const stamp = date => date.toISOString().replace(/\.\d{3}Z$/, 'Z');
 const oneLine = error => sanitizeReason(error?.message ?? error, 'failed').replace(/\s+/g, ' ').slice(0, 240);
@@ -200,6 +209,20 @@ export function createJournal({ env = process.env, home = homedir(), now = () =>
       if (document.busy) delete document.busy[`${slug}/${platform}`];
       writeAtomic(path, `${JSON.stringify(document, null, 2)}\n`);
     },
+    // The displaced-build repairs this host made today (UTC), per app: the flap guard's memory.
+    repairsToday(slug, platform) {
+      const entry = read().repairs?.[`${slug}/${platform}`];
+      return entry && entry.day === stamp(now()).slice(0, 10) && Number.isSafeInteger(entry.count) ? entry.count : 0;
+    },
+    repairAttempt(slug, platform) {
+      const document = read();
+      const day = stamp(now()).slice(0, 10);
+      const key = `${slug}/${platform}`;
+      const count = (document.repairs?.[key]?.day === day && Number.isSafeInteger(document.repairs[key].count) ? document.repairs[key].count : 0) + 1;
+      document.repairs = { ...document.repairs, [key]: { day, count } };
+      writeAtomic(path, `${JSON.stringify(document, null, 2)}\n`);
+      return count;
+    },
     // When this build was first found in use on the device (kept until it is installed), in milliseconds.
     busySince(slug, platform, block) {
       const document = read();
@@ -221,8 +244,8 @@ export function defaultLog(env = process.env) {
 
 // ---------------------------------------------------------------------------------------------------- outcomes
 
-const markerOf = { installed: 'HUB_CATCHUP_INSTALLED', confirmed: 'HUB_CATCHUP_CONFIRMED' };
-const statusOf = { installed: 'installed', confirmed: 'installed', ahead: 'skipped', failure: 'failure' };
+const markerOf = { installed: 'HUB_CATCHUP_INSTALLED', confirmed: 'HUB_CATCHUP_CONFIRMED', repaired: 'HUB_CATCHUP_REPAIRED' };
+const statusOf = { installed: 'installed', confirmed: 'installed', repaired: 'repaired', ahead: 'skipped', failure: 'failure' };
 
 function outcome(item, platform, kind, fields) {
   const { app, latest, block } = item;
@@ -248,7 +271,7 @@ export function factsOf(result) {
     build: result.build,
     sha256: block.sha256,
     status: statusOf[result.kind],
-    by: result.kind === 'installed' ? 'catch-up' : result.kind === 'confirmed' ? 'manual' : null,
+    by: result.kind === 'installed' || result.kind === 'repaired' ? 'catch-up' : result.kind === 'confirmed' ? 'manual' : null,
     reason: result.reason ?? null,
     stage: result.stage ?? null,
     commit: block.commit,
@@ -263,8 +286,13 @@ export function factsOf(result) {
 async function settle(ctx, result) {
   const where = `${result.slug} ${result.platform} ${describe(result.version, result.build)}`;
   if (result.kind === 'idle') { ctx.log(`HUB_CATCHUP_IDLE ${where}: ${result.message}`); return true; }
+  // A checked build that needs nothing (the iPad holds it, or something newer) is summed up once per pass, not recorded.
+  if (result.kind === 'quiet') return true;
+  // A repair that failed changes nothing in latest.json (the build is installed there); it is logged, counted by the
+  // flap guard and tried again on a later pass.
+  if (result.kind === 'repair-failed') { ctx.log(`HUB_CATCHUP_REPAIR_FAILED ${where}: attempt failed at ${result.stage}: ${result.reason}`); return false; }
   if (ctx.mode !== 'live') {
-    const would = { installed: 'record installed (HUB_CATCHUP_INSTALLED)', confirmed: 'record installed by a person (HUB_CATCHUP_CONFIRMED)', ahead: `record skipped (${result.marker})`, failure: 'count a failed attempt', 'would-install': 'install' }[result.kind];
+    const would = { installed: 'record installed (HUB_CATCHUP_INSTALLED)', confirmed: 'record installed by a person (HUB_CATCHUP_CONFIRMED)', ahead: `record skipped (${result.marker})`, failure: 'count a failed attempt', 'would-install': 'install', 'would-repair': 'repair the displaced build (reinstall in place)' }[result.kind];
     ctx.log(`HUB_CATCHUP_WATCH ${where}: would ${would}: ${result.message ?? result.reason}`);
     return true;
   }
@@ -293,6 +321,7 @@ async function readApps(ctx, platform) {
   const work = [];
   const quiet = [];
   const resend = [];
+  const settled = [];
   const unreadable = [];
   let errors = 0;
   for (const app of ctx.settings.apps) {
@@ -316,10 +345,16 @@ async function readApps(ctx, platform) {
     for (const each of platforms) if (latest[each]?.device?.event_pending) resend.push({ app, platform: each });
     const block = latest[platform];
     if (!app.lanes.includes(platform) || !block) { quiet.push(`${app.slug} no ${platform} build`); continue; }
-    if (block.device.status !== 'pending') { quiet.push(`${app.slug} ${describe(block.version, buildOf(block, platform))} ${block.device.status}`); continue; }
+    if (block.device.status !== 'pending') {
+      quiet.push(`${app.slug} ${describe(block.version, buildOf(block, platform))} ${block.device.status}`);
+      // The iPad pass still looks at an installed (or skipped) build once: something else may have replaced it. A
+      // failed one gave up on purpose and stays silent until `retry`.
+      if (platform === 'ios' && ['installed', 'skipped'].includes(block.device.status)) settled.push({ app, latest, block, settled: true });
+      continue;
+    }
     work.push({ app, latest, block });
   }
-  return { work, quiet, unreadable, errors, resend };
+  return { work, quiet, unreadable, errors, resend, settled };
 }
 
 // ---------------------------------------------------------------------------------------------------- the S26 pass
@@ -438,8 +473,11 @@ export async function androidPass(ctx) {
 
 // ---------------------------------------------------------------------------------------------------- the iPad pass
 
+// `item.settled` marks a build latest.json already calls installed (or skipped): the pass only checks that the iPad still
+// holds it, and repairs it in place when another channel replaced it with an older build (TOLT-152).
 async function iosApp(ctx, item) {
   const { block, app } = item;
+  const repair = item.settled === true;
   let installed;
   try {
     installed = ctx.ipad.installed(block.bundle);
@@ -447,7 +485,18 @@ async function iosApp(ctx, item) {
     return outcome(item, 'ios', 'idle', { message: `the iPad did not answer (${oneLine(error)})` });
   }
   const plan = iosPlan(installed, block);
+  const wouldKind = repair ? 'would-repair' : 'would-install';
   try {
+    if (repair) {
+      // Only an OLDER build on the iPad is displaced. A newer one is a person's choice, a missing app a person's
+      // deletion, an equal one is the healthy case; none of them is touched.
+      if (!installed) return outcome(item, 'ios', 'idle', { message: `${block.bundle} is not on the iPad (removed on purpose?); not reinstalled` });
+      if (plan.action === 'ahead') return outcome(item, 'ios', 'idle', { message: `the iPad runs ${plan.was}, newer than latest.json; not touched` });
+      if (plan.action === 'conflict') return outcome(item, 'ios', 'idle', { message: `the iPad runs ${plan.was}, which cannot be compared with ${describe(block.version, block.build)}; not touched` });
+      if (plan.action === 'confirm') return outcome(item, 'ios', 'quiet', { message: `the iPad runs ${plan.was}` });
+      const repairs = ctx.journal.repairsToday(app.slug, 'ios');
+      if (repairs >= iosRepairsPerDay) return outcome(item, 'ios', 'idle', { message: `the iPad was displaced by ${plan.was} again; already repaired ${repairs} times today (the limit), only logging` });
+    }
     if (plan.action === 'ahead') return outcome(item, 'ios', 'ahead', { marker: 'HUB_IPAD_NEWER', reason: `the iPad runs ${plan.was}, newer than this build`, message: `the iPad runs ${plan.was}; not touched` });
     if (plan.action === 'conflict') throw stageError('install', `the iPad runs ${plan.was}, which cannot be compared with ${describe(block.version, block.build)}`);
     if (plan.action === 'confirm') {
@@ -465,7 +514,7 @@ async function iosApp(ctx, item) {
       if (!block.key) return outcome(item, 'ios', 'idle', { message: 'no IPA in the outbox and none published; waiting for the next deploy' });
       if (ctx.metered()) return outcome(item, 'ios', 'idle', { message: `the IPA is not in the outbox and the link is metered; it downloads on a home network (${block.bytes ?? '?'} bytes)` });
       from = ctx.store.url(block.key);
-      if (ctx.mode !== 'live') return outcome(item, 'ios', 'would-install', { message: `${describe(block.version, block.build)} over ${plan.was}, after downloading ${from} (${block.bytes ?? '?'} bytes)` });
+      if (ctx.mode !== 'live') return outcome(item, 'ios', wouldKind, { message: `${describe(block.version, block.build)} over ${plan.was}, after downloading ${from} (${block.bytes ?? '?'} bytes)` });
       ipa = await ctx.fetchIpa(app.slug, block);
     }
     // devicectl install closes a running app, and devicectl cannot tell a game on screen from a suspended one: while the
@@ -477,7 +526,9 @@ async function iosApp(ctx, item) {
       if (waited < iosBusyCapMs) return outcome(item, 'ios', 'idle', { message: `${block.bundle} is running on the iPad; the install waits for a pass when it is closed (${Math.floor(waited / 60_000)} of ${iosBusyCapMs / 60_000} minutes)` });
       ctx.log(`HUB_CATCHUP_BUSY ${app.slug} ios: ${block.bundle} has been running for ${Math.floor(waited / 60_000)} minutes; installing now`);
     }
-    if (ctx.mode !== 'live') return outcome(item, 'ios', 'would-install', { message: `${describe(block.version, block.build)} over ${plan.was} from ${from} (sha256 matches)${running ? '; it would wait while the app runs' : ''}` });
+    if (ctx.mode !== 'live') return outcome(item, 'ios', wouldKind, { message: `${describe(block.version, block.build)} over ${plan.was} from ${from} (sha256 matches)${running ? '; it would wait while the app runs' : ''}` });
+    // The flap guard counts the attempt, whether or not the install then works.
+    if (repair) ctx.journal.repairAttempt(app.slug, 'ios');
     const unpacked = ctx.unpackIpa(ipa);
     try {
       if (unpacked.bundle !== block.bundle || unpacked.version !== block.version || unpacked.build !== block.build) throw stageError('install', `the IPA is ${unpacked.bundle} ${describe(unpacked.version, unpacked.build)}, latest.json names ${block.bundle} ${describe(block.version, block.build)}`);
@@ -491,24 +542,29 @@ async function iosApp(ctx, item) {
     const after = ctx.ipad.installed(block.bundle);
     if (!after || after.version !== block.version || after.build !== block.build) throw stageError('verify', `readback: the iPad reports ${after ? describe(after.version, after.build) : 'no app'}, expected ${describe(block.version, block.build)}`);
     ctx.journal.put(app.slug, 'ios', block);
+    if (repair) return outcome(item, 'ios', 'repaired', { reason: `repaired: displaced by ${plan.was}`, message: `displaced by ${plan.was}; reinstalled in place from ${from}; readback ${describe(after.version, after.build)}` });
     return outcome(item, 'ios', 'installed', { message: `installed over ${plan.was} from ${from}; readback ${describe(after.version, after.build)}` });
   } catch (error) {
-    return failure(item, 'ios', error);
+    const failed = failure(item, 'ios', error);
+    return repair ? { ...failed, kind: 'repair-failed' } : failed;
   }
 }
 
 export async function iosPass(ctx) {
-  const { work: listed, quiet, errors: readErrors, unreadable } = await readApps(ctx, 'ios');
+  const { work: pendingListed, settled, quiet, errors: readErrors, unreadable } = await readApps(ctx, 'ios');
   let errors = readErrors;
-  if (listed.length === 0) {
+  if (pendingListed.length === 0 && settled.length === 0) {
     ctx.log(`HUB_CATCHUP_IDLE ios ${ctx.mode}: nothing pending (${idleSummary(quiet, unreadable)})`);
     return { errors, results: [] };
   }
+  // Pending builds first; then the installed ones, which only get looked at on the iPad (the displaced-build repair).
+  const listed = [...pendingListed, ...settled];
   const held = await notInFlight(ctx, listed, 'ios');
   const { work } = held;
   errors += held.errors;
   if (work.length === 0) return { errors, results: [] };
-  const pending = work.map(item => `${item.app.slug} ${describe(item.block.version, item.block.build)}`).join(', ');
+  const describeItems = items => items.map(item => `${item.app.slug} ${describe(item.block.version, item.block.build)}`).join(', ');
+  const waiting = work.some(item => !item.settled) ? `${describeItems(work.filter(item => !item.settled))} pending` : `${describeItems(work)} to check`;
   let results = null;
   try {
     results = await ctx.lock('mac-ios', async () => {
@@ -516,11 +572,11 @@ export async function iosPass(ctx) {
       try {
         found = ctx.ipad.find();
       } catch (error) {
-        ctx.log(`HUB_CATCHUP_IDLE ios ${ctx.mode}: ${pending} pending; the iPad is not listed (${oneLine(error).slice(0, 120)})`);
+        ctx.log(`HUB_CATCHUP_IDLE ios ${ctx.mode}: ${waiting}; the iPad is not listed (${oneLine(error).slice(0, 120)})`);
         return null;
       }
       if (found.tunnel === 'unavailable') {
-        ctx.log(`HUB_CATCHUP_IDLE ios ${ctx.mode}: ${pending} pending; the iPad is unavailable to devicectl (away or asleep)`);
+        ctx.log(`HUB_CATCHUP_IDLE ios ${ctx.mode}: ${waiting}; the iPad is unavailable to devicectl (away or asleep)`);
         return null;
       }
       const done = [];
@@ -534,6 +590,8 @@ export async function iosPass(ctx) {
   }
   if (!results) return { errors, results: [] };
   for (const result of results) if (!await settle(ctx, result)) errors += 1;
+  const fine = results.filter(result => result.kind === 'quiet');
+  if (fine.length > 0 && fine.length === results.length) ctx.log(`HUB_CATCHUP_IDLE ios ${ctx.mode}: nothing pending (${fine.map(result => `${result.slug} ${describe(result.version, result.build)} on the iPad`).join(', ')})`);
   return { errors, results };
 }
 
@@ -567,6 +625,11 @@ async function flushEvent(ctx, slug, latest, platform) {
 // device fields change, and the field set stays the contract's.
 export function transition(device, facts, { maxFailures, now }) {
   const since = stamp(now);
+  // A build latest.json calls installed (or skipped as newer) was found displaced by an older one and reinstalled.
+  if (facts.status === 'repaired') {
+    if (!['installed', 'skipped'].includes(device.status)) return null;
+    return { change: { status: 'installed', since, by: 'catch-up', reason: String(facts.reason ?? 'repaired: displaced by an older build').slice(0, 300), event_pending: true }, event: true };
+  }
   if (facts.status === 'installed') {
     if (device.status === 'installed') return null;
     return { change: { status: 'installed', since, by: facts.by, reason: null, event_pending: true }, event: true };
@@ -685,7 +748,7 @@ const argPatterns = Object.freeze({
   platform: /^(android|ios)$/,
   version: semver,
   build: buildPattern,
-  status: /^(installed|skipped|failure)$/,
+  status: /^(installed|repaired|skipped|failure)$/,
   by: /^(catch-up|manual)$/,
   reason: reasonPattern,
   stage: /^(install|verify)$/,
@@ -732,7 +795,7 @@ export function parseRecordArgs(argv) {
     values[name] = value;
   }
   for (const name of ['slug', 'platform', 'version', 'build', 'status']) if (!values[name]) throw new Error(`record needs --${name}`);
-  if (values.status === 'installed' && !values.by) throw new Error('record --status installed needs --by catch-up|manual');
+  if (['installed', 'repaired'].includes(values.status) && !values.by) throw new Error(`record --status ${values.status} needs --by catch-up|manual`);
   return {
     slug: values.slug,
     platform: values.platform,

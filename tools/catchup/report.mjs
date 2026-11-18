@@ -53,7 +53,9 @@ export function catchupEvent({ name, slug, platform, block, device, run, commit,
     data.summary = `${label}: ${known.name} catch-up failed at ${delivery.stage}: ${reason}`.slice(0, 200);
     Object.assign(data, { stage: delivery.stage, reason, failed_at: stamp(now) });
   } else {
-    data.summary = `${label}: ${known.name} installed by ${delivery.by}, verified`.slice(0, 200);
+    // A displaced build put back (TOLT-152): the device's reason reads "repaired: displaced by <what replaced it>".
+    const repaired = /^repaired:/.test(device.reason ?? '');
+    data.summary = (repaired ? `${label}: ${known.name} repaired by ${delivery.by} (${reason.replace(/^repaired:\s*/, '')}), verified` : `${label}: ${known.name} installed by ${delivery.by}, verified`).slice(0, 200);
     Object.assign(data, { verified: true, deployed_at: stamp(now) });
   }
   const derived = run.repo ? correlationFor({ GITHUB_REPOSITORY: run.repo, GITHUB_RUN_ID: String(run.id) }) : null;

@@ -55,6 +55,19 @@ Nothing has to be at home first: the `gate` job reads the Mac's link (home, mete
 - **iPad away:** Install on iPad in the notification (or Install on the build page in Safari), then Install in the iPadOS prompt.
 - **Back home:** nothing. The catch-up installs or confirms each pending build and sends one notification per device; it waits while the app is on screen.
 
+### When something else replaces the iPad build
+
+A deploy installs a development-signed build on the iPad with `devicectl`. If the same bundle id also ships through TestFlight or the App Store (Tower, Gruvato and Navi share one), a TestFlight update, or a tap in the TestFlight app, replaces that build with whatever TestFlight holds, which is usually older: the two channels run on different build numbers. `latest.json` still says `installed`, so the iPad quietly shows an old version until the next deploy. Tower's own log shows it: 0.3.18 (23) was on the iPad on 2026-10-30, and on 2026-11-02 the catch-up logged "installed over 0.3.0 (9)" (TestFlight build 9) when it put 0.3.19 (24) there.
+
+The iPad catch-up now looks again. On each pass, for every app whose iOS build is `installed` (or `skipped`), it reads the iPad once and compares it with `latest.json` (version first, then build):
+
+- **Older on the iPad:** the build was displaced. It is reinstalled in place from the Mac's outbox (or downloaded off a metered link), exactly like a pending build: same sha256 check, same wait while the app runs (up to 45 minutes), same readback, one event. `latest.json` keeps `installed` and records `by: catch-up` with the reason `repaired: displaced by 0.3.0 (9)`; the notification says it was repaired.
+- **Equal:** nothing. **Newer, or the app is gone (you deleted it):** nothing but a log line. A device that gave up (`failed`) stays silent until `catchup.mjs retry`.
+- **Watch mode:** logs `HUB_CATCHUP_WATCH ... would repair`, installs nothing.
+- **Flap guard:** an app is repaired at most 3 times per UTC day on a host (`iosRepairsPerDay`); after that the pass only logs `already repaired 3 times today`. A repair that fails logs `HUB_CATCHUP_REPAIR_FAILED`, counts toward the limit and is tried again on a later pass.
+
+It never removes the app, clears data or downgrades. This only shortens the damage: TestFlight can still replace the build between passes (5 minutes). The fix that ends the fight is a separate development bundle id (`store_bundle` in the policy, as Green In Between does): the dev build then lives beside the TestFlight app and nothing replaces anything. For Tower that changes its frozen owner identity and the saves in it, so it is the owner's call, not the hub's.
+
 ## Deploy policy
 
 The rules every deploy obeys live in one file in this repo: [`tools/ci/policy.json`](tools/ci/policy.json). The `gate` job reads it from the exact tag the run pins — never from a workflow input, an environment variable, an app manifest or a hook — so the front door, `gh workflow run`, the GitHub mobile app and every rerun all run the same rules. Only the hub can change a rule; apps inherit it through the `@v1` pin and never carry deploy policy of their own.

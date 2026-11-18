@@ -18,7 +18,7 @@ import { withLock } from '../ci/lib/lock.mjs';
 import { compareBuild, validateLatest } from '../ci/lib/latest.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import {
-  androidPass, androidPlan, compareIos, hubWriter, inCidr, iosPass, iosPlan, latestProblems, linuxContext,
+  androidPass, androidPlan, compareIos, createJournal, hubWriter, iosRepairsPerDay, inCidr, iosPass, iosPlan, latestProblems, linuxContext,
   loadSettings, macContext, parseRecordArgs, readMode, reasonText, record, recordArgs, retry, serviceAccountEnv, settingsFrom, sshRecordCommand, withFallback, writeMode,
 } from './catchup.mjs';
 import { catchupEvent, producer, sendCatchupEvent } from './report.mjs';
@@ -671,6 +671,136 @@ test('iPad: other bytes in the outbox are never installed; watch mode installs n
     assert.ok(!watch.ipadState.calls.some(call => call.startsWith('install ')));
     assert.deepEqual([watch.reports.length, watch.linux.s3.writer.writes.length, watch.linux.events.length], [0, 0, 0]);
   } finally { watch.cleanup(); }
+});
+
+// ---------------------------------------------------------------------------------------------------- displaced builds (TOLT-152)
+
+// The 2026-11-02 case: the deploy installed 0.3.19 (24), then a TestFlight install of the same bundle put 0.3.0 (9) over it.
+// latest.json still says installed, so only the repair looks at the iPad again.
+const displacedHost = async ({ mode = 'live', device = { version: '0.3.0', build: '9' }, status = 'installed', outbox = true } = {}) => {
+  const mac = macHost({ mode });
+  const latest = latestDoc({ android: null, ios: iosBlock({ version: '0.3.19', build: '24', status, by: status === 'installed' ? 'deploy' : null }) });
+  publish(mac.linux.s3, { latest, ipa: ipaText({ version: '0.3.19', build: '24' }) });
+  mac.ipadState.installed = device;
+  if (outbox) mac.outbox(ipaText({ version: '0.3.19', build: '24' }), { version: '0.3.19', build: '24' });
+  return mac;
+};
+const installsOf = mac => mac.ipadState.calls.filter(call => call.startsWith('install '));
+
+test('iPad displaced: 0.3.19 (24) installed, TestFlight put 0.3.0 (9) over it: reinstalled in place, read back, reported with the reason', async () => {
+  const mac = await displacedHost();
+  try {
+    await iosPass(mac.ctx);
+    assert.equal(installsOf(mac).length, 1, 'one in-place install');
+    assert.deepEqual(mac.ipadState.installed, { version: '0.3.19', build: '24', developer: true });
+    assert.equal(mac.lines(/^HUB_CATCHUP_REPAIRED tower-of-lost-things ios 0\.3\.19 \(24\): displaced by 0\.3\.0 \(9\); reinstalled in place from the outbox; readback 0\.3\.19 \(24\)/).length, 1);
+    assert.deepEqual(mac.reports[0].slice(0, 12), ['--slug', slug, '--platform', 'ios', '--version', '0.3.19', '--build', '24', '--status', 'repaired', '--by', 'catch-up']);
+    assert.ok(mac.reports[0].includes('repaired: displaced by 0.3.0 (9)'));
+    const device = latestOf(mac.linux.s3).ios.device;
+    assert.deepEqual([device.status, device.by, device.reason], ['installed', 'catch-up', 'repaired: displaced by 0.3.0 (9)']);
+    assert.equal(mac.linux.events.length, 1);
+    assert.equal(mac.linux.events[0].type, 'bloodbank.project.deployment.completed');
+    assert.match(mac.linux.events[0].data.summary, /iPad repaired by catch-up \(displaced by 0\.3\.0 \(9\)\), verified/);
+    assert.equal(mac.linux.s3.requests.filter(request => request.key.endsWith('.ipa')).length, 0, 'the outbox cost no network bytes');
+    // Healthy again: the next pass reads the iPad, finds the build, and does nothing.
+    mac.ipadState.calls.length = 0;
+    await iosPass(mac.ctx);
+    assert.equal(installsOf(mac).length, 0);
+    assert.equal(mac.reports.length, 1);
+    assert.equal(mac.lines(/^HUB_CATCHUP_IDLE ios live: nothing pending \(tower-of-lost-things 0\.3\.19 \(24\) on the iPad\)/).length, 1);
+  } finally { mac.cleanup(); }
+});
+
+test('iPad displaced: an equal build, a newer build and an app that is gone are never touched', async () => {
+  for (const [name, device] of [['equal', { version: '0.3.19', build: '24' }], ['newer version', { version: '0.4.0', build: '1' }], ['newer build', { version: '0.3.19', build: '25' }], ['missing', null]]) {
+    const mac = await displacedHost({ device });
+    try {
+      await iosPass(mac.ctx);
+      assert.equal(installsOf(mac).length, 0, `${name}: nothing installed`);
+      assert.deepEqual([mac.reports.length, mac.linux.s3.writer.writes.length, mac.linux.events.length], [0, 0, 0], `${name}: nothing recorded`);
+      assert.equal(latestOf(mac.linux.s3).ios.device.status, 'installed', `${name}: latest.json unchanged`);
+      if (name === 'missing') assert.match(mac.lines(/^HUB_CATCHUP_IDLE /)[0], /is not on the iPad \(removed on purpose\?\); not reinstalled/);
+      if (name.startsWith('newer')) assert.match(mac.lines(/^HUB_CATCHUP_IDLE /)[0], /newer than latest\.json; not touched/);
+    } finally { mac.cleanup(); }
+  }
+});
+
+test('iPad displaced: watch mode only logs; a failed device stays silent; an unavailable iPad is not asked', async () => {
+  const watch = await displacedHost({ mode: 'watch' });
+  try {
+    await iosPass(watch.ctx);
+    assert.match(watch.lines(/^HUB_CATCHUP_WATCH /)[0], /would repair the displaced build \(reinstall in place\): 0\.3\.19 \(24\) over 0\.3\.0 \(9\) from the outbox/);
+    assert.deepEqual([installsOf(watch).length, watch.reports.length, watch.linux.s3.writer.writes.length, watch.linux.events.length], [0, 0, 0, 0]);
+  } finally { watch.cleanup(); }
+
+  const failed = await displacedHost({ status: 'failed' });
+  try {
+    await iosPass(failed.ctx);
+    assert.deepEqual(failed.ipadState.calls, [], 'a device that gave up is not looked at until retry');
+  } finally { failed.cleanup(); }
+
+  const away = await displacedHost();
+  try {
+    away.ipadState.tunnel = 'unavailable';
+    await iosPass(away.ctx);
+    assert.deepEqual(away.ipadState.calls, ['list devices']);
+    assert.match(away.lines(/^HUB_CATCHUP_IDLE /)[0], /tower-of-lost-things 0\.3\.19 \(24\) to check; the iPad is unavailable/);
+  } finally { away.cleanup(); }
+});
+
+test('iPad displaced: waits while the app runs, and the flap guard stops a device that keeps being displaced', async () => {
+  const mac = await displacedHost();
+  try {
+    mac.ipadState.running = true;
+    await iosPass(mac.ctx);
+    assert.equal(installsOf(mac).length, 0, 'not under a kid');
+    assert.match(mac.lines(/^HUB_CATCHUP_IDLE /)[0], /is running on the iPad; the install waits/);
+    mac.ipadState.running = false;
+    for (let round = 1; round <= iosRepairsPerDay; round += 1) {
+      await iosPass(mac.ctx);
+      assert.equal(installsOf(mac).length, round, `repair ${round}`);
+      mac.ipadState.installed = { version: '0.3.0', build: '9' };
+    }
+    await iosPass(mac.ctx);
+    assert.equal(installsOf(mac).length, iosRepairsPerDay, 'the limit holds: no fourth install today');
+    assert.match(mac.lines(/^HUB_CATCHUP_IDLE /).at(-1), /displaced by 0\.3\.0 \(9\) again; already repaired 3 times today \(the limit\), only logging/);
+    assert.deepEqual(mac.ipadState.installed, { version: '0.3.0', build: '9' }, 'logged, not touched');
+  } finally { mac.cleanup(); }
+});
+
+test('iPad displaced: the flap guard counts per UTC day and per app, and a failed repair counts and changes no latest.json', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'hub-catchup-flap-'));
+  try {
+    let clock = new Date('2026-11-02T22:00:00Z');
+    const journal = createJournal({ env: {}, home, now: () => clock });
+    assert.equal(journal.repairsToday(slug, 'ios'), 0);
+    journal.repairAttempt(slug, 'ios');
+    journal.repairAttempt(slug, 'ios');
+    assert.equal(journal.repairsToday(slug, 'ios'), 2);
+    assert.equal(journal.repairsToday('other-app', 'ios'), 0);
+    clock = new Date('2026-11-03T00:05:00Z');
+    assert.equal(journal.repairsToday(slug, 'ios'), 0, 'a new UTC day starts over');
+  } finally { rmSync(home, { recursive: true, force: true }); }
+
+  const mac = await displacedHost();
+  try {
+    mac.ctx.ipad.install = () => { throw new Error('devicectl install failed'); };
+    const result = await iosPass(mac.ctx);
+    assert.equal(result.errors, 1);
+    assert.equal(mac.lines(/^HUB_CATCHUP_REPAIR_FAILED tower-of-lost-things ios 0\.3\.19 \(24\): attempt failed at install: devicectl install failed/).length, 1);
+    assert.deepEqual([mac.reports.length, mac.linux.s3.writer.writes.length, mac.linux.events.length], [0, 0, 0]);
+    assert.equal(latestOf(mac.linux.s3).ios.device.status, 'installed');
+    assert.equal(mac.ctx.journal.repairsToday(slug, 'ios'), 1, 'the attempt counted');
+  } finally { mac.cleanup(); }
+});
+
+test('iPad displaced: a deploy in flight holds the repair too', async () => {
+  const mac = await displacedHost();
+  try {
+    mac.linux.s3.put(`${slug}/inflight.json`, { version: '0.3.20', run: { id: '37950000000' }, started_at: '2026-10-10T11:50:00Z', platforms: ['android', 'ios'] });
+    await iosPass(mac.ctx);
+    assert.deepEqual(mac.ipadState.calls, [], 'the deploy owns the iPad');
+  } finally { mac.cleanup(); }
 });
 
 // ---------------------------------------------------------------------------------------------------- record, event, store
