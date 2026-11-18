@@ -221,6 +221,24 @@ hub-device run emulator [--profile default|playstore --for 1h --why TEXT --wait 
 - **The reaper.** There is no timer, cron job, unit or Candybar job. Every `hub-device` invocation (`status` included) first tears down the pool's leases that expired, whose `--pid` holder (or `run` process) is gone, or whose slot no longer holds them. It touches only their recorded, identity-checked processes and logs `HUB_EMULATOR_REAPED <id> <slot> (<why>)` on stderr. So an expired lease keeps its emulator until the next `hub-device` call on the host. While a lease is still being made it is tied to the process making it, so killing that process mid-boot leaves nothing for long.
 - `status` lists the pool's emulators under EMULATORS, and in the inventory their adb server and emulator are `managed (lease <id>)`. Everything else stays `foreign` and is never touched. Linux (big-chungus) only. Prefix `heavy` (`heavy hub-device run emulator -- ...`) to put the boot in `batch.slice`.
 
+## The App Store listing
+
+A store page is data, not clicking. Each app keeps `store/apple/listing.json` in its own repo, and the hub reads and writes it through the App Store Connect API:
+
+```bash
+mise run listing pull ~/code/tolt/tower-of-lost-things                 # snapshot the ASC listing into store/apple/listing.json
+mise run listing push ~/code/tolt/tower-of-lost-things                 # print a field-by-field diff, write nothing
+mise run listing push ~/code/tolt/tower-of-lost-things --apply true    # write it, read it back, fail if anything differs
+```
+
+The app is found from the hub policy: the checkout's `owner/name` (its git remote, or `--repo`) names an `apps` entry, and that entry's `ios.store_bundle` (else `ios.bundle`) is the App Store bundle id. Keys come from 1Password at call time (App Manager key by default, `HUB_ASC_KEY=admin` for the few calls that need Admin); no value is written anywhere.
+
+`listing.json` covers: app name, subtitle, privacy policy URL; promotional text, description, keywords, what's new, support and marketing URL; copyright; primary and secondary category with subcategories; content rights; every age rating question (the file must answer all of them, Kids age band included); App Review contact, notes and demo account; and an `exportCompliance` check. A field the file leaves out is not managed. A value of `op://...` is read from 1Password at push time (review phone number), and `pull` keeps such references instead of writing the value; `pull` never writes review contact fields. `schema`, `locale` and the field names are checked strictly, with Apple's length limits, so a bad file fails before any call.
+
+Screenshots are PNGs under `store/apple/screenshots/<DISPLAY_TYPE>/NN-name.png` (`APP_IPHONE_67` takes 1290x2796 or 1320x2868, `APP_IPAD_PRO_3GEN_129` takes 2048x2732 or 2064x2752), kept out of git and made by the app's own script. A push compares file checksums and order with what Apple holds, and replaces a whole set only when it differs, so a second push writes nothing.
+
+It never touches builds, TestFlight groups, price, availability or review submission. `exportCompliance` is only compared with the latest build's `usesNonExemptEncryption` and reported. App Privacy (the nutrition label) has no public API; keep the exact answers beside the listing as `store/apple/app-privacy.md`.
+
 ## Hosts and checks
 
 For the iOS job's ephemeral token boundary and the authorized new TestFlight

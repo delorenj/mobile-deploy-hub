@@ -119,6 +119,19 @@ flag "--metered <metered>" default="auto"
 '''
 run = 'node tools/deploy.mjs train --dry-run "$usage_dry_run" --bump "$usage_bump" --platform "$usage_platform" --dry-handoff "$usage_dry_handoff" --metered "$usage_metered"'
 
+# The App Store listing (TOLT-153): the text, ratings, review notes and screenshots of an app's store page, kept as
+# store/apple/listing.json in the app's repo and written through the ASC API. Never touches builds, TestFlight, price or review.
+[tasks."listing"]
+description = "App Store listing: mise run listing pull|push <app-repo-dir> [--apply true] [--repo owner/name]; push prints a diff unless --apply true"
+tools = { node = "24" }
+usage = '''
+arg "<command>"
+arg "<dir>"
+flag "--apply <apply>" default="false"
+flag "--repo <repo>" default=""
+'''
+run = 'node tools/listing.mjs "$usage_command" "$usage_dir" $([ "$usage_apply" = true ] && echo --apply) $([ -n "$usage_repo" ] && echo --repo "$usage_repo")'
+
 [tasks.conformance]
 description = "Check through gh api that Tower, Green In Between and Gruvato deploy only through the hub (caller hash, manifest, no other uploads, no bump/tag/announce tasks)"
 tools = { node = "24" }
