@@ -98,9 +98,14 @@ export function resolveRefs(file, read) {
   return out;
 }
 
-// A phone number goes to Apple as +<digits>.
+// A phone number goes to Apple as +<digits>. A bare 10-digit number is read as North American (+1), the way a US
+// contact card stores it; any other number must carry its country code.
 export function normalizeField(key, value) {
-  if (key === 'contactPhone') { const digits = value.replace(/\D/g, ''); return digits ? `+${digits}` : value; }
+  if (key === 'contactPhone') {
+    const digits = value.replace(/\D/g, '');
+    if (!digits) return value;
+    return `+${digits.length === 10 && !value.trim().startsWith('+') ? `1${digits}` : digits}`;
+  }
   return value;
 }
 

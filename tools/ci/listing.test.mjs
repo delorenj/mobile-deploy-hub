@@ -45,6 +45,8 @@ test('op:// references resolve at push time and a phone becomes +digits', () => 
   const resolved = resolveRefs(base(), ref => { assert.equal(ref, 'op://v/i/phone'); return '1 (555) 123-4567\n'; });
   assert.equal(resolved.review.contactPhone, '+15551234567');
   assert.equal(normalizeField('contactEmail', 'a@b.c'), 'a@b.c');
+  assert.equal(normalizeField('contactPhone', '(215) 555-0100'), '+12155550100');
+  assert.equal(normalizeField('contactPhone', '+44 20 7946 0000'), '+442079460000');
 });
 
 test('desiredState turns bool answers into booleans and keeps null as a clear', () => {
