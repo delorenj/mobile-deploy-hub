@@ -22,9 +22,9 @@ import { hook, run } from '../lib/exec.mjs';
 import { exportGodot } from '../lib/godot.mjs';
 import { apkName } from '../lib/latest.mjs';
 import { withLock } from '../lib/lock.mjs';
-import { editionApkName, editionLane } from '../lib/editions.mjs';
+import { editionApkName, editionLane, isPublicEdition } from '../lib/editions.mjs';
 import { editionsOf, loadManifest } from '../lib/manifest.mjs';
-import { loadPolicy, tagOf } from '../lib/policy.mjs';
+import { editionPinOf, loadPolicy, tagOf } from '../lib/policy.mjs';
 import { uploadBundle } from '../lib/play.mjs';
 import { dropApk, s26OnLan } from '../lib/quickdrop.mjs';
 import { buildReceipt, sha256File, writeReceipt } from '../lib/receipt.mjs';
@@ -233,6 +233,12 @@ export async function play(config, { env = process.env, fetchImpl } = {}) {
   });
 }
 
+// Whether GitHub says the repository is private; anything else (public, internal, an error) is not.
+export function repoIsPrivate(repo, env) {
+  const answer = spawnSync('gh', ['api', `repos/${repo}`, '--jq', '.private'], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  return answer.status === 0 && String(answer.stdout).trim() === 'true';
+}
+
 export function releaseArguments({ tag, repo, sha, title, notes, assets, verifyTag = false }) {
   return ['release', 'create', tag, ...assets, '--repo', repo, '--target', sha, '--title', title, '--notes', notes, ...(verifyTag ? ['--verify-tag'] : [])];
 }
@@ -254,16 +260,24 @@ async function releaseLane(config, { env }) {
   const spec = manifest.android ?? (() => { throw new Error('the manifest has no android section'); })();
   const out = join(config.out, 'android');
   const assets = [basename(spec.artifact), ...(spec.receipt ? [basename(spec.receipt)] : []), 'hub-receipt-android.json'].map(name => join(out, name));
-  // Every extra edition rides the private Release too (its APK and its hub receipt), under names no other asset has.
-  for (const { name } of editionsOf(manifest)) {
+  const repo = env.GITHUB_REPOSITORY;
+  if (!repo) throw new Error('GITHUB_REPOSITORY is not set');
+  // Every extra edition rides the Release too (its APK and its hub receipt), under names no other asset has, but a
+  // private edition only when the Release is private: the repository must say it is private (an unreadable answer
+  // counts as public). On a public repository only the editions the manifest and the policy both made public ride along.
+  const declared = editionsOf(manifest);
+  const privateRepo = declared.length > 0 && repoIsPrivate(repo, env);
+  for (const { name, spec: edition } of declared) {
+    if (!privateRepo && !isPublicEdition(edition, editionPinOf(loadPolicy().policy.apps[repo], name))) {
+      console.log(`HUB_RELEASE_EDITION_HELD ${name}: ${repo} is not a private repository, so the private ${name} edition stays off its Release`);
+      continue;
+    }
     assets.push(join(out, 'editions', name, editionApkName(manifest.project.slug, name, config.version, config.androidCode)), join(out, `hub-receipt-${editionLane(name)}.json`));
   }
   const names = assets.map(asset => basename(asset));
   const clash = names.find((name, index) => names.indexOf(name) !== index);
   if (clash) throw new Error(`two Release assets are both named ${clash}; rename the app's artifact or receipt`);
   for (const asset of assets) if (!exists(asset)) throw new Error(`release asset missing: ${asset}`);
-  const repo = env.GITHUB_REPOSITORY;
-  if (!repo) throw new Error('GITHUB_REPOSITORY is not set');
   const tag = tagOf(loadPolicy().policy.apps[repo], config.version);
   // The commit the APK was built from: the bump commit, never the commit before it.
   const sha = config.buildSha || env.GITHUB_SHA || 'HEAD';

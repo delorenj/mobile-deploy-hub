@@ -234,7 +234,7 @@ async function appHost({ manifest = twoEditions() } = {}) {
   const sdk = await buildTools(root);
   await script(join(bin, 'adb'), fakeAdb(state));
   await script(join(bin, 'bb-emit'), `cat > /dev/null\necho "bb-emit $*" >> "${root}/bb-emit.log"`);
-  await script(join(bin, 'gh'), `echo "gh $*" >> "${root}/gh.log"\n[ "$1 $2" = "release view" ] && exit 1\nexit 0`);
+  await script(join(bin, 'gh'), `echo "gh $*" >> "${root}/gh.log"\n[ "$1 $2" = "release view" ] && exit 1\n[ "$1" = "api" ] && echo "\${GH_PRIVATE:-true}"\nexit 0`);
   const output = join(root, 'github-output.txt');
   await writeFile(output, '');
   const remote = args => git(root, ['--git-dir', origin, ...args], baseEnv).trim();
@@ -352,7 +352,9 @@ async function deliverHost({ policyPublic = true, manifestPublic = true, betaByt
   const sha = text => execFileSync('sha256sum', [], { input: text }).toString().slice(0, 64);
   const receipts = join(out, 'receipts');
   await mkdir(receipts, { recursive: true });
-  await writeFile(join(receipts, 'hub-receipt-android.json'), JSON.stringify({ lane: 'android', outcome: deviceOutcome, version: '0.2.2', staged: { name: 'example-app-0.2.2-5.apk', bytes: deviceBytes.length, sha256: sha(deviceBytes) }, quickdrop: { status: 'skipped' }, delivery: { platform: 'android', status: 'pending', reason: "not on big-chungus's adb", sha256: sha(deviceBytes) } }));
+  await writeFile(join(receipts, 'hub-receipt-android.json'), JSON.stringify({ lane: 'android', outcome: deviceOutcome, version: '0.2.2', staged: { name: 'example-app-0.2.2-5.apk', bytes: deviceBytes.length, sha256: sha(deviceBytes) }, quickdrop: { status: 'skipped' }, delivery: { platform: 'android', status: 'pending', reason: "not on big-chungus's adb", sha256: sha(deviceBytes) },
+    // The android lane's own receipt names every edition it built (android.mjs), private ones included.
+    editions: [{ edition: 'beta', package: 'io.example.beta', staged: { name: 'example-app-beta-0.2.2-5.apk', bytes: betaBytes.length, sha256: sha(betaBytes) }, public: manifestPublic }] }));
   if (betaReceipt) await writeFile(join(receipts, 'hub-receipt-android-edition-beta.json'), JSON.stringify({ lane: 'android-edition-beta', outcome: 'success', version: '0.2.2', edition: { name: 'beta', package: 'io.example.beta', device: false, public: manifestPublic }, staged: { name: 'example-app-beta-0.2.2-5.apk', bytes: betaBytes.length, sha256: sha(betaBytes) } }));
   const env = { PATH: process.env.PATH, ANDROID_HOME: sdk, JAVA_HOME: join(root, 'java'), GITHUB_REPOSITORY: 'delorenj/example-app', GITHUB_RUN_ID: '777', GITHUB_RUN_ATTEMPT: '1', HUB_REF: 'local', HUB_LOCK_DIR: join(root, 'locks'), HUB_NEEDS: JSON.stringify({ plan: { result: 'success' }, android: { result: deviceOutcome } }) };
   const configure = (extra = []) => ({ ...parseConfig(['deliver', '--scope', 'android', '--manifest', 'mobile-deploy.json', '--out', out, '--version', '0.2.2', '--android-code', '5', '--build-sha', 'b'.repeat(40), ...extra], env), cwd: app });
@@ -360,7 +362,8 @@ async function deliverHost({ policyPublic = true, manifestPublic = true, betaByt
   const s3 = { putText(text, key) { writes.push({ op: 'put', key, text }); }, put(file, key) { writes.push({ op: 'put', key, file }); }, remove(key) { writes.push({ op: 'rm', key }); }, list() { return []; } };
   const logs = [];
   const run = (extra = [], { fetchImpl = notFound } = {}) => deliver(configure(extra), { env, home: root, fetchImpl, s3Factory: async () => s3, log: line => logs.push(line), policyFile: policyPath });
-  return { root, staging, writes, logs, run, sha, cleanup: () => rm(root, { recursive: true, force: true }) };
+  const receipt = () => readJson(join(out, 'deliver/hub-receipt-deliver-android.json'));
+  return { root, staging, writes, logs, run, sha, receipt, cleanup: () => rm(root, { recursive: true, force: true }) };
 }
 
 test('deliver publishes a public edition to its own stable folder: APK, checksum, receipt, pointer, page; the device pointer stays the device\'s', async () => {
@@ -398,15 +401,17 @@ test('a private edition is never written to the build directory, whichever side 
       assert.deepEqual(result.editions.map(item => [item.name, item.public, item.pointer, item.url]), [['beta', false, 'private', null]]);
     } finally { await d.cleanup(); }
   }
-  // The manifest alone can never publish: the policy must allow it (the gate refuses first; deliver refuses again).
+  // The manifest alone can never publish: the policy must allow it (the gate refuses first; deliver refuses again, for
+  // the edition alone: the device edition is delivered, then the job fails).
   const d = await deliverHost({ policyPublic: false, manifestPublic: true });
   try {
-    await assert.rejects(d.run(['--dry-run', 'false']), /HUB_GATE_REFUSED pins: the manifest asks to publish the beta edition publicly; the policy does not allow it/);
-    assert.deepEqual(d.writes, []);
+    await assert.rejects(d.run(['--dry-run', 'false']), /beta edition was not published \(beta: HUB_GATE_REFUSED pins: the manifest asks to publish the beta edition publicly; the policy does not allow it/);
+    assert.ok(!d.writes.some(write => /editions|io\.example\.beta|-beta-/.test(`${write.key} ${write.text ?? ''}`)), d.writes.map(write => write.key).join('\n'));
+    assert.ok(d.writes.some(write => write.key === 'example-app/latest.json'), 'the device edition still publishes');
   } finally { await d.cleanup(); }
 });
 
-test('deliver refuses a staged edition APK that is not the policy\'s package and signer, or has no receipt, and publishes none of it', async () => {
+test('deliver refuses a staged edition APK that is not the policy\'s package and signer, or has no receipt, publishes none of it, and still delivers the device edition', async () => {
   const cases = [
     [{ betaBytes: 'io.example.beta 0.2.2 5 beta WRONGSIGNER' }, /APK signer e{64} differs from the pinned/],
     [{ betaBytes: 'io.example.app 0.2.2 5 beta ' }, /the staged beta edition APK is io\.example\.app 0\.2\.2 \(5\), not io\.example\.beta/],
@@ -417,7 +422,13 @@ test('deliver refuses a staged edition APK that is not the policy\'s package and
     const d = await deliverHost(options);
     try {
       await assert.rejects(d.run(['--dry-run', 'false']), pattern);
-      assert.deepEqual(d.writes, [], 'nothing published, the device pointer included');
+      const keys = d.writes.map(write => write.key);
+      assert.ok(!keys.some(key => /editions/.test(key)), `nothing of the edition is published\n${keys.join('\n')}`);
+      for (const key of ['example-app/0.2.2/example-app-0.2.2-5.apk', 'example-app/latest.json', 'example-app/index.html']) assert.ok(keys.includes(key), `the device edition is delivered: ${key}\n${keys.join('\n')}`);
+      const failed = d.receipt();
+      assert.deepEqual([failed.outcome, failed.stage, failed.editions[0].pointer, failed.pointer.android], ['failure', 'deliver', 'failed', 'replaced']);
+      assert.match(failed.editions[0].reason, pattern);
+      assert.ok(failed.published.apk, 'the failure receipt keeps what the device published');
     } finally { await d.cleanup(); }
   }
   // A failed android lane publishes no edition (the device block reports the failure as before).
@@ -446,6 +457,56 @@ test('a dry run deliver checks and renders the edition and writes nothing; the e
     assert.ok(!newer.writes.some(write => /editions/.test(write.key)), 'an older build never replaces a newer public edition');
     assert.equal(result.editions[0].pointer, 'kept');
   } finally { await newer.cleanup(); }
+});
+
+test('the android lane\'s real receipt never names an edition in the build directory: private or public', async () => {
+  for (const options of [{ policyPublic: false, manifestPublic: false }, { policyPublic: true, manifestPublic: true }]) {
+    const d = await deliverHost(options);
+    try {
+      await d.run(['--dry-run', 'false']);
+      const published = d.writes.find(write => write.key === 'example-app/0.2.2/receipt-android.json');
+      assert.ok(published, d.writes.map(write => write.key).join('\n'));
+      assert.doesNotMatch(published.text, /io\.example\.beta|-beta-|"editions"/, 'the device receipt in the bucket names no edition');
+    } finally { await d.cleanup(); }
+  }
+});
+
+test('a public edition that fails to publish never holds back the device: latest.json, inflight.json and the catch-up refresh all happen', async () => {
+  const d = await deliverHost();
+  try {
+    const inflight = JSON.stringify({ schema: 1, run: { id: '777' }, platforms: ['android'] });
+    const fetchImpl = async url => {
+      if (String(url).endsWith(editionLatestKey('example-app', 'beta'))) return { status: 200, ok: true, text: async () => '{"extra":1}' };
+      if (String(url).endsWith('example-app/inflight.json')) return { status: 200, ok: true, text: async () => inflight };
+      return { status: 404, ok: false, text: async () => '' };
+    };
+    await assert.rejects(d.run(['--dry-run', 'false'], { fetchImpl }), /the beta edition was not published \(beta: edition latest\.json: unknown key "extra"\); the device's delivery stands/);
+    const ops = d.writes.map(write => `${write.op} ${write.key}`);
+    assert.ok(ops.includes('put example-app/latest.json'), ops.join('\n'));
+    assert.ok(ops.includes('rm example-app/inflight.json'), `this run's inflight.json is cleared, so the catch-up is free to install\n${ops.join('\n')}`);
+    assert.ok(!ops.some(op => /editions/.test(op)), ops.join('\n'));
+    assert.ok(d.logs.some(line => /^::error::edition beta \(io\.example\.beta\) was not published/.test(line)), d.logs.join('\n'));
+    assert.equal(d.receipt().editions[0].pointer, 'failed');
+  } finally { await d.cleanup(); }
+  // A dry run reports the same edition failure and still writes nothing.
+  const dry = await deliverHost({ betaReceipt: false });
+  try {
+    await assert.rejects(dry.run([]), /the beta edition's receipt for 0\.2\.2 is missing/);
+    assert.deepEqual(dry.writes, []);
+  } finally { await dry.cleanup(); }
+});
+
+test('a private edition rides the Release only when GitHub says the repository is private', async () => {
+  const h = await appHost({ manifest: twoEditions({ public: false }) });
+  try {
+    const planned = await quiet(() => plan(h.configure('plan', ['--dry-run', 'false']), { env: h.env, home: h.root, fetchImpl: notFound, s3Factory: async () => h.s3 }));
+    git(h.app, ['checkout', '-q', planned.build_sha], h.env);
+    await quiet(() => android(h.configure('android', ['--dry-run', 'false', '--version', '0.2.2', '--android-code', '5', '--build-sha', planned.build_sha]), { env: h.env, home: h.root, quickdropLink: async () => ({ onLan: true, reason: 'test' }) }));
+    await quiet(() => release(h.configure('release', ['--dry-run', 'false', '--version', '0.2.2', '--android-code', '5', '--build-sha', planned.build_sha]), { env: { ...h.env, GH_TOKEN: 'token', GH_PRIVATE: 'false' } }));
+    const created = readFileSync(join(h.root, 'gh.log'), 'utf8').split('\n').find(line => line.startsWith('gh release create'));
+    assert.match(created, /android\/App\.apk .*hub-receipt-android\.json/);
+    assert.doesNotMatch(created, /beta/, 'a public repository\'s Release carries no private edition');
+  } finally { await h.cleanup(); }
 });
 
 // ---------------------------------------------------------------------------------------------------- device selection

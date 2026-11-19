@@ -74,8 +74,10 @@ android  device APK built, verified, staged            (as before)
                        staged to <staging>/android/editions/<name>/<slug>-<name>-<v>-<code>.apk
                        receipt hub-receipt-android-edition-<name>.json
          S26 install + Quickdrop: device APK only        (never an edition)
-release  private GitHub Release: device APK and receipt as before, plus each edition's APK and receipt
-deliver  device edition as before; each public edition published (below); private editions write nothing
+release  GitHub Release: device APK and receipt as before, plus each edition's APK and receipt when GitHub says the
+         repository is private (on a public repository only public editions ride along: HUB_RELEASE_EDITION_HELD)
+deliver  device edition as before (pointer, pages, inflight.json, catch-up refresh), then each public edition (below);
+         private editions write nothing, and the device's public receipt-android.json names no edition
 ```
 
 A wrong signer or package, a missing artifact or a version mismatch in any edition fails the build stage (`edition <name>: ...`), before anything is installed or published.
@@ -94,7 +96,9 @@ builds/<slug>/editions/<edition>/index.html      one APK link, the checksum, the
 
 This is the hub's existing public bucket (https://s3.delo.sh/builds, MinIO, no 25 MiB page limit). Writes go under the same `s3-<slug>` lock as the device publish: APK and checksum first, then the receipt, then `latest.json`, then the page, so a reader never sees a pointer to missing bytes. The pointer moves forward only (greater version, then code; a rerun of the same release is allowed); an older build keeps the newer one and logs `HUB_EDITION_POINTER`. Retention keeps the newest `keep_apk` version folders and the pointer's, per edition, and touches nothing else. A dry run renders and checks everything and writes nothing (`HUB_EDITION_DRY_RUN`).
 
-Deliver re-verifies the staged APK before publishing: the receipt is a success, the file name and sha match the receipt, the signer and package equal the policy pins, and the version and code equal the run's. If any check fails nothing is published, the device edition included.
+Deliver re-verifies the staged APK before publishing: the receipt is a success, the file name and sha match the receipt, the signer and package equal the policy pins, and the version and code equal the run's. If any check fails, nothing of that edition is published.
+
+An edition never holds the device back. Its checks run per edition, and its publication runs after the device's `latest.json`, pages and `inflight.json` cleanup, so the S26's Install APK and catch-up get the new build whatever happens to an edition. A failed edition is logged (`::error::edition <name> ... was not published`), recorded in the deliver receipt (`editions[].pointer: "failed"` with its `reason`), and fails the deliver job only at its very end, once the device's delivery is written. Fix the cause and `gh run rerun <id> --failed`: the device publish repeats idempotently (same release, same run) and the edition is retried. No second bump.
 
 ## Obtainium
 
@@ -109,6 +113,8 @@ Add the app with source type HTML, URL `https://s3.delo.sh/builds/<slug>/edition
 | `edition <name>: APK signer ... differs from the pinned` | the hook signed with the wrong key; nothing was installed or published |
 | `... is declared twice` / `... already writes` | a copied block, a path shared by two editions; fixed before any bump |
 | `HUB_EDITION_POINTER` | a build older than the published edition was kept out of the pointer |
+| `the <name> edition was not published (...); the device's delivery stands` | deliver: the device is delivered; fix the edition's cause (staged bytes, receipt, a hand-edited edition `latest.json`) and rerun the failed job |
+| `HUB_RELEASE_EDITION_HELD` | the repository is not private (or GitHub did not answer), so a private edition stayed off the Release |
 
 ## Earshot adoption
 
