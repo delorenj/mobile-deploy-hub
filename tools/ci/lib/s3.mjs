@@ -26,10 +26,12 @@ export const contentTypes = Object.freeze({
   '.html': 'text/html; charset=utf-8',
   '.json': 'application/json',
   '.png': 'image/png',
+  // A public edition's checksum file (MOBI-14), in sha256sum's format.
+  '.sha256': 'text/plain; charset=utf-8',
 });
 
 export function contentTypeOf(key) {
-  const match = /\.[a-z]+$/.exec(key);
+  const match = /\.[a-z0-9]+$/.exec(key);
   const type = match && contentTypes[match[0]];
   if (!type) throw new Error(`no content type for ${key}; the build directory holds only ${Object.keys(contentTypes).join(' ')}`);
   return type;

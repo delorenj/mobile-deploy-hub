@@ -161,3 +161,19 @@ ${deviceItems(latest)}
 </div>`).join('\n');
   return page('Builds', `<h1>Builds</h1>\n<p class="muted">Tower of Lost Things, Green In Between and Gruvato, as mobile-deploy-hub published them.</p>\n${cards}`);
 }
+
+// MOBI-14: a public edition's page, builds/<slug>/editions/<edition>/index.html. It carries exactly one APK link (the
+// current build, its version in the file name), so Obtainium's HTML source finds it and reads the version from it; the
+// checksum file and latest.json sit beside it. It never lists the device edition or any other edition.
+export function editionPage(pointer) {
+  const name = pointer.key.split('/').pop();
+  const body = `<h1>${html(pointer.app)} · ${html(pointer.title)}</h1>
+<p class="muted">Version <span class="version">${html(pointer.version)}</span> (${html(pointer.code)}), package <code>${html(pointer.package)}</code></p>
+<div class="card">
+<div class="buttons"><a class="button" href="${attr(pointer.url)}">Download ${html(name)}${pointer.bytes ? ` (${megabytes(pointer.bytes)})` : ''}</a></div>
+<p>SHA-256 <code>${html(pointer.sha256)}</code> · <a href="${attr(pointer.sha256_url)}">checksum file</a></p>
+<p class="muted">Signing certificate SHA-256 <code>${html(pointer.signer_sha256)}</code></p>
+</div>
+<p class="muted">Commit <code>${html(short(pointer.commit))}</code>. Updated ${html(pointer.updated_at)}. The current version as data: <a href="latest.json">latest.json</a>.</p>`;
+  return page(`${pointer.app} ${pointer.title}`, body);
+}
