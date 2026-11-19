@@ -27,7 +27,10 @@
     },
     "delorenj/earshot": {
       "slug": "earshot", "lanes": ["android"],
-      "android": { "package": "sh.delo.earshot", "signer_sha256": "edcb667da42bd67c7de3d31cb22c38e223d81c159d0987d186cda24e951d6eac" }
+      "android": {
+        "package": "sh.delo.earshot", "signer_sha256": "edcb667da42bd67c7de3d31cb22c38e223d81c159d0987d186cda24e951d6eac",
+        "editions": { "beta": { "package": "io.automaticai.earshot", "signer_sha256": "edcb667da42bd67c7de3d31cb22c38e223d81c159d0987d186cda24e951d6eac" } }
+      }
     },
     "delorenj/shortwave": {
       "slug": "shortwave", "lanes": ["android"],

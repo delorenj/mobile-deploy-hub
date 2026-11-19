@@ -18,9 +18,9 @@ import { checkCaller, refusal } from '../lib/caller.mjs';
 import { loadDevices } from '../lib/devices.mjs';
 import { attempt } from '../lib/exec.mjs';
 import { latestKey, parseLatest } from '../lib/latest.mjs';
-import { loadManifest } from '../lib/manifest.mjs';
+import { editionsOf, loadManifest } from '../lib/manifest.mjs';
 import { macEstimate, tailscaleStatus } from '../lib/metered.mjs';
-import { appFor, bundleSplitOf, groupsLabel, requiredTargets, testflightPolicyOf } from '../lib/policy.mjs';
+import { appFor, bundleSplitOf, editionPinOf, groupsLabel, requiredTargets, testflightPolicyOf } from '../lib/policy.mjs';
 import { buildReceipt, setOutputs, writeReceipt } from '../lib/receipt.mjs';
 import { jobWriter, probe, readObject } from '../lib/s3.mjs';
 import { guarded, policyBanner, readCatchupMode, readMacLink, releaseRef } from './common.mjs';
@@ -83,6 +83,16 @@ export function checkPins({ app, manifest }) {
   if (app.android && manifest.android) {
     if (manifest.android.package !== app.android.package) throw refusal('pins', `the manifest's android.package is ${manifest.android.package}; the policy pins ${app.android.package}`);
     if (manifest.android.signer_sha256 !== app.android.signer_sha256) throw refusal('pins', `the manifest's android.signer_sha256 is ${String(manifest.android.signer_sha256).slice(0, 12)}...; the policy pins ${app.android.signer_sha256.slice(0, 12)}... (a new signing key is a hub release)`);
+    // MOBI-14: every extra edition is pinned too, and only the policy can let one be published anonymously. An edition
+    // the policy pins but the manifest no longer declares is inert.
+    for (const { name, spec } of editionsOf(manifest)) {
+      const pin = editionPinOf(app, name);
+      const where = `android.editions.${name}`;
+      if (!pin) throw refusal('pins', `the manifest declares the Android edition ${name} (${spec.package}); the policy pins no such edition (apps.<repo>.android.editions.${name}; a new edition is a hub release)`);
+      if (spec.package !== pin.package) throw refusal('pins', `the manifest's ${where}.package is ${spec.package}; the policy pins ${pin.package}`);
+      if (spec.signer_sha256 !== pin.signer_sha256) throw refusal('pins', `the manifest's ${where}.signer_sha256 is ${spec.signer_sha256.slice(0, 12)}...; the policy pins ${pin.signer_sha256.slice(0, 12)}... (a new signing key is a hub release)`);
+      if (spec.public && pin.public !== true) throw refusal('pins', `the manifest asks to publish the ${name} edition (${spec.package}) publicly; the policy does not allow it (apps.<repo>.android.editions.${name}.public; public publication is a hub release)`);
+    }
   }
   if (app.ios && manifest.ios && manifest.ios.bundle !== app.ios.bundle) throw refusal('pins', `the manifest's ios.bundle is ${manifest.ios.bundle}; the policy pins ${app.ios.bundle}`);
   // The App Store bundle is pinned too: the policy's store_bundle, else the device bundle (Tower's is one id).

@@ -7,7 +7,17 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 const topKeys = ['schema', 'project', 'version', 'android', 'ios'];
-const androidKeys = ['package', 'prepare', 'export', 'godot', 'bundle', 'bundle_artifact', 'artifact', 'receipt', 'signer_sha256'];
+const androidKeys = ['package', 'prepare', 'export', 'godot', 'bundle', 'bundle_artifact', 'artifact', 'receipt', 'signer_sha256', 'editions'];
+// MOBI-14: more signed Android editions of one app (docs/multi-edition-android.md). The top-level android block is the
+// device edition, the one APK the S26, Quickdrop and the catch-up ever see. Each entry of android.editions is another
+// signed APK of the same version (its own package, hook, artifact, receipt and signer pin) that the android job builds
+// and verifies beside it and never installs. `public` opts it into the anonymous edition page; the policy must allow it.
+const editionKeys = ['package', 'prepare', 'export', 'godot', 'artifact', 'receipt', 'signer_sha256', 'public'];
+const publicKeys = ['title'];
+export const editionName = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
+// "device" names the top-level block in receipts and docs, so no extra edition may take it.
+export const reservedEditions = Object.freeze(['device']);
+export const maxEditions = 8;
 const iosKeys = ['bundle', 'prepare', 'export', 'archive', 'receipt', 'device', 'device_artifact', 'store'];
 // Two shapes of one store lane. With ios.export (Tower, Navi) the Linux half writes the App Store Xcode project: archive and
 // receipt name it, and the app's upload hook signs and uploads it on the Mac. Without ios.export (a Mac-only app, Green In
@@ -59,29 +69,129 @@ function sha1(section, value) {
   if (value.signer_sha1 !== undefined && !/^[0-9A-F]{40}$/.test(value.signer_sha1)) fail(`${section}.signer_sha1 must be an uppercase hex SHA-1 fingerprint`);
 }
 
+// The APK half every edition shares: the package, the optional prepare hook, the export hook (or a Godot preset), the
+// artifact, the optional app receipt and the signer pin. `why` finishes the message for a block with no APK lane.
+function apkLane(section, value, why) {
+  const pkg = text(section, value, 'package', { required: true });
+  if (!/^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/.test(pkg)) fail(`${section}.package must be a reverse-DNS package name`);
+  text(section, value, 'prepare');
+  relativePath(section, value, 'receipt');
+  const sideload = text(section, value, 'export') ?? value.godot;
+  if (value.godot !== undefined) {
+    exactKeys(`${section}.godot`, value.godot, ['path', 'preset']);
+    text(`${section}.godot`, value.godot, 'path', { required: true });
+    text(`${section}.godot`, value.godot, 'preset', { required: true });
+    if (value.export !== undefined) fail(`${section} declares both export and godot; pick one`);
+  }
+  if (sideload === undefined) fail(`${section} needs an export hook or a godot section: ${why}`);
+  relativePath(section, value, 'artifact', { suffix: '.apk', required: true });
+  if (!/^[0-9a-f]{64}$/.test(value.signer_sha256 ?? '')) fail(`${section}.signer_sha256 must be a lowercase hex SHA-256 digest`);
+}
+
 function androidSection(android) {
   exactKeys('android', android, androidKeys);
-  const pkg = text('android', android, 'package', { required: true });
-  if (!/^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/.test(pkg)) fail('android.package must be a reverse-DNS package name');
-  text('android', android, 'prepare');
-  relativePath('android', android, 'receipt');
-  const sideload = text('android', android, 'export') ?? android.godot;
-  if (android.godot !== undefined) {
-    exactKeys('android.godot', android.godot, ['path', 'preset']);
-    text('android.godot', android.godot, 'path', { required: true });
-    text('android.godot', android.godot, 'preset', { required: true });
-    if (android.export !== undefined) fail('android declares both export and godot; pick one');
-  }
   // Every deploy installs the sideload APK on the S26, so the APK lane is required; Play's AAB is extra.
-  if (sideload === undefined) fail('android needs an export hook or a godot section: every deploy installs the APK on the S26');
-  relativePath('android', android, 'artifact', { suffix: '.apk', required: true });
-  if (!/^[0-9a-f]{64}$/.test(android.signer_sha256 ?? '')) fail('android.signer_sha256 must be a lowercase hex SHA-256 digest');
+  apkLane('android', android, 'every deploy installs the APK on the S26');
   if (android.bundle !== undefined) {
     text('android', android, 'bundle');
     relativePath('android', android, 'bundle_artifact', { suffix: '.aab', required: true });
   } else if (android.bundle_artifact !== undefined) {
     fail('android.bundle_artifact needs android.bundle');
   }
+  if (android.editions !== undefined) editionsSection(android);
+}
+
+// The extra editions, refused before any version is spent when they are malformed or collide: a bad name, the reserved
+// device name, a `device` flag (the device edition is the top-level block, so there is exactly one), a package another
+// edition already is, or an artifact or receipt path another edition (or the device edition) already writes.
+function editionsSection(android) {
+  const editions = android.editions;
+  if (!editions || typeof editions !== 'object' || Array.isArray(editions)) fail('android.editions must be an object of named editions');
+  const names = Object.keys(editions);
+  if (names.length === 0) fail('android.editions names no edition; leave it out for a single-edition app');
+  if (names.length > maxEditions) fail(`android.editions names ${names.length} editions; at most ${maxEditions}`);
+  const packages = new Map([[android.package, 'the device edition (android.package)']]);
+  const paths = new Map();
+  const claim = (path, where) => {
+    if (path === undefined) return;
+    if (paths.has(path)) fail(`${where} is ${path}, which ${paths.get(path)} already writes; every edition needs its own artifact and receipt`);
+    paths.set(path, where);
+  };
+  claim(android.artifact, 'android.artifact');
+  claim(android.receipt, 'android.receipt');
+  claim(android.bundle_artifact, 'android.bundle_artifact');
+  for (const name of names) {
+    const section = `android.editions.${name}`;
+    if (!editionName.test(name) || name.length > 32) fail(`android.editions: "${name}" is not an edition name (lowercase letters, digits and single dashes, starting with a letter, at most 32 characters)`);
+    if (reservedEditions.includes(name)) fail(`android.editions: "${name}" is reserved for the device edition, which is the top-level android block`);
+    const spec = editions[name];
+    if (spec && typeof spec === 'object' && !Array.isArray(spec) && 'device' in spec) fail(`${section}.device: the device edition is the top-level android block; an extra edition never installs on a device`);
+    exactKeys(section, spec, editionKeys);
+    apkLane(section, spec, 'the hub builds and signs every declared edition');
+    if (packages.has(spec.package)) fail(`${section}.package ${spec.package} is already ${packages.get(spec.package)}; every edition is its own package`);
+    packages.set(spec.package, section);
+    claim(spec.artifact, `${section}.artifact`);
+    claim(spec.receipt, `${section}.receipt`);
+    if (spec.public !== undefined) {
+      exactKeys(`${section}.public`, spec.public, publicKeys);
+      const title = text(`${section}.public`, spec.public, 'title');
+      if (title !== undefined && (title.length > 80 || /[\r\n]/.test(title))) fail(`${section}.public.title must be one line of at most 80 characters`);
+    }
+  }
+}
+
+// JSON.parse keeps the last of two equal keys, so a copied edition block whose name was not changed would silently
+// replace the first. The manifest has already parsed, so this walk only has to find object keys, and only reports the
+// ones under `under` (android.editions): a duplicate elsewhere keeps its pre-MOBI-14 meaning.
+export function duplicateKeys(source, under = ['android', 'editions']) {
+  let at = 0;
+  const found = [];
+  const space = () => { while (at < source.length && ' \t\n\r'.includes(source[at])) at += 1; };
+  const string = () => {
+    const start = at;
+    at += 1;
+    while (source[at] !== '"') at += source[at] === '\\' ? 2 : 1;
+    at += 1;
+    return JSON.parse(source.slice(start, at));
+  };
+  const inside = path => path.length >= under.length && under.every((key, index) => path[index] === key);
+  const value = path => {
+    space();
+    const head = source[at];
+    if (head === '{') {
+      at += 1;
+      const seen = new Set();
+      space();
+      if (source[at] === '}') { at += 1; return; }
+      for (;;) {
+        space();
+        const key = string();
+        space();
+        at += 1;
+        if (seen.has(key) && inside(path)) found.push([...path, key].join('.'));
+        seen.add(key);
+        value([...path, key]);
+        space();
+        if (source[at++] === ',') continue;
+        return;
+      }
+    }
+    if (head === '[') {
+      at += 1;
+      space();
+      if (source[at] === ']') { at += 1; return; }
+      for (let index = 0; ; index += 1) {
+        value([...path, String(index)]);
+        space();
+        if (source[at++] === ',') continue;
+        return;
+      }
+    }
+    if (head === '"') { string(); return; }
+    while (at < source.length && !',]} \t\n\r'.includes(source[at])) at += 1;
+  };
+  value([]);
+  return found;
 }
 
 function bundleId(section, value) {
@@ -142,6 +252,10 @@ export function parseManifest(source) {
   text('version', manifest.version, 'read', { required: true });
   text('version', manifest.version, 'bump', { required: true });
   if (manifest.android !== undefined) androidSection(manifest.android);
+  if (manifest.android?.editions !== undefined) {
+    const twice = duplicateKeys(source);
+    if (twice.length > 0) fail(`${twice[0]} is declared twice; JSON keeps only the last, so an edition would vanish`);
+  }
   if (manifest.ios !== undefined) iosSection(manifest.ios);
   return manifest;
 }
@@ -150,4 +264,9 @@ export async function loadManifest(cwd, path) {
   let source;
   try { source = await readFile(join(cwd, path), 'utf8'); } catch (error) { fail(`cannot read ${path} (${error.code ?? error.message})`); }
   return parseManifest(source);
+}
+
+// The extra editions in declaration order: [{name, spec}]. An app without android.editions has none (single edition).
+export function editionsOf(manifest) {
+  return Object.entries(manifest?.android?.editions ?? {}).map(([name, spec]) => ({ name, spec }));
 }

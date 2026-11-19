@@ -98,6 +98,31 @@ export function bundleSplitOf(policy, repo, app, manifest = null) {
   return { status, device, store, allowed, repo };
 }
 
+// MOBI-14: the extra Android editions an app may build (docs/multi-edition-android.md). The top-level package and signer
+// stay the device edition's, the only APK a device, Quickdrop or the catch-up may receive; each named edition pins its own
+// package and signer, so the gate and deliver hold every edition's APK to the policy and never to a manifest alone.
+// `public: true` is the hub's half of the opt-in to the anonymous edition page (the manifest's `public` block is the
+// app's half); without it an edition stays private (built, verified, attached to the private Release, never published).
+export const editionNamePattern = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
+
+function androidEditions(where, android) {
+  const editions = android.editions;
+  if (!isObject(editions) || Object.keys(editions).length === 0) fail(`${where} must name at least one edition`);
+  const packages = new Set([android.package]);
+  for (const [name, edition] of Object.entries(editions)) {
+    if (!editionNamePattern.test(name) || name.length > 32 || name === 'device') fail(`${where} has a bad edition name ${JSON.stringify(name)} (lowercase letters, digits and dashes; "device" is the top-level block)`);
+    exact(`${where}.${name}`, edition, ['package', 'signer_sha256'], ['public']);
+    if (!/^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/.test(edition.package ?? '')) fail(`${where}.${name}.package must be an Android package name`);
+    if (packages.has(edition.package)) fail(`${where}.${name}.package ${edition.package} is already pinned for this app; every edition is its own package`);
+    packages.add(edition.package);
+    if (!/^[0-9a-f]{64}$/.test(edition.signer_sha256 ?? '')) fail(`${where}.${name}.signer_sha256 must be the lowercase sha256 of the signing certificate`);
+    if ('public' in edition && typeof edition.public !== 'boolean') fail(`${where}.${name}.public must be true or false`);
+  }
+}
+
+// The policy's pin for one extra edition of an app, or null.
+export const editionPinOf = (app, name) => app?.android?.editions?.[name] ?? null;
+
 export function parsePolicy(source) {
   let policy;
   try { policy = JSON.parse(source); } catch (error) { fail(`not valid JSON (${error.message})`); }
@@ -137,9 +162,10 @@ export function parsePolicy(source) {
     if (slugs.has(app.slug)) fail(`apps: slug ${app.slug} is used twice`);
     slugs.add(app.slug);
     if (app.lanes.includes('android')) {
-      exact(`apps.${repo}.android`, app.android, ['package', 'signer_sha256']);
+      exact(`apps.${repo}.android`, app.android, ['package', 'signer_sha256'], ['editions']);
       if (!/^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/.test(app.android.package ?? '')) fail(`apps.${repo}.android.package must be an Android package name`);
       if (!/^[0-9a-f]{64}$/.test(app.android.signer_sha256 ?? '')) fail(`apps.${repo}.android.signer_sha256 must be the lowercase sha256 of the signing certificate`);
+      if ('editions' in app.android) androidEditions(`apps.${repo}.android.editions`, app.android);
     }
     if (app.lanes.includes('ios')) {
       // store_bundle: the App Store bundle id, when it differs from the iPad's development one (Green In Between's
