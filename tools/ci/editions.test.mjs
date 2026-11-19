@@ -125,7 +125,7 @@ const exampleApp = (editions = { beta: { package: 'io.example.beta', signer_sha2
 
 test('the policy pins each edition\'s package and signer; public is the policy\'s half of the opt-in', () => {
   const earshot = policy.apps['delorenj/earshot'];
-  assert.deepEqual([earshot.android.package, editionPinOf(earshot, 'beta')?.package, editionPinOf(earshot, 'beta')?.public ?? false], ['sh.delo.earshot', 'io.automaticai.earshot', false], 'Earshot\'s beta is pinned, and stays private until a release allows it');
+  assert.deepEqual([earshot.android.package, editionPinOf(earshot, 'beta')?.package, editionPinOf(earshot, 'beta')?.public ?? false], ['sh.delo.earshot', 'io.automaticai.earshot', true], 'Earshot\'s beta is pinned and public (EARS-3: the paid beta APK is an anonymous download)');
   assert.equal(editionPinOf(policy.apps['delorenj/gruvato'], 'beta'), null, 'single-edition apps pin no editions');
   const text = readFileSync(policyFile, 'utf8');
   const cases = {
