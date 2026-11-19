@@ -3,6 +3,12 @@
 // only while the S26 syncs from the LAN; never over a newer APK). play and release publish after the build checks, S26
 // or not; since v1.1.3 each writes its own receipt, so a failed upload is reported at stage deliver and never turns
 // the S26's delivery into a failure.
+//
+// MOBI-14: an app may declare more signed editions (android.editions). Each one is built with its own hook (HUB_EDITION
+// names it), checked against its own package, signer pin and the planned version, staged in its own folder and given
+// its own receipt (lane android-edition-<name>), all before the S26 is looked at, so a broken edition fails a dry run
+// and a real run at stage build. Only the device edition (the top-level android block) is ever installed or dropped in
+// Quickdrop; the extra editions go to the private Release, and a public one to its edition page in deliver.
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, mkdirSync, statSync } from 'node:fs';
 import { copyFile, mkdir } from 'node:fs/promises';
@@ -16,7 +22,8 @@ import { hook, run } from '../lib/exec.mjs';
 import { exportGodot } from '../lib/godot.mjs';
 import { apkName } from '../lib/latest.mjs';
 import { withLock } from '../lib/lock.mjs';
-import { loadManifest } from '../lib/manifest.mjs';
+import { editionApkName, editionLane } from '../lib/editions.mjs';
+import { editionsOf, loadManifest } from '../lib/manifest.mjs';
 import { loadPolicy, tagOf } from '../lib/policy.mjs';
 import { uploadBundle } from '../lib/play.mjs';
 import { dropApk, s26OnLan } from '../lib/quickdrop.mjs';
@@ -76,6 +83,11 @@ async function androidLane(config, manifest, { env, home, track, policy, log, qu
   const staged = { name, bytes, sha256 };
   track.receipt.staged = staged;
   log(`HUB_STAGED ${name} ${bytes} bytes for deliver`);
+
+  // The extra editions, built and verified before the S26 step; none of them is ever an install candidate.
+  const editions = [];
+  for (const edition of editionsOf(manifest)) editions.push(await buildEdition(config, manifest, edition, { env, home, hooks, out, stageDir, log }));
+  if (editions.length > 0) track.receipt.editions = editions.map(({ edition, package: pkg, staged: copy }) => ({ edition, package: pkg, staged: copy }));
 
   const planned = Number(config.androidCode);
   const delivery = { platform: 'android', target: devices.android.model, device: devices.android.name, version: config.version, build: String(planned), sha256, verified: false, status: 'pending', reason: null };
@@ -143,8 +155,51 @@ async function androidLane(config, manifest, { env, home, track, policy, log, qu
   }
   track.receipt.quickdrop = quickdrop;
 
-  await writeReceipt(out, buildReceipt({ lane: 'android', config, env, version: config.version, androidCode: config.androidCode, artifacts, signer, notes, delivery, staged, quickdrop }), env);
-  return { out, artifact: apk, sha256, signer, delivery, staged, quickdrop };
+  for (const built of editions) {
+    await writeReceipt(out, buildReceipt({
+      lane: editionLane(built.edition), config, env, version: config.version, androidCode: config.androidCode,
+      artifacts: [{ name: built.staged.name, sha256: built.sha256 }], signer: built.signer,
+      notes: [`edition ${built.edition} (${built.package}): built and verified; never installed on a device${built.public ? '; deliver publishes it if the policy allows' : '; private (Release only)'}`],
+      edition: { name: built.edition, package: built.package, device: false, public: built.public }, staged: built.staged,
+    }), env);
+  }
+  await writeReceipt(out, buildReceipt({ lane: 'android', config, env, version: config.version, androidCode: config.androidCode, artifacts, signer, notes, delivery, staged, quickdrop, ...(editions.length > 0 ? { editions: editions.map(({ edition, package: pkg, staged: copy, public: open }) => ({ edition, package: pkg, staged: copy, public: open })) } : {}) }), env);
+  return { out, artifact: apk, sha256, signer, delivery, staged, quickdrop, editions };
+}
+
+// One extra edition: its hook (with HUB_EDITION and HUB_EDITION_PACKAGE), then the same checks as the device APK (one
+// signer and it is the pin, the package, the planned version and code), its own copy under out/android/editions/<name>/
+// and staging/android/editions/<name>/, named <slug>-<edition>-<X.Y.Z>-<code>.apk so no two editions can share a file.
+async function buildEdition(config, manifest, { name, spec }, { env, home, hooks, out, stageDir, log }) {
+  const where = `android.editions.${name}`;
+  const fault = message => new Error(`edition ${name}: ${message}`);
+  const editionHooks = { ...hooks, HUB_EDITION: name, HUB_EDITION_PACKAGE: spec.package };
+  if (spec.prepare) hook(`${where}.prepare`, spec.prepare, { cwd: config.cwd, env: editionHooks });
+  if (spec.export) hook(`${where}.export`, spec.export, { cwd: config.cwd, env: editionHooks });
+  else await exportGodot({ project: join(config.cwd, spec.godot.path), preset: spec.godot.preset, output: join(config.cwd, spec.artifact), env: editionHooks });
+  const built = join(config.cwd, spec.artifact);
+  if (!exists(built)) throw fault(`the export hook did not produce ${spec.artifact}`);
+  const apkFile = editionApkName(manifest.project.slug, name, config.version, config.androidCode);
+  const dir = join(out, 'editions', name);
+  await mkdir(dir, { recursive: true });
+  const apk = join(dir, apkFile);
+  await copyFile(built, apk);
+  const sha256 = await sha256File(apk);
+  let signer;
+  try { signer = verifySigner({ apk, expected: spec.signer_sha256, env, home }).signer_sha256; } catch (error) { throw fault(error.message); }
+  const identity = apkIdentity({ apk, env, home });
+  if (identity.package !== spec.package) throw fault(`the APK is ${identity.package}, the manifest pins ${spec.package}`);
+  if (identity.versionName !== config.version || String(identity.versionCode) !== config.androidCode) throw fault(`the APK carries ${identity.versionName} (${identity.versionCode}) but the plan says ${config.version} (${config.androidCode}); the bump did not reach the export`);
+  if (spec.receipt && exists(join(config.cwd, spec.receipt))) {
+    await checkAppReceipt(join(config.cwd, spec.receipt), config, `${where}.receipt`);
+    await copyFile(join(config.cwd, spec.receipt), join(dir, basename(spec.receipt)));
+  }
+  const { size: bytes } = statSync(apk);
+  const stage = join(stageDir, 'editions', name);
+  mkdirSync(stage, { recursive: true });
+  copyFileSync(apk, join(stage, apkFile));
+  log(`HUB_EDITION_BUILT ${name} ${spec.package} ${config.version} (${config.androidCode}) sha256=${sha256} bytes=${bytes} signer=${signer}; staged, never installed`);
+  return { edition: name, package: spec.package, apk, sha256, signer, bytes, staged: { name: apkFile, bytes, sha256 }, public: Boolean(spec.public) };
 }
 
 export async function android(config, { env = process.env, home = homedir(), log = console.log, quickdropLink = null } = {}) {
@@ -199,6 +254,13 @@ async function releaseLane(config, { env }) {
   const spec = manifest.android ?? (() => { throw new Error('the manifest has no android section'); })();
   const out = join(config.out, 'android');
   const assets = [basename(spec.artifact), ...(spec.receipt ? [basename(spec.receipt)] : []), 'hub-receipt-android.json'].map(name => join(out, name));
+  // Every extra edition rides the private Release too (its APK and its hub receipt), under names no other asset has.
+  for (const { name } of editionsOf(manifest)) {
+    assets.push(join(out, 'editions', name, editionApkName(manifest.project.slug, name, config.version, config.androidCode)), join(out, `hub-receipt-${editionLane(name)}.json`));
+  }
+  const names = assets.map(asset => basename(asset));
+  const clash = names.find((name, index) => names.indexOf(name) !== index);
+  if (clash) throw new Error(`two Release assets are both named ${clash}; rename the app's artifact or receipt`);
   for (const asset of assets) if (!exists(asset)) throw new Error(`release asset missing: ${asset}`);
   const repo = env.GITHUB_REPOSITORY;
   if (!repo) throw new Error('GITHUB_REPOSITORY is not set');
