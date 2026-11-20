@@ -191,3 +191,25 @@ failed install, and give up on the build for good after `max_failures` passes.
 - `android.public: true` is a deliberate hole. Review it like a credential change.
 - The iOS-lane and opted-in apps' anonymous pages show device states and run links (private repos answer 404 to
   outsiders). Nothing there downloads a private build.
+
+## Live verification (2026-11-19, v1.2.41)
+
+Applied in the documented order: release (every app's strict dry run green), `hosts:install` (catch-up v1.2.41 on big-chungus and the Mac), `bucket-policy:apply` (set-json, read-back equal, pages re-rendered for all six apps), strict `bucket-policy` (59 of 59 anonymous probes answer as the policy says). Everything below is plain `curl` with no credentials against `https://s3.delo.sh/builds`.
+
+| Request | Code |
+| --- | --- |
+| `/`, `/?prefix=earshot/`, `/?list-type=2`, `/?list-type=2&prefix=earshot/editions/beta/` (listings) | 403 |
+| `earshot/<v>/earshot-<v>-<code>.apk` and `.sha256`, receipt, release notes | 403 |
+| `earshot/index.html` (device-only app page) | 403 |
+| `tower-of-lost-things`, `gruvato`, `shortwave` device `.apk` and `.sha256` | 403 |
+| `earshot/latest.json`, `index.html` (root), `index.json` | 200 |
+| `earshot/editions/beta/latest.json`, `index.html` | 200 |
+| `earshot/editions/beta/0.1.11/...-1011.apk` (public edition) | 206 |
+| `green-in-between` and `navi` device `.apk` (kept public, see the decision record) | 206 |
+| `tower-of-lost-things`, `gruvato`, `navi`, `green-in-between` iPad page | 206 |
+
+The anonymous pointer names the device APK's key; that name opens nothing, the object answers 403.
+
+Earshot's real deploy of 0.1.11 (run 44668200341, green) went through the hub: the S26 reads back `versionName=0.1.11`, the public pointer and the beta edition pointer both moved to 0.1.11, and the beta APK is publicly readable. The completion event's Install APK link is presigned for 7 days (`X-Amz-Expires=604800`, `response-cache-control=private, no-store`): without credentials it answered 200 with the exact bytes (sha256 equals the pointer's), while the plain URL of the same object answered 403.
+
+One release attempt (v1.2.40) went red on the green-in-between dry run: that app's own pinned clock-site test did not know its new capture driver. The hub rolled `v1` back, the app test was fixed in the app, and v1.2.41 shipped green.
