@@ -400,11 +400,14 @@ test('MOBI-17: a deliver that sells a public edition keeps the device edition pr
     const deviceApk = 'example-app/0.2.2/example-app-0.2.2-5.apk';
     assert.ok(d.writes.some(write => write.key === deviceApk), 'the device APK is published (privately)');
     assert.equal(isAnonymous(synthetic, deviceApk), false);
-    for (const key of ['example-app/latest.json', 'example-app/index.html', 'example-app/0.2.2/receipt-android.json', 'example-app/0.2.2/release-notes.json']) assert.equal(isAnonymous(synthetic, key), false, key);
-    for (const key of ['example-app/editions/beta/index.html', 'example-app/editions/beta/latest.json']) assert.equal(isAnonymous(synthetic, key), true, key);
+    for (const key of ['example-app/index.html', 'example-app/0.2.2/receipt-android.json', 'example-app/0.2.2/release-notes.json', 'example-app/0.2.2/example-app-0.2.2-5.apk.sha256']) assert.equal(isAnonymous(synthetic, key), false, key);
+    // the pointers name the device APK and never grant it: anonymous, so the catch-up reads them without 1Password
+    for (const key of ['example-app/latest.json', 'example-app/inflight.json', 'example-app/editions/beta/index.html', 'example-app/editions/beta/latest.json']) assert.equal(isAnonymous(synthetic, key), true, key);
     for (const write of d.writes.filter(item => item.text !== undefined)) {
       assert.equal(publicTextProblem(synthetic, write.key, write.text), null, write.key);
-      if (isAnonymous(synthetic, write.key)) assert.doesNotMatch(write.text, /example-app-0\.2\.2-5\.apk|X-Amz-/, `${write.key} is anonymous`);
+      // a pointer names the device APK (the catch-up follows it) and never grants it; nothing else anonymous may
+      if (isAnonymous(synthetic, write.key)) assert.doesNotMatch(write.text, /X-Amz-/, `${write.key} is anonymous`);
+      if (isAnonymous(synthetic, write.key) && !/(^|\/)(latest|inflight)\.json$/.test(write.key)) assert.doesNotMatch(write.text, /example-app-0\.2\.2-5\.apk/, `${write.key} is anonymous`);
     }
     const page = d.writes.find(write => write.key === 'example-app/index.html').text;
     assert.doesNotMatch(page, /Install APK|\.apk/);
@@ -527,8 +530,10 @@ test('a private edition rides the Release only when GitHub says the repository i
     await quiet(() => android(h.configure('android', ['--dry-run', 'false', '--version', '0.2.2', '--android-code', '5', '--build-sha', planned.build_sha]), { env: h.env, home: h.root, quickdropLink: async () => ({ onLan: true, reason: 'test' }) }));
     await quiet(() => release(h.configure('release', ['--dry-run', 'false', '--version', '0.2.2', '--android-code', '5', '--build-sha', planned.build_sha]), { env: { ...h.env, GH_TOKEN: 'token', GH_PRIVATE: 'false' } }));
     const created = readFileSync(join(h.root, 'gh.log'), 'utf8').split('\n').find(line => line.startsWith('gh release create'));
-    assert.match(created, /android\/App\.apk .*hub-receipt-android\.json/);
     assert.doesNotMatch(created, /beta/, 'a public repository\'s Release carries no private edition');
+    // MOBI-17: nor the private device edition (the policy does not publish it), nor its receipts
+    assert.doesNotMatch(created, /App\.apk|hub-receipt-android\.json|receipt/, 'a public repository\'s Release carries no private device APK');
+    assert.match(created, /^gh release create v0\.2\.2 --repo /);
   } finally { await h.cleanup(); }
 });
 

@@ -240,6 +240,9 @@ export function repoIsPrivate(repo, env) {
   return answer.status === 0 && String(answer.stdout).trim() === 'true';
 }
 
+// MOBI-17: the device APK rides the Release when the Release is private, or when the policy publishes it anyway.
+export const deviceRidesRelease = ({ privateRepo, access }) => privateRepo === true || access?.devicePublic === true;
+
 export function releaseArguments({ tag, repo, sha, title, notes, assets, verifyTag = false }) {
   return ['release', 'create', tag, ...assets, '--repo', repo, '--target', sha, '--title', title, '--notes', notes, ...(verifyTag ? ['--verify-tag'] : [])];
 }
@@ -260,14 +263,19 @@ async function releaseLane(config, { env }) {
   if (!env.GH_TOKEN) throw new Error('GH_TOKEN is empty; the caller must grant contents: write');
   const spec = manifest.android ?? (() => { throw new Error('the manifest has no android section'); })();
   const out = join(config.out, 'android');
-  const assets = [basename(spec.artifact), ...(spec.receipt ? [basename(spec.receipt)] : []), 'hub-receipt-android.json'].map(name => join(out, name));
   const repo = env.GITHUB_REPOSITORY;
   if (!repo) throw new Error('GITHUB_REPOSITORY is not set');
+  // A Release is as public as its repository: the repository must say it is private (an unreadable answer counts as
+  // public). MOBI-17: the device APK and its receipts ride a public repository's Release only when the policy publishes
+  // the device edition (lib/access.mjs), so a public repo never hands out what the bucket keeps private.
+  const privateRepo = repoIsPrivate(repo, env);
+  const deviceOpen = deviceRidesRelease({ privateRepo, access: accessFor(loadPolicy().policy, manifest.project.slug) });
+  const assets = deviceOpen ? [basename(spec.artifact), ...(spec.receipt ? [basename(spec.receipt)] : []), 'hub-receipt-android.json'].map(name => join(out, name)) : [];
+  if (!deviceOpen) console.log(`HUB_RELEASE_DEVICE_HELD ${repo} is not a private repository and the policy keeps the device edition private, so its APK and receipts stay off the Release`);
   // Every extra edition rides the Release too (its APK and its hub receipt), under names no other asset has, but a
-  // private edition only when the Release is private: the repository must say it is private (an unreadable answer
-  // counts as public). On a public repository only the editions the manifest and the policy both made public ride along.
+  // private edition only when the Release is private. On a public repository only the editions the manifest and the
+  // policy both made public ride along.
   const declared = editionsOf(manifest);
-  const privateRepo = declared.length > 0 && repoIsPrivate(repo, env);
   for (const { name, spec: edition } of declared) {
     if (!privateRepo && !isPublicEdition(edition, editionPinOf(loadPolicy().policy.apps[repo], name))) {
       console.log(`HUB_RELEASE_EDITION_HELD ${name}: ${repo} is not a private repository, so the private ${name} edition stays off its Release`);
@@ -294,7 +302,7 @@ async function releaseLane(config, { env }) {
   if (existing.status === 0) {
     // The plan never reuses a version, so the Release of this tag came from an earlier attempt of this deploy
     // ("Re-run failed jobs"). Its assets are replaced by this attempt's.
-    run('gh', ['release', 'upload', tag, ...assets, '--repo', repo, '--clobber'], { env, cwd: config.cwd });
+    if (assets.length > 0) run('gh', ['release', 'upload', tag, ...assets, '--repo', repo, '--clobber'], { env, cwd: config.cwd });
     run('gh', ['release', 'edit', tag, '--repo', repo, '--notes', notes], { env, cwd: config.cwd });
     console.log(`HUB_RELEASE_UPDATED ${tag} ${repo}: an earlier attempt published it; assets replaced by this attempt's`);
     return { tag, repo, assets, updated: true };

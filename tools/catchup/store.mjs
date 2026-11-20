@@ -81,10 +81,16 @@ export async function downloadVerified(url, dest, { bytes, sha256, fetchImpl = g
 
 // The bucket as a pass sees it. `root` is the bucket's URL where reads go (http://127.0.0.1:9012/builds on
 // big-chungus, https://s3.delo.sh/builds on the Mac); `writer` exists only on big-chungus.
-// `credentials` (big-chungus only) is the writer's keys, or an async function returning them: every read is signed.
-export function createStore({ root, writer = null, fetchImpl = globalThis.fetch, cacheDir = null, credentials = null }) {
-  const url = key => `${root.replace(/\/$/, '')}/${key}`;
-  const auth = credentials ? async target => signedHeaders({ credentials: typeof credentials === 'function' ? await credentials() : credentials, url: target }) : null;
+// `credentials` (big-chungus only) is the writer's keys, or an async function returning them. `signs(key)` says which
+// reads need them (lib/access.mjs: whatever the bucket policy does not open); the rest go anonymous and never ask for
+// the keys, so a pass that only reads pointers never reaches 1Password (its account allows 1000 reads a day).
+export function createStore({ root, writer = null, fetchImpl = globalThis.fetch, cacheDir = null, credentials = null, signs = () => true }) {
+  const base = `${root.replace(/\/$/, '')}/`;
+  const url = key => `${base}${key}`;
+  const keyOf = target => (target.startsWith(base) ? target.slice(base.length) : target);
+  const auth = credentials
+    ? async target => (signs(keyOf(target)) ? signedHeaders({ credentials: typeof credentials === 'function' ? await credentials() : credentials, url: target }) : {})
+    : null;
   return {
     url,
     auth,

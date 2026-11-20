@@ -32,7 +32,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpath
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { accessOf, linkCacheControl, linkLifetimeS } from '../ci/lib/access.mjs';
+import { accessOf, isAnonymous, linkCacheControl, linkLifetimeS } from '../ci/lib/access.mjs';
 import { createAdb, findPhone } from '../ci/lib/adb.mjs';
 import { apkIdentity, verifySigner } from '../ci/lib/android.mjs';
 import { sanitizeReason } from '../ci/lib/announce.mjs';
@@ -327,8 +327,7 @@ async function readApps(ctx, platform) {
   const unreadable = [];
   let errors = 0;
   for (const app of ctx.settings.apps) {
-    // MOBI-17: the Mac reads anonymously, and only an app with an iOS lane makes its pointer anonymous (D4); an
-    // Android-only app's latest.json answers 403 there, and is big-chungus's to read with keys.
+    // MOBI-17: the Mac's pass is the iPad's; an Android-only app has nothing for it, and is big-chungus's to read.
     if (platform === 'ios' && !app.lanes.includes('ios')) { quiet.push(`${app.slug} no ios build`); continue; }
     let latest;
     try {
@@ -907,9 +906,10 @@ export function linuxContext({
   adbWaitMs = 20_000,
   lockWaitMs = 5_000,
 } = {}) {
-  // Every read of the bucket here is signed with the writer's keys: device APKs and most pointers are not anonymous.
+  // A read of what the bucket policy keeps private (a device APK) is signed with the writer's keys; the pointers are
+  // anonymous, so an idle pass never asks 1Password for them (lib/access.mjs).
   const credentials = typeof writer.credentials === 'function' ? () => writer.credentials() : null;
-  const store = createStore({ root: settings.loopbackRoot, writer, fetchImpl, credentials });
+  const store = createStore({ root: settings.loopbackRoot, writer, fetchImpl, credentials, signs: key => !isAnonymous(settings.policy, key) });
   const cache = join(home, '.cache/mobile-deploy-hub/catchup');
   const adb = createAdb({ env, home });
   const ctx = {

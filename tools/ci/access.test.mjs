@@ -3,7 +3,9 @@
 // the policy parser, and the bucket policy tool (tools/bucket-policy.mjs).
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { accessFor, accessOf, anonymousListing, anonymousResources, assertPublicText, bucketPolicy, cacheControlFor, isAnonymous, linkCacheControl, linkLifetimeS, privateApkPattern, publicTextProblem, renderBucketPolicy, wildcard } from './lib/access.mjs';
 import { linksFor } from './lib/announce.mjs';
@@ -13,7 +15,8 @@ import { appPage, indexData, indexPage } from './lib/pages.mjs';
 import { loadPolicy, parsePolicy } from './lib/policy.mjs';
 import { cacheControlOf, createS3, jobCredentials, publishPages, readObject } from './lib/s3.mjs';
 import { amzDate, maxPresignS, presign, presignedFacts, signedHeaders } from './lib/sigv4.mjs';
-import { adminRefs, check, committedFile, documentDiff, fileProblem, normalize, probe, probePlan, applyDocument, liveDocument } from '../bucket-policy.mjs';
+import { accessMarker, adminRefs, callerRef, check, committedFile, documentDiff, fileProblem, main as bucketMain, normalize, probe, probePlan, probeResults, readiness, rerenderPages, applyDocument, liveDocument } from '../bucket-policy.mjs';
+import { deviceRidesRelease } from './commands/android.mjs';
 
 const { policy } = loadPolicy();
 const policySource = readFileSync(fileURLToPath(new URL('./policy.json', import.meta.url)), 'utf8');
@@ -101,9 +104,14 @@ test('access: no anonymous listing, no private device APK, receipt, notes or pag
     assert.equal(open(`${slug}/1.0.0/release-notes.json`), false);
   }
   assert.equal(open('shortwave/index.html'), false);
-  assert.equal(open('shortwave/latest.json'), false);
   assert.equal(open('earshot/index.html'), false);
-  assert.equal(open('earshot/latest.json'), false);
+  // every app's pointers name a build and never grant it: anonymous, so the catch-up's idle pass needs no 1Password read
+  for (const slug of ['shortwave', 'earshot', 'tower-of-lost-things', 'gruvato']) {
+    assert.equal(open(`${slug}/latest.json`), true, `${slug} latest.json`);
+    assert.equal(open(`${slug}/inflight.json`), true, `${slug} inflight.json`);
+  }
+  assert.equal(open('earshot/latest.jsonx'), false);
+  assert.equal(open('earshot/0.1.10/latest.json'), false, 'only the app-level pointer');
   // D3: the public edition stays anonymous, in its own folder only
   for (const key of ['earshot/editions/beta/index.html', 'earshot/editions/beta/latest.json', 'earshot/editions/beta/1.0.0/earshot-beta-1.0.0-3.apk', 'earshot/editions/beta/1.0.0/receipt.json']) assert.equal(open(key), true, key);
   assert.equal(open('earshot/editions/pro/latest.json'), false, 'only the editions the policy pins public');
@@ -216,12 +224,14 @@ test('headers: objects anonymous readers cannot get are private in every cache; 
   const captured = [];
   const s3 = createS3({ policy, credentials: keys, env: {}, runner: runnerCapture(captured) });
   s3.putText('{}', 'shortwave/latest.json');
+  s3.putText('<p>x</p>', 'shortwave/index.html');
   s3.putText('{}', 'tower-of-lost-things/latest.json');
   s3.putText('{}', 'earshot/editions/beta/latest.json');
   s3.putText('{}', 'shortwave/1.0.0/receipt.json');
   s3.putText('x', 'earshot/editions/beta/1.0.0/receipt.json');
   const attrs = Object.fromEntries(captured.map(item => [item.key, item.attr.split('Cache-Control=')[1]]));
-  assert.equal(attrs['shortwave/latest.json'], '"private, no-cache"');
+  assert.equal(attrs['shortwave/latest.json'], '"no-cache"', 'a pointer is anonymous');
+  assert.equal(attrs['shortwave/index.html'], '"private, no-cache"', 'an Android-only app page is not');
   assert.equal(attrs['tower-of-lost-things/latest.json'], '"no-cache"');
   assert.equal(attrs['earshot/editions/beta/latest.json'], '"no-cache"');
   assert.equal(attrs['shortwave/1.0.0/receipt.json'], '"private, max-age=31536000, immutable"');
@@ -360,6 +370,87 @@ test('bucket-policy: the probe plan expects 403 for what is private and 404 or 2
   assert.deepEqual(expectOf('tower-of-lost-things/0.0.0/tower-of-lost-things-0.0.0-0.apk'), [403]);
   assert.deepEqual(expectOf('navi/0.0.0/navi-0.0.0-0.apk'), [404, 200]);
   assert.deepEqual(expectOf('index.html'), [404, 200]);
+  assert.deepEqual(expectOf('earshot/latest.json'), [404, 200]);
+  assert.deepEqual(expectOf('shortwave/inflight.json'), [404, 200]);
+  assert.deepEqual(expectOf('earshot/0.0.0/earshot-0.0.0-0.apk.sha256'), [403]);
+});
+
+test('bucket-policy: the release check (pending ok) warns on a private key that still answers, and fails on listing, a closed public key or no answer', async () => {
+  const text = readFileSync(committedFile, 'utf8');
+  const old = { Statement: [{ Effect: 'Allow', Principal: { AWS: ['*'] }, Action: ['s3:GetObject'], Resource: ['arn:aws:s3:::builds/*'] }] };
+  const logs = [];
+  assert.deepEqual(await check({ policy, text, pendingOk: true, fetchImpl: bucketFetch(old), log: line => logs.push(line) }), [], 'the old public-read bucket is only pending');
+  assert.ok(logs.some(line => /^::warning::BUCKET_POLICY_PENDING .*shortwave-0\.0\.0-0\.apk answered 404, expected 403/.test(line)));
+  assert.match(logs.at(-1), /^BUCKET_POLICY_PENDING .*private keys? still answer anonymously: after this release, mise run hosts:install, then mise run bucket-policy:apply$/);
+  assert.ok((await check({ policy, text, fetchImpl: bucketFetch(old), log: () => {} })).length > 0, 'the strict check still fails on it');
+  const listing = async url => (url.includes('list-type') ? new Response('', { status: 200 }) : bucketFetch(JSON.parse(text))(url));
+  assert.equal((await check({ policy, text, pendingOk: true, fetchImpl: listing, log: () => {} })).length, 1, 'listing is never pending');
+  const closed = async url => (url.includes('editions/beta') ? new Response('', { status: 403 }) : bucketFetch(old)(url));
+  assert.ok((await check({ policy, text, pendingOk: true, fetchImpl: closed, log: () => {} })).some(problem => /editions\/beta.*answered 403, expected 404 or 200/.test(problem)), 'a public edition answering 403 fails the release');
+  assert.equal((await check({ policy, text, pendingOk: true, fetchImpl: async () => { throw new Error('ECONNREFUSED'); }, log: () => {} })).length, probePlan(policy).length);
+  const kinds = new Set((await probeResults({ policy, fetchImpl: bucketFetch(old) })).map(problem => problem.kind));
+  assert.deepEqual([...kinds], ['open']);
+});
+
+test('bucket-policy: apply is refused while v1 or the installed catch-up predates MOBI-17, and nothing reaches mc', async () => {
+  const fake = ({ v1 = true, fetchOk = true } = {}) => args => {
+    if (args[0] === 'fetch') return { ok: fetchOk, out: fetchOk ? '' : 'fatal: unable to access' };
+    if (args[0] === 'cat-file') return { ok: v1 && args[2] === `FETCH_HEAD:${accessMarker}`, out: '' };
+    throw new Error(`unexpected git ${args.join(' ')}`);
+  };
+  const home = '/home/h';
+  const installed = '/home/h/.local/share/mobile-deploy-hub/current';
+  const has = paths => path => paths.includes(path);
+  assert.deepEqual(readiness({ home, git: fake(), exists: has([installed, `${installed}/${accessMarker}`]) }), []);
+  assert.deepEqual(readiness({ home, git: fake(), exists: has([]) }), [], 'a host with no catch-up has none to break');
+  assert.match(readiness({ home, git: fake({ v1: false }), exists: has([]) })[0], /^v1, the hub version every app's deploy runs, predates MOBI-17.*release the hub first/);
+  assert.match(readiness({ home, git: fake(), exists: has([installed]) })[0], /catch-up installed on this host .* predates MOBI-17.*hosts:install/);
+  assert.match(readiness({ home, git: fake({ fetchOk: false }), exists: has([]) })[0], /cannot read v1 from origin/);
+  assert.equal(callerRef, 'v1');
+  const calls = [];
+  const logs = [];
+  const code = await bucketMain(['apply'], { log: line => logs.push(line), readiness: () => ['v1 predates MOBI-17'], runner: (...args) => { calls.push(args); return { ok: true, status: 0, stdout: '', stderr: '' }; }, read: async () => 'x' });
+  assert.equal(code, 1);
+  assert.equal(calls.length, 0, 'nothing was applied');
+  assert.match(logs.at(-1), /^BUCKET_POLICY_NOT_READY nothing was applied$/);
+});
+
+test('bucket-policy: a ready apply sets the policy, re-renders every page, then runs the strict check', async () => {
+  const text = readFileSync(committedFile, 'utf8');
+  const order = [];
+  const runner = (command, args) => { order.push(args.includes('set-json') ? 'set-json' : 'get-json'); return { ok: true, status: 0, stdout: args.includes('get-json') ? text : '', stderr: '' }; };
+  const rerender = async () => { order.push('pages'); return []; };
+  const fetchImpl = async url => { if (!order.includes('probe')) order.push('probe'); return bucketFetch(JSON.parse(text))(url); };
+  const logs = [];
+  const code = await bucketMain(['apply'], { log: line => logs.push(line), readiness: () => [], runner, read: async ref => (ref.endsWith('/username') ? 'admin' : 'Admin-secret-for-tests'), rerender, fetchImpl });
+  assert.equal(code, 0, logs.join('\n'));
+  assert.deepEqual(order, ['set-json', 'get-json', 'pages', 'probe']);
+  assert.ok(logs.includes('BUCKET_POLICY_APPLIED the live policy equals the committed file'));
+  assert.match(logs.at(-1), /^BUCKET_POLICY_OK /);
+  const failedPages = await bucketMain(['apply'], { log: () => {}, readiness: () => [], runner, read: async () => 'Admin-secret-for-tests', rerender: async () => ['earshot'], fetchImpl });
+  assert.equal(failedPages, 1, 'a page that could not be re-rendered fails the apply');
+});
+
+test('bucket-policy: pages re-renders each app with a latest.json under its own lock, and reports the ones that failed', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mobi17-pages-'));
+  try {
+    const published = [];
+    const readLatest = async (_policy, key) => (key.startsWith('shortwave/') ? null : key.startsWith('gruvato/') ? '{not json' : JSON.stringify(latestFor(key.split('/')[0])));
+    const publish = async ({ slug, latest, credentials }) => { published.push(slug); assert.equal(latest.slug, slug); assert.deepEqual(credentials, keys); };
+    const logs = [];
+    const failed = await rerenderPages({ policy, env: { HUB_LOCK_DIR: dir }, credentials: keys, s3: {}, publish, readLatest, log: line => logs.push(line) });
+    assert.deepEqual(failed, ['gruvato']);
+    assert.deepEqual(published.sort(), ['earshot', 'green-in-between', 'navi', 'tower-of-lost-things']);
+    assert.ok(logs.some(line => line === 'BUCKET_POLICY_PAGES shortwave: no latest.json, no page'));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('release: the device APK rides a Release only when the repository is private or the policy publishes the device edition', () => {
+  assert.equal(deviceRidesRelease({ privateRepo: true, access: accessFor(policy, 'earshot') }), true);
+  assert.equal(deviceRidesRelease({ privateRepo: false, access: accessFor(policy, 'earshot') }), false, 'a public repo never hands out a private device APK');
+  assert.equal(deviceRidesRelease({ privateRepo: false, access: accessFor(policy, 'shortwave') }), false);
+  assert.equal(deviceRidesRelease({ privateRepo: false, access: accessFor(policy, 'navi') }), true, 'a device-public app already publishes it');
+  assert.equal(deviceRidesRelease({ privateRepo: undefined, access: null }), false, 'an unreadable answer counts as public');
 });
 
 // A live bucket that follows the bucket policy: anonymous reads of an allowed key are 404 (or 200), the rest 403.

@@ -157,7 +157,7 @@ A dry run never commits to the remote, tags, installs, publishes, uploads or emi
 
 App authors can add optional, structured, tracked [release notes](docs/release-notes.md) for the next planned version. The hub snapshots the full range since the previous published build and publishes one canonical per-version record to the build page and private Release; existing apps without notes keep working with an honest missing-notes label.
 
-MinIO bucket `builds` (private by default; see [private-device-builds.md](docs/private-device-builds.md): only public editions, an iOS-lane app's over-the-air objects, opted-in device editions and the root index are anonymous, no listing; written only from big-chungus over `127.0.0.1:9012` by the MinIO user `mobile-deploy-hub`, whose keys are the DeLoSecrets item "MinIO builds writer (mobile-deploy-hub)", read with `op read` at call time into the `mc` child's environment only):
+MinIO bucket `builds` (private by default; see [private-device-builds.md](docs/private-device-builds.md): only public editions, every app's pointers, an iOS-lane app's over-the-air objects, opted-in device editions and the root index are anonymous, no listing; written only from big-chungus over `127.0.0.1:9012` by the MinIO user `mobile-deploy-hub`, whose keys are the DeLoSecrets item "MinIO builds writer (mobile-deploy-hub)", read with `op read` at call time into the `mc` child's environment only):
 
 ```
 builds/index.html, index.json                    every app: newest version, device states, install links
@@ -170,7 +170,7 @@ builds/<slug>/editions/<edition>/index.html, latest.json   a public extra editio
 builds/<slug>/editions/<edition>/<X.Y.Z>/<slug>-<edition>-<X.Y.Z>-<code>.apk, .apk.sha256, receipt.json
 ```
 
-Device APKs, their receipts and release notes, and an Android-only app's page and pointers are **not** anonymous (MOBI-17). The hub reads them with its writer keys (SigV4) and hands a person a presigned link (7 days, `private, no-store`) in the deploy notification. The bucket policy is generated from `tools/ci/policy.json` into `tools/ci/bucket-policy.json`; `mise run bucket-policy` checks it and the live bucket, `mise run bucket-policy:apply` applies it.
+Device APKs, their checksums, receipts and release notes, and an Android-only app's page are **not** anonymous (MOBI-17). Every app's `latest.json` and `inflight.json` are: they name a build and never grant it. The hub reads private objects with its writer keys (SigV4) and hands a person a presigned link (7 days, `private, no-store`) in the deploy notification. The bucket policy is generated from `tools/ci/policy.json` into `tools/ci/bucket-policy.json`; `mise run bucket-policy` checks it and the live bucket, `mise run bucket-policy:apply` applies it (after the release and `mise run hosts:install` when the change makes something private).
 
 `inflight.json` names the platforms a real run builds; each deliver job clears its own, and the catch-up holds every older pending build of those platforms until then. A device block's package, signer and bundle must be the policy's pins (`tools/ci/policy.json` `apps`), or the catch-up refuses the file.
 

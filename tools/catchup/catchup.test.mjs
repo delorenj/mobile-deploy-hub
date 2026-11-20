@@ -1106,7 +1106,7 @@ function privateBucket(s3, { signed = [] } = {}) {
   };
   return s3;
 }
-const withKeys = s3 => ({ env, home }) => Object.assign(Object.create(s3.writer), { credentials: async () => writerKeys });
+const withKeys = (s3, counter = { asked: 0 }) => ({ env, home }) => Object.assign(Object.create(s3.writer), { credentials: async () => { counter.asked += 1; return writerKeys; } });
 
 test('MOBI-17 catch-up: the S26 pass reads a private device APK with the hub writer\'s keys, sha256 and signer still checked', async () => {
   const signed = [];
@@ -1118,10 +1118,39 @@ test('MOBI-17 catch-up: the S26 pass reads a private device APK with the hub wri
     const result = await androidPass(host.ctx);
     assert.equal(result.errors, 0);
     assert.equal(host.phone.installed(), apkText(), 'the S26 still gets the APK');
-    assert.ok(signed.includes(`${slug}/latest.json`), 'the pointer is read signed');
+    assert.equal(signed.includes(`${slug}/latest.json`), false, 'the pointer is anonymous: read without a signature');
     assert.ok(signed.includes(`${slug}/0.2.2/${slug}-0.2.2-4.apk`), 'the device APK is read signed');
     assert.equal(s3.requests.filter(request => request.key.endsWith('.apk')).length, 1);
   } finally { host.cleanup(); }
+});
+
+test('MOBI-17 catch-up: a pass with nothing to install never asks 1Password for the keys (its account allows 1000 reads a day)', async () => {
+  const signed = [];
+  const counter = { asked: 0 };
+  const s3 = privateBucket(fakeS3(), { signed });
+  const host = linuxHost({ s3, writer: withKeys(s3, counter) });
+  try {
+    publish(s3, { latest: latestDoc({ android: androidBlock({ status: 'installed', by: 'deploy' }) }), apk: apkText() });
+    host.phone.install(apkText());
+    for (let pass = 0; pass < 3; pass += 1) assert.equal((await androidPass(host.ctx)).errors, 0);
+    assert.equal(counter.asked, 0, 'three idle passes, no key read');
+    assert.deepEqual(signed, []);
+    assert.ok(s3.requests.some(request => request.key === `${slug}/latest.json`), 'the pointers were still read');
+  } finally { host.cleanup(); }
+});
+
+test('MOBI-17 catch-up: the store signs only the keys it is told are private', async () => {
+  const seen = [];
+  let asked = 0;
+  const fetchImpl = async (url, options = {}) => { seen.push({ url, authorization: options.headers?.authorization }); return new Response('{"a":1}', { status: 200 }); };
+  const store = createStore({ root: 'http://127.0.0.1:9012/builds', fetchImpl, credentials: async () => { asked += 1; return writerKeys; }, signs: key => !isAnonymous(policy, key) });
+  await store.latest('earshot');
+  await store.inflight('shortwave');
+  assert.deepEqual(seen.map(item => item.authorization), [undefined, undefined]);
+  assert.equal(asked, 0);
+  assert.match((await store.auth('http://127.0.0.1:9012/builds/earshot/0.1.10/earshot-0.1.10-1010.apk')).authorization, /^AWS4-HMAC-SHA256 /);
+  assert.equal(asked, 1);
+  assert.deepEqual(await store.auth('http://127.0.0.1:9012/builds/earshot/editions/beta/latest.json'), {});
 });
 
 test('MOBI-17 catch-up: a host with no keys cannot read a private device APK and installs nothing', async () => {
@@ -1158,7 +1187,7 @@ test('MOBI-17 catch-up: the store signs every read when it has keys, and sends n
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('MOBI-17 catch-up: the Mac\'s iPad pass never asks for an Android-only app\'s pointer (it would answer 403 anonymously)', async () => {
+test('MOBI-17 catch-up: the Mac\'s iPad pass never asks for an Android-only app\'s pointer (nothing there is the iPad\'s)', async () => {
   const s3 = privateBucket(fakeS3());
   const linux = linuxHost({ s3, writer: withKeys(s3) });
   const mac = macHost({ linux, tunnel: 'disconnected' });

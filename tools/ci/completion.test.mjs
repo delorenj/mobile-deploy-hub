@@ -252,5 +252,26 @@ test('MOBI-17 announce: the device APK link in the notification is presigned for
     assert.ok(!JSON.stringify(withKeys.data).includes('Wr1ter-secret'), 'the secret is never in the event');
     const without = await f.run({}, { credentials: null });
     assert.deepEqual(without.data.links.map(link => link.rel), ['page', 'run'], 'a private link with no keys is dropped');
+    assert.match(without.data.summary, /\+ Install APK link withheld \(no signing keys\)$/, 'and the notification says so');
+    assert.doesNotMatch(withKeys.data.summary, /withheld/);
+  } finally { await f.cleanup(); }
+});
+
+test('MOBI-17 announce: a failed read of the signing keys is asked once more before the links are given up', async () => {
+  const published = { apk: `https://s3.delo.sh/builds/${slug}/0.3.20/${slug}-0.3.20-25.apk`, apk_bytes: 74_700_000, ota: null, ipa_bytes: null, page: `https://s3.delo.sh/builds/${slug}/index.html`, manifest: null, any: true };
+  const receipts = [gateReceipt, planReceipt('0.3.20', 25), { lane: 'android', outcome: 'success', delivery: { status: 'installed', verified: true, build: '25' } }, { lane: 'ios', outcome: 'success', delivery: { status: 'installed', verified: true, build: '25' }, store: { status: 'assigned', build: '25' } }, { lane: 'deliver-android', outcome: 'success', published }];
+  const f = await announceFixture({ receipts, needs: allGreen, latest: latestFor('0.3.20', 25, { android: 'installed', ios: 'installed' }) });
+  try {
+    let asked = 0;
+    const flaky = async () => { asked += 1; if (asked === 1) throw new Error('op read timed out'); return { access: 'mobile-deploy-hub', secret: 'Wr1ter-secret-for-tests-only' }; };
+    const event = await f.run({ GITHUB_ACTIONS: 'true' }, { credentialsFor: flaky, now: () => new Date('2026-11-19T12:00:00Z') });
+    assert.equal(asked, 2);
+    assert.match(event.data.links.find(link => link.rel === 'apk').url, /X-Amz-Signature=/);
+    asked = 0;
+    const dead = async () => { asked += 1; throw new Error('op read timed out'); };
+    const gaveUp = await f.run({ GITHUB_ACTIONS: 'true' }, { credentialsFor: dead });
+    assert.equal(asked, 2, 'two tries, then the links are dropped');
+    assert.equal(gaveUp.data.links.some(link => link.rel === 'apk'), false);
+    assert.match(gaveUp.data.summary, /Install APK link withheld/);
   } finally { await f.cleanup(); }
 });

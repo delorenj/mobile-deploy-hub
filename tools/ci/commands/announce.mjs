@@ -64,7 +64,7 @@ export function findLostMac({ env, needs, policy, runner = runBounded }) {
   return null;
 }
 
-export async function announce(config, { env = process.env, home = homedir(), fetchImpl = fetch, log = console.log, lostMac = undefined, credentials = undefined, now = () => new Date() } = {}) {
+export async function announce(config, { env = process.env, home = homedir(), fetchImpl = fetch, log = console.log, lostMac = undefined, credentials = undefined, credentialsFor = null, now = () => new Date() } = {}) {
   const { policy } = policyBanner(log);
   const devices = loadDevices(env);
   const needs = parseNeeds(env.HUB_NEEDS);
@@ -82,6 +82,17 @@ export async function announce(config, { env = process.env, home = homedir(), fe
   const project = { slug, name: manifest?.project?.name ?? app?.slug ?? 'unknown app' };
   const declared = manifest ? { android: Boolean(manifest.android), ios: Boolean(manifest.ios) } : { android: (app?.lanes ?? ['android']).includes('android'), ios: (app?.lanes ?? []).includes('ios') };
 
+  // MOBI-17: the notification's links to private objects are presigned with the job's keys (never stored anywhere); the
+  // logs and receipts keep the plain URLs. No keys (a test, a shell outside a job) means those links are dropped.
+  // The same keys sign every read of a private object below.
+  // A failed read of the keys is asked once more (jobCredentials forgets a failure) before the links are given up.
+  let keys = credentials;
+  if (keys === undefined) {
+    keys = null;
+    for (let tries = 1; tries <= 2 && keys === null && jobContext(env); tries += 1) {
+      try { keys = await (credentialsFor ?? jobCredentials)(env); } catch (error) { log(`::warning::no keys to sign download links, try ${tries} of 2 (${firstLine(error.message)})`); }
+    }
+  }
   const planReceipt = receipts.plan;
   const planOutputs = needs.plan?.outputs ?? {};
   let version = planReceipt?.version || planOutputs.version || config.version || '';
@@ -96,7 +107,7 @@ export async function announce(config, { env = process.env, home = homedir(), fe
   }
   if (!semver.test(version)) {
     // No manifest and no plan: the newest published version, else 0.0.0 (the event says why it stopped).
-    try { const text = await readObject(policy, latestKey(project.slug), { fetchImpl, env }); version = text ? parseLatest(text).version : '0.0.0'; } catch { version = '0.0.0'; }
+    try { const text = await readObject(policy, latestKey(project.slug), { fetchImpl, env, credentials: keys }); version = text ? parseLatest(text).version : '0.0.0'; } catch { version = '0.0.0'; }
   }
   const commit = planReceipt?.sha || planOutputs.build_sha || env.GITHUB_SHA || '';
   if (!/^[0-9a-f]{7,40}$/.test(commit)) throw new Error('announce cannot name the commit (no plan receipt and no GITHUB_SHA)');
@@ -119,21 +130,17 @@ export async function announce(config, { env = process.env, home = homedir(), fe
   }
   const lost = lostMac === undefined ? findLostMac({ env, needs, policy }) : lostMac;
   if (lost) log(`HUB_MAC_LOST ${lost.job}: ${lost.reason}`);
-  // MOBI-17: the notification's links to private objects are presigned with the job's keys (never stored anywhere); the
-  // logs and receipts keep the plain URLs. No keys (a test, a shell outside a job) means those links are dropped.
-  let keys = credentials;
-  if (keys === undefined) {
-    try { keys = jobContext(env) ? await jobCredentials(env) : null; } catch (error) { keys = null; log(`::warning::no keys to sign download links (${firstLine(error.message)})`); }
-  }
   const linked = linkable({ policy, slug: project.slug, published: published.page ? published : null, credentials: keys, now: now() });
   if (linked.minted.length > 0) log(`HUB_LINKS_PRESIGNED ${linked.minted.join(', ')}: valid 7 days, sent only in the notification`);
   if (linked.dropped.length > 0) log(`::warning::HUB_LINKS_DROPPED ${linked.dropped.join(', ')}: private, and there were no keys to sign a link`);
-  const event = deploymentEvent({ project, declared, platform: config.platform, devices, needs, receipts, version, androidCode: androidCode ? String(androidCode) : '', commit, iosLane, published: linked.published, env, lostMac: lost, extraDeliveries });
+  // The notification says a private link is missing, so nobody waits for an Install APK button that will not come.
+  const withheld = linked.dropped.length > 0 ? [`${linked.dropped.map(field => (field === 'apk' ? 'Install APK' : 'Builds')).join(' and ')} link withheld (no signing keys)`] : [];
+  const event = deploymentEvent({ project, declared, platform: config.platform, devices, needs, receipts, version, androidCode: androidCode ? String(androidCode) : '', commit, iosLane, published: linked.published, env, lostMac: lost, extraDeliveries, extras: withheld });
   // The page and Release both reference this immutable per-version record. Notification text stays a short
   // operational status (the Bloodbank schema caps it); its page button opens the full authored notes.
   if (published.page && !config.dryRun) {
     try {
-      const raw = await readObject(policy, notesKey(project.slug, version), { fetchImpl, env });
+      const raw = await readObject(policy, notesKey(project.slug, version), { fetchImpl, env, credentials: keys });
       if (raw) {
         const canonical = validateNotes(JSON.parse(raw), { current: version, commit });
         if (canonical.status === 'authored') log(`HUB_RELEASE_NOTES ${notesText(canonical).split('\n')[0]}: ${published.page}`);
@@ -145,7 +152,7 @@ export async function announce(config, { env = process.env, home = homedir(), fe
   let latest = null;
   let latestUnread = false;
   if (!config.dryRun) {
-    try { const text = await readObject(policy, latestKey(project.slug), { fetchImpl, env }); latest = text ? parseLatest(text, { slug: project.slug }) : null; } catch (error) { latestUnread = true; log(`HUB_COMPLETION_LATEST ${firstLine(error.message)}: a pending device cannot be shown durable`); }
+    try { const text = await readObject(policy, latestKey(project.slug), { fetchImpl, env, credentials: keys }); latest = text ? parseLatest(text, { slug: project.slug }) : null; } catch (error) { latestUnread = true; log(`HUB_COMPLETION_LATEST ${firstLine(error.message)}: a pending device cannot be shown durable`); }
   }
   const run = runOf(env);
   const judge = failure => completionOf({

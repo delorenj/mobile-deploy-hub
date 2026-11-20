@@ -10,10 +10,13 @@
 //   - a public edition (apps.<repo>.android.editions.<name>.public)   builds/<slug>/editions/<name>/*        (MOBI-14)
 //   - a public device edition (apps.<repo>.android.public)            builds/<slug>/*                       (opt-in)
 //   - an app with an iOS lane: what the iPad and the Mac's catch-up read without a key (D4): the over-the-air manifest,
-//     IPAs and icons, the app page with its Install on iPad button, latest.json and inflight.json
+//     IPAs and icons, the app page with its Install on iPad button
+//   - every app's two pointers, latest.json and inflight.json: they name a build and never grant it (the bucket policy
+//     refuses the APK they name). Anonymous so the catch-up's two-minute pass reads them without 1Password, whose
+//     account allows 1000 service-account reads a day; a signed read every pass would spend 1440
 //   - the root index (builds/index.html, index.json), rendered with only anonymous links
-// Everything else needs the hub's credentials or a presigned link: device APKs, their receipts and release notes, an
-// Android-only app's page and pointers. No one lists the bucket anonymously.
+// Everything else needs the hub's credentials or a presigned link: device APKs, their checksums, receipts and release
+// notes, an Android-only app's page. No one lists the bucket anonymously.
 import { presignedMark } from './sigv4.mjs';
 
 const slugPattern = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
@@ -31,10 +34,11 @@ export function accessOf(app) {
     devicePublic,
     ios,
     publicEditions: Object.freeze(editions),
-    // The app page and the two pointers: anonymous where an anonymous reader needs them (the S26 of a friend or a client
-    // for a public device edition; the iPad and the Mac's catch-up for an iOS lane).
+    // The app page: anonymous where an anonymous reader needs it (the S26 of a friend or a client for a public device
+    // edition; the iPad for an iOS lane).
     pageOpen: devicePublic || ios,
-    pointersOpen: devicePublic || ios,
+    // The pointers name a build and never grant it, so they are anonymous for every app (see the header).
+    pointersOpen: true,
   });
 }
 
@@ -51,8 +55,9 @@ export function bucketPolicy(policy) {
   const statements = [
     statement('PublicEditions', apps.flatMap(access => access.publicEditions.map(name => `${access.slug}/editions/${name}/*`))),
     statement('PublicDeviceEditions', apps.filter(access => access.devicePublic).map(access => `${access.slug}/*`)),
+    statement('Pointers', apps.filter(access => access.pointersOpen && !access.devicePublic).flatMap(access => [`${access.slug}/latest.json`, `${access.slug}/inflight.json`])),
     statement('IpadOverTheAir', apps.filter(access => access.ios && !access.devicePublic).flatMap(access => [
-      `${access.slug}/index.html`, `${access.slug}/latest.json`, `${access.slug}/inflight.json`, `${access.slug}/ios/manifest.plist`,
+      `${access.slug}/index.html`, `${access.slug}/ios/manifest.plist`,
       `${access.slug}/*.ipa`, `${access.slug}/*/icon-57.png`, `${access.slug}/*/icon-512.png`,
     ])),
     statement('BuildIndex', ['index.html', 'index.json']),
@@ -98,8 +103,8 @@ export function privateApkPattern(policy) {
   return new RegExp(`(?:^|[^A-Za-z0-9._-])(${slugs.join('|')})/\\d+\\.\\d+\\.\\d+/\\1-\\d+\\.\\d+\\.\\d+-\\d+\\.apk`);
 }
 
-// latest.json and inflight.json name the device APK's key (the pointer the catch-up follows), never grant it: they stay
-// readable for the Mac where an iOS lane needs them, and the bucket policy is what refuses the APK itself.
+// latest.json and inflight.json name the device APK's key (the pointer the catch-up follows), never grant it: they are
+// anonymous for every app, and the bucket policy is what refuses the APK itself.
 const pointerKey = key => /^[a-z0-9][a-z0-9-]*\/(latest|inflight)\.json$/.test(key);
 
 // The write-time guard (createS3.putText): what an anonymous object may never carry.

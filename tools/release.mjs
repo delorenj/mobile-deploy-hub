@@ -58,11 +58,13 @@ export async function release(version, { log = console.log, dryRuns = true } = {
   log('RELEASE_CHECK mise run conformance');
   const problems = conformance({ policy: loadPolicy().policy, log });
   if (problems.length > 0) throw new Error(`${problems.length} conformance problems`);
-  // MOBI-17: the live bucket must answer anonymous reads as policy.json says (docs/private-device-builds.md). A release
-  // that ships a policy change waits for `mise run bucket-policy:apply`.
-  log('RELEASE_CHECK mise run bucket-policy');
-  const access = await checkBucketPolicy({ policy: loadPolicy().policy, log });
-  if (access.length > 0) throw new Error(`${access.length} bucket policy problems (mise run bucket-policy:apply)`);
+  // MOBI-17 (docs/private-device-builds.md, "Applying it"): the live bucket must not be more closed than policy.json says
+  // (no listing, every public key readable). It may still be more open: a change that makes something private is applied
+  // after this release and hosts:install, so the hub that reads it with keys ships first, and a red dry run that moves
+  // v1 back meets the bucket the old code reads. The strict check (mise run bucket-policy) follows the apply.
+  log('RELEASE_CHECK mise run bucket-policy -- --pending-ok');
+  const access = await checkBucketPolicy({ policy: loadPolicy().policy, log, pendingOk: true });
+  if (access.length > 0) throw new Error(`${access.length} bucket policy problems (a public key closed, listing open, or the committed file stale; apply what opens before the release)`);
 
   const text = readFileSync(workflowPath, 'utf8');
   const flipped = flipInnerRefs(text, tag);

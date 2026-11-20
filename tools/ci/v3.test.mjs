@@ -690,7 +690,8 @@ async function laneHost(f) {
   await script(join(sdk, 'aapt2'), 'set -- $(cat "$3"); echo "package: name=\'$1\' versionCode=\'$3\' versionName=\'$2\' platformBuildVersionName=\'15\'"');
   await script(join(bin, 'adb'), fakeAdb(state));
   await script(join(bin, 'bb-emit'), `cat > "${f.root}/event-$$.json"\necho "bb-emit $*" >> "${f.root}/bb-emit.log"`);
-  await script(join(bin, 'gh'), `echo "gh $*" >> "${f.root}/gh.log"\n[ "$1 $2" = "release view" ] && exit "\${FAKE_RELEASE_EXISTS:-1}"\nexit 0`);
+  // The app repo is private, like every real one (the release lane asks before it attaches the device APK, MOBI-17).
+  await script(join(bin, 'gh'), `echo "gh $*" >> "${f.root}/gh.log"\n[ "$1 $2" = "release view" ] && exit "\${FAKE_RELEASE_EXISTS:-1}"\ncase "$*" in "api "*" --jq .private") echo "\${GH_PRIVATE:-true}";; esac\nexit 0`);
   const output = join(f.root, 'github-output.txt');
   await writeFile(output, '');
   const env = {
