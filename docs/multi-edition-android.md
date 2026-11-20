@@ -102,7 +102,7 @@ An edition never holds the device back. Its checks run per edition, and its publ
 
 ## Obtainium
 
-Add the app with source type HTML, URL `https://s3.delo.sh/builds/<slug>/editions/<edition>/index.html` (for Earshot beta: `https://s3.delo.sh/builds/earshot/editions/beta/index.html`). The page has exactly one APK link, whose file name carries the version, so a version regex such as `-(\d+\.\d+\.\d+)-\d+\.apk` extracts it. Verify the download with the `.sha256` file next to it.
+Add the app with source type HTML, URL `https://s3.delo.sh/builds/<slug>/editions/<edition>/index.html` (for Earshot beta: `https://s3.delo.sh/builds/earshot/editions/beta/index.html`). The page has exactly one APK link, whose file name carries the version, so a version regex extracts it: use `\d+\.\d+\.\d+(?=-\d+\.apk)` (no match group needed). The older `-(\d+\.\d+\.\d+)-\d+\.apk` only works with "Match group to use" = 1, and with no rule at all Obtainium shows an APK-hash pseudo-version. The deep link `obtainium://add/<url>` only prefills the URL; `obtainium://app/<percent-encoded JSON>` imports an app with the rule already set. Verify the download with the `.sha256` file next to it. `tools/verify/obtainium-check.mjs <index-url> <package> <version> --serial emulator-NNNN` checks all of this end to end on an emulator ([tools/verify/README.md](../tools/verify/README.md)).
 
 ## Failure modes
 
