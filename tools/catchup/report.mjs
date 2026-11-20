@@ -17,7 +17,7 @@ export const failureStage = reason => (/\bat verify\b/.test(reason ?? '') ? 'ver
 
 // block: the release the catch-up acted on (version, code or build, sha256). device: its new state. run, commit and
 // correlation: the deploy that published it.
-export function catchupEvent({ name, slug, platform, block, device, run, commit, hubRef, correlation, devices, publicBase, now = new Date() }) {
+export function catchupEvent({ name, slug, platform, block, device, run, commit, hubRef, correlation, devices, publicBase, pageUrl = null, now = new Date() }) {
   const android = platform === 'android';
   const known = devices[platform];
   const build = buildOf(block, platform);
@@ -35,7 +35,8 @@ export function catchupEvent({ name, slug, platform, block, device, run, commit,
     ...(failed ? { stage: failureStage(device.reason), reason } : { by: device.by === 'manual' ? 'manual' : 'catch-up' }),
   };
   const runUrl = typeof run?.url === 'string' && /^https:\/\//.test(run.url) ? run.url : null;
-  const page = `${publicBase.replace(/\/$/, '')}/${slug}/index.html`;
+  // MOBI-17: a private page's link is presigned by the caller (pageUrl); `false` means there is none to give.
+  const page = pageUrl === null ? `${publicBase.replace(/\/$/, '')}/${slug}/index.html` : pageUrl;
   const label = `${name} ${block.version} (${build}) ${String(commit).slice(0, 7)}`;
   const data = {
     schema_version: 1,
@@ -47,8 +48,9 @@ export function catchupEvent({ name, slug, platform, block, device, run, commit,
     run: { id: String(run.id), attempt: Number(run.attempt ?? 1), url: runUrl, hub_ref: hubRef ?? null },
     trigger: 'catch-up',
     // G1: catch-up .completed links the build page; catch-up .failed the page and the run.
-    links: [{ rel: 'page', label: 'Builds', url: page }, ...(failed && runUrl ? [{ rel: 'run', label: 'Run', url: runUrl }] : [])],
   };
+  const links = [...(page ? [{ rel: 'page', label: 'Builds', url: page }] : []), ...(failed && runUrl ? [{ rel: 'run', label: 'Run', url: runUrl }] : [])];
+  if (links.length > 0) data.links = links;
   if (failed) {
     data.summary = `${label}: ${known.name} catch-up failed at ${delivery.stage}: ${reason}`.slice(0, 200);
     Object.assign(data, { stage: delivery.stage, reason, failed_at: stamp(now) });

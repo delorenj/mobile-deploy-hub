@@ -103,6 +103,8 @@ export function bundleSplitOf(policy, repo, app, manifest = null) {
 // package and signer, so the gate and deliver hold every edition's APK to the policy and never to a manifest alone.
 // `public: true` is the hub's half of the opt-in to the anonymous edition page (the manifest's `public` block is the
 // app's half); without it an edition stays private (built, verified, attached to the private Release, never published).
+// MOBI-17: the bucket policy (lib/access.mjs, tools/ci/bucket-policy.json) is generated from these pins, so a new public
+// edition is anonymous only once that file is regenerated and applied (tools/bucket-policy.mjs).
 export const editionNamePattern = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
 
 function androidEditions(where, android) {
@@ -162,10 +164,18 @@ export function parsePolicy(source) {
     if (slugs.has(app.slug)) fail(`apps: slug ${app.slug} is used twice`);
     slugs.add(app.slug);
     if (app.lanes.includes('android')) {
-      exact(`apps.${repo}.android`, app.android, ['package', 'signer_sha256'], ['editions']);
+      exact(`apps.${repo}.android`, app.android, ['package', 'signer_sha256'], ['editions', 'public']);
       if (!/^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/.test(app.android.package ?? '')) fail(`apps.${repo}.android.package must be an Android package name`);
       if (!/^[0-9a-f]{64}$/.test(app.android.signer_sha256 ?? '')) fail(`apps.${repo}.android.signer_sha256 must be the lowercase sha256 of the signing certificate`);
       if ('editions' in app.android) androidEditions(`apps.${repo}.android.editions`, app.android);
+      // MOBI-17: the device edition is private unless the policy publishes it (its APKs, pointers and page anonymous, as
+      // before MOBI-17). An app that sells a public edition can never publish its device edition: that would be a free
+      // copy one folder up (docs/private-device-builds.md).
+      if ('public' in app.android) {
+        if (typeof app.android.public !== 'boolean') fail(`apps.${repo}.android.public must be true or false`);
+        const selling = Object.entries(app.android.editions ?? {}).filter(([, pin]) => pin.public === true).map(([name]) => name);
+        if (app.android.public && selling.length > 0) fail(`apps.${repo}.android.public cannot be true: the app publishes the ${selling.join(' and ')} edition${selling.length > 1 ? 's' : ''}, so its device edition stays private`);
+      }
     }
     if (app.lanes.includes('ios')) {
       // store_bundle: the App Store bundle id, when it differs from the iPad's development one (Green In Between's

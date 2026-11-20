@@ -169,7 +169,7 @@ export async function gate(config, {
     // The newest published state, for the metered estimate (and, in plan, the downgrade check).
     let latest = null;
     try {
-      const text = await readObject(policy, latestKey(app.slug), { fetchImpl });
+      const text = await readObject(policy, latestKey(app.slug), { fetchImpl, env });
       latest = text === null ? null : parseLatest(text, { slug: app.slug });
     } catch (error) {
       throw refusal('s3', `the build directory's ${latestKey(app.slug)} cannot be read or is invalid (${error.message}); deliver and the catch-up depend on it`);

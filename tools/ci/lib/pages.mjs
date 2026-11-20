@@ -81,9 +81,12 @@ ${body}
 `;
 }
 
-function buttons(latest) {
+// MOBI-17: a page is an anonymous object for some apps, so it links the device APK only when the policy publishes that
+// device edition (`apkLinks`, from lib/access.mjs). Otherwise the S26 gets its APK from adb, Quickdrop, the catch-up, or
+// the presigned link in the notification; the page says so instead of linking a URL that answers 403.
+function buttons(latest, { apkLinks = false } = {}) {
   const parts = [];
-  if (latest.android?.url) parts.push(`<a class="button" href="${attr(latest.android.url)}">Install APK${latest.android.bytes ? ` (${megabytes(latest.android.bytes)})` : ''}</a>`);
+  if (apkLinks && latest.android?.url) parts.push(`<a class="button" href="${attr(latest.android.url)}">Install APK${latest.android.bytes ? ` (${megabytes(latest.android.bytes)})` : ''}</a>`);
   if (latest.ios?.install_url) parts.push(`<a class="button" href="${attr(latest.ios.install_url)}">Install on iPad</a>`);
   return parts.length > 0 ? `<div class="buttons">${parts.join('')}</div>` : '';
 }
@@ -109,7 +112,8 @@ function noteSections(note) {
 
 // The device states come from latest.json, which deliver and the catch-up both keep current; the page never carries
 // a per-run list that a catch-up re-render would lose.
-export function appPage({ latest, history = [], releaseNotes = {} }) {
+export function appPage({ latest, history = [], releaseNotes = {}, access = null }) {
+  const apkLinks = access?.devicePublic === true;
   const runLink = latest.run?.url ? `<a href="${attr(latest.run.url)}">run ${html(latest.run.id)}</a>` : `run ${html(latest.run?.id ?? '-')}`;
   const sizes = [
     latest.android ? `APK ${megabytes(latest.android.bytes)}` : null,
@@ -117,15 +121,16 @@ export function appPage({ latest, history = [], releaseNotes = {} }) {
   ].filter(Boolean).join(', ');
   const olderItems = history.filter(item => item.version !== latest.version);
   const older = olderItems.length > 0
-    ? `<h2>Build history</h2>\n${olderItems.map(item => `<details><summary>${html(item.version)} (${html(item.code)})${item.bytes ? ` · ${megabytes(item.bytes)}` : ''}</summary>${noteSections(releaseNotes[item.version])}<a href="${attr(item.url)}">Download retained APK</a></details>`).join('\n')}`
+    ? `<h2>Build history</h2>\n${olderItems.map(item => `<details><summary>${html(item.version)} (${html(item.code)})${item.bytes ? ` · ${megabytes(item.bytes)}` : ''}</summary>${noteSections(releaseNotes[item.version])}${apkLinks ? `<a href="${attr(item.url)}">Download retained APK</a>` : ''}</details>`).join('\n')}`
     : '';
   const body = `<h1>${html(latest.name)}</h1>
 <p class="muted">Newest deploy ${html(latest.version)}, commit <code>${html(short(latest.commit))}</code>, ${runLink}${latest.hub_ref ? `, hub ${html(latest.hub_ref)}` : ''}</p>
 <div class="card">
-${buttons(latest)}
+${buttons(latest, { apkLinks })}
 <ul>
 ${deviceItems(latest)}
 </ul>
+${latest.android && !apkLinks ? '<p class="muted">The Android build is private: it installs on the owner\'s phone through the deploy, and a download link arrives in the deploy notification.</p>' : ''}
 ${sizes ? `<p class="muted">${html(sizes)}</p>` : ''}
 </div>
 <section class="card"><h2>Release notes · ${html(latest.version)}</h2>${noteSections(releaseNotes[latest.version])}</section>
@@ -134,7 +139,10 @@ ${older}
   return page(`${latest.name} builds`, body);
 }
 
-export function indexData(apps, now = new Date()) {
+// `access` maps a slug to its lib/access.mjs entry; the root index is anonymous, so it carries a device APK URL or a
+// page link only for an app that publishes them anonymously.
+const openAccess = () => ({ devicePublic: true, pageOpen: true });
+export function indexData(apps, { now = new Date(), access = openAccess } = {}) {
   return {
     schema: 1,
     updated_at: now.toISOString().replace(/\.\d{3}Z$/, 'Z'),
@@ -142,19 +150,19 @@ export function indexData(apps, now = new Date()) {
       slug: latest.slug,
       name: latest.name,
       version: latest.version,
-      page: `${latest.slug}/index.html`,
-      android: latest.android ? { version: latest.android.version, code: latest.android.code, url: latest.android.url, bytes: latest.android.bytes, device: latest.android.device.status } : null,
+      page: access(latest.slug).pageOpen ? `${latest.slug}/index.html` : null,
+      android: latest.android ? { version: latest.android.version, code: latest.android.code, ...(access(latest.slug).devicePublic ? { url: latest.android.url } : {}), bytes: latest.android.bytes, device: latest.android.device.status } : null,
       ios: latest.ios ? { version: latest.ios.version, build: latest.ios.build, install_url: latest.ios.install_url, device: latest.ios.device.status } : null,
     })),
   };
 }
 
-export function indexPage(apps) {
+export function indexPage(apps, { access = openAccess } = {}) {
   const cards = apps.length === 0
     ? '<p class="muted">No builds yet. The first real deploy of each app publishes here.</p>'
     : apps.map(latest => `<div class="card">
-<h2><a href="${attr(`${latest.slug}/index.html`)}">${html(latest.name)}</a> ${html(latest.version)}</h2>
-${buttons(latest)}
+<h2>${access(latest.slug).pageOpen ? `<a href="${attr(`${latest.slug}/index.html`)}">${html(latest.name)}</a>` : html(latest.name)} ${html(latest.version)}</h2>
+${buttons(latest, { apkLinks: access(latest.slug).devicePublic })}
 <ul>
 ${deviceItems(latest)}
 </ul>

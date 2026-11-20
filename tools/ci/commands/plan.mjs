@@ -219,7 +219,7 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
 
     // The newest published builds: the planned Android code must be above them too.
     track.stage = 'preflight';
-    const latestText = await readObject(policy, latestKey(manifest.project.slug), { fetchImpl });
+    const latestText = await readObject(policy, latestKey(manifest.project.slug), { fetchImpl, env });
     const latest = latestText === null ? null : parseLatest(latestText, { slug: manifest.project.slug });
 
     // The S26, waited for; away is pending, not a stop. A wrong device still stops the run.

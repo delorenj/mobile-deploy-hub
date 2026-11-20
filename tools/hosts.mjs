@@ -10,6 +10,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { accessFor } from './ci/lib/access.mjs';
 import { loadDevices } from './ci/lib/devices.mjs';
 import { latestKey, parseLatest } from './ci/lib/latest.mjs';
 import { indexData, indexPage } from './ci/lib/pages.mjs';
@@ -67,16 +68,19 @@ export async function hostsInstall({ log = console.log } = {}) {
   await step('build directory', async () => {
     const health = await fetch(`${policy.delivery.s3.write}/minio/health/live`, { signal: AbortSignal.timeout(10_000) });
     if (!health.ok) throw new Error(`MinIO on ${policy.delivery.s3.write} answered ${health.status}`);
-    const existing = await readObject(policy, 'index.html');
+    // MOBI-17: the pointers of a private app are not anonymous, so the hub reads them with the writer's keys.
+    const credentials = await writerCredentials();
+    const existing = await readObject(policy, 'index.html', { credentials });
     if (existing) return `${policy.delivery.s3.public}/index.html exists`;
     const apps = [];
     for (const app of Object.values(policy.apps)) {
-      const text = await readObject(policy, latestKey(app.slug));
+      const text = await readObject(policy, latestKey(app.slug), { credentials });
       if (text) apps.push(parseLatest(text, { slug: app.slug }));
     }
-    const s3 = createS3({ policy, credentials: await writerCredentials() });
-    s3.putText(`${JSON.stringify(indexData(apps), null, 2)}\n`, 'index.json');
-    s3.putText(indexPage(apps), 'index.html');
+    const s3 = createS3({ policy, credentials });
+    const access = slug => accessFor(policy, slug);
+    s3.putText(`${JSON.stringify(indexData(apps, { access }), null, 2)}\n`, 'index.json');
+    s3.putText(indexPage(apps, { access }), 'index.html');
     return `rendered ${policy.delivery.s3.public}/index.html (${apps.length} apps)`;
   });
 

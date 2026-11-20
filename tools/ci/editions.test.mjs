@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseConfig } from './lib/config.mjs';
 import { duplicateKeys, editionsOf, parseManifest } from './lib/manifest.mjs';
+import { isAnonymous, publicTextProblem } from './lib/access.mjs';
 import { editionPinOf, loadPolicy, parsePolicy, policyFile } from './lib/policy.mjs';
 import { checksumLine, editionApkKey, editionApkName, editionLatestKey, editionPageKey, isPublicEdition, mayReplaceEdition, pruneEdition, serializeEditionPointer, validateEditionPointer } from './lib/editions.mjs';
 import { editionPage } from './lib/pages.mjs';
@@ -363,7 +364,7 @@ async function deliverHost({ policyPublic = true, manifestPublic = true, betaByt
   const logs = [];
   const run = (extra = [], { fetchImpl = notFound } = {}) => deliver(configure(extra), { env, home: root, fetchImpl, s3Factory: async () => s3, log: line => logs.push(line), policyFile: policyPath });
   const receipt = () => readJson(join(out, 'deliver/hub-receipt-deliver-android.json'));
-  return { root, staging, writes, logs, run, sha, receipt, cleanup: () => rm(root, { recursive: true, force: true }) };
+  return { root, staging, writes, logs, run, sha, receipt, policyPath, cleanup: () => rm(root, { recursive: true, force: true }) };
 }
 
 test('deliver publishes a public edition to its own stable folder: APK, checksum, receipt, pointer, page; the device pointer stays the device\'s', async () => {
@@ -388,6 +389,28 @@ test('deliver publishes a public edition to its own stable folder: APK, checksum
     assert.ok(!keys.some(key => /editions/.test(key) && /^put example-app\/0\.2\.2\//.test(key)));
     assert.deepEqual(result.editions.map(item => [item.name, item.public, item.pointer, item.page]), [['beta', true, 'replaced', `${base}/example-app/editions/beta/index.html`]]);
     assert.ok(d.logs.some(line => /^HUB_EDITION_PUBLISHED beta io\.example\.beta 0\.2\.2 \(5\)/.test(line)), d.logs.join('\n'));
+  } finally { await d.cleanup(); }
+});
+
+test('MOBI-17: a deliver that sells a public edition keeps the device edition private: no anonymous object names its APK, the pages carry no device link', async () => {
+  const d = await deliverHost();
+  try {
+    await d.run(['--dry-run', 'false']);
+    const synthetic = parsePolicy(readFileSync(d.policyPath, 'utf8'));
+    const deviceApk = 'example-app/0.2.2/example-app-0.2.2-5.apk';
+    assert.ok(d.writes.some(write => write.key === deviceApk), 'the device APK is published (privately)');
+    assert.equal(isAnonymous(synthetic, deviceApk), false);
+    for (const key of ['example-app/latest.json', 'example-app/index.html', 'example-app/0.2.2/receipt-android.json', 'example-app/0.2.2/release-notes.json']) assert.equal(isAnonymous(synthetic, key), false, key);
+    for (const key of ['example-app/editions/beta/index.html', 'example-app/editions/beta/latest.json']) assert.equal(isAnonymous(synthetic, key), true, key);
+    for (const write of d.writes.filter(item => item.text !== undefined)) {
+      assert.equal(publicTextProblem(synthetic, write.key, write.text), null, write.key);
+      if (isAnonymous(synthetic, write.key)) assert.doesNotMatch(write.text, /example-app-0\.2\.2-5\.apk|X-Amz-/, `${write.key} is anonymous`);
+    }
+    const page = d.writes.find(write => write.key === 'example-app/index.html').text;
+    assert.doesNotMatch(page, /Install APK|\.apk/);
+    assert.match(page, /The Android build is private/);
+    const root = d.writes.filter(write => write.key === 'index.html' || write.key === 'index.json').map(write => write.text).join('\n');
+    assert.doesNotMatch(root, /example-app[^"<]*\.apk|example-app\/index\.html/);
   } finally { await d.cleanup(); }
 });
 

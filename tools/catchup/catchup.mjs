@@ -32,6 +32,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpath
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { accessOf, linkCacheControl, linkLifetimeS } from '../ci/lib/access.mjs';
 import { createAdb, findPhone } from '../ci/lib/adb.mjs';
 import { apkIdentity, verifySigner } from '../ci/lib/android.mjs';
 import { sanitizeReason } from '../ci/lib/announce.mjs';
@@ -43,6 +44,7 @@ import { withLock } from '../ci/lib/lock.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { sha256File } from '../ci/lib/receipt.mjs';
 import { createS3, publishPages, writerCredentials } from '../ci/lib/s3.mjs';
+import { presign } from '../ci/lib/sigv4.mjs';
 import { catchupEvent, sendCatchupEvent } from './report.mjs';
 import { createStore, downloadVerified } from './store.mjs';
 
@@ -325,6 +327,9 @@ async function readApps(ctx, platform) {
   const unreadable = [];
   let errors = 0;
   for (const app of ctx.settings.apps) {
+    // MOBI-17: the Mac reads anonymously, and only an app with an iOS lane makes its pointer anonymous (D4); an
+    // Android-only app's latest.json answers 403 there, and is big-chungus's to read with keys.
+    if (platform === 'ios' && !app.lanes.includes('ios')) { quiet.push(`${app.slug} no ios build`); continue; }
     let latest;
     try {
       latest = await ctx.store.latest(app.slug);
@@ -597,8 +602,22 @@ export async function iosPass(ctx) {
 
 // ---------------------------------------------------------------------------------------------------- record (big-chungus)
 
-function eventFor(ctx, { name, slug, platform, block, device, hubRef }) {
-  return catchupEvent({ name, slug, platform, block, device, run: block.run, commit: block.commit, hubRef, correlation: block.correlation, devices: ctx.devices, publicBase: ctx.settings.publicRoot, now: ctx.now() });
+// MOBI-17: the event's page link is the plain URL when anonymous readers can open that page, otherwise a presigned link
+// (seven days, signed with the hub writer's keys, never stored), otherwise none.
+async function pageLink(ctx, slug) {
+  const app = ctx.settings.apps.find(entry => entry.slug === slug);
+  const open = accessOf(app).pageOpen;
+  if (open || typeof ctx.credentials !== 'function') return open ? null : false;
+  try {
+    return presign({ credentials: await ctx.credentials(), url: `${ctx.settings.publicRoot.replace(/\/$/, '')}/${slug}/index.html`, expiresS: linkLifetimeS, now: ctx.now(), responseCacheControl: linkCacheControl });
+  } catch (error) {
+    ctx.log(`::warning::HUB_CATCHUP_LINKS ${slug}: no presigned page link (${oneLine(error)})`);
+    return false;
+  }
+}
+
+async function eventFor(ctx, { name, slug, platform, block, device, hubRef }) {
+  return catchupEvent({ name, slug, platform, block, device, run: block.run, commit: block.commit, hubRef, correlation: block.correlation, devices: ctx.devices, publicBase: ctx.settings.publicRoot, pageUrl: await pageLink(ctx, slug), now: ctx.now() });
 }
 
 const hubRefOf = (latest, block) => (block.run.id === latest.run.id ? latest.hub_ref : null);
@@ -606,7 +625,7 @@ const hubRefOf = (latest, block) => (block.run.id === latest.run.id ? latest.hub
 // Sends the event a device block is marked for, then clears the mark. Called under the s3-<slug> lock.
 async function flushEvent(ctx, slug, latest, platform) {
   const block = latest[platform];
-  const event = eventFor(ctx, { name: latest.name, slug, platform, block, device: block.device, hubRef: hubRefOf(latest, block) });
+  const event = await eventFor(ctx, { name: latest.name, slug, platform, block, device: block.device, hubRef: hubRefOf(latest, block) });
   try {
     ctx.emit(event);
   } catch (error) {
@@ -674,7 +693,7 @@ export async function record(ctx, facts) {
         run: { repo, id: String(run.id), attempt: Number(run.attempt ?? 1), url: run.url ?? `https://github.com/${repo}/actions/runs/${run.id}` },
         correlation: facts.correlation ?? null,
       };
-      const event = eventFor(ctx, { name: facts.name ?? latest.name, slug: facts.slug, platform: facts.platform, block: old, device: { status: 'installed', by: facts.by }, hubRef: facts.hub_ref ?? null });
+      const event = await eventFor(ctx, { name: facts.name ?? latest.name, slug: facts.slug, platform: facts.platform, block: old, device: { status: 'installed', by: facts.by }, hubRef: facts.hub_ref ?? null });
       try {
         ctx.emit(event);
         ctx.log(`HUB_CATCHUP_REPORTED ${where}: ${event.type} sent: ${event.data.summary}`);
@@ -851,17 +870,21 @@ export function serviceAccountEnv(env = process.env, home = homedir()) {
 
 // The hub's builds writer (C1): keys from 1Password at the first write, into the mc child's MC_HOST_builds only.
 // open() hands the same writer to the hub's publishPages.
+// credentials() hands the same keys to the catch-up's signed reads (MOBI-17); a failed read is asked again next time.
 export function hubWriter({ settings, env = process.env, home = homedir(), read, runner }) {
   let s3 = null;
+  let keys = null;
+  const credentials = () => {
+    if (!keys) keys = writerCredentials({ env: serviceAccountEnv(env, home), ...(read ? { read } : {}) }).catch(error => { keys = null; throw error; });
+    return keys;
+  };
   const open = async () => {
-    if (!s3) {
-      const credentials = await writerCredentials({ env: serviceAccountEnv(env, home), ...(read ? { read } : {}) });
-      s3 = createS3({ policy: settings.policy, credentials, env, ...(runner ? { runner } : {}) });
-    }
+    if (!s3) s3 = createS3({ policy: settings.policy, credentials: await credentials(), env, ...(runner ? { runner } : {}) });
     return s3;
   };
   return {
     open,
+    credentials,
     async putJson(key, value) {
       const text = serializeLatest(value);
       (await open()).putText(text, key);
@@ -884,19 +907,22 @@ export function linuxContext({
   adbWaitMs = 20_000,
   lockWaitMs = 5_000,
 } = {}) {
-  const store = createStore({ root: settings.loopbackRoot, writer, fetchImpl });
+  // Every read of the bucket here is signed with the writer's keys: device APKs and most pointers are not anonymous.
+  const credentials = typeof writer.credentials === 'function' ? () => writer.credentials() : null;
+  const store = createStore({ root: settings.loopbackRoot, writer, fetchImpl, credentials });
   const cache = join(home, '.cache/mobile-deploy-hub/catchup');
   const adb = createAdb({ env, home });
   const ctx = {
     ...base({ env, home, log, now, settings, devices, lockWaitMs }),
     store,
+    credentials,
     adb,
     // E2: 20 s by serial, with at most one mDNS nudge in that window.
     findPhone: () => findPhone(adb, { serial: devices.android.serial, model: devices.android.model, waitMs: adbWaitMs, pollMs: Math.min(2_000, adbWaitMs), nudgeEvery: 5, log }),
     fetchApk: async (slug, block) => {
       const dir = join(cache, slug);
       const dest = join(dir, basename(block.key));
-      const got = await downloadVerified(store.url(block.key), dest, { bytes: block.bytes, sha256: block.sha256, fetchImpl });
+      const got = await downloadVerified(store.url(block.key), dest, { bytes: block.bytes, sha256: block.sha256, fetchImpl, auth: store.auth });
       for (const name of readdirSync(dir)) if (name !== basename(dest)) rmSync(join(dir, name), { force: true });
       if (got.downloaded > 0) log(`HUB_CATCHUP_FETCHED ${slug} android ${basename(dest)} ${got.downloaded} bytes over loopback, sha256 matches`);
       return got.path;
@@ -919,7 +945,7 @@ export function linuxContext({
   };
   // E4.3: the app page and the index, re-rendered by the hub's own publishPages (deliver calls it the same way).
   ctx.pages = pages ?? (async (slug, latest) => {
-    await publishPages({ s3: await writer.open(), policy: settings.policy, slug, latest, fetchImpl, env });
+    await publishPages({ s3: await writer.open(), policy: settings.policy, slug, latest, fetchImpl, env, credentials: credentials ? await credentials() : null });
     log(`HUB_CATCHUP_PAGES ${slug}: app page and index re-rendered`);
   });
   ctx.record = facts => record(ctx, facts);

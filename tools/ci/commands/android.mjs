@@ -14,6 +14,7 @@ import { copyFileSync, mkdirSync, statSync } from 'node:fs';
 import { copyFile, mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
+import { accessFor } from '../lib/access.mjs';
 import { createAdb, findPhone } from '../lib/adb.mjs';
 import { apkIdentity, verifySigner } from '../lib/android.mjs';
 import { hookEnvironment } from '../lib/config.mjs';
@@ -284,9 +285,11 @@ async function releaseLane(config, { env }) {
   const digest = await sha256File(join(out, basename(spec.artifact)));
   const planNotes = readReceipts(env.HUB_RECEIPTS || join(config.out, 'receipts')).plan?.release_notes;
   const policy = loadPolicy().policy;
-  const saved = await readObject(policy, notesKey(manifest.project.slug, config.version));
+  const saved = await readObject(policy, notesKey(manifest.project.slug, config.version), { env });
   const canonical = saved ? validateNotes(JSON.parse(saved), { current: config.version, commit: sha }) : planNotes ? validateNotes(planNotes, { current: config.version, commit: sha }) : null;
-  const notes = canonical ? `${notesText(canonical)}\n\nBuild: ${basename(spec.artifact)} sha256 ${digest}.\nBuild page: https://s3.delo.sh/builds/${manifest.project.slug}/index.html` : `No author-written release notes were supplied for this build.\nCommit ${sha}; run ${env.GITHUB_RUN_ID ?? 'local'}.\nBuild page: https://s3.delo.sh/builds/${manifest.project.slug}/index.html`;
+  // MOBI-17: the Release text is read by anyone who can see the repo's Releases; a private page's URL would only answer 403.
+  const pageLine = accessFor(policy, manifest.project.slug).pageOpen ? `\nBuild page: https://s3.delo.sh/builds/${manifest.project.slug}/index.html` : '';
+  const notes = canonical ? `${notesText(canonical)}\n\nBuild: ${basename(spec.artifact)} sha256 ${digest}.${pageLine}` : `No author-written release notes were supplied for this build.\nCommit ${sha}; run ${env.GITHUB_RUN_ID ?? 'local'}.${pageLine}`;
   const existing = spawnSync('gh', ['release', 'view', tag, '--repo', repo], { env, stdio: 'ignore' });
   if (existing.status === 0) {
     // The plan never reuses a version, so the Release of this tag came from an earlier attempt of this deploy

@@ -12,6 +12,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isAnonymous } from '../ci/lib/access.mjs';
 import { bbEmitPath, uuidv5 } from '../ci/lib/announce.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
 import { withLock } from '../ci/lib/lock.mjs';
@@ -22,7 +23,8 @@ import {
   loadSettings, macContext, parseRecordArgs, readMode, reasonText, record, recordArgs, retry, serviceAccountEnv, settingsFrom, sshRecordCommand, withFallback, writeMode,
 } from './catchup.mjs';
 import { catchupEvent, producer, sendCatchupEvent } from './report.mjs';
-import { downloadVerified, readJson } from './store.mjs';
+import { presignedFacts } from '../ci/lib/sigv4.mjs';
+import { createStore, downloadVerified, readJson } from './store.mjs';
 
 const hubRoot = fileURLToPath(new URL('../../', import.meta.url));
 const devices = loadDevices({});
@@ -1080,4 +1082,123 @@ test('the Mac revalidates its pointers with the strong tag, uncompressed, and re
   assert.deepEqual(await store.latest('tower-of-lost-things'), { ok: true });
   assert.deepEqual(reads, ['tower-of-lost-things/latest.json']);
   assert.equal(await store.inflight('tower-of-lost-things'), null, 'a missing object is not a failure: no fallback');
+});
+
+// ---------------------------------------------------------------------------------------- MOBI-17: a private bucket
+
+const writerKeys = { access: 'mobile-deploy-hub', secret: 'Wr1ter-secret-for-tests-only' };
+
+// The bucket as MinIO enforces the hub's bucket policy: an anonymous read of a key the policy does not open is 403; a
+// read signed with the writer's keys (SigV4 header, over loopback) gets the object.
+function privateBucket(s3, { signed = [] } = {}) {
+  const open = s3.fetchImpl;
+  s3.fetchImpl = async (url, options = {}) => {
+    const key = url.replace(/^https?:\/\/[^/]+\/builds\//, '');
+    const authorization = options.headers?.authorization;
+    if (authorization) {
+      assert.match(authorization, /^AWS4-HMAC-SHA256 Credential=mobile-deploy-hub\/\d{8}\/us-east-1\/s3\/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=[0-9a-f]{64}$/);
+      assert.ok(!JSON.stringify(options.headers).includes(writerKeys.secret), 'the secret is never sent');
+      signed.push(key);
+      return open(url, options);
+    }
+    if (!isAnonymous(policy, key)) return new Response('<Error><Code>AccessDenied</Code></Error>', { status: 403 });
+    return open(url, options);
+  };
+  return s3;
+}
+const withKeys = s3 => ({ env, home }) => Object.assign(Object.create(s3.writer), { credentials: async () => writerKeys });
+
+test('MOBI-17 catch-up: the S26 pass reads a private device APK with the hub writer\'s keys, sha256 and signer still checked', async () => {
+  const signed = [];
+  const s3 = privateBucket(fakeS3(), { signed });
+  const host = linuxHost({ s3, writer: withKeys(s3) });
+  try {
+    publish(s3, { latest: latestDoc(), apk: apkText() });
+    host.phone.install(apkText({ version: '0.2.1', code: 3 }));
+    const result = await androidPass(host.ctx);
+    assert.equal(result.errors, 0);
+    assert.equal(host.phone.installed(), apkText(), 'the S26 still gets the APK');
+    assert.ok(signed.includes(`${slug}/latest.json`), 'the pointer is read signed');
+    assert.ok(signed.includes(`${slug}/0.2.2/${slug}-0.2.2-4.apk`), 'the device APK is read signed');
+    assert.equal(s3.requests.filter(request => request.key.endsWith('.apk')).length, 1);
+  } finally { host.cleanup(); }
+});
+
+test('MOBI-17 catch-up: a host with no keys cannot read a private device APK and installs nothing', async () => {
+  const s3 = privateBucket(fakeS3());
+  const host = linuxHost({ s3 });
+  try {
+    publish(s3, { latest: latestDoc(), apk: apkText() });
+    host.phone.install(apkText({ version: '0.2.1', code: 3 }));
+    const result = await androidPass(host.ctx);
+    assert.ok(result.errors >= 1);
+    assert.equal(host.phone.installed(), apkText({ version: '0.2.1', code: 3 }));
+    assert.doesNotMatch(host.phone.calls(), /install -r/);
+  } finally { host.cleanup(); }
+});
+
+test('MOBI-17 catch-up: the store signs every read when it has keys, and sends no signature when it has none', async () => {
+  const seen = [];
+  const fetchImpl = async (url, options = {}) => { seen.push(options.headers ?? {}); return new Response('{"a":1}', { status: 200 }); };
+  const keyed = createStore({ root: 'http://127.0.0.1:9012/builds', fetchImpl, credentials: async () => writerKeys });
+  await keyed.latest(slug);
+  await keyed.inflight(slug);
+  assert.equal(seen.length, 2);
+  for (const headers of seen) assert.match(headers.authorization, /^AWS4-HMAC-SHA256 Credential=mobile-deploy-hub\//);
+  const anonymous = createStore({ root: 'https://s3.delo.sh/builds', fetchImpl });
+  await anonymous.latest(slug);
+  assert.equal(seen[2].authorization, undefined);
+  assert.equal(anonymous.auth, null);
+  const dir = mkdtempSync(join(tmpdir(), 'hub-catchup-auth-'));
+  try {
+    const bytes = Buffer.from('abc');
+    const got = await downloadVerified('http://127.0.0.1:9012/builds/x/a.apk', join(dir, 'a.apk'), { bytes: 3, sha256: sha('abc'), fetchImpl: async (url, options) => { seen.push(options.headers); return new Response(bytes, { status: 200 }); }, auth: keyed.auth });
+    assert.equal(got.downloaded, 3);
+    assert.match(seen.at(-1).authorization, /^AWS4-HMAC-SHA256 /);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('MOBI-17 catch-up: the Mac\'s iPad pass never asks for an Android-only app\'s pointer (it would answer 403 anonymously)', async () => {
+  const s3 = privateBucket(fakeS3());
+  const linux = linuxHost({ s3, writer: withKeys(s3) });
+  const mac = macHost({ linux, tunnel: 'disconnected' });
+  try {
+    publish(s3, { latest: latestDoc({ android: androidBlock({ status: 'installed', by: 'deploy' }), ios: iosBlock() }), ipa: ipaText() });
+    mac.ipadState.installed = { version: '0.2.1', build: '4' };
+    mac.outbox(ipaText());
+    const result = await iosPass(mac.ctx);
+    assert.equal(result.errors, 0, 'no unreadable pointer');
+    const asked = new Set(s3.requests.map(request => request.key.split('/')[0]));
+    for (const androidOnly of ['earshot', 'shortwave']) assert.equal(asked.has(androidOnly), false, `${androidOnly} is not the Mac's to read`);
+    assert.ok(asked.has(slug));
+    assert.equal(mac.lines(/HUB_CATCHUP_ERROR/).length, 0);
+    assert.ok(mac.ipadState.calls.some(call => call.startsWith('install ')), 'the iPad still gets its build');
+  } finally { mac.cleanup(); }
+});
+
+test('MOBI-17 catch-up: the event\'s page link is plain for an anonymous page, presigned for a private one, and absent without keys', async () => {
+  const run = async ({ keyed, lanes }) => {
+    const s3 = privateBucket(fakeS3());
+    const host = linuxHost({ s3, writer: keyed ? withKeys(s3) : undefined });
+    try {
+      const copy = structuredClone(policy);
+      Object.values(copy.apps).find(app => app.slug === slug).lanes = lanes;
+      host.ctx.settings = settingsFrom(copy);
+      publish(s3, { latest: latestDoc(), apk: apkText() });
+      host.phone.install(apkText({ version: '0.2.1', code: 3 }));
+      await androidPass(host.ctx);
+      return host.events.at(-1)?.data.links ?? null;
+    } finally { host.cleanup(); }
+  };
+  const plain = await run({ keyed: true, lanes: ['android', 'ios'] });
+  assert.deepEqual(plain.map(link => link.url), [`https://s3.delo.sh/builds/${slug}/index.html`], 'the iPad page is anonymous');
+  const signed = await run({ keyed: true, lanes: ['android'] });
+  const facts = presignedFacts(signed[0].url);
+  assert.deepEqual([signed[0].rel, facts.expiresS, facts.key], ['page', 604800, `/builds/${slug}/index.html`]);
+  assert.equal(new URL(signed[0].url).searchParams.get('response-cache-control'), 'private, no-store');
+  assert.ok(signed[0].url.length <= 600);
+  assert.equal(await run({ keyed: false, lanes: ['android'] }), null, 'no keys: the pointer itself is unreadable, so nothing is installed and no event is sent');
+  // and an event that has no link to give carries none, never a URL that answers 403
+  const bare = catchupEvent({ name: 'Tower', slug, platform: 'android', block: latestDoc().android, device: { status: 'installed', by: 'catch-up' }, run: runOf(runId), commit, hubRef: null, correlation: null, devices, publicBase: 'https://s3.delo.sh/builds', pageUrl: false, now: now() });
+  assert.equal(bare.data.links, undefined);
 });

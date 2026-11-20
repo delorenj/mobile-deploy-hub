@@ -216,7 +216,7 @@ export async function deliver(config, { env = process.env, home = homedir(), fet
     };
 
     if (config.dryRun) {
-      const currentText = await readObject(policy, latestKey(slug), { fetchImpl });
+      const currentText = await readObject(policy, latestKey(slug), { fetchImpl, env });
       const current = currentText ? parseLatest(currentText, { slug }) : null;
       const merged = mergeLatest({ current, candidates, top, stamp, log });
       if (merged.latest) {
@@ -227,7 +227,7 @@ export async function deliver(config, { env = process.env, home = homedir(), fet
       if (candidates.ios?.key) manifestPlist({ ipaUrl: candidates.ios.url, bundle: candidates.ios.bundle, version: candidates.ios.version, title: manifest.project.name, displayImage: icons[57] ?? null, fullSizeImage: icons[512] ?? null });
       for (const edition of editions.filter(item => item.candidate)) {
         try {
-          const text = await readObject(policy, editionLatestKey(slug, edition.name), { fetchImpl });
+          const text = await readObject(policy, editionLatestKey(slug, edition.name), { fetchImpl, env });
           const current = text ? parseEditionPointer(text, { slug, edition: edition.name }) : null;
           const verdict = mayReplaceEdition(current, edition.candidate);
           serializeEditionPointer(edition.candidate);
@@ -247,13 +247,13 @@ export async function deliver(config, { env = process.env, home = homedir(), fet
     const s3 = s3Factory ? await s3Factory() : await jobWriter(policy, env);
     let pointer = {};
     await withLock(`s3-${slug}`, async () => {
-      const currentText = await readObject(policy, latestKey(slug), { fetchImpl });
+      const currentText = await readObject(policy, latestKey(slug), { fetchImpl, env });
       const current = currentText ? parseLatest(currentText, { slug }) : null;
       const merged = mergeLatest({ current, candidates, top, stamp, log });
       pointer = merged.pointer;
       if (merged.latest && merged.moved) {
         const key = notesKey(slug, config.version);
-        const saved = merged.latest.version === config.version ? await readObject(policy, key, { fetchImpl }) : null;
+        const saved = merged.latest.version === config.version ? await readObject(policy, key, { fetchImpl, env }) : null;
         // A version already published (including the other platform's earlier delivery) owns its notes.
         // An old release without notes stays missing; never silently rewrite its record from newer sources.
         const canonical = persistedNotes(saved, releaseNotes, { current: config.version, commit });
@@ -280,7 +280,7 @@ export async function deliver(config, { env = process.env, home = homedir(), fet
       }
       // 6. this run's platform is no longer in flight
       try {
-        const text = await readObject(policy, inflightKey(slug), { fetchImpl });
+        const text = await readObject(policy, inflightKey(slug), { fetchImpl, env });
         const next = inflightAfter(text ? JSON.parse(text) : null, run, scope);
         if (next.action === 'remove') s3.remove(inflightKey(slug));
         else if (next.action === 'write') s3.putText(`${JSON.stringify(next.inflight)}\n`, inflightKey(slug));
@@ -381,7 +381,7 @@ async function editionCandidate({ entry, name, spec, pin, open, manifest, slug, 
 // Inside the s3-<slug> lock: the bytes (APK, checksum, receipt) first, then the pointer, then the page, then retention.
 // The pointer moves forward only; an older or foreign build of the same release leaves it alone.
 async function publishEdition({ s3, policy, slug, edition, receipts, run, correlation, env, fetchImpl, log, notes }) {
-  const text = await readObject(policy, editionLatestKey(slug, edition.name), { fetchImpl });
+  const text = await readObject(policy, editionLatestKey(slug, edition.name), { fetchImpl, env });
   const current = text ? parseEditionPointer(text, { slug, edition: edition.name }) : null;
   const verdict = mayReplaceEdition(current, edition.candidate);
   if (!verdict.replace) { edition.pointer = 'kept'; log(`HUB_EDITION_POINTER ${edition.name} ${verdict.reason}`); return; }

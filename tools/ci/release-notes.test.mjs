@@ -80,7 +80,7 @@ test('the first published version owns the immutable note snapshot across platfo
 test('page escapes hostile content and refuses unsafe URLs while showing prior notes', () => {
   const latest = sampleLatest();
   const releaseNotes = { [latest.version]: { ...full(), version: latest.version, entries: [note(latest.version)] }, '0.0.1': { ...full(), version: '0.0.1', previous_version: null, entries: [note('0.0.1')] } };
-  const page = appPage({ latest, history: [{ version: '0.0.1', code: 1, url: 'javascript:alert(1)', bytes: 100 }], releaseNotes });
+  const page = appPage({ latest, history: [{ version: '0.0.1', code: 1, url: 'javascript:alert(1)', bytes: 100 }], releaseNotes, access: { devicePublic: true } });
   assert.match(page, /New &lt;p&gt; &amp; more/);
   assert.match(page, /What to try/);
   assert.match(page, /Known limitations/);

@@ -1,18 +1,24 @@
 // The build directory on MinIO (design v1.1, C). Only big-chungus writes it, over the loopback port the MinIO stack
 // publishes (policy delivery.s3.write), as the MinIO user mobile-deploy-hub, whose policy can touch the builds bucket
 // only. Its keys come from 1Password at call time and reach exactly one place: the MC_HOST_builds variable in the
-// environment of the `mc` child process. Never argv, never a file, never GITHUB_ENV, never a log line. Everyone reads
-// anonymously: phones and the iPad through https://s3.delo.sh/builds, this host through the loopback port.
+// environment of the `mc` child process. Never argv, never a file, never GITHUB_ENV, never a log line.
+//
+// MOBI-17 (docs/private-device-builds.md): the bucket is private by default. Anonymous readers (phones, the iPad, the
+// Mac's catch-up, Obtainium) get only what lib/access.mjs opens: public editions, public device editions, the iPad's
+// over-the-air objects and pointers, the root index. Everything else the hub reads with the same writer keys (an
+// authenticated GET, SigV4, over the loopback port) and hands to a person as a presigned link (lib/sigv4.mjs).
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { accessFor, assertPublicText, cacheControlFor, isAnonymous } from './access.mjs';
 import { isCredentialVariable } from './config.mjs';
 import { attempt } from './exec.mjs';
 import { compareBuild, compareSemver, latestKey, pageKey, parseLatest, publicUrl, serializeLatest } from './latest.mjs';
 import { withLock } from './lock.mjs';
 import { appPage, indexData, indexPage } from './pages.mjs';
 import { notesKey, validateNotes } from './release-notes.mjs';
+import { signedHeaders } from './sigv4.mjs';
 
 // DeLoSecrets item "MinIO builds writer (mobile-deploy-hub)", by UUID (titles are not unique in the vault).
 export const writerItem = 'op://DeLoSecrets/dfch6zwvscl3ootrcbkwbfelka';
@@ -37,9 +43,10 @@ export function contentTypeOf(key) {
   return type;
 }
 
-// Pointers and pages are revalidated on every read; versioned objects never change.
+// Pointers and pages are revalidated on every read; versioned objects never change. An object anonymous readers cannot
+// get is `private` (no shared cache keeps it); createS3 decides that from the access model.
 export const mutableKey = key => /(^|\/)(index\.html|index\.json|latest\.json|inflight\.json|manifest\.plist)$/.test(key) || key.startsWith('.probe/');
-export const cacheControlOf = key => (mutableKey(key) ? 'no-cache' : 'public, max-age=31536000, immutable');
+export const cacheControlOf = (key, { anonymous = true } = {}) => cacheControlFor(mutableKey(key), anonymous);
 
 // mc --attr: ';' separates attributes, so values are double-quoted (Content-Type carries "; charset=utf-8").
 export const attrOf = ({ contentType, cacheControl }) => `Content-Type="${contentType}";Cache-Control="${cacheControl}"`;
@@ -109,11 +116,13 @@ export function createS3({ policy, credentials, env = process.env, runner = atte
   const api = {
     bucket,
     endpoint,
-    // A file to one key, with its content type and cache policy set explicitly.
-    put(file, key, { contentType = contentTypeOf(key), cacheControl = cacheControlOf(key), timeout = 30 * 60_000 } = {}) {
+    // A file to one key, with its content type and cache policy set explicitly (private unless the key is anonymous).
+    put(file, key, { contentType = contentTypeOf(key), cacheControl = cacheControlOf(key, { anonymous: isAnonymous(policy, key) }), timeout = 30 * 60_000 } = {}) {
       mc(['cp', '--attr', attrOf({ contentType, cacheControl }), file, target(key)], { timeout, label: `cp ${key}` });
     },
+    // Text an anonymous reader could get never carries a presigned link or a private device APK's link (MOBI-17).
     putText(text, key, options = {}) {
+      assertPublicText(policy, key, text);
       const dir = mkdtempSync(join(tmpdir(), 'hub-s3-'));
       try {
         const file = join(dir, key.split('/').pop());
@@ -141,17 +150,32 @@ export function assertJobContext(env = process.env) {
   throw new Error('the deploy jobs write the build directory only inside a workflow job; set HUB_S3_LOCAL=1 to do it from this shell on purpose');
 }
 
-export async function jobWriter(policy, env = process.env) {
+export const jobContext = (env = process.env) => env.GITHUB_ACTIONS === 'true' || env.HUB_S3_LOCAL === '1';
+
+// One read of the writer's keys per job process, shared by the writer and every authenticated read (a failed read is
+// not remembered, so the next call asks 1Password again).
+let jobKeys = null;
+export async function jobCredentials(env = process.env, { read } = {}) {
   assertJobContext(env);
-  return createS3({ policy, credentials: await writerCredentials({ env }), env });
+  if (!jobKeys) jobKeys = writerCredentials({ env, ...(read ? { read } : {}) }).catch(error => { jobKeys = null; throw error; });
+  return jobKeys;
 }
 
-// Anonymous reads over the loopback port (the bucket is public-read). A missing object is null.
-export async function readObject(policy, key, { fetchImpl = fetch, base = policy.delivery.s3.write, timeoutMs = 20_000 } = {}) {
+export async function jobWriter(policy, env = process.env) {
+  assertJobContext(env);
+  return createS3({ policy, credentials: await jobCredentials(env), env });
+}
+
+// A read of one object over the loopback port. A missing object is null. MOBI-17: the read is authenticated (SigV4 with
+// the writer's keys) whenever there are keys: `credentials` given, or, left undefined, the job's own inside a workflow
+// job. `credentials: null`, or a test or a shell outside a job, reads anonymously (and gets 403 for a private object).
+export async function readObject(policy, key, { fetchImpl = fetch, base = policy.delivery.s3.write, timeoutMs = 20_000, credentials = undefined, env = process.env, now = () => new Date() } = {}) {
   const url = `${base.replace(/\/+$/, '')}/${policy.delivery.s3.bucket}/${key}`;
-  const response = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs), headers: { 'Cache-Control': 'no-cache' } });
+  const keys = credentials === undefined ? (jobContext(env) ? await jobCredentials(env) : null) : credentials;
+  const headers = { 'Cache-Control': 'no-cache', ...(keys ? signedHeaders({ credentials: keys, url, now: now() }) : {}) };
+  const response = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs), headers });
   if (response.status === 404) return null;
-  if (!response.ok) throw new Error(`GET ${key} from the build directory answered ${response.status}`);
+  if (!response.ok) throw new Error(`GET ${key} from the build directory answered ${response.status}${response.status === 403 && !keys ? ' (a private object read without the hub\'s keys)' : ''}`);
   return response.text();
 }
 
@@ -179,29 +203,34 @@ export function historyOf(listing, policy, slug) {
 // The app page, then (under the s3-index lock, shared by every app) index.json and index.html from every app's
 // latest.json. deliver and the catch-up reporter both call this after they write latest.json, so the page always
 // shows latest.json's device states (a per-run list would vanish on a catch-up re-render).
-export async function publishPages({ s3, policy, slug, latest, currentNotes = null, fetchImpl = fetch, env = process.env }) {
+// MOBI-17: a page links a device APK only when the policy publishes that device edition (lib/access.mjs); it never
+// carries a presigned link, since a page may be anonymous. `credentials` reads the private notes and pointers (the
+// catch-up passes its writer's keys; a deploy job's own are used when it is left undefined).
+export async function publishPages({ s3, policy, slug, latest, currentNotes = null, fetchImpl = fetch, env = process.env, credentials = undefined }) {
+  const read = key => readObject(policy, key, { fetchImpl, credentials, env });
   const history = historyOf(s3.list(`${slug}/`), policy, slug);
   const versions = [...new Set([latest.version, ...history.map(item => item.version)])];
   const releaseNotes = {};
   for (const version of versions) {
-    const raw = version === latest.version && currentNotes ? JSON.stringify(currentNotes) : await readObject(policy, notesKey(slug, version), { fetchImpl });
+    const raw = version === latest.version && currentNotes ? JSON.stringify(currentNotes) : await read(notesKey(slug, version));
     if (raw) releaseNotes[version] = validateNotes(JSON.parse(raw), { current: version });
   }
-  s3.putText(appPage({ latest, history, releaseNotes }), pageKey(slug));
+  s3.putText(appPage({ latest, history, releaseNotes, access: accessFor(policy, slug) }), pageKey(slug));
   await withLock('s3-index', async () => {
     const apps = [];
     for (const app of Object.values(policy.apps)) {
       // Another app's unreadable pointer leaves that app off the index; it never stops this app's publish.
       try {
-        const text = app.slug === slug ? serializeLatest(latest) : await readObject(policy, latestKey(app.slug), { fetchImpl });
+        const text = app.slug === slug ? serializeLatest(latest) : await read(latestKey(app.slug));
         if (text) apps.push(parseLatest(text, { slug: app.slug }));
       } catch (error) {
         if (app.slug === slug) throw error;
         console.log(`::warning::${latestKey(app.slug)} is left off the index (${error.message.split('\n')[0]})`);
       }
     }
-    s3.putText(`${JSON.stringify(indexData(apps), null, 2)}\n`, 'index.json');
-    s3.putText(indexPage(apps), 'index.html');
+    const accessBySlug = slug_ => accessFor(policy, slug_);
+    s3.putText(`${JSON.stringify(indexData(apps, { access: accessBySlug }), null, 2)}\n`, 'index.json');
+    s3.putText(indexPage(apps, { access: accessBySlug }), 'index.html');
   }, { env, timeoutMs: 10 * 60_000 });
 }
 

@@ -195,7 +195,7 @@ async function announceFixture({ receipts, needs, latest, dryRun = false, testfl
   const env = { PATH: process.env.PATH, GITHUB_REPOSITORY: repo, GITHUB_RUN_ID: '41500000000', GITHUB_RUN_ATTEMPT: '1', GITHUB_SHA: 'c'.repeat(40), HUB_BB_EMIT: join(bin, 'bb-emit'), HUB_NEEDS: JSON.stringify(needs), HUB_RECEIPTS: join(out, 'receipts') };
   const config = { ...parseConfig(['announce', '--manifest', 'tools/ci/mobile-deploy.json', '--out', out, '--dry-run', String(dryRun), '--testflight', String(testflight)], env), cwd: app };
   const fetchImpl = async () => (latest ? { status: 200, ok: true, text: async () => JSON.stringify(latest) } : { status: 404, ok: false, text: async () => '' });
-  const run = async (more = {}) => announce(config, { env: { ...env, ...more }, home: root, fetchImpl, log: () => {}, lostMac: null });
+  const run = async (more = {}, deps = {}) => announce(config, { env: { ...env, ...more }, home: root, fetchImpl, log: () => {}, lostMac: null, ...deps });
   const completion = async () => JSON.parse(await readFile(join(out, 'completion/completion.json'), 'utf8'));
   return { run, completion, cleanup: () => rm(root, { recursive: true, force: true }) };
 }
@@ -237,4 +237,20 @@ test('announce writes completion-out red for 0.3.19\'s shape, and rewrites it re
     assert.equal(c.verdict, 'RED', 'a run whose event never went out is not shipped');
     assert.equal(c.failure.job, 'announce');
   } finally { await g.cleanup(); }
+});
+
+test('MOBI-17 announce: the device APK link in the notification is presigned for 7 days, the anonymous iPad page stays plain, and no keys drops the APK link', async () => {
+  const published = { apk: `https://s3.delo.sh/builds/${slug}/0.3.20/${slug}-0.3.20-25.apk`, apk_bytes: 74_700_000, ota: null, ipa_bytes: null, page: `https://s3.delo.sh/builds/${slug}/index.html`, manifest: null, any: true };
+  const receipts = [gateReceipt, planReceipt('0.3.20', 25), { lane: 'android', outcome: 'success', delivery: { status: 'installed', verified: true, build: '25' } }, { lane: 'ios', outcome: 'success', delivery: { status: 'installed', verified: true, build: '25' }, store: { status: 'assigned', build: '25' } }, { lane: 'deliver-android', outcome: 'success', published }];
+  const f = await announceFixture({ receipts, needs: allGreen, latest: latestFor('0.3.20', 25, { android: 'installed', ios: 'installed' }) });
+  try {
+    const withKeys = await f.run({}, { credentials: { access: 'mobile-deploy-hub', secret: 'Wr1ter-secret-for-tests-only' }, now: () => new Date('2026-11-19T12:00:00Z') });
+    const byRel = Object.fromEntries(withKeys.data.links.map(link => [link.rel, link]));
+    assert.match(byRel.apk.url, /^https:\/\/s3\.delo\.sh\/builds\/tower-of-lost-things\/0\.3\.20\/tower-of-lost-things-0\.3\.20-25\.apk\?X-Amz-Algorithm=AWS4-HMAC-SHA256&/);
+    assert.equal(new URL(byRel.apk.url).searchParams.get('X-Amz-Expires'), '604800');
+    assert.equal(byRel.page.url, published.page, 'the iPad page is anonymous, so its link is plain');
+    assert.ok(!JSON.stringify(withKeys.data).includes('Wr1ter-secret'), 'the secret is never in the event');
+    const without = await f.run({}, { credentials: null });
+    assert.deepEqual(without.data.links.map(link => link.rel), ['page', 'run'], 'a private link with no keys is dropped');
+  } finally { await f.cleanup(); }
 });

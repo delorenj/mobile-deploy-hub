@@ -12,6 +12,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { deploy, finishByHand, parseArguments, realGh, realGit, unknownStatus } from './deploy.mjs';
+import { check as checkBucketPolicy } from './bucket-policy.mjs';
 import { conformance } from './conformance.mjs';
 import { loadPolicy } from './ci/lib/policy.mjs';
 
@@ -57,6 +58,11 @@ export async function release(version, { log = console.log, dryRuns = true } = {
   log('RELEASE_CHECK mise run conformance');
   const problems = conformance({ policy: loadPolicy().policy, log });
   if (problems.length > 0) throw new Error(`${problems.length} conformance problems`);
+  // MOBI-17: the live bucket must answer anonymous reads as policy.json says (docs/private-device-builds.md). A release
+  // that ships a policy change waits for `mise run bucket-policy:apply`.
+  log('RELEASE_CHECK mise run bucket-policy');
+  const access = await checkBucketPolicy({ policy: loadPolicy().policy, log });
+  if (access.length > 0) throw new Error(`${access.length} bucket policy problems (mise run bucket-policy:apply)`);
 
   const text = readFileSync(workflowPath, 'utf8');
   const flipped = flipInnerRefs(text, tag);

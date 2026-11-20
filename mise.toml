@@ -137,6 +137,16 @@ description = "Check through gh api that Tower, Green In Between and Gruvato dep
 tools = { node = "24" }
 run = "node tools/conformance.mjs"
 
+[tasks."bucket-policy"]
+description = "Check the build directory's access (MOBI-17): tools/ci/bucket-policy.json equals what policy.json renders, and the live bucket answers anonymous probes as it says (no listing, no private device APK). Needs no credential."
+tools = { node = "24" }
+run = "node tools/bucket-policy.mjs check"
+
+[tasks."bucket-policy:apply"]
+description = "Set the live bucket policy of `builds` from tools/ci/bucket-policy.json (idempotent; admin keys from 1Password over loopback), then run the check. Add --dry-run to see the diff only."
+tools = { node = "24" }
+run = "node tools/bucket-policy.mjs apply"
+
 [tasks.release]
 description = "Release the hub: mise run release -- X.Y.Z (check, conformance, tag, move v1, one strict dry run per app, v1 back if red)"
 tools = { node = "24", actionlint = "1.7.12" }

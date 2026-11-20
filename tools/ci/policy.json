@@ -11,7 +11,7 @@
     },
     "delorenj/green-in-between": {
       "slug": "green-in-between", "lanes": ["android", "ios"],
-      "android": { "package": "io.lasertoast.greeninbetween.spike", "signer_sha256": "d9d0253a4ce5bfb8a18d01efddc042e8828c3f73b04da41b4c3358e125c5222a" },
+      "android": { "package": "io.lasertoast.greeninbetween.spike", "signer_sha256": "d9d0253a4ce5bfb8a18d01efddc042e8828c3f73b04da41b4c3358e125c5222a", "public": true },
       "ios": { "bundle": "io.lasertoast.greeninbetween.spike", "store_bundle": "io.lasertoast.greeninbetween" }
     },
     "delorenj/gruvato": {
@@ -22,7 +22,7 @@
     "AutomaticAI-io/navi": {
       "slug": "navi", "lanes": ["android", "ios"], "tag_prefix": "navi-v", "version": "tag",
       "testflight": { "groups": ["Owner Testing", "Client Review"], "train": "minor" },
-      "android": { "package": "io.automaticai.ipm.navi", "signer_sha256": "d09a011f872cc3e25f5b6c46e66a5e07c68c1240566bc0d4b66bf41e0fff3a3c" },
+      "android": { "package": "io.automaticai.ipm.navi", "signer_sha256": "d09a011f872cc3e25f5b6c46e66a5e07c68c1240566bc0d4b66bf41e0fff3a3c", "public": true },
       "ios": { "bundle": "io.automaticai.ipm.navi" }
     },
     "delorenj/earshot": {
