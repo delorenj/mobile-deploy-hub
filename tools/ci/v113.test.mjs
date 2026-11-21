@@ -28,7 +28,9 @@ import { sendIpa } from './commands/ios.mjs';
 import { main } from './hub.mjs';
 import { judgeRun, watch } from './macwatch.mjs';
 import { checkWorkflow, triggersOf } from '../conformance.mjs';
-import { sampleLatest } from './test-fixtures.mjs';
+import { hermetic, sampleLatest } from './test-fixtures.mjs';
+
+hermetic(); // offline and outside any workflow job, on every host (test-fixtures.mjs)
 
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 const { policy } = loadPolicy();

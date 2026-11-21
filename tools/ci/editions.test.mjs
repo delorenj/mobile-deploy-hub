@@ -23,7 +23,9 @@ import { checkPins } from './commands/gate.mjs';
 import { deliver } from './commands/deliver.mjs';
 import { android, plan, release } from './hub.mjs';
 import { latestProblems, settingsFrom } from '../catchup/catchup.mjs';
-import { sampleLatest } from './test-fixtures.mjs';
+import { hermetic, sampleLatest } from './test-fixtures.mjs';
+
+hermetic(); // offline and outside any workflow job, on every host (test-fixtures.mjs)
 
 const { policy } = loadPolicy();
 const signer = '2d4954863dabb5da86d69ce4b60b3e400e73669b50a80658b0941440a7941a97';
@@ -308,7 +310,7 @@ test('a real run installs only the device edition on the S26 and in Quickdrop; t
     assert.equal(readFileSync(join(h.state, 'installed.apk'), 'utf8'), 'io.example.app 0.2.2 5 ');
     assert.doesNotMatch(h.adbCalls(), /io\.example\.beta/, 'the S26 is never even asked about the beta package');
     assert.deepEqual(readdirSync(join(h.root, 'quickdrop/builds')), ['example-app-0.2.2-5.apk'], 'Quickdrop holds the device edition only');
-    await quiet(() => release(h.configure('release', ['--dry-run', 'false', '--version', '0.2.2', '--android-code', '5', '--build-sha', planned.build_sha]), { env: { ...h.env, GH_TOKEN: 'token' } }));
+    await quiet(() => release(h.configure('release', ['--dry-run', 'false', '--version', '0.2.2', '--android-code', '5', '--build-sha', planned.build_sha]), { env: { ...h.env, GH_TOKEN: 'token' }, fetchImpl: notFound }));
     const created = readFileSync(join(h.root, 'gh.log'), 'utf8').split('\n').find(line => line.startsWith('gh release create'));
     assert.match(created, /android\/App\.apk .*hub-receipt-android\.json .*editions\/beta\/example-app-beta-0\.2\.2-5\.apk .*hub-receipt-android-edition-beta\.json/);
   } finally { await h.cleanup(); }
@@ -528,7 +530,7 @@ test('a private edition rides the Release only when GitHub says the repository i
     const planned = await quiet(() => plan(h.configure('plan', ['--dry-run', 'false']), { env: h.env, home: h.root, fetchImpl: notFound, s3Factory: async () => h.s3 }));
     git(h.app, ['checkout', '-q', planned.build_sha], h.env);
     await quiet(() => android(h.configure('android', ['--dry-run', 'false', '--version', '0.2.2', '--android-code', '5', '--build-sha', planned.build_sha]), { env: h.env, home: h.root, quickdropLink: async () => ({ onLan: true, reason: 'test' }) }));
-    await quiet(() => release(h.configure('release', ['--dry-run', 'false', '--version', '0.2.2', '--android-code', '5', '--build-sha', planned.build_sha]), { env: { ...h.env, GH_TOKEN: 'token', GH_PRIVATE: 'false' } }));
+    await quiet(() => release(h.configure('release', ['--dry-run', 'false', '--version', '0.2.2', '--android-code', '5', '--build-sha', planned.build_sha]), { env: { ...h.env, GH_TOKEN: 'token', GH_PRIVATE: 'false' }, fetchImpl: notFound }));
     const created = readFileSync(join(h.root, 'gh.log'), 'utf8').split('\n').find(line => line.startsWith('gh release create'));
     assert.doesNotMatch(created, /beta/, 'a public repository\'s Release carries no private edition');
     // MOBI-17: nor the private device edition (the policy does not publish it), nor its receipts

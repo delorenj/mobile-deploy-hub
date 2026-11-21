@@ -21,6 +21,8 @@ import { parseManifest } from './lib/manifest.mjs';
 import { android, announce, plan, play, preflightIos, release } from './hub.mjs';
 import { checkPhone, lanesFrom, parseArguments, phone } from '../deploy.mjs';
 
+hermetic(); // offline and outside any workflow job, on every host (test-fixtures.mjs)
+
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 const signer = '2d4954863dabb5da86d69ce4b60b3e400e73669b50a80658b0941440a7941a97';
 const devices = loadDevices({});
@@ -607,11 +609,22 @@ test('the hub never removes an app, clears its data or downgrades it', () => {
   };
   for (const dir of ['tools', 'actions', '.github']) walk(join(repoRoot, dir));
   assert.ok(files.length > 15, 'the scan saw the hub');
+  // tools/verify holds operator-run checks for an EMULATOR (obtainium-check uninstalls the package under test and clears
+  // Obtainium's data, so the install it reads back is Obtainium's own). They are no deploy path: each one that would hit
+  // the scan must refuse every serial but emulator-NNNN and every device without ro.kernel.qemu=1, and nothing the
+  // hub runs (tools/ci, tools/catchup, tools/device, actions, workflows) may name tools/verify.
+  const verifyDir = join(repoRoot, 'tools/verify') + '/';
+  const emulatorOnly = text => /\/\^emulator-\\d\+\$\/\.test\(serial\)/.test(text) && /getprop ro\.kernel\.qemu'\)\.trim\(\) !== '1'/.test(text);
   const hits = [];
   for (const file of files) {
-    readFileSync(file, 'utf8').split('\n').forEach((line, index) => {
-      for (const [pattern, name] of forbidden) if (pattern.test(line)) hits.push(`${relative(repoRoot, file)}:${index + 1} ${name}: ${line.trim().slice(0, 120)}`);
+    const text = readFileSync(file, 'utf8');
+    if (!file.startsWith(verifyDir) && /tools\/verify\b|obtainium-check/.test(text)) hits.push(`${relative(repoRoot, file)} names tools/verify, which is emulator-only`);
+    const own = [];
+    text.split('\n').forEach((line, index) => {
+      for (const [pattern, name] of forbidden) if (pattern.test(line)) own.push(`${relative(repoRoot, file)}:${index + 1} ${name}: ${line.trim().slice(0, 120)}`);
     });
+    if (own.length > 0 && file.startsWith(verifyDir)) assert.ok(emulatorOnly(text), `${relative(repoRoot, file)} removes or clears an app but does not refuse a non-emulator serial and device`);
+    else hits.push(...own);
   }
   assert.deepEqual(hits, []);
   // The one install each device gets: in place.
@@ -800,7 +813,11 @@ test('a real run end to end: bump pushed, APK installed in place and read back, 
     assert.equal(lane.delivery.verified, true);
     assert.match(host.adbCalls(), /install -r .*App\.apk/);
     assert.equal(readFileSync(join(host.state, 'installed.apk'), 'utf8'), 'io.example.app 0.2.2 5 ');
-    await quiet(() => release(host.configure('release', ['--dry-run', 'false', '--version', '0.2.2', '--android-code', '5', '--build-sha', planned.build_sha]), { env: { ...host.env, GH_TOKEN: 'token' } }));
+    // The saved release notes are read through the injected fetch, never the live bucket (MOBI-17 made them private,
+    // so an un-injected read answered 403 here and ECONNREFUSED on a host without MinIO).
+    const reads = [];
+    await quiet(() => release(host.configure('release', ['--dry-run', 'false', '--version', '0.2.2', '--android-code', '5', '--build-sha', planned.build_sha]), { env: { ...host.env, GH_TOKEN: 'token' }, fetchImpl: async url => { reads.push(String(url)); return noLatest(); } }));
+    assert.deepEqual(reads, ['http://127.0.0.1:9012/builds/example-app/0.2.2/release-notes.json']);
     assert.match(host.calls("gh.log"), /gh release create v0\.2\.2 [^\n]* --target [0-9a-f]{40} [\s\S]*--verify-tag\n/);
     const needs = JSON.stringify({ gate: { result: 'success' }, plan: { result: 'success', outputs: out }, android: { result: 'success' }, deliver: { result: 'success' } });
     await rm(join(f.root, 'bb-emit.log'), { force: true });
@@ -832,7 +849,7 @@ test('Re-run failed jobs finishes a deploy: same build verified without reinstal
     assert.match(host.adbCalls(), /install -r /);
     assert.equal(readFileSync(join(host.state, 'installed.apk'), 'utf8'), 'io.example.app 0.2.2 5 attempt-2');
     // The Release an earlier attempt published gets this attempt's assets.
-    await quiet(() => release(host.configure('release', ['--dry-run', 'false', '--version', '0.2.2', '--android-code', '5', '--build-sha', planned.build_sha]), { env: { ...host.env, GH_TOKEN: 'token', FAKE_RELEASE_EXISTS: '0' } }));
+    await quiet(() => release(host.configure('release', ['--dry-run', 'false', '--version', '0.2.2', '--android-code', '5', '--build-sha', planned.build_sha]), { env: { ...host.env, GH_TOKEN: 'token', FAKE_RELEASE_EXISTS: '0' }, fetchImpl: noLatest }));
     assert.match(host.calls('gh.log'), /gh release upload v0\.2\.2 .* --clobber/);
     // A phone ahead of the plan is never downgraded.
     await host.installApk('io.example.app 0.2.9 9');
@@ -902,7 +919,7 @@ test('a --play run needs the keyless inputs, a dry run too, and the dry run neve
 // ---------------------------------------------------------------------------------------------------- v1.1 downgrade guards
 
 import { apkKey as keyOfApk, publicUrl as urlOf } from './lib/latest.mjs';
-import { sampleLatest } from './test-fixtures.mjs';
+import { hermetic, sampleLatest } from './test-fixtures.mjs';
 
 function publishedFor(slug, version, code) {
   const doc = sampleLatest({ slug, version });

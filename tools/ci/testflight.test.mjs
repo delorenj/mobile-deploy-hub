@@ -15,7 +15,9 @@ import { loadPolicy } from './lib/policy.mjs';
 import { gate } from './commands/gate.mjs';
 import { storePreflight } from './commands/plan.mjs';
 import { loadDevices } from './lib/devices.mjs';
-import { sampleLatest } from './test-fixtures.mjs';
+import { hermetic, sampleLatest } from './test-fixtures.mjs';
+
+hermetic(); // offline and outside any workflow job, on every host (test-fixtures.mjs)
 
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 const template = readFileSync(templateFile, 'utf8');

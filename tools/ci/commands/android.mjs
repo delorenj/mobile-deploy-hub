@@ -247,16 +247,19 @@ export function releaseArguments({ tag, repo, sha, title, notes, assets, verifyT
   return ['release', 'create', tag, ...assets, '--repo', repo, '--target', sha, '--title', title, '--notes', notes, ...(verifyTag ? ['--verify-tag'] : [])];
 }
 
-export async function release(config, { env = process.env } = {}) {
+// fetchImpl reaches the build directory (the saved release notes), like plan, deliver and announce: the one read here
+// that a test must be able to answer, since an un-injected read gets whatever the live bucket says (403 for a private
+// object since MOBI-17, ECONNREFUSED on a host with no MinIO).
+export async function release(config, { env = process.env, fetchImpl = fetch } = {}) {
   return guarded('android-release', join(config.out, 'android'), config, env, async track => {
     track.stage = 'deliver';
-    const done = await releaseLane(config, { env });
+    const done = await releaseLane(config, { env, fetchImpl });
     await writeReceipt(join(config.out, 'android'), buildReceipt({ lane: 'android-release', config, env, version: config.version, androidCode: config.androidCode, notes: [`${done.updated ? 'updated' : 'published'} the private Release ${done.tag}`] }), env);
     return done;
   });
 }
 
-async function releaseLane(config, { env }) {
+async function releaseLane(config, { env, fetchImpl }) {
   if (config.dryRun) throw new Error('refusing to publish a release on a dry run');
   const manifest = await loadManifest(config.cwd, config.manifest);
   if (!semver.test(config.version)) throw new Error('release needs the plan version');
@@ -293,7 +296,7 @@ async function releaseLane(config, { env }) {
   const digest = await sha256File(join(out, basename(spec.artifact)));
   const planNotes = readReceipts(env.HUB_RECEIPTS || join(config.out, 'receipts')).plan?.release_notes;
   const policy = loadPolicy().policy;
-  const saved = await readObject(policy, notesKey(manifest.project.slug, config.version), { env });
+  const saved = await readObject(policy, notesKey(manifest.project.slug, config.version), { env, fetchImpl });
   const canonical = saved ? validateNotes(JSON.parse(saved), { current: config.version, commit: sha }) : planNotes ? validateNotes(planNotes, { current: config.version, commit: sha }) : null;
   // MOBI-17: the Release text is read by anyone who can see the repo's Releases; a private page's URL would only answer 403.
   const pageLine = accessFor(policy, manifest.project.slug).pageOpen ? `\nBuild page: https://s3.delo.sh/builds/${manifest.project.slug}/index.html` : '';

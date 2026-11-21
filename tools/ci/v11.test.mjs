@@ -13,8 +13,10 @@ import { callerHash, checkCaller, normalizeCaller, templateFile } from './lib/ca
 import { parseConfig } from './lib/config.mjs';
 import { loadPolicy, parsePolicy, policyFile, tagOf, tagOnlyOf } from './lib/policy.mjs';
 import * as hub from './hub.mjs';
-import { sampleLatest } from './test-fixtures.mjs';
+import { hermetic, sampleLatest } from './test-fixtures.mjs';
 import { gate } from './hub.mjs';
+
+hermetic(); // offline and outside any workflow job, on every host (test-fixtures.mjs)
 
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 const template = readFileSync(templateFile, 'utf8');

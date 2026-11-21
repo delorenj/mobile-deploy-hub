@@ -12,7 +12,9 @@ import { loadDevices } from './lib/devices.mjs';
 import { parseConfig } from './lib/config.mjs';
 import { loadPolicy } from './lib/policy.mjs';
 import { announce } from './commands/announce.mjs';
-import { device, sampleLatest } from './test-fixtures.mjs';
+import { device, hermetic, sampleLatest } from './test-fixtures.mjs';
+
+hermetic(); // offline and outside any workflow job, on every host (test-fixtures.mjs)
 
 const { policy: releasedPolicy } = loadPolicy();
 // Exercise the deferred contract explicitly; the released policy intentionally has no completion block.

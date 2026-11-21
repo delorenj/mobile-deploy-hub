@@ -14,6 +14,9 @@ import { highestVersionCode, uploadBundle } from './lib/play.mjs';
 import { buildReceipt, hubRef, setOutputs, summaryMarkdown, writeReceipt } from './lib/receipt.mjs';
 import { exportGodot, scriptErrors } from './lib/godot.mjs';
 import { play } from './hub.mjs';
+import { hermetic } from './test-fixtures.mjs';
+
+hermetic(); // offline and outside any workflow job, on every host (test-fixtures.mjs)
 
 const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
 const signer = '2d4954863dabb5da86d69ce4b60b3e400e73669b50a80658b0941440a7941a97';
