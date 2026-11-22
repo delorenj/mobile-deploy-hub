@@ -32,7 +32,7 @@ All references are against 4cdefdc plus the hermetic-tests fix.
 ### Host-bound staleness
 
 - An owner whose `host` is not this host is treated as stale, and so is a ticket from another host (`lock.mjs:49,53,142,157-158`).
-- So the Hub API must run on big-chungus as the runner user, with the same lock dir. The Mac's locks need the Mac Agent.
+- So the Hub API must run on big-chungus as the runner user, with the same lock dir. The Mac's locks need the Mac's Host Agent.
 
 ### History
 
@@ -73,7 +73,9 @@ All references are against 4cdefdc plus the hermetic-tests fix.
 
 - `<name>.reservations/<enqueued_at>-<run>.json` holding `{run, repo, expires_at}`.
 - The plan job writes it and the android or iOS job adopts it. It lives in a separate directory because `staleWaiter` deletes tickets that have no live pid.
-- The serving rule merges tickets and reservations by `enqueued_at`. A reservation at the head that has not been claimed holds the lock for up to the grace period.
+- The serving rule merges tickets and reservations by `enqueued_at`. A reservation at the head that has not been claimed holds the lock for up to the grace period. After that the next ticket is served, and the reservation keeps the head: it is never re-sorted behind later arrivals (PRD FR-9).
+- The plan job takes its reservation inside today's `withLock('adb', …)` block (`plan.mjs:230`), which runs before `bumpTransaction` (`plan.mjs:254`). So "reserve before the bump" needs no reordering of the plan job.
+- An unclaimed reservation also carries a ceiling (`expires_at` = taken + 3 h), so a run whose install job never starts cannot hold the head forever.
 
 ### 4. Heartbeat for remote Claimants
 
@@ -86,9 +88,10 @@ All references are against 4cdefdc plus the hermetic-tests fix.
 - `hub-device` reads it, and falls back to `devices.json` when the file is absent.
 - Lock names stay as today for the seeded Resources (`adb`, `s24`, `emulator-N`). New Resources get `res-<slug>`.
 
-### 6. Mac Agent
+### 6. Host Agent (the Mac's first)
 
-- It serves `mac-ios` and an `ipad` lock on the Mac's disk.
+- A Host Agent owns one host's lock dir and reports that host's devices. big-chungus's is the Hub API process itself; the Mac's serves `mac-ios` and an `ipad` lock on the Mac's disk.
+- A third host is the same agent plus a Registry entry for it. No lock spans hosts, which keeps `lock.mjs`'s host-bound staleness rule intact.
 - Option (a): the Hub API reaches it over `ssh hub-mac` using the same retried-connection classification as `tools/ci/lib/handoff.mjs`.
 - Option (b): a long-lived Mac process behind a tailnet port.
 - Either way, it adds no clock.
@@ -108,6 +111,8 @@ All references are against 4cdefdc plus the hermetic-tests fix.
 
 ### 9. Capacity math
 
+v1 ships measured waits always, the replayed range at c+1 always, and the modelled number only with 30 or more holds in the window (PRD FR-19). Savings are also shown as hours of waiting per week: (Wq(c) − Wq(c+1)) × arrivals per week.
+
 - λ is requests per hour from request events. E[S] and Var[S] come from `held_ms`, and c is the number of Resources in the Pool.
 - Erlang C gives P(wait) and Wq for M/M/c.
 - The Allen-Cunneen approximation for M/G/c is Wq ≈ Wq(M/M/c) · (Ca² + Cs²)/2, where Cs² = Var[S]/E[S]² and Ca² comes from the inter-arrival times.
@@ -120,8 +125,10 @@ All references are against 4cdefdc plus the hermetic-tests fix.
 1. Event Log release.
 2. Pin flip, so callers are on a version with queue-joining `withLock`.
 3. `hosts:install`, which puts the new `hub-device` and the Hub API on big-chungus.
-4. Mac Agent.
+4. Mac Host Agent.
 5. Holocene page.
+
+The PRD groups these as v1a (step 1 plus the queue-joining `withLock` and reservations), v1b (registry, Hub API, Mac Host Agent) and v1c (capacity and the Holocene page).
 
 Fairness is partial until reruns of runs pinned to older hub versions age out.
 
@@ -137,7 +144,7 @@ Fairness is partial until reruns of runs pinned to older hub versions age out.
 | A lock held across a multi-job span, plus self-deadlock detection | GitLab `strategy: mirror`; Buildkite concurrency gates, https://buildkite.com/docs/pipelines/configure/workflows/controlling-concurrency | FR-9: Reservation from plan to install, and refusal when a run would wait on itself |
 | Retries keep their original place | Buildkite `ordered`; Selenium Grid 4 puts a failed match back at the front, https://www.selenium.dev/documentation/grid/configuration/cli_options/ | FR-9: a rerun keeps its original place |
 | A bounded queue, a wait timeout set apart from CI credential lifetime, and a queue-stats endpoint | BrowserStack queue, https://www.browserstack.com/docs/automate/selenium/queue-tests ; AWS Device Farm `PENDING_CONCURRENCY` | FR-8 (wait shorter than job timeout), FR-14 and FR-21 |
-| A TTL with heartbeat at about TTL/3, a jeopardy (grace) state, a lock-delay before reassigning, and a monotonic fencing token | etcd leases, https://etcd.io/docs/v3.5/learning/api/ ; Consul sessions with lock-delay, https://developer.hashicorp.com/consul/docs/automate/session ; Chubby (12 s lease, 45 s grace) | FR-10 |
+| A TTL with heartbeat at about TTL/3, a jeopardy (grace) state, a lock-delay before reassigning, and a monotonic fencing token | etcd leases, https://etcd.io/docs/v3.5/learning/api/ ; Consul sessions with lock-delay, https://developer.hashicorp.com/consul/docs/automate/session ; Chubby (12 s lease, 45 s grace) | FR-10 (jeopardy, quarantine); the fencing token is deferred past v1 (PRD §7.2) because every v1 install comes from a local, pid-bound deploy job |
 | An owner override ("steal") with an audit trail | Jenkins Reserve, Steal and Reassign | FR-11 force-release |
 | Holder, queue and Reservations visible to everyone | The counterexample: STF bookings hidden from other users, https://github.com/openstf/stf/issues/1251 | FR-14 and FR-24 |
 | Device health kept separate from lease state | Selenium node heartbeat; Kubernetes device plugins, where unhealthy devices lower allocatable capacity | FR-5 |
