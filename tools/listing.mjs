@@ -195,16 +195,19 @@ export async function pull({ dir, repo, client = ascClient(), adminClient, log =
 // one call goes through an Admin client, made only when it is needed.
 const adminOnly = new Set(['content rights']);
 
-export async function push({ dir, repo, apply = false, screenshots, client = ascClient(), adminClient, read = opRead, log = console.log }) {
+export async function push({ dir, repo, apply = false, screenshots, only, client = ascClient(), adminClient, read = opRead, log = console.log }) {
   const ctx = appContext(dir, repo);
   const file = parseListing(readFileSync(ctx.file, 'utf8'));
   const desired = desiredState(resolveRefs(file, read));
   const want = Object.fromEntries(adminGroups.map(g => [g, g in desired]));
   const adminFor = adminFrom(client, adminClient);
   const actual = await readActual(client, ctx.bundle, { versionString: file.version?.versionString, locale: file.locale, want, adminFor });
-  const changes = diffState(desired, actual.state);
+  // --only screenshots leaves every text field as Apple has it (someone may have edited it in App Store Connect);
+  // --only fields leaves the screenshot sets alone.
+  if (only && !['screenshots', 'fields'].includes(only)) throw new Error(`--only takes screenshots or fields, not ${only}`);
+  const changes = only === 'screenshots' ? [] : diffState(desired, actual.state);
 
-  const local = localScreenshots(screenshots ?? ctx.shots);
+  const local = only === 'fields' ? {} : localScreenshots(screenshots ?? ctx.shots);
   const problems = checkScreenshots(local);
   if (problems.length) throw new Error(`screenshots: ${problems.join('; ')}`);
   const remote = Object.keys(local).length ? await readScreenshots(client, actual.ids.versionLocalization) : {};
@@ -230,7 +233,7 @@ export async function push({ dir, repo, apply = false, screenshots, client = asc
   if (shotChanges.length) await applyScreenshots(client, actual.ids.versionLocalization, local, remote, shotChanges, log);
 
   const after = await readActual(client, ctx.bundle, { versionString: file.version?.versionString, locale: file.locale, want, adminFor });
-  const left = diffState(desired, after.state);
+  const left = only === 'screenshots' ? [] : diffState(desired, after.state);
   const shotsLeft = screenshotDiff(local, Object.keys(local).length ? await readScreenshots(client, after.ids.versionLocalization) : {});
   if (left.length || shotsLeft.length) {
     for (const c of left) log(`  STILL DIFFERENT ${formatChange(c)}`);
@@ -249,6 +252,7 @@ function parseArgs(argv) {
     if (rest[i] === '--apply') flags.apply = true;
     else if (rest[i] === '--repo') flags.repo = rest[++i];
     else if (rest[i] === '--screenshots') flags.screenshots = resolve(rest[++i]);
+    else if (rest[i] === '--only') flags.only = rest[++i];
     else throw new Error(`unknown argument ${rest[i]}`);
   }
   return { cmd, dir, ...flags };
@@ -257,7 +261,7 @@ function parseArgs(argv) {
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   try {
     const args = parseArgs(process.argv.slice(2));
-    if (!['pull', 'push'].includes(args.cmd) || !args.dir) throw new Error('usage: node tools/listing.mjs pull|push <app-repo-dir> [--apply] [--repo owner/name] [--screenshots dir]');
+    if (!['pull', 'push'].includes(args.cmd) || !args.dir) throw new Error('usage: node tools/listing.mjs pull|push <app-repo-dir> [--apply] [--repo owner/name] [--screenshots dir] [--only screenshots|fields]');
     if (args.cmd === 'pull') await pull(args); else await push(args);
   } catch (error) { console.error(`listing: ${error.message}`); process.exit(1); }
 }

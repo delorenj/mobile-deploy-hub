@@ -275,6 +275,18 @@ test('push --apply writes the listing, reads it back equal, and a second push is
   assert.ok(again.lines.some(l => l.includes('nothing to write')));
 });
 
+test('push --only screenshots replaces the sets and never writes a text field', async () => {
+  const { db, client } = fakeAsc();
+  const dir = appDir({ shots: true });
+  const out = quiet();
+  const result = await push({ dir, repo, apply: true, only: 'screenshots', client, adminClient: client, read, log: out.log });
+  assert.equal(result.clean, true);
+  assert.equal(Object.values(db.sets)[0].shots.length, 2);
+  assert.ok(db.writes.every(w => /appScreenshot/.test(w)), `only screenshot calls: ${db.writes.join(', ')}`);
+  assert.equal(db.age.attributes.advertising, true, 'the age rating the file would change is left alone');
+  await assert.rejects(push({ dir, repo, only: 'nope', client, read, log: () => {} }), /--only takes/);
+});
+
 test('push refuses a screenshot of the wrong size before any call', async () => {
   const { db, client } = fakeAsc();
   const dir = appDir({ shots: true });
