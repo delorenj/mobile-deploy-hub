@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Catch-up installers (docs/design-hub-v1.1.md, section E). A deploy publishes every build even when a device is
 // away and marks that device `pending` in builds/<slug>/latest.json. These passes finish the job when it comes back:
-//   android  big-chungus, systemd user timer every 120 s: the S26 on this host's adb server
-//   ios      the Mac, LaunchAgent in gui/502 every 300 s: the iPad through devicectl, from the Mac's IPA outbox
+//   android  big-chungus, candybar mobile-deploy-hub-catchup every 120 s (runs the .service): the S26 on this host's adb server
+//   ios      the Mac, LaunchAgent in gui/502, kickstarted every 300 s by candybar mobile-deploy-hub-ios-catchup: the iPad through devicectl, from the Mac's IPA outbox
 //   record   big-chungus: one device's new status into latest.json, under the s3-<slug> lock, and the one event
 //            (the Mac calls it over ssh)
 //   retry    big-chungus: a device that gave up goes back to pending

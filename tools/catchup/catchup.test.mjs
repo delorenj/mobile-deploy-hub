@@ -958,35 +958,29 @@ test('the CLI runs through the `current` symlink the units start it by, and mode
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('units: the S26 pass every 2 minutes under systemd, the iPad pass every 5 in the GUI session; install.sh never goes live', () => {
+test('units: the S26 and iPad passes are clockless executors (candybar is the only clock); install.sh never goes live', () => {
   const unit = name => readFileSync(join(hubRoot, 'tools/catchup/units', name), 'utf8');
   const service = unit('mobile-deploy-hub-catchup.service');
   assert.match(service, /^Type=oneshot$/m);
   assert.match(service, /^Environment=HOME=%h$/m);
   assert.match(service, /^ExecStart=%h\/\.local\/share\/mise\/installs\/node\/24\/bin\/node %h\/\.local\/share\/mobile-deploy-hub\/current\/tools\/catchup\/catchup\.mjs android$/m);
   assert.match(service, /^KillMode=process$/m, 'an adb server the pass starts survives it');
-  const timer = unit('mobile-deploy-hub-catchup.timer');
-  assert.match(timer, /^OnCalendar=\*:0\/2$/m);
-  assert.match(timer, /^Persistent=true$/m);
-  assert.match(timer, /^WantedBy=timers\.target$/m);
+  for (const name of ['mobile-deploy-hub-catchup.timer', 'mobile-deploy-hub-macwatch.timer']) assert.equal(existsSync(join(hubRoot, 'tools/catchup/units', name)), false, `${name} is retired: candybar is the only clock`);
   const plist = unit('sh.delo.mobile-deploy-hub.catchup.plist');
   assert.match(plist, /<key>Label<\/key>\s*<string>sh\.delo\.mobile-deploy-hub\.catchup<\/string>/);
-  assert.match(plist, /<key>StartInterval<\/key>\s*<integer>300<\/integer>/);
+  assert.doesNotMatch(plist, /<key>(?:StartInterval|StartCalendarInterval|RunAtLoad|KeepAlive|WatchPaths)<\/key>/, 'the LaunchAgent has no clock of its own: candybar kickstarts it');
   assert.match(plist, /<string>@HOME@\/\.local\/share\/mobile-deploy-hub\/current\/tools\/catchup\/catchup\.mjs<\/string>\s*<string>ios<\/string>/);
   assert.match(plist, /<key>LimitLoadToSessionType<\/key>\s*<string>Aqua<\/string>/);
   assert.match(plist, /@HOME@\/Library\/Logs\/mobile-deploy-hub\/catchup\.log/);
   const install = unit('install.sh');
   assert.match(install, /launchctl bootstrap "\$domain" "\$plist"/);
   assert.match(install, /domain="gui\/\$\(id -u\)"/);
-  assert.doesNotMatch(install, /^\s*systemctl --user enable --now mobile-deploy-hub-(?:catchup|macwatch)\.timer/m, 'candybar owns the Linux cadence; a release must not resurrect the timers');
-  assert.match(install, /cp "\$units\/mobile-deploy-hub-catchup\.service" "\$units\/mobile-deploy-hub-catchup\.timer" "\$dest\/"/, 'unit files remain available for rollback');
+  assert.doesNotMatch(install, /systemctl --user enable/, 'candybar owns the Linux cadence; a release must not resurrect a timer');
+  assert.doesNotMatch(install, /cp [^\n]*\.timer/, 'install.sh never copies a timer');
+  assert.match(install, /rm -f "\$dest\/mobile-deploy-hub-catchup\.timer" "\$dest\/mobile-deploy-hub-macwatch\.timer"/, 'a stray copy from an older release is swept');
   assert.match(install, /if \[\[ ! -f \$config \]\]; then[\s\S]*"mode":"watch"/, 'a new host watches');
   assert.doesNotMatch(install, /"mode":"live"|mode live"/, 'going live is never the installer\'s call');
   if (spawnSync('plutil', ['-help']).status === 0 || existsSync('/usr/bin/plutil')) assert.equal(spawnSync('plutil', ['-lint', join(hubRoot, 'tools/catchup/units/sh.delo.mobile-deploy-hub.catchup.plist')]).status, 0);
-  if (existsSync('/usr/bin/systemd-analyze')) {
-    const result = spawnSync('systemd-analyze', ['--user', 'verify', join(hubRoot, 'tools/catchup/units/mobile-deploy-hub-catchup.timer')], { encoding: 'utf8' });
-    assert.doesNotMatch(`${result.stdout}${result.stderr}`, /mobile-deploy-hub-catchup\.(timer|service):\d+:/, 'systemd accepts the units');
-  }
 });
 
 // ---------------------------------------------------------------------------------------------------- v1.1.3

@@ -439,13 +439,13 @@ test('the watchdog cancels through the host\'s gh and logs why; an idle app cost
   assert.equal(calls.filter(call => /green-in-between/.test(call)).length, 2, 'an app with no run in flight: two list calls, nothing else');
 });
 
-test('the watchdog unit is preserved for rollback, and the installer leaves its timer disabled', () => {
+test('the watchdog is a clockless service unit: candybar fires it, no timer is shipped or installed', () => {
   const service = readFileSync(join(repoRoot, 'tools/catchup/units/mobile-deploy-hub-macwatch.service'), 'utf8');
   assert.match(service, /^ExecStart=%h\/\.local\/share\/mise\/installs\/node\/24\/bin\/node %h\/\.local\/share\/mobile-deploy-hub\/current\/tools\/ci\/macwatch\.mjs$/m);
-  assert.match(readFileSync(join(repoRoot, 'tools/catchup/units/mobile-deploy-hub-macwatch.timer'), 'utf8'), /^OnCalendar=\*:1\/2$/m);
+  assert.equal(existsSync(join(repoRoot, 'tools/catchup/units/mobile-deploy-hub-macwatch.timer')), false);
   const installer = readFileSync(join(repoRoot, 'tools/catchup/units/install.sh'), 'utf8');
-  assert.match(installer, /cp "\$units\/mobile-deploy-hub-macwatch\.service" "\$units\/mobile-deploy-hub-macwatch\.timer" "\$dest\/"/);
-  assert.doesNotMatch(installer, /^\s*systemctl --user enable --now mobile-deploy-hub-(?:catchup|macwatch)\.timer/m);
+  assert.match(installer, /cp "\$units\/mobile-deploy-hub-catchup\.service" "\$units\/mobile-deploy-hub-macwatch\.service" "\$dest\/"/);
+  assert.doesNotMatch(installer, /systemctl --user enable/);
 });
 
 // ---------------------------------------------------------------------------------------------------- the pages

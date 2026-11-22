@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// The Mac watchdog (hub v1.1.3), a systemd user timer on big-chungus every 2 minutes (tools/catchup/units). GitHub
+// The Mac watchdog (hub v1.1.3), run every 2 minutes on big-chungus by the candybar mobile-deploy-hub-macwatch (its .service is in tools/catchup/units). GitHub
 // keeps a self-hosted job queued for 24 hours, and a Mac that went away after the gate (a closed lid, a dropped
 // hotspot) would hold a deploy's iPad job, and with it announce and the one notification, that long. Each app has a
 // single Linux runner, so this cannot be a job of the run: it would hold the runner the plan and deliver need.

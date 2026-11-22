@@ -1,5 +1,6 @@
 # The S26 catch-up pass (mobile-deploy-hub, docs/design-hub-v1.1.md E1 and E2). units/install.sh copies this into
-# ~/.config/systemd/user/ on big-chungus; mobile-deploy-hub-catchup.timer starts it every 2 minutes. The pass
+# ~/.config/systemd/user/ on big-chungus; candybar mobile-deploy-hub-catchup starts it every 2 minutes (there is no
+# .timer: candybar is the only clock, and a pass still running when the next fire is due is skipped as an overlap). The pass
 # installs nothing until the host's mode is live: `catchup.mjs mode live` (see the build log in the design doc).
 [Unit]
 Description=Mobile Deploy Hub catch-up: install pending builds on the S26

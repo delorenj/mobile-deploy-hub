@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Installs the catch-up on THIS host (docs/design-hub-v1.1.md E1), in watch mode unless the host already has a mode:
 #   big-chungus  the hub's tools/ under ~/.local/share/mobile-deploy-hub/releases/<ref>, `current` pointing at it,
-#                the systemd user service units for S26 catch-up + Mac watchdog; candybar owns their timer cadence
-#                (story 7.11). The old timer files are retained for rollback, never enabled by this installer.
+#                the systemd user service units for S26 catch-up + Mac watchdog. They have no timer: candybar
+#                (mobile-deploy-hub-catchup, mobile-deploy-hub-macwatch) is the only clock.
 #   the Mac      the same tree, and the LaunchAgent sh.delo.mobile-deploy-hub.catchup bootstrapped into the GUI
-#                session gui/<uid> (every 5 minutes)
+#                session gui/<uid>. It has no interval either: it is the on-demand executor of the iPad pass, and
+#                candybar mobile-deploy-hub-ios-catchup (.candybars/ in the hub) kickstarts it over ssh every 5 minutes.
 # Run it from the tools/ tree it should install: tools/catchup/units/install.sh <ref>. On the Mac, copy tools/ to
 # ~/.local/share/mobile-deploy-hub/releases/<ref>/tools first (rsync over ssh) and run it from there: nothing is
 # copied twice. `mise run hosts:install` in the hub does both. It never changes a host's mode; going live is
@@ -53,13 +54,12 @@ case "$(uname -s)" in
   Linux)
     dest="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     mkdir -p "$dest"
-    cp "$units/mobile-deploy-hub-catchup.service" "$units/mobile-deploy-hub-catchup.timer" "$dest/"
-    cp "$units/mobile-deploy-hub-macwatch.service" "$units/mobile-deploy-hub-macwatch.timer" "$dest/"
+    cp "$units/mobile-deploy-hub-catchup.service" "$units/mobile-deploy-hub-macwatch.service" "$dest/"
+    # The two .timer files were retired (candybar owns both cadences since story 7.11): sweep any copy an older
+    # release installed, so a stray one can never become a second clock.
+    rm -f "$dest/mobile-deploy-hub-catchup.timer" "$dest/mobile-deploy-hub-macwatch.timer"
     systemctl --user daemon-reload
-    # Candybar owns these two cadences after the story 7.11 cutover; enabling
-    # either timer on every hub release resurrects the native scheduler and
-    # double-runs the job. Keep the timer files for ledger rollback by path.
-    echo "catch-up units installed (timers stay disabled; candybar owns cadence)"
+    echo "catch-up units installed (service units only; candybar owns cadence)"
     ;;
   Darwin)
     label=sh.delo.mobile-deploy-hub.catchup

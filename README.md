@@ -300,4 +300,4 @@ node ~/.local/share/mobile-deploy-hub/current/tools/catchup/catchup.mjs mode liv
 ssh hub-mac '~/.local/share/mise/installs/node/24/bin/node ~/.local/share/mobile-deploy-hub/current/tools/catchup/catchup.mjs mode live'
 ```
 
-The Mac watchdog (`tools/ci/macwatch.mjs`, systemd timer `mobile-deploy-hub-macwatch.timer` on big-chungus, every 2 minutes) cancels a deploy run whose Mac job has waited longer than `mac.queue_limit_min` for its runner, once the run's APK half is done; it uses big-chungus's `gh` login. `HUB_MACWATCH_*` lines in its journal say what it did.
+The Mac watchdog (`tools/ci/macwatch.mjs`, fired every 2 minutes on big-chungus by the candybar `mobile-deploy-hub-macwatch`, which runs its `.service`; there is no timer) cancels a deploy run whose Mac job has waited longer than `mac.queue_limit_min` for its runner, once the run's APK half is done; it uses big-chungus's `gh` login. `HUB_MACWATCH_*` lines in its journal say what it did.

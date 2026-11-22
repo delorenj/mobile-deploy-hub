@@ -1,0 +1,17 @@
+# The iPad catch-up clock. Candybar on big-chungus is the only schedule; the Mac's LaunchAgent
+# sh.delo.mobile-deploy-hub.catchup (tools/catchup/units) has no interval any more and is only the executor this
+# kickstarts: devicectl and the keychain work inside the logged-in GUI session, never over plain ssh.
+# Desk: .candybars/mobile-deploy-hub-ios-catchup/ (README.md, kick.mjs). Policy: catch_up.ios_every_s is 300.
+[candybar]
+description = "Kick the iPad catch-up pass on the Mac (launchctl kickstart over ssh), wait for it, report its exit code"
+tags = ["mobile-deploy-hub", "mac"]
+schedule = "*/5 * * * *"
+timezone = "America/New_York"
+# Created paused: the cutover (desk README) enables it once the Mac's LaunchAgent has no interval of its own.
+enabled = false
+
+[candybar.runner]
+kind = "exec"
+argv = ["/home/delorenj/.local/share/mise/installs/node/24/bin/node", ".candybars/mobile-deploy-hub-ios-catchup/kick.mjs"]
+# The wait inside kick.mjs is bounded at 20 minutes; this is the hard stop above it.
+timeout_s = 1500
