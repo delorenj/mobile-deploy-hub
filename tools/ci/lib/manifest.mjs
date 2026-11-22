@@ -7,7 +7,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 const topKeys = ['schema', 'project', 'version', 'android', 'ios'];
-const androidKeys = ['package', 'prepare', 'export', 'godot', 'bundle', 'bundle_artifact', 'artifact', 'receipt', 'signer_sha256', 'editions'];
+const androidKeys = ['package', 'prepare', 'export', 'godot', 'bundle', 'bundle_artifact', 'bundle_signing', 'artifact', 'receipt', 'signer_sha256', 'editions'];
 // MOBI-14: more signed Android editions of one app (docs/multi-edition-android.md). The top-level android block is the
 // device edition, the one APK the S26, Quickdrop and the catch-up ever see. Each entry of android.editions is another
 // signed APK of the same version (its own package, hook, artifact, receipt and signer pin) that the android job builds
@@ -88,6 +88,22 @@ function apkLane(section, value, why) {
   if (!/^[0-9a-f]{64}$/.test(value.signer_sha256 ?? '')) fail(`${section}.signer_sha256 must be a lowercase hex SHA-256 digest`);
 }
 
+// MOBI-18: where the bundle hook finds the key that signs the Play bundle, as op:// references. The hub passes the
+// references on (HUB_PLAY_SIGNING_*_REF) and never resolves one; the hook reads them with `op read`. A reference to
+// anything but a vault is refused, so a raw password or a path can never ride in the manifest.
+export const signingRefKeys = ['key_ref', 'alias_ref', 'password_ref'];
+export const signingRef = /^op:\/\/[^\r\n\0/]+\/[^\r\n\0/]+\/[^\r\n\0]+$/;
+
+function bundleSigning(android) {
+  if (android.bundle_signing === undefined) return;
+  if (android.bundle === undefined) fail('android.bundle_signing needs android.bundle');
+  exactKeys('android.bundle_signing', android.bundle_signing, signingRefKeys);
+  for (const key of signingRefKeys) {
+    const ref = text('android.bundle_signing', android.bundle_signing, key, { required: true });
+    if (!signingRef.test(ref)) fail(`android.bundle_signing.${key} must be an op://vault/item/field reference, never a value`);
+  }
+}
+
 function androidSection(android) {
   exactKeys('android', android, androidKeys);
   // Every deploy installs the sideload APK on the S26, so the APK lane is required; Play's AAB is extra.
@@ -98,6 +114,7 @@ function androidSection(android) {
   } else if (android.bundle_artifact !== undefined) {
     fail('android.bundle_artifact needs android.bundle');
   }
+  bundleSigning(android);
   if (android.editions !== undefined) editionsSection(android);
 }
 

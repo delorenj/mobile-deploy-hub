@@ -11,6 +11,26 @@ import { readFile } from 'node:fs/promises';
 const api = 'https://androidpublisher.googleapis.com/androidpublisher/v3/applications';
 const upload = 'https://androidpublisher.googleapis.com/upload/androidpublisher/v3/applications';
 
+// What the app's android.bundle hook may rely on (MOBI-18), the same for every app that ships a Play bundle:
+//   HUB_PLAY_PACKAGE          the application id Play serves (policy store_package, else the device package)
+//   HUB_PLAY_UPLOAD_SHA256    the Play upload certificate the bundle must be signed with (policy store_upload_sha256);
+//                             absent for an app that uploads under its device package
+//   HUB_PLAY_SIGNING_KEY_REF / _ALIAS_REF / _PASSWORD_REF
+//                             the op:// references of the manifest's android.bundle_signing, when it declares them
+// References, never values: the hub does not read the secret and the hook does its own `op read`. The hub sets exactly
+// these names on the bundle hook and clears them everywhere else, so a stale one in the runner's environment never
+// reaches a hook. After the hook the hub reads the bundle itself (lib/aab.mjs) and trusts none of it.
+export const playHookVariables = Object.freeze(['HUB_PLAY_PACKAGE', 'HUB_PLAY_UPLOAD_SHA256', 'HUB_PLAY_SIGNING_KEY_REF', 'HUB_PLAY_SIGNING_ALIAS_REF', 'HUB_PLAY_SIGNING_PASSWORD_REF']);
+
+export function playHookEnv(base, target, signing) {
+  const env = { ...base };
+  for (const name of playHookVariables) delete env[name];
+  env.HUB_PLAY_PACKAGE = target.package;
+  if (target.uploadSha256) env.HUB_PLAY_UPLOAD_SHA256 = target.uploadSha256;
+  if (signing) Object.assign(env, { HUB_PLAY_SIGNING_KEY_REF: signing.key_ref, HUB_PLAY_SIGNING_ALIAS_REF: signing.alias_ref, HUB_PLAY_SIGNING_PASSWORD_REF: signing.password_ref });
+  return env;
+}
+
 export function defaultPlayStatus(track) {
   return track === 'internal' ? 'completed' : 'draft';
 }

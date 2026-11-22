@@ -11,7 +11,7 @@
     },
     "delorenj/green-in-between": {
       "slug": "green-in-between", "lanes": ["android", "ios"],
-      "android": { "package": "io.lasertoast.greeninbetween.spike", "signer_sha256": "d9d0253a4ce5bfb8a18d01efddc042e8828c3f73b04da41b4c3358e125c5222a", "public": true },
+      "android": { "package": "io.lasertoast.greeninbetween.spike", "signer_sha256": "d9d0253a4ce5bfb8a18d01efddc042e8828c3f73b04da41b4c3358e125c5222a", "public": true, "store_package": "io.lasertoast.gib", "store_upload_sha256": "6a1cda1cfa3eb35b950dc0fd6bc73030bd105823af3aafd9222797c4e307bae1" },
       "ios": { "bundle": "io.lasertoast.greeninbetween.spike", "store_bundle": "io.lasertoast.greeninbetween" }
     },
     "delorenj/gruvato": {

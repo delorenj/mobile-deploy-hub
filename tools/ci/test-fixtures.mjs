@@ -1,4 +1,5 @@
 // Shared test fixtures (not a test file: node --test runs only *.test.mjs).
+import { deflateRawSync } from 'node:zlib';
 import { apkKey, installUrl, ipaKey, publicUrl } from './lib/latest.mjs';
 
 export const base = 'https://s3.delo.sh/builds';
@@ -41,3 +42,63 @@ export function sampleLatest(overrides = {}) {
   return { schema: 1, slug, name: 'Tower of Lost Things', version: '0.2.2', commit: 'b'.repeat(40), hub_ref: 'v1.1.0', run, correlation, updated_at: '2026-10-09T20:00:00Z', android, ios, mac_bytes: 31_000_000, ...overrides };
 }
 
+
+// ---------------------------------------------------------------------------------------------------- app bundles (MOBI-18)
+// A minimal Android App Bundle for the Play-bundle checks: a zip whose base/manifest/AndroidManifest.xml is aapt2's proto
+// XmlNode, exactly the shape lib/aab.mjs reads from a real bundle. Unsigned; a test that needs a real signature runs
+// jarsigner over it. `compress` deflates the manifest member (real bundles do); `code` as `number` writes the attribute
+// as a compiled int, as aapt2 does for numeric attributes, and as a string otherwise.
+const varint = number => {
+  const bytes = [];
+  let rest = BigInt(number);
+  do { const low = Number(rest & 0x7fn); rest >>= 7n; bytes.push(rest > 0n ? low | 0x80 : low); } while (rest > 0n);
+  return Buffer.from(bytes);
+};
+const field = (number, payload) => Buffer.concat([varint((number << 3) | 2), varint(payload.length), payload]);
+const text = value => Buffer.from(value, 'utf8');
+
+export function protoManifest({ package: pkg, versionCode, versionName = '1.0.0', asNumber = false, root = 'manifest' }) {
+  const attribute = (namespace, name, value, compiled) => Buffer.concat([field(1, text(namespace)), field(2, text(name)), ...(value === undefined ? [] : [field(3, text(value))]), ...(compiled === undefined ? [] : [field(6, field(7, Buffer.concat([varint(6 << 3), varint(compiled)])))])]);
+  const android = 'http://schemas.android.com/apk/res/android';
+  const attributes = [
+    attribute('', 'package', pkg),
+    asNumber ? attribute(android, 'versionCode', undefined, versionCode) : attribute(android, 'versionCode', String(versionCode)),
+    attribute(android, 'versionName', versionName),
+  ];
+  const element = Buffer.concat([field(3, text(root)), ...attributes.map(item => field(4, item))]);
+  return field(1, element);
+}
+
+const crcTable = Array.from({ length: 256 }, (_, n) => { let c = n; for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });
+const crc32 = buffer => { let c = 0xffffffff; for (const byte of buffer) c = crcTable[(c ^ byte) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; };
+
+export function zipOf(entries) {
+  const locals = [];
+  const central = [];
+  let offset = 0;
+  for (const { name, data, deflate = false } of entries) {
+    const raw = Buffer.from(data);
+    const body = deflate ? deflateRawSync(raw) : raw;
+    const nameBytes = text(name);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0); local.writeUInt16LE(20, 4); local.writeUInt16LE(deflate ? 8 : 0, 8);
+    local.writeUInt32LE(crc32(raw), 14); local.writeUInt32LE(body.length, 18); local.writeUInt32LE(raw.length, 22); local.writeUInt16LE(nameBytes.length, 26);
+    const entry = Buffer.alloc(46);
+    entry.writeUInt32LE(0x02014b50, 0); entry.writeUInt16LE(20, 4); entry.writeUInt16LE(20, 6); entry.writeUInt16LE(deflate ? 8 : 0, 10);
+    entry.writeUInt32LE(crc32(raw), 16); entry.writeUInt32LE(body.length, 20); entry.writeUInt32LE(raw.length, 24); entry.writeUInt16LE(nameBytes.length, 28); entry.writeUInt32LE(offset, 42);
+    locals.push(local, nameBytes, body);
+    central.push(entry, nameBytes);
+    offset += 30 + nameBytes.length + body.length;
+  }
+  const directory = Buffer.concat(central);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(entries.length, 8); end.writeUInt16LE(entries.length, 10); end.writeUInt32LE(directory.length, 12); end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, directory, end]);
+}
+
+export const makeBundle = (manifest, extra = []) => zipOf([
+  { name: 'BundleConfig.pb', data: 'config' },
+  { name: 'base/manifest/AndroidManifest.xml', data: protoManifest(manifest), deflate: true },
+  { name: 'base/dex/classes.dex', data: 'dex' },
+  ...extra,
+]);

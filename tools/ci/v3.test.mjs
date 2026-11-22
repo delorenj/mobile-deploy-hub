@@ -919,7 +919,7 @@ test('a --play run needs the keyless inputs, a dry run too, and the dry run neve
 // ---------------------------------------------------------------------------------------------------- v1.1 downgrade guards
 
 import { apkKey as keyOfApk, publicUrl as urlOf } from './lib/latest.mjs';
-import { hermetic, sampleLatest } from './test-fixtures.mjs';
+import { hermetic, makeBundle, sampleLatest } from './test-fixtures.mjs';
 
 function publishedFor(slug, version, code) {
   const doc = sampleLatest({ slug, version });
@@ -1003,5 +1003,151 @@ test('a Mac that went away after the gate turns the iPad lane into skip-lost bef
     assert.ok(logs.some(line => /^HUB_IOS_SKIPPED lost: the Mac went offline after the gate/.test(line)), logs.join('\n'));
     const inflight = JSON.parse(host.s3.writes.find(write => write.key === 'example-app/inflight.json').text);
     assert.deepEqual(inflight.platforms, ['android'], 'the catch-up keeps holding only what this run builds');
+  } finally { await f.cleanup(); }
+});
+
+// ---------------------------------------------------------------------------------------------------- MOBI-18: Play store package
+
+const storeUpload = '6a1cda1cfa3eb35b950dc0fd6bc73030bd105823af3aafd9222797c4e307bae1';
+const keyless = host => ({ ...host.env, HUB_WIF_PROVIDER: 'projects/1/locations/global/workloadIdentityPools/github/providers/example-app', HUB_PLAY_SA: 'publish@example.iam.gserviceaccount.com' });
+
+// An app whose Play listing is io.example.store while its device APK is io.example.app: the policy pins the split (a
+// synthetic policy file, since the live one lists real apps), the manifest names where the signing refs are, and the
+// bundle hook copies a bundle the test prepared and records the HUB_PLAY_* variables it was given. The JDK tools are
+// fakes that answer from FAKE_UPLOAD, so the lane's verdicts are the hub's own.
+async function storeHost(f, { split = true, bundle = { package: 'io.example.store', versionCode: 5 } } = {}) {
+  const host = await laneHost(f);
+  await host.installApk('io.example.app 0.2.1 4');
+  const policy = JSON.parse(readFileSync(join(repoRoot, 'tools/ci/policy.json'), 'utf8'));
+  policy.apps['delorenj/example-app'] = { slug: 'example-app', lanes: ['android'], android: { package: 'io.example.app', signer_sha256: signer, ...(split ? { store_package: 'io.example.store', store_upload_sha256: storeUpload } : {}) } };
+  const policyFile = join(f.root, 'policy.json');
+  await writeFile(policyFile, JSON.stringify(policy));
+  await writeFile(join(f.root, 'store.aab'), makeBundle(bundle));
+  const bin = join(f.root, 'bin');
+  await script(join(bin, 'jarsigner'), 'echo "jar verified."');
+  await script(join(bin, 'keytool'), `d="\${FAKE_UPLOAD:-${storeUpload}}"\necho "Signer #1:"\necho\necho "Certificate #1:"\necho "Certificate fingerprints:"\necho "	 SHA256: $(echo "$d" | tr a-f A-F | sed 's/../&:/g; s/:$//')"`);
+  const env = { ...host.env, STORE_AAB: join(f.root, 'store.aab'), HOOK_ENV_OUT: join(f.root, 'hook-env.txt') };
+  return { ...host, env, policyFile, hookEnv: () => readFileSync(env.HOOK_ENV_OUT, 'utf8').trim().split('\n') };
+}
+
+const storeManifest = () => {
+  const base = v3Manifest();
+  return {
+    ...base,
+    android: {
+      ...base.android,
+      bundle: 'mkdir -p artifacts && cp "$STORE_AAB" artifacts/App.aab && env | grep "^HUB_PLAY_" | grep -v "^HUB_PLAY_SA=" | sort > "$HOOK_ENV_OUT"',
+      bundle_artifact: 'artifacts/App.aab',
+      bundle_signing: { key_ref: 'op://DeLoSecrets/Play upload/keystore', alias_ref: 'op://DeLoSecrets/Play upload/key_alias', password_ref: 'op://DeLoSecrets/Play upload/store_password' },
+    },
+  };
+};
+
+async function storeLane(host, f, { env = host.env, policyFile = host.policyFile, logs = [] } = {}) {
+  await quiet(() => plan(host.configure('plan', ['--play', 'true']), { env: keyless({ env }), home: f.root, fetchImpl: noLatest }));
+  const out = host.outputs();
+  const args = ['--play', 'true', '--version', out.version, '--android-code', out.android_code, '--build-sha', out.build_sha, '--bump-patch', out.bump_patch];
+  return android(host.configure('android', args), { env: { ...env, HUB_ADB_LANE_WAIT_MS: '1' }, home: f.root, policyFile, log: line => logs.push(line) });
+}
+
+test('a split app: the bundle hook is told the store package, the upload certificate and the signing references; the hub then verifies the bundle (dry run, Play untouched)', async () => {
+  const f = await gitFixture({ manifest: storeManifest() });
+  try {
+    const host = await storeHost(f);
+    const logs = [];
+    const lane = await quiet(() => storeLane(host, f, { logs }));
+    assert.deepEqual(host.hookEnv(), [
+      `HUB_PLAY_PACKAGE=io.example.store`,
+      `HUB_PLAY_SIGNING_ALIAS_REF=op://DeLoSecrets/Play upload/key_alias`,
+      `HUB_PLAY_SIGNING_KEY_REF=op://DeLoSecrets/Play upload/keystore`,
+      `HUB_PLAY_SIGNING_PASSWORD_REF=op://DeLoSecrets/Play upload/store_password`,
+      `HUB_PLAY_UPLOAD_SHA256=${storeUpload}`,
+    ].sort());
+    assert.ok(logs.some(line => line === 'HUB_PLAY_TARGET io.example.store (store package; the device app is io.example.app)'), logs.join('\n'));
+    assert.ok(logs.some(line => line === `HUB_PLAY_BUNDLE_OK io.example.store versionCode=5 upload_sha256=${storeUpload}`), logs.join('\n'));
+    assert.equal(lane.delivery.verified, false, 'a dry run installs nothing');
+    const receipt = readJson(join(f.out, 'android/hub-receipt-android.json'));
+    assert.deepEqual(receipt.play, { package: 'io.example.store', versionCode: 5, upload_sha256: storeUpload });
+    assert.ok(receipt.artifacts.some(item => item.name === 'App.aab'));
+  } finally { await f.cleanup(); }
+});
+
+test('a split app\'s bundle that is not the store package, the planned code or the upload key fails the android lane, with a marker', async () => {
+  const cases = [
+    ['the device package', { bundle: { package: 'io.example.app', versionCode: 5 } }, {}, /HUB_PLAY_BUNDLE_REFUSED package: the bundle is io\.example\.app, the policy says Play serves io\.example\.store/],
+    ['a stale versionCode', { bundle: { package: 'io.example.store', versionCode: 4 } }, {}, /HUB_PLAY_BUNDLE_REFUSED versionCode: .*versionCode 4 but the plan says 5/],
+    ['the wrong key', {}, { FAKE_UPLOAD: 'd9d0253a4ce5bfb8a18d01efddc042e8828c3f73b04da41b4c3358e125c5222a' }, /HUB_PLAY_BUNDLE_REFUSED signer: .*d9d0253a/],
+  ];
+  for (const [name, options, extraEnv, expected] of cases) {
+    const f = await gitFixture({ manifest: storeManifest() });
+    try {
+      const host = await storeHost(f, options);
+      await assert.rejects(quiet(() => storeLane(host, f, { env: { ...host.env, ...extraEnv } })), expected, name);
+      const receipt = readJson(join(f.out, 'android/hub-receipt-android.json'));
+      assert.deepEqual([receipt.outcome, receipt.stage], ['failure', 'build'], `${name}: the failure is a build-stage receipt`);
+      assert.match(receipt.reason, /^HUB_PLAY_BUNDLE_REFUSED/);
+    } finally { await f.cleanup(); }
+  }
+});
+
+test('an app with no store split keeps the old contract: hook gets its device package, nothing about a certificate, and the bundle is not read', async () => {
+  const f = await gitFixture({ manifest: storeManifest() });
+  try {
+    const host = await storeHost(f, { split: false, bundle: { package: 'anything.goes', versionCode: 99 } });
+    const logs = [];
+    await quiet(() => storeLane(host, f, { logs }));
+    assert.deepEqual(host.hookEnv().filter(line => !/SIGNING/.test(line)), ['HUB_PLAY_PACKAGE=io.example.app']);
+    assert.ok(logs.some(line => /^HUB_PLAY_BUNDLE_UNCHECKED io\.example\.app: /.test(line)), logs.join('\n'));
+    assert.equal(readJson(join(f.out, 'android/hub-receipt-android.json')).play, undefined);
+  } finally { await f.cleanup(); }
+});
+
+function playRecorder() {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    const { pathname } = new URL(url);
+    calls.push(`${init.method} ${pathname}`);
+    const reply = value => ({ ok: true, status: 200, json: async () => value, text: async () => JSON.stringify(value) });
+    if (pathname.endsWith('/edits') && init.method === 'POST') return reply({ id: 'E1' });
+    if (pathname.endsWith('/bundles') && init.method === 'GET') return reply({ bundles: [{ versionCode: 4 }] });
+    if (pathname.endsWith('/apks')) return reply({ apks: [] });
+    if (pathname.endsWith('/bundles') && init.method === 'POST') return reply({ versionCode: 5 });
+    return reply({});
+  };
+  return { fetchImpl, calls };
+}
+
+test('the Play upload goes to the store package: edit, bundle and track name it, and the receipt says so', async () => {
+  const f = await gitFixture({ manifest: storeManifest() });
+  try {
+    const host = await storeHost(f);
+    await quiet(() => storeLane(host, f));
+    const api = playRecorder();
+    const logs = [];
+    const real = host.configure('play', ['--dry-run', 'false', '--play', 'true', '--version', '0.2.2', '--android-code', '5']);
+    const uploaded = await play(real, { env: { ...host.env, PLAY_TOKEN: 'tok' }, fetchImpl: api.fetchImpl, policyFile: host.policyFile, log: line => logs.push(line) });
+    assert.deepEqual([uploaded.track, uploaded.versionCode], ['internal', 5]);
+    assert.ok(api.calls.length >= 5);
+    for (const call of api.calls) assert.match(call, /\/applications\/io\.example\.store\/(edits|bundles)|\/applications\/io\.example\.store\//, call);
+    assert.ok(!api.calls.some(call => call.includes('io.example.app')), 'the device package is never the upload target');
+    assert.ok(api.calls.includes('PUT /androidpublisher/v3/applications/io.example.store/edits/E1/tracks/internal'));
+    assert.ok(logs.some(line => /^HUB_PLAY_BUNDLE_OK io\.example\.store /.test(line)));
+    const receipt = readJson(join(f.out, 'android/hub-receipt-android-play.json'));
+    assert.equal(receipt.play.package, 'io.example.store');
+    assert.match(receipt.notes[0], /^Play io\.example\.store internal: uploaded versionCode 5/);
+  } finally { await f.cleanup(); }
+});
+
+test('the upload step re-reads the bundle and refuses a swapped one before it contacts Play', async () => {
+  const f = await gitFixture({ manifest: storeManifest() });
+  try {
+    const host = await storeHost(f);
+    await quiet(() => storeLane(host, f));
+    await writeFile(join(f.out, 'android/App.aab'), makeBundle({ package: 'io.example.app', versionCode: 5 }));
+    const api = playRecorder();
+    const real = host.configure('play', ['--dry-run', 'false', '--play', 'true', '--version', '0.2.2', '--android-code', '5']);
+    await assert.rejects(play(real, { env: { ...host.env, PLAY_TOKEN: 'tok' }, fetchImpl: api.fetchImpl, policyFile: host.policyFile, log() {} }), /HUB_PLAY_BUNDLE_REFUSED package/);
+    assert.deepEqual(api.calls, [], 'Play was never contacted');
+    assert.equal(readJson(join(f.out, 'android/hub-receipt-android-play.json')).outcome, 'failure');
   } finally { await f.cleanup(); }
 });

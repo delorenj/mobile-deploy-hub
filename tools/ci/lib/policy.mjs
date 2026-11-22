@@ -122,6 +122,37 @@ function androidEditions(where, android) {
   }
 }
 
+// The Play store split, Android's half of MOBI-15. An app whose device build (the sideload APK the S26 gets) and Play
+// listing are different apps pins both halves of the Play side: android.store_package, the application id Play serves
+// (Green In Between: device io.lasertoast.greeninbetween.spike, Play io.lasertoast.gib), and android.store_upload_sha256,
+// the certificate of the key that signs the bundle for Play. That is the Play UPLOAD key, never the device signer: the
+// device signer is a debug key that no store accepts. An app without store_package uploads under its device package, as
+// before (Gruvato), and the hub holds nothing about its bundle's signer. A split app's bundle is read by the hub before any
+// upload (lib/aab.mjs) and refused unless it is the store package, the planned versionCode and signed by exactly that key.
+export const packagePattern = /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/;
+
+function androidStore(where, android) {
+  const has = key => key in android;
+  if (has('store_upload_sha256') && !has('store_package')) fail(`${where}.store_upload_sha256 needs ${where}.store_package: an app that uploads under its device package has no separate Play key to pin`);
+  if (!has('store_package')) return;
+  if (!packagePattern.test(android.store_package ?? '')) fail(`${where}.store_package must be an Android package name`);
+  if (android.store_package === android.package) fail(`${where}.store_package ${android.store_package} is the device package: leave store_package out when the Play app and the device app are one id`);
+  for (const [name, edition] of Object.entries(android.editions ?? {})) {
+    if (edition.package === android.store_package) fail(`${where}.store_package ${android.store_package} is the package of the ${name} edition; the Play app is its own id`);
+  }
+  if (!/^[0-9a-f]{64}$/.test(android.store_upload_sha256 ?? '')) fail(`${where}.store_upload_sha256 is required with store_package: the lowercase sha256 of the Play upload certificate`);
+  if (android.store_upload_sha256 === android.signer_sha256) fail(`${where}.store_upload_sha256 is the device signer: the Play upload key is a different key from the sideload one`);
+}
+
+// Where the Play upload goes and what its bundle is held to: the policy's store package and upload certificate, else the
+// device package (nothing pinned about the signer). `app` may be null for a repository the policy does not list (a local
+// run); the manifest's own package then stands in.
+export function playTargetOf(app, fallbackPackage = null) {
+  const android = app?.android;
+  const split = typeof android?.store_package === 'string';
+  return { package: split ? android.store_package : (android?.package ?? fallbackPackage), split, uploadSha256: split ? android.store_upload_sha256 : null };
+}
+
 // The policy's pin for one extra edition of an app, or null.
 export const editionPinOf = (app, name) => app?.android?.editions?.[name] ?? null;
 
@@ -164,10 +195,11 @@ export function parsePolicy(source) {
     if (slugs.has(app.slug)) fail(`apps: slug ${app.slug} is used twice`);
     slugs.add(app.slug);
     if (app.lanes.includes('android')) {
-      exact(`apps.${repo}.android`, app.android, ['package', 'signer_sha256'], ['editions', 'public']);
+      exact(`apps.${repo}.android`, app.android, ['package', 'signer_sha256'], ['editions', 'public', 'store_package', 'store_upload_sha256']);
       if (!/^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/.test(app.android.package ?? '')) fail(`apps.${repo}.android.package must be an Android package name`);
       if (!/^[0-9a-f]{64}$/.test(app.android.signer_sha256 ?? '')) fail(`apps.${repo}.android.signer_sha256 must be the lowercase sha256 of the signing certificate`);
       if ('editions' in app.android) androidEditions(`apps.${repo}.android.editions`, app.android);
+      androidStore(`apps.${repo}.android`, app.android);
       // MOBI-17: the device edition is private unless the policy publishes it (its APKs, pointers and page anonymous, as
       // before MOBI-17). An app that sells a public edition can never publish its device edition: that would be a free
       // copy one folder up (docs/private-device-builds.md).

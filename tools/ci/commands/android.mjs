@@ -16,6 +16,7 @@ import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { accessFor } from '../lib/access.mjs';
 import { createAdb, findPhone } from '../lib/adb.mjs';
+import { verifyPlayBundle } from '../lib/aab.mjs';
 import { apkIdentity, verifySigner } from '../lib/android.mjs';
 import { hookEnvironment } from '../lib/config.mjs';
 import { loadDevices } from '../lib/devices.mjs';
@@ -26,7 +27,8 @@ import { withLock } from '../lib/lock.mjs';
 import { editionApkName, editionLane, isPublicEdition } from '../lib/editions.mjs';
 import { editionsOf, loadManifest } from '../lib/manifest.mjs';
 import { editionPinOf, loadPolicy, tagOf } from '../lib/policy.mjs';
-import { uploadBundle } from '../lib/play.mjs';
+import { playHookEnv, uploadBundle } from '../lib/play.mjs';
+import { playTargetOf } from '../lib/policy.mjs';
 import { dropApk, s26OnLan } from '../lib/quickdrop.mjs';
 import { buildReceipt, sha256File, writeReceipt } from '../lib/receipt.mjs';
 import { notesKey, notesText, validateNotes } from '../lib/release-notes.mjs';
@@ -67,11 +69,23 @@ async function androidLane(config, manifest, { env, home, track, policy, log, qu
     await copyFile(join(config.cwd, spec.receipt), join(out, basename(spec.receipt)));
   }
   if (config.play) {
-    hook('android.bundle', spec.bundle, { cwd: config.cwd, env: hooks });
+    // The Play upload goes to the policy's store package (the device package when the app has no separate Play app).
+    // The hook builds and signs with what the hub tells it; the hub then reads the copy it will upload.
+    const target = playTargetOf(policy.apps[env.GITHUB_REPOSITORY ?? ''], spec.package);
+    log(`HUB_PLAY_TARGET ${target.package}${target.split ? ` (store package; the device app is ${spec.package})` : ' (the device package)'}`);
+    hook('android.bundle', spec.bundle, { cwd: config.cwd, env: playHookEnv(hooks, target, spec.bundle_signing) });
     const aab = join(config.cwd, spec.bundle_artifact);
     if (!exists(aab)) throw new Error(`the bundle hook did not produce ${spec.bundle_artifact}`);
-    await copyFile(aab, join(out, basename(spec.bundle_artifact)));
-    artifacts.push({ name: basename(spec.bundle_artifact), sha256: await sha256File(join(out, basename(spec.bundle_artifact))) });
+    const stagedAab = join(out, basename(spec.bundle_artifact));
+    await copyFile(aab, stagedAab);
+    if (target.split) {
+      const facts = verifyPlayBundle({ aab: stagedAab, expect: { package: target.package, versionCode: config.androidCode, uploadSha256: target.uploadSha256 }, env, home });
+      log(`HUB_PLAY_BUNDLE_OK ${facts.package} versionCode=${facts.versionCode} upload_sha256=${facts.upload_sha256}`);
+      track.receipt.play = { package: facts.package, versionCode: facts.versionCode, upload_sha256: facts.upload_sha256 };
+    } else {
+      log(`HUB_PLAY_BUNDLE_UNCHECKED ${target.package}: the policy pins no store_package or store_upload_sha256 for this app, so the hub does not read its bundle`);
+    }
+    artifacts.push({ name: basename(spec.bundle_artifact), sha256: await sha256File(stagedAab) });
   }
   const { size: bytes } = statSync(apk);
   log(`HUB_ANDROID_BUILT ${basename(spec.artifact)} ${config.version} (${config.androidCode}) sha256=${sha256} bytes=${bytes}`);
@@ -164,7 +178,7 @@ async function androidLane(config, manifest, { env, home, track, policy, log, qu
       edition: { name: built.edition, package: built.package, device: false, public: built.public }, staged: built.staged,
     }), env);
   }
-  await writeReceipt(out, buildReceipt({ lane: 'android', config, env, version: config.version, androidCode: config.androidCode, artifacts, signer, notes, delivery, staged, quickdrop, ...(editions.length > 0 ? { editions: editions.map(({ edition, package: pkg, staged: copy, public: open }) => ({ edition, package: pkg, staged: copy, public: open })) } : {}) }), env);
+  await writeReceipt(out, buildReceipt({ lane: 'android', config, env, version: config.version, androidCode: config.androidCode, artifacts, signer, notes, delivery, staged, quickdrop, ...(track.receipt.play ? { play: track.receipt.play } : {}), ...(editions.length > 0 ? { editions: editions.map(({ edition, package: pkg, staged: copy, public: open }) => ({ edition, package: pkg, staged: copy, public: open })) } : {}) }), env);
   return { out, artifact: apk, sha256, signer, delivery, staged, quickdrop, editions };
 }
 
@@ -203,8 +217,8 @@ async function buildEdition(config, manifest, { name, spec }, { env, home, hooks
   return { edition: name, package: spec.package, apk, sha256, signer, bytes, staged: { name: apkFile, bytes, sha256 }, public: Boolean(spec.public) };
 }
 
-export async function android(config, { env = process.env, home = homedir(), log = console.log, quickdropLink = null } = {}) {
-  const { policy } = policyBanner(log);
+export async function android(config, { env = process.env, home = homedir(), log = console.log, quickdropLink = null, policyFile } = {}) {
+  const { policy } = policyBanner(log, policyFile);
   const manifest = await loadManifest(config.cwd, config.manifest);
   return guarded('android', join(config.out, 'android'), config, env, track => androidLane(config, manifest, { env, home, track, policy, log, quickdropLink }));
 }
@@ -212,24 +226,34 @@ export async function android(config, { env = process.env, home = homedir(), log
 // The Play upload and the Release run as later steps of the android job. Each writes its own receipt (lane android-play,
 // android-release), so a failure there is reported at stage deliver while the android lane's receipt keeps the S26's
 // real delivery (installed or pending).
-export async function play(config, { env = process.env, fetchImpl } = {}) {
+export async function play(config, { env = process.env, fetchImpl, policyFile, log = console.log } = {}) {
   return guarded('android-play', join(config.out, 'android'), config, env, async track => {
     track.stage = 'deliver';
     if (config.dryRun) throw new Error('refusing to contact Play on a dry run');
+    const { policy } = policyBanner(log, policyFile);
     const manifest = await loadManifest(config.cwd, config.manifest);
     if (!config.play) throw new Error('the play command needs --play true');
     const spec = manifest.android;
     if (!spec?.bundle_artifact) throw new Error('the manifest declares no android.bundle_artifact');
+    // Edits, bundle upload and track all name the store package; the policy, never the manifest, says which it is.
+    const target = playTargetOf(policy.apps[env.GITHUB_REPOSITORY ?? ''], spec.package);
+    const aab = join(config.out, 'android', basename(spec.bundle_artifact));
+    // The android job verified this file; it is read again here because the artifact travels between jobs and the next
+    // call is the one that spends the version on Play.
+    if (target.split) {
+      const facts = verifyPlayBundle({ aab, expect: { package: target.package, versionCode: config.androidCode, uploadSha256: target.uploadSha256 }, env, home: homedir() });
+      log(`HUB_PLAY_BUNDLE_OK ${facts.package} versionCode=${facts.versionCode} upload_sha256=${facts.upload_sha256}`);
+    }
     const uploaded = await uploadBundle({
-      pkg: spec.package,
+      pkg: target.package,
       track: config.track,
-      aab: join(config.out, 'android', basename(spec.bundle_artifact)),
+      aab,
       token: env.PLAY_TOKEN,
       expectedCode: config.androidCode ? Number(config.androidCode) : undefined,
       status: config.playStatusExplicit ? config.playStatus : undefined,
       fetchImpl,
     });
-    await writeReceipt(join(config.out, 'android'), buildReceipt({ lane: 'android-play', config, env, version: config.version, androidCode: config.androidCode, notes: [`Play ${config.track}: uploaded`] }), env);
+    await writeReceipt(join(config.out, 'android'), buildReceipt({ lane: 'android-play', config, env, version: config.version, androidCode: config.androidCode, play: { package: target.package, track: uploaded.track, status: uploaded.status, versionCode: uploaded.versionCode, edit: uploaded.edit }, notes: [`Play ${target.package} ${config.track}: uploaded versionCode ${uploaded.versionCode} as ${uploaded.status}`] }), env);
     return uploaded;
   });
 }
