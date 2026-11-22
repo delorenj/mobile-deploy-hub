@@ -20,7 +20,7 @@ The shared deploy pipeline every mobile app calls: a reusable workflow (`.github
 ## Where things are
 
 - Device and emulator checkout: `tools/ci/lib/lock.mjs` (locks, leases, FIFO queues), `tools/device/hub-device.mjs` (CLI), `tools/device/emulator.mjs` (pool). Extend these; never add a second lock, queue or device store. Leases and deploys exclude each other only because they share lock names in one lock dir (`adb` is the S26).
-- Anything that serves locks over a network runs on big-chungus as the runner user with the same `HUB_LOCK_DIR`: `lock.mjs` treats an owner or queue ticket from another host as stale and deletes it. The `mac-ios` lock lives on the Mac's disk.
+- Anything that serves locks over a network runs on big-chungus as the runner user with the same `HUB_LOCK_DIR`: `lock.mjs` deletes a queue ticket from another host as stale; an owner from another host is honoured until its Lease's `expires_at`, or for 4 hours for a job lock. The `mac-ios` lock lives on the Mac's disk.
 - The hub's control surface is a page in Holocene (`~/code/33GOD/holocene`; the Candybar page and `apps/api/src/candybar.ts` are the template). The hub keeps authority over leases and queues; Holocene reads them and forwards narrow writes server-side.
 
 ## Running and verifying
