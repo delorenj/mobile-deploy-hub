@@ -287,6 +287,18 @@ test('push --only screenshots replaces the sets and never writes a text field', 
   await assert.rejects(push({ dir, repo, only: 'nope', client, read, log: () => {} }), /--only takes/);
 });
 
+test('a screenshot delete the App Manager key may not make is retried once with the Admin key', async () => {
+  const { db, client } = fakeAsc();
+  const dir = appDir({ shots: true });
+  await push({ dir, repo, apply: true, only: 'screenshots', client, adminClient: client, read, log: () => {} });
+  writeFileSync(join(dir, 'store/apple/screenshots/APP_IPHONE_67/01.png'), png(1320, 2868));
+  const manager = { ...client, which: 'manager', delete: async path => { throw new Error(`ASC DELETE ${path} -> 403 (FORBIDDEN_ERROR)`); } };
+  const admin = { ...client, which: 'admin', deletes: [], delete: async path => { admin.deletes.push(path); return client.delete(path); } };
+  const result = await push({ dir, repo, apply: true, only: 'screenshots', client: manager, adminClient: admin, read, log: () => {} });
+  assert.equal(result.clean, true);
+  assert.equal(admin.deletes.length, 2);
+});
+
 test('push refuses a screenshot of the wrong size before any call', async () => {
   const { db, client } = fakeAsc();
   const dir = appDir({ shots: true });

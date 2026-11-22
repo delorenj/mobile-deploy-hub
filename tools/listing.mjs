@@ -148,14 +148,21 @@ async function uploadScreenshot(client, setId, { name, bytes, md5: sum }) {
   throw new Error(`${name} did not finish processing in time`);
 }
 
-export async function applyScreenshots(client, localizationId, local, remote, types, log = console.log) {
+// A screenshot uploaded with the Admin key can only be deleted with it (the App Manager key gets a 403), so a refused
+// delete is retried once through the Admin client.
+export async function applyScreenshots(client, localizationId, local, remote, types, log = console.log, adminFor = null) {
   for (const { type } of types) {
     let set = remote[type];
     if (!set) {
       const made = (await client.post('/v1/appScreenshotSets', { data: { type: 'appScreenshotSets', attributes: { screenshotDisplayType: type }, relationships: { appStoreVersionLocalization: { data: { type: 'appStoreVersionLocalizations', id: localizationId } } } } })).data;
       set = { id: made.id, shots: [] };
     }
-    for (const shot of set.shots) await client.delete(`/v1/appScreenshots/${shot.id}`);
+    for (const shot of set.shots) {
+      try { await client.delete(`/v1/appScreenshots/${shot.id}`); } catch (error) {
+        if (!adminFor || client.which === 'admin' || !/\b403\b/.test(String(error.message))) throw error;
+        await adminFor().delete(`/v1/appScreenshots/${shot.id}`);
+      }
+    }
     const ids = [];
     for (const file of local[type]) { ids.push(await uploadScreenshot(client, set.id, file)); log(`  uploaded ${type}/${file.name}`); }
     await client.patch(`/v1/appScreenshotSets/${set.id}/relationships/appScreenshots`, { data: ids.map(id => ({ type: 'appScreenshots', id })) });
@@ -230,7 +237,7 @@ export async function push({ dir, repo, apply = false, screenshots, only, client
     if (call.method === 'POST' && call.path.endsWith('appStoreVersionLocalizations')) actual.ids.versionLocalization = result.data.id;
     log(`  wrote ${call.label}`);
   }
-  if (shotChanges.length) await applyScreenshots(client, actual.ids.versionLocalization, local, remote, shotChanges, log);
+  if (shotChanges.length) await applyScreenshots(client, actual.ids.versionLocalization, local, remote, shotChanges, log, adminFor);
 
   const after = await readActual(client, ctx.bundle, { versionString: file.version?.versionString, locale: file.locale, want, adminFor });
   const left = only === 'screenshots' ? [] : diffState(desired, after.state);
