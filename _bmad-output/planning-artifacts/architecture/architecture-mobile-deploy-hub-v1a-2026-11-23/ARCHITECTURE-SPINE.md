@@ -159,7 +159,7 @@ Arrows mean "may import or write". Nothing points back up. Only `lock.mjs` write
 - **Rule:**
   - **Layout:** `<name>.reservations/<owner>--<repo>--<run>/` holds:
     - `reservation.json`, written once (`wx`): `{format, run_key, repo, run, reserved_at, expires_at, grace_ms}`;
-    - `grace.json`, created once (`wx`): `{grace_started_at}`.
+    - `grace.json`, created once (`wx`), holding `grace_started_at`.
 
     Readers use the record's absolute times and `grace_ms`, never their own policy.
   - **Writers:** the gate reserves `adb` (on Linux) only when the run will install to the S26. `preflight-ios` reserves `mac-ios` (on the Mac) only when iOS is in scope. A live Reservation for the run is reused.
@@ -209,7 +209,7 @@ Arrows mean "may import or write". Nothing points back up. Only `lock.mjs` write
     | extend | owner rewrite that passes AD-16 |
     | refused | catch-up `ahead` decision (AD-15) |
 
-  - **No forced removal on these paths:** nothing on these paths uses `rmSync({force})`. The winner deletes its own tomb.
+  - **No forced removal on these paths:** nothing on these paths uses a forced `rmSync`. The winner deletes its own tomb.
   - **Read-only status:** `hub-device status` writes nothing. Its emulator reap (`:701`) moves to the emulator acquire paths.
   - **Failures:** a write failure logs `HUB_EVENT_LOG_FAILED`, and the transition still happens.
   - **Sequence tests:** these tests pin the event sequences: a full deploy run, a Lease, an emulator Lease, a pending delivery and a timed-out wait.
