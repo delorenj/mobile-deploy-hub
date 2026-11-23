@@ -6,8 +6,8 @@
   "apps": {
     "delorenj/tower-of-lost-things": {
       "slug": "tower-of-lost-things", "lanes": ["android", "ios"],
-      "android": { "package": "io.automaticai.towerofdumbthings", "signer_sha256": "2d4954863dabb5da86d69ce4b60b3e400e73669b50a80658b0941440a7941a97" },
-      "ios": { "bundle": "io.automaticai.towerofdumbthings" }
+      "android": { "package": "io.lasertoast.tolt", "signer_sha256": "2d4954863dabb5da86d69ce4b60b3e400e73669b50a80658b0941440a7941a97" },
+      "ios": { "bundle": "io.lasertoast.tolt" }
     },
     "delorenj/green-in-between": {
       "slug": "green-in-between", "lanes": ["android", "ios"],
@@ -38,7 +38,7 @@
     }
   },
   "shared_bundle_allowlist": {
-    "delorenj/tower-of-lost-things": { "since": "2026-11-18", "reason": "Not migrated: the iPad dev build and TestFlight share io.automaticai.towerofdumbthings (MOBI-16, owner decision)." },
+    "delorenj/tower-of-lost-things": { "since": "2026-11-18", "reason": "Not migrated: the iPad dev build and TestFlight share io.lasertoast.tolt (MOBI-16, owner decision)." },
     "delorenj/gruvato": { "since": "2026-11-18", "reason": "Not migrated: the iPad dev build and TestFlight share sh.delo.gruvato (MOBI-16, owner decision)." },
     "AutomaticAI-io/navi": { "since": "2026-11-18", "reason": "Not migrated: the iPad dev build and TestFlight share io.automaticai.ipm.navi (MOBI-16, owner decision)." }
   },

@@ -31,7 +31,7 @@ const devices = loadDevices({});
 const signer = '2d4954863dabb5da86d69ce4b60b3e400e73669b50a80658b0941440a7941a97';
 const sha = text => createHash('sha256').update(text).digest('hex');
 const slug = 'tower-of-lost-things';
-const pkg = 'io.automaticai.towerofdumbthings';
+const pkg = 'io.lasertoast.tolt';
 const commit = '1a2b3c4d'.repeat(5);
 const runId = '37940000000';
 const repo = 'delorenj/tower-of-lost-things';
@@ -255,7 +255,7 @@ test('only pending builds are acted on; a build the deploy installed is never to
     // That deploy's APK half is published (deliver-android took android off inflight.json): the S26 is free again.
     host.s3.put(`${slug}/inflight.json`, { version: '0.2.3', run: '37950000000', started_at: '2026-10-10T11:50:00Z', platforms: ['ios'] });
     await androidPass(host.ctx);
-    assert.match(host.phone.installed(), /^io\.automaticai\.towerofdumbthings 0\.2\.2 4 /, 'a deploy that is only building the iPad does not hold the S26');
+    assert.match(host.phone.installed(), /^io\.lasertoast\.tolt 0\.2\.2 4 /, 'a deploy that is only building the iPad does not hold the S26');
   } finally { host.cleanup(); }
 });
 
@@ -1011,12 +1011,12 @@ test('the S26 is not updated under a kid: the app on top with the screen on wait
     host.phone.install(apkText({ version: '0.2.1', code: 3 }));
     host.phone.playing(pkg);
     await androidPass(host.ctx);
-    assert.equal(host.lines(/^HUB_CATCHUP_IDLE tower-of-lost-things android 0\.2\.2 \(4\): io\.automaticai\.towerofdumbthings is on screen on the S26/).length, 1, host.logs.join('\n'));
+    assert.equal(host.lines(/^HUB_CATCHUP_IDLE tower-of-lost-things android 0\.2\.2 \(4\): io\.lasertoast\.tolt is on screen on the S26/).length, 1, host.logs.join('\n'));
     assert.doesNotMatch(host.phone.calls(), /\binstall\b/);
     assert.deepEqual([host.events.length, host.s3.writer.writes.length], [0, 0], 'waiting is not a failed attempt');
     host.phone.asleep(true);
     await androidPass(host.ctx);
-    assert.match(host.phone.installed(), /^io\.automaticai\.towerofdumbthings 0\.2\.2 4 /);
+    assert.match(host.phone.installed(), /^io\.lasertoast\.tolt 0\.2\.2 4 /);
   } finally { host.cleanup(); }
 });
 

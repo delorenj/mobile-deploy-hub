@@ -114,7 +114,7 @@ test('snapshotToListing never writes review contact fields and keeps op:// refer
 
 test('the hub policy maps an app repo to its App Store bundle', () => {
   const { policy } = loadPolicy();
-  assert.equal(storeBundleFor(policy, 'delorenj/tower-of-lost-things'), 'io.automaticai.towerofdumbthings');
+  assert.equal(storeBundleFor(policy, 'delorenj/tower-of-lost-things'), 'io.lasertoast.tolt');
   assert.equal(storeBundleFor(policy, 'delorenj/green-in-between'), 'io.lasertoast.greeninbetween');
   assert.throws(() => storeBundleFor(policy, 'delorenj/earshot'), /no iOS lane/);
   assert.throws(() => storeBundleFor(policy, 'x/y'), /not listed/);
@@ -135,7 +135,7 @@ test('token is an ES256 JWT that the matching public key verifies', () => {
 // ---- a fake App Store Connect, enough for push and pull ----
 function fakeAsc() {
   const db = {
-    app: { id: 'APP', attributes: { name: 'Example', bundleId: 'io.automaticai.towerofdumbthings', contentRightsDeclaration: null } },
+    app: { id: 'APP', attributes: { name: 'Example', bundleId: 'io.lasertoast.tolt', contentRightsDeclaration: null } },
     version: { id: 'VER', attributes: { versionString: '1.0', platform: 'IOS', appStoreState: 'PREPARE_FOR_SUBMISSION', copyright: null } },
     info: { id: 'INFO', attributes: { state: 'PREPARE_FOR_SUBMISSION' }, cats: { primaryCategory: 'GAMES' } },
     infoLoc: { id: 'IL', attributes: { locale: 'en-US', name: 'Example Game', subtitle: null, privacyPolicyUrl: null } },

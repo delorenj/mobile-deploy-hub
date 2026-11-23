@@ -65,7 +65,7 @@ test('Tower, Gruvato and Navi are allowlisted: one HUB_POLICY warning each and t
 
 test('an allowlisted app that already has its own store bundle warns that it can leave the list, and is not refused', () => {
   const p = structuredClone(policy);
-  p.apps[TOWER].ios.store_bundle = 'io.automaticai.towerofdumbthings.store-id';
+  p.apps[TOWER].ios.store_bundle = 'io.lasertoast.tolt.store-id';
   const { verdict, logs } = run(p, TOWER, storeManifest);
   assert.equal(verdict.status, 'stale-allowlist');
   assert.equal(logs.length, 1);
@@ -86,7 +86,7 @@ test('direction: the device bundle takes the suffix, so a store bundle that is t
   assert.throws(() => parsePolicy(edit(p => { p.apps[TOWER].ios.store_bundle = `${p.apps[TOWER].ios.bundle}.store`; })), /device bundle takes the suffix/);
   // Anything else that differs is accepted: only the one reversed shape is checkable without knowing Apple's record.
   assert.doesNotThrow(() => parsePolicy(edit(p => { p.apps[TOWER].ios.store_bundle = 'io.automaticai.tower'; })));
-  assert.doesNotThrow(() => parsePolicy(edit(p => { p.apps[TOWER].ios.bundle = `${p.apps[TOWER].ios.bundle}.dev`; p.apps[TOWER].ios.store_bundle = 'io.automaticai.towerofdumbthings'; })));
+  assert.doesNotThrow(() => parsePolicy(edit(p => { p.apps[TOWER].ios.bundle = `${p.apps[TOWER].ios.bundle}.dev`; p.apps[TOWER].ios.store_bundle = 'io.lasertoast.tolt'; })));
 });
 
 test('the allowlist is parsed strictly: iOS apps from the policy only, a real date, a one-line reason, nothing else', () => {

@@ -29,13 +29,13 @@ export function hermetic() {
 export function sampleLatest(overrides = {}) {
   const slug = 'tower-of-lost-things';
   const android = {
-    package: 'io.automaticai.towerofdumbthings', version: '0.2.2', code: 4,
+    package: 'io.lasertoast.tolt', version: '0.2.2', code: 4,
     key: apkKey(slug, '0.2.2', 4), url: publicUrl(base, apkKey(slug, '0.2.2', 4)), bytes: 72_300_000, sha256: 'a'.repeat(64), signer_sha256: 'c'.repeat(64),
     quickdrop: 'builds/tower-of-lost-things-0.2.2-4.apk', device: device('S26', 'SM-S948U', 'pending'), run, correlation, commit: 'b'.repeat(40),
   };
   const manifestUrl = `${base}/${slug}/ios/manifest.plist`;
   const ios = {
-    bundle: 'io.automaticai.towerofdumbthings', version: '0.2.2', build: '4',
+    bundle: 'io.lasertoast.tolt', version: '0.2.2', build: '4',
     key: ipaKey(slug, '0.2.2', '4'), url: publicUrl(base, ipaKey(slug, '0.2.2', '4')), bytes: 27_300_000, sha256: 'd'.repeat(64),
     manifest_url: manifestUrl, install_url: installUrl(manifestUrl), device: device('iPad', 'iPad14,5', 'installed'), run, correlation, commit: 'b'.repeat(40),
   };
