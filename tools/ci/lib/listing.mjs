@@ -17,6 +17,8 @@ export const ageRatingQuestions = Object.freeze({
   ageAssurance: bool, sexualContentGraphicAndNudity: levels, sexualContentOrNudity: levels, socialMedia: bool, socialMediaAgeRestricted: bool,
   horrorOrFearThemes: levels, matureOrSuggestiveThemes: levels, unrestrictedWebAccess: bool, userGeneratedContent: bool,
   violenceCartoonOrFantasy: levels, violenceRealisticProlongedGraphicOrSadistic: levels, violenceRealistic: levels,
+  // Added by Apple in late 2026: a new app cannot be submitted without them (existing apps by 2027-01-15).
+  datingAndRelationships: bool, sharedLocation: bool,
 });
 
 const limits = {
