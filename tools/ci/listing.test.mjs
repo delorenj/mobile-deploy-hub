@@ -432,3 +432,13 @@ test('pull keeps price and availability only when the file already manages them'
   assert.deepEqual(file.availability, { territories: ['AUS', 'CAN', 'NZL', 'USA'], availableInNewTerritories: false });
   void db;
 });
+
+test('a field write the App Manager key gets 403 on is retried once with the Admin key', async () => {
+  const { client } = fakeAsc();
+  const dir = appDir({});
+  const manager = { ...client, which: 'manager', patch: async (path, body) => { if (path.startsWith('/v1/appInfos/')) throw new Error(`ASC PATCH ${path} -> 403 (FORBIDDEN_ERROR)`); return client.patch(path, body); } };
+  const admin = { ...client, which: 'admin', patches: [], patch: async (path, body) => { admin.patches.push(path); return client.patch(path, body); } };
+  const result = await push({ dir, repo, apply: true, only: 'fields', client: manager, adminClient: admin, read, log: () => {} });
+  assert.equal(result.clean, true);
+  assert.ok(admin.patches.some(p => p.startsWith('/v1/appInfos/')), 'the refused appInfos write went through the Admin key');
+});

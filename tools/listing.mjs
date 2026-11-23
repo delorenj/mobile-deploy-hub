@@ -233,7 +233,13 @@ export async function push({ dir, repo, apply = false, screenshots, only, client
   const calls = planCalls(changes, actual.ids, desired);
   for (const call of calls) {
     const via = call.admin || adminOnly.has(call.label) ? adminFor() : client;
-    const result = await (call.method === 'POST' ? via.post(call.path, call.body) : via.patch(call.path, call.body));
+    const send = c => (call.method === 'POST' ? c.post(call.path, call.body) : c.patch(call.path, call.body));
+    // A brand-new app answers the App Manager key 403 on some writes (its appInfos, on 2026-11-23); the Admin key can.
+    const result = await send(via).catch(error => {
+      if (via.which === 'admin' || !/\b403\b/.test(String(error.message))) throw error;
+      log(`  ${call.label}: the ${via.which} key got 403, retrying with the Admin key`);
+      return send(adminFor());
+    });
     if (call.method === 'POST' && call.path.endsWith('appStoreVersionLocalizations')) actual.ids.versionLocalization = result.data.id;
     log(`  wrote ${call.label}`);
   }
