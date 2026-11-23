@@ -226,7 +226,7 @@ A Lease cannot be extended while another Claimant waits for its Resource. Realiz
 **Consequences (testable):**
 - The refusal names the waiters and their positions.
 - Jarad can override it from the Control Surface; the override is recorded with who and why in the Event Log.
-- A Lease on a deploy target is limited to 60 minutes. `[ASSUMPTION: 60 minutes]` Long holds belong on the S24 or an emulator, as today's guidance already says.
+- A Lease on a deploy target is limited to 60 minutes (confirmed by Jarad, 2026-11-23). Long holds belong on the S24 or an emulator, as today's guidance already says.
 
 #### FR-11: Cancel and force-release
 
@@ -496,7 +496,16 @@ The baseline is the deploy history in GitHub's run logs for the 30 days before v
 
 ## 9. Open Questions
 
-None block architecture. The decisions taken in place of the earlier questions are in `.memlog.md`; the ones Jarad has not confirmed are listed there as needing him.
+None. Jarad confirmed the six revision-3 decisions on 2026-11-23:
+
+1. Deploy targets stay pinned in `devices.json` and change only by a hub release (FR-29, §6).
+2. A delivery that loses its Resource to an earlier Hold goes pending and the catch-up installs it, instead of the run going red (FR-30).
+3. No Lease extension while others wait, and a Lease on a deploy target lasts at most 60 minutes (FR-31).
+4. The iPad and the Mac's build lane are one `ios-lane` Resource in v1 (FR-12).
+5. Remote waiting, Heartbeats and fencing tokens wait for v2 (§7.2).
+6. The Mac's Host Agent is its own always-on login agent, separate from the iPad catch-up (`addendum.md` §B.6).
+
+The remaining `[ASSUMPTION]` tags in §10 are tuning values, not open questions. Each is revisited when 14 days of Event Log data show it is wrong.
 
 ## 10. Assumptions Index
 
@@ -509,5 +518,4 @@ None block architecture. The decisions taken in place of the earlier questions a
 - FR-20: the starvation threshold is 15 minutes.
 - FR-27: history windows of 1, 7, 14 and 30 days.
 - FR-28: away flagged after 30 minutes, retirement suggested after 14 days absent.
-- FR-31: a Lease on a deploy target lasts at most 60 minutes.
 - NFR-6: the Hub API listens on loopback only; people reach it only through Holocene.
