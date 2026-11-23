@@ -1,16 +1,16 @@
 ---
 title: Hub Resource Registry
-status: draft
+status: final
 created: 2026-11-21
-updated: 2026-11-21
+updated: 2026-11-23
 ---
 
 # PRD: Hub Resource Registry
-*Working title. Covers the registry, its Hub API and the Holocene page.*
+*Working title. Covers the Registry, the Hub API and the Control Surface.*
 
 ## 0. Document Purpose
 
-This PRD is for Jarad, the hub's owner and only operator, and for the downstream architecture and epic workflows that will build it. It extends what mobile-deploy-hub already does well: leases, first-in-first-out queues and the emulator pool in `tools/ci/lib/lock.mjs`, `tools/device/hub-device.mjs` and `tools/device/emulator.mjs`. It turns that into a registry every app, agent and deploy run can rely on. Inputs:
+This PRD is for Jarad, the hub's owner and only operator, and for the downstream architecture and epic workflows that will build it. It extends what mobile-deploy-hub already does well: leases, first-in-first-out queues and the emulator pool in `tools/ci/lib/lock.mjs`, `tools/device/hub-device.mjs` and `tools/device/emulator.mjs`. It turns that into a Registry that every app, agent and deploy run can rely on. Inputs:
 - `_bmad-output/planning-artifacts/resource-registry-seed.md`, which holds the requirements and the gap evidence with file and line references;
 - Jarad's answers of 2026-11-21, recorded in `.memlog.md`;
 - the four reviews in this folder (`review-rubric.md`, `review-adversarial.md`, `review-feasibility.md`, `reconcile-inputs.md`), checked against the code at v1.2.42.
@@ -19,11 +19,11 @@ Terms come from the Glossary (§3) and are used exactly. Features are grouped, w
 
 ## 1. Vision
 
-The hub's device leasing works, and Jarad wants to keep it and grow it. Today it knows two phones by name, a small emulator pool, and an iPad and a Mac it cannot lease. Deploy runs do not stand in line: they keep retrying the lock, so queued Leases win every handoff, and a deploy can wait out its limit and fail after its version was already bumped. Nobody can see that the deploy is waiting, how long it will wait, or whether one more phone would have prevented it. Agents cannot tell which phone deploys install to, or whether it is free.
+The hub's device leasing works, and Jarad wants to keep it and grow it. Today it knows two phones by name, a small emulator Pool, and an iPad and a Mac it cannot lease. Deploy runs do not stand in line: they keep retrying the lock, so queued Leases win every handoff, and a deploy can wait out its limit and fail after its version was already bumped. Nobody can see that the deploy is waiting, how long it will wait, or whether one more phone would have prevented it. Agents cannot tell which phone deploys install to, or whether it is free.
 
 The Hub Resource Registry makes every contended thing a **Resource**: phones, the iPad and the Mac's iOS lane, and emulator slots. Each one is registered once, and registering needs no hub release. Every **Claimant** stands in the same first-come-first-served **Queue**: a deploy run, a hub job such as the catch-up, an agent or Jarad. A deploy run takes a **Reservation** when it starts and keeps its place through its build. A deploy that cannot get its device in time no longer fails: its delivery goes pending and the catch-up installs it when the device frees, exactly as it does today for a device that is away. Every waiter sees its position and an **ETA**. An append-only **Event Log** records every request, hold and release. From that history the hub answers "how much waiting would one more device save?" with a **Capacity Estimate** instead of a guess.
 
-It is driven through a **Hub API** written in Node, which wraps the existing lock code rather than replacing it. Each host's locks are owned by a **Host Agent** on that host; v1 runs one on big-chungus (inside the Hub API) and one on the Mac. It is managed from a **Control Surface**: its own page in Holocene, the canonical control surface. The hub keeps authority over Holds and Queues. Holocene shows them and forwards Jarad's actions.
+It is driven through a **Hub API** written in Node, which wraps the existing lock code rather than replacing it. Each host's locks are owned by a **Host Agent** on that host; v1 runs one on big-chungus (inside the Hub API) and one on the Mac. It is managed from a **Control Surface**, its own page in Holocene. The hub keeps authority over Holds and Queues; Holocene shows them and forwards Jarad's actions.
 
 ## 2. Target User
 
@@ -53,8 +53,8 @@ It is driven through a **Hub API** written in Node, which wraps the existing loc
   - **Edge case:** the Lease ahead runs long and Tower's install wait runs out. Tower's delivery is marked pending, the build is published, and the catch-up installs it on the S26 when the S26 frees. The version is not wasted.
 - **UJ-2. An Earshot QA agent finds a phone.**
   - The agent runs `hub-device lease phone --wait` on big-chungus and gets the S24.
-  - When both phones are held, the agent waits in the phone Pool's line at position 1 with an ETA of 5 to 10 minutes, gets the first phone that frees, and releases it when the run ends.
-  - **Edge case:** the agent's process dies mid-wait. Its place is dropped by the next Claimant that looks at the line, as today, so nobody waits behind a ghost.
+  - When both phones are held, the agent waits in the phone Pool's Queue at position 1 with an ETA of 5 to 10 minutes, gets the first phone that frees, and releases it when the run ends.
+  - **Edge case:** the agent's process dies mid-wait. Its place is dropped by the next Claimant that looks at the Queue, as today, so nobody waits behind a ghost.
 - **UJ-3. Jarad registers a new phone from Holocene.**
   - Jarad pairs a Pixel with big-chungus over wireless debugging, opens the Control Surface, and sees it listed as a discovered, unregistered device.
   - He registers it with a name, kind and Capabilities.
@@ -165,7 +165,7 @@ A Claimant can ask for "any Resource matching these Capabilities", such as an An
 
 ### 4.2 Holds, Queues and Reservations
 
-**Description:** One first-come-first-served Queue per Resource serves every Claimant kind. Deploy jobs and hub jobs join it like Leases do instead of retrying `mkdir`. A deploy run takes a Reservation when it starts and uses it for every Job Hold it takes on that Resource, so the build no longer loses its place. A deploy that cannot get its device within its wait budget marks the delivery pending and leaves it to the catch-up, instead of failing. v1 Holds and queued requests are tied to a local process or to a stated expiry; waiting in line without a local process (remote waiting with Heartbeats) is v2. Realizes UJ-1 and UJ-2.
+**Description:** One first-come-first-served Queue per Resource serves every Claimant kind. Deploy jobs and hub jobs join it like Leases do instead of retrying `mkdir`. A deploy run takes a Reservation when it starts and uses it for every Job Hold it takes on that Resource, so the build no longer loses its place. A deploy that cannot get its device within its wait budget marks the delivery pending and leaves it to the catch-up, instead of failing. v1 Holds and queued requests are tied to a local process or to a stated expiry; waiting in line without a local process (remote waiting with Heartbeats, see §7.2) is v2. Realizes UJ-1 and UJ-2.
 
 #### FR-7: First come, first served for every Claimant
 
@@ -226,7 +226,7 @@ A Lease cannot be extended while another Claimant waits for its Resource. Realiz
 **Consequences (testable):**
 - The refusal names the waiters and their positions.
 - Jarad can override it from the Control Surface; the override is recorded with who and why in the Event Log.
-- A Lease on a deploy target is limited to 60 minutes (confirmed by Jarad, 2026-11-23). Long holds belong on the S24 or an emulator, as today's guidance already says.
+- A Lease on a deploy target is limited to 60 minutes (confirmed by Jarad, 2026-11-23), in place of FR-10's 48-hour limit. Long holds belong on the S24 or an emulator, as today's guidance already says.
 
 #### FR-11: Cancel and force-release
 
@@ -273,7 +273,7 @@ The Hub API returns, and streams as changes, every Resource's Reachability, curr
 Every queued Claimant gets an ETA, built from the expected remaining time of the Holds ahead of it and the expected hold time of each Claimant ahead of it, across the Resources it is waiting on. Realizes UJ-1 and UJ-2.
 
 **Consequences (testable):**
-- The ETA is a range: the 25th to 75th percentile of the matching past holds, combined along the line. `[ASSUMPTION: interquartile range]`
+- The ETA is a range: the 25th to 75th percentile of the matching past holds, combined along the Queue. `[ASSUMPTION: interquartile range]`
 - A Job Hold's expected length comes from past holds of the same repo and job.
 - A Lease's expected end is its start plus the median share of their stated duration that past Leases of the same Claimant kind used, never later than its expiry.
 - With low data, the range widens to the stated durations or job timeouts and is flagged "low data".
@@ -459,7 +459,7 @@ Each slice is a hub release that ships on its own. The order follows `addendum.m
   - The Mac's Host Agent (the rest of FR-12).
 - **v1c, the Control Surface and the numbers:**
   - Capacity Estimate and starvation signal (FR-19, FR-20).
-  - The Holocene page (FR-24 to FR-28), in the Holocene repo.
+  - The Control Surface (FR-24 to FR-28), in the Holocene repo.
 
 The starvation fix depends only on v1a.
 

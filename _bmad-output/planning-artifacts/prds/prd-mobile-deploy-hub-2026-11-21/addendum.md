@@ -1,6 +1,6 @@
 # Addendum: Hub Resource Registry
 
-This is the mechanism and evidence behind `prd.md`, kept here so the PRD stays about capabilities. It is input for `bmad-architecture`, not a decision of record. Line references are against v1.2.42 (`fc98114`); the four reviews in this folder (`review-*.md`, `reconcile-inputs.md`) hold the full code evidence.
+This is the mechanism and evidence behind `prd.md`, kept here so the PRD stays about capabilities. It is input for `bmad-architecture`, not a decision of record. Line references are against v1.2.42 (`fc98114`); the four review files in this folder (`review-*.md`, `reconcile-inputs.md`) hold the full code evidence.
 
 ## A. Where today's behaviour comes from
 
@@ -10,8 +10,11 @@ This is the mechanism and evidence behind `prd.md`, kept here so the PRD stays a
 - **Lease record:** `kind:'lease'`, `lease_id`, `holder`, `why`, `expires_at`, `holder_pid` and `holder_process_start`. The maximum is 48h (`MAX_LEASE_MS`).
 - **Lease queue:** first-in-first-out tickets in `<name>.queue/<ms>-<counter>-<pid>.json`, polled every 1s by `acquireLease`, which prunes stale tickets on every poll (`listWaiters(..., {prune:true})`, `:213`).
 - **Ticket staleness** (`staleWaiter`, `:139-146`): a ticket from another host, without `pid`/`process_start`, or naming a dead or reused process is stale. Nothing without a live local process can live in `.queue/`. `staleWaiter` has no covering test today.
-- **Owner staleness:** a Lease from another host is judged only by its expiry (`:49`); a job owner from another host goes stale after `staleMs` (4 h, `:53`). Only queue tickets are host-bound. So the Hub API must run on big-chungus as the runner user (because of the tickets and the local `holder_pid` checks), and a dead Mac-side job lock can block for 4 hours.
-- **Deploy job locks:** `withLock` (`:65-97`) retries `mkdir` every 2s and never reads or writes the queue. This is the starvation mechanism. Wait budgets today: plan waits 20 min in a 20 min job (`plan.mjs:234`, `mobile-deploy.yml:196`); android waits 20 min after its build in a 45 min job (`android.mjs:156`, `yml:258`); iOS waits 40 + 40 min around in-lock builds in a 120 min job (`ios.mjs:344,390`, `yml:377`).
+- **Owner staleness:** a Lease from another host is judged only by its expiry (`:49`); a job owner from another host goes stale after `staleMs` (4 h, `:53`). Only queue tickets are host-bound. Two consequences: the Hub API must run on big-chungus as the runner user (because of the tickets and the local `holder_pid` checks), and a dead Mac-side job lock can block for 4 hours.
+- **Deploy job locks:** `withLock` (`:65-97`) retries `mkdir` every 2s and never reads or writes the queue. This is the starvation mechanism. Wait budgets today:
+  - plan waits 20 min in a 20 min job (`plan.mjs:234`, `mobile-deploy.yml:196`);
+  - android waits 20 min after its build in a 45 min job (`android.mjs:156`, `mobile-deploy.yml:258`);
+  - iOS waits 40 + 40 min around in-lock builds in a 120 min job (`ios.mjs:344,390`, `mobile-deploy.yml:377`).
 - **`withLock` also guards internal locks:** `s3-index`, `s3-<slug>`, `emulator-reaper` (`s3.mjs:219`, `deliver.mjs:249`, `bucket-policy.mjs:208`, `emulator.mjs:297,340`).
 - **Parsed wording:** the catch-up matches `/host lock adb is held/` and `/host lock mac-ios is held/` (`catchup.mjs:469,591`); the reaper matches `/^host lock emulator-reaper /` (`emulator.mjs:312,342`). Any rewording breaks them.
 - **`updateLease` race** (`:290-299`): read, check, rename-write, with no `expires_at > now` check. A late renewal can overwrite the record of a holder that reclaimed the lock in between.
@@ -34,7 +37,7 @@ This is the mechanism and evidence behind `prd.md`, kept here so the PRD stays a
 - It covers the Mac **build** and the iPad install (`ios.mjs:276-344`), taken twice per iOS job (`:276`, `:390`), and the iPad catch-up (`catchup.mjs:574-592`). `preflight-ios` reads the iPad's version with no lock.
 - It lives on the Mac's disk, so big-chungus cannot see it.
 - devicectl and the keychain work only inside the Mac's logged-in GUI session, never over plain ssh (`.candybars/mobile-deploy-hub-ios-catchup/kick.mjs:4-6`).
-- The iPad catch-up is a one-shot LaunchAgent (`sh.delo.mobile-deploy-hub.catchup`, no interval) kicked by a candybar every 5 minutes; `kick.mjs` reports a running job as `HUB_MAC_BUSY`, a success.
+- The iPad catch-up is a one-shot LaunchAgent (`sh.delo.mobile-deploy-hub.catchup`, no interval) kicked by a candybar every 5 minutes; `kick.mjs` reports a running job as `HUB_MAC_BUSY`, which counts as a success.
 
 ### Versions in play at once
 
@@ -69,7 +72,7 @@ This is the mechanism and evidence behind `prd.md`, kept here so the PRD stays a
   ```
 
 - Events: request, acquire, release, extend, timeout, cancel, claim, expire, reclaim, force-release, override, pending (FR-30), registry-add/edit/retire, reachability.
-- Emit each once: `withLock` (request before its loop, acquire, timeout, release in `finally`), `acquireLease` (request after the ticket rename, acquire, timeout, cancel in `finally`), `reclaim()` (with a reason), `releaseLease`, `listWaiters` prune, `updateLease`, emulator reap failure (capacity loss).
+- Emit each event once, from these places: `withLock` (request before its loop, acquire, timeout, release in `finally`), `acquireLease` (request after the ticket rename, acquire, timeout, cancel in `finally`), `reclaim()` (with a reason), `releaseLease`, `listWaiters` prune, `updateLease`, emulator reap failure (capacity loss).
 - Scope: Registry Resources only. The internal locks write nothing.
 - A GitHub-killed job writes no release; the next acquirer's reclaim records `last_alive_at` from the dead owner's record so `held_ms` is not inflated.
 - Ship this in a hub release before anything else, so history starts building up.
@@ -88,12 +91,12 @@ This is the mechanism and evidence behind `prd.md`, kept here so the PRD stays a
 - Serving rule: merge `.queue/` and `.reservations/` by `enqueued_at`. A Reservation at the head whose run is not asking idles a free Resource for `grace_s`, once (`head_since` records it). After that the next ticket is served; the Reservation keeps its `enqueued_at` and never idles the Resource again.
 - Same-run passthrough: a `withLock` whose `GITHUB_RUN_ID` matches a live Reservation goes through it, so plan, android, and iOS's two takes never wait on their own run.
 - The Peek: plan reads the installed versionCode with a read-only `adb shell` query while a **Lease** holds the S26 (never while a Job Hold does). It takes no lock and starts no server.
-- Release: the run's last Job Hold, or the `announce` job (`if: always()`, `yml:511-514`) deletes the run's Reservations, locally for `adb` and over ssh for the Mac's; the `expires_at` ceiling covers a run that never reaches `announce`.
+- Release: the run's last Job Hold, or the `announce` job (`if: always()`, `mobile-deploy.yml:511-514`) deletes the run's Reservations, locally for `adb` and over ssh for the Mac's; the `expires_at` ceiling covers a run that never reaches `announce`.
 - The serving rule and the reservation format must ship in the **same** release as queue-joining `withLock`; any later addition is ignored forever by the pins in between.
 
 ### 4. Remote tickets (format only in v1)
 
-- The first queue-joining release freezes the ticket format, so it ships `kind:'remote'` tickets with their own `expires_at`, which every pruner honours, even though v1 writes none.
+- The first queue-joining release freezes the ticket format, so it must already recognise `kind:'remote'` tickets, with their own `expires_at` that every pruner honours, even though v1 writes none.
 - v2 remote waiting uses them with Heartbeats renewing `expires_at`, the quarantine encoded in the on-disk `expires_at` (pinned `stale()` reclaims exactly at it), and the Lease's stated end in a separate `ends_at`.
 - `updateLease` gets an expiry check in v1a regardless (PRD FR-10).
 
@@ -132,16 +135,15 @@ v1 ships measured waits always, the replayed range at c+1 always, and the modell
 
 - λ is requests per hour from request events, excluding hub-job attempts and internal locks. E[S] and Var[S] come from `held_ms`, and c is the number of Resources in the Pool.
 - Only flexible demand (Pool requests) moves to a new Resource. Demand pinned to one Resource (deploys on their target, requests by name) is reported separately; the phone Pool with a pinned S26 is not a pure M/G/c.
-- Erlang C gives P(wait) and Wq for M/M/c; Allen-Cunneen corrects for G: Wq ≈ Wq(M/M/c) · (Ca² + Cs²)/2.
-- Treat timeouts and pending deliveries as abandonment, and flag that Erlang C overstates the wait when abandonment is high (Erlang A).
-- Below the threshold, replay the logged arrivals and holds through a small simulation at c and c+1 and report the range.
+- The formulas (Erlang C, the Allen-Cunneen correction, Erlang A) and the small-sample fallback are in "Capacity math, refined" in Section C.
+- Treat timeouts and pending deliveries as abandonment, and flag that Erlang C overstates the wait when abandonment is high.
 
 ### 10. Rollout order
 
 1. **v1a release:** Event Log, queue-joining `withLock`, Reservations, the Peek, FR-30 pending, FR-31, the frozen ticket format, `updateLease` fix.
 2. Pin flip (callers pick it up through `@v1`). The catch-ups switch at the first real deploy on the new pin; `hub-device` at `hosts:install`.
 3. **v1b:** Registry, Hub API, Mac Host Agent, then `hosts:install`.
-4. **v1c:** Capacity Estimate and the Holocene page.
+4. **v1c:** Capacity Estimate and the Control Surface.
 
 Fairness is partial until reruns of runs pinned to older hub versions age out (30 days).
 
@@ -184,7 +186,7 @@ Fairness is partial until reruns of runs pinned to older hub versions age out (3
 ### Capacity math, refined
 
 - **Erlang C:** with offered load E = λ·h and E < c, Wq = P_w·h/(c − E).
-- **Allen-Cunneen:** Wq ≈ ((Ca² + Cs²)/2)·Wq(M/M/c). It is exact for M/G/1 (Pollaczek-Khinchine), that is with Poisson arrivals (Ca² = 1); for G/G/c it is an approximation. Grace periods act as server vacations, so the modelled wait understates reality when Reservations are busy.
+- **Allen-Cunneen:** Wq ≈ ((Ca² + Cs²)/2)·Wq(M/M/c). It is exact for M/G/1 (Pollaczek-Khinchine: Poisson arrivals, Ca² = 1) and an approximation for G/G/c. Grace periods act as server vacations, so the modelled wait understates reality when Reservations are busy.
 - **Savings from one more device:** Wq(c) − Wq(c+1) at the same λ, h and Cs².
 - **Erlang A** (abandonment rate θ): use it once timeouts are frequent, because Erlang C overstates the wait.
 - **Small samples:** for c ≤ 3 and fewer than about 20 holds, report the empirical median wait, or replay the logged arrivals and holds through a small simulation at c and c+1. Report ρ next to the result, and compute per Pool.
