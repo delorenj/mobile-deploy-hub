@@ -56,7 +56,7 @@ development_status:
 
   epic-3: backlog
   3-1-peek-at-the-s26-without-disturbing-a-lease: done
-  3-2-a-blocked-android-delivery-goes-pending: backlog
+  3-2-a-blocked-android-delivery-goes-pending: done
   3-3-the-catch-up-delivers-contention-pending-builds-in-its-turn: backlog
   3-4-a-newer-installed-build-is-refused-with-a-name: backlog
   3-5-ios-contention-is-red-and-says-who: backlog
