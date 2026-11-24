@@ -2,7 +2,7 @@
 title: 'Story 4.3: Status shows every waiter, Reservations and ETAs'
 type: 'feature'
 created: '2026-11-24'
-status: 'awaiting-operator'
+status: done
 review_loop_iteration: 0
 baseline_revision: '51cc70a8100110cc3353a95b7436486f7dae2d98'
 followup_review_recommended: true
@@ -232,3 +232,13 @@ One level up (belsky-doctrine): Jarad asked to see the line for the S26. Every Q
 - On big-chungus, status shows nothing for `mac-ios`, because that lock lives on the Mac. Run status on the Mac to see the iPad line.
 - Until about 20 holds per repo and job accumulate in the 30-day window, most status ETAs read `low-data`.
 - v1.2.46 has still not been proven by a real deploy (see the hub memory), and v1.2.47 stacks on it.
+
+## Operator Confirmation
+
+Confirmed 2026-11-24: the external actions this story owed were carried out.
+
+- After the orchestrator merges stories 4.1, 4.2 and 4.3 to main, cut the hub release from a fresh clean clone of main with `mise run release -- 1.2.47` (if more stories land first, extend the `## v1.2.47` section in docs/hub-releases.md before tagging).
+- Once the release runner reports every app dry run finished, run `mise run hosts:install` from a clean checkout at tag v1.2.47 on big-chungus and on the Mac, then confirm both hosts report `current` at v1.2.47 and no catch-up timer or launchd interval came back.
+- On big-chungus, run `hub-device status` and `hub-device status --json` from the installed release while a deploy waits on `adb`, and confirm the JOB row with repo, run, job and `eta=` and the RESERVATIONS section appear.
+
+_Appended by the bmad-loop orchestrator (`bmad-loop confirm`, #335): a human confirmed these external actions out of band, and the story was advanced from `awaiting-operator` to `done`._
