@@ -358,7 +358,7 @@ Arrows mean "may import or write". Nothing points back up. Only `lock.mjs` write
   - The Event Log may ship in an earlier release.
   - `hosts:install` runs on both hosts right after that release, so `hub-device`, the wrapper on the Mac, and `announce`'s ssh verb all speak the same format.
 
-### AD-21: The Queue replaces lane concurrency groups
+### AD-21: The Queue replaces lane concurrency groups [ADOPTED]
 
 - **Binds:** `.github/workflows/mobile-deploy.yml`; FR-8, SM-1.
 - **Prevents:** GitHub's one-pending-per-group replacement silently dropping a run that the Queue would have served.
