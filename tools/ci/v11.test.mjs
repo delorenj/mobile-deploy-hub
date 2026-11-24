@@ -14,7 +14,7 @@ import { parseConfig } from './lib/config.mjs';
 import { loadPolicy, parsePolicy, policyFile, tagOf, tagOnlyOf } from './lib/policy.mjs';
 import * as hub from './hub.mjs';
 import { hermetic, sampleLatest } from './test-fixtures.mjs';
-import { listReservations } from './lib/lock.mjs';
+import { acquireLease, listReservations, updateLease } from './lib/lock.mjs';
 import { readEvents } from './lib/events.mjs';
 import { gate } from './hub.mjs';
 
@@ -152,7 +152,7 @@ async function gateFixture({ manifest = towerManifest(), caller = template, repo
   const configure = (extra = [], more = {}) => ({ ...parseConfig(['gate', '--manifest', 'tools/ci/mobile-deploy.json', '--out', join(root, 'out'), ...extra], { ...env, ...more }), cwd: app });
   const s3 = fakeS3();
   const logs = [];
-  const deps = (more = {}) => ({ env, home: root, fetchImpl: notFound, s3Factory: async () => s3, tailscale: () => peer('76.98.73.87:11349'), macProbe: () => ({ runner: 'alive', catchup: 'live' }), runnerStatus: () => ({ status: 'online', busy: false }), adbFactory: noPhone, log: line => logs.push(line), ...more });
+  const deps = (more = {}) => ({ env, home: root, fetchImpl: notFound, s3Factory: async () => s3, tailscale: () => peer('76.98.73.87:11349'), macProbe: () => ({ runner: 'alive', catchup: 'live' }), runnerStatus: () => ({ status: 'online', busy: false }), adbFactory: noPhone, adbRunner: () => { throw new Error('no adb in this test'); }, log: line => logs.push(line), ...more });
   const outputs = () => Object.fromEntries(readFileSync(output, 'utf8').trim().split('\n').filter(Boolean).map(line => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
   return { root, app, env, configure, s3, logs, deps, outputs, cleanup: () => rm(root, { recursive: true, force: true }) };
 }
@@ -170,6 +170,29 @@ test('the gate passes a well-formed run and reads the state of things: metered M
     assert.equal(f.outputs().ios_lane, 'run');
     const receipt = JSON.parse(readFileSync(join(f.root, 'out/gate/hub-receipt-gate.json'), 'utf8'));
     assert.equal(receipt.policy, loadPolicy().sha256, 'every receipt records the full policy digest');
+  } finally { await f.cleanup(); }
+});
+
+// Story 3.1 (FR-9, AD-13): under a live Lease on `adb` the gate's S26 probe only Peeks, never starting a server or connecting.
+test('the gate under a Lease on adb Peeks: present when the -L read works, unknown when it fails, and the adb factory is never used', async () => {
+  const f = await gateFixture();
+  try {
+    const lease = await acquireLease('adb', { holder: 'agent-a', why: 'device proof', forMs: 30 * 60_000, id: 'held', env: f.env, log: () => {} });
+    assert.equal(updateLease('adb', lease.lease_id, { device: { phone: 's26', serial: 'R5GL43A7PCH', adb_id: 'adb-R5GL43A7PCH-zz._adb-tls-connect._tcp', adb_port: 5038 } }, { env: f.env, ino: lease.lock_ino }), true);
+    const argvs = [];
+    const seen = [];
+    const reading = (command, args, options) => { argvs.push(args); seen.push(options.env.RUNNER_TRACKING_ID); return 'Packages:\n  Package [x] (1):\n    versionCode=3\n'; };
+    const factory = () => { throw new Error('findPhone must not run under a Lease'); };
+    await gate(f.configure(), f.deps({ adbFactory: factory, adbRunner: reading }));
+    assert.ok(f.logs.some(line => /^HUB_GATE ok policy=[0-9a-f]{8} mac=metered s26=present /.test(line)), f.logs.join('\n'));
+    assert.ok(f.logs.some(line => /^HUB_S26_PEEK lease=held adb=adb-R5GL43A7PCH-zz\S* port=5038 /.test(line)), f.logs.join('\n'));
+    assert.equal(argvs.length, 1);
+    assert.deepEqual(argvs[0].slice(0, 5), ['-L', 'tcp:127.0.0.1:5038', '-s', 'adb-R5GL43A7PCH-zz._adb-tls-connect._tcp', 'shell']);
+    assert.deepEqual(seen, ['']);
+    for (const args of argvs) assert.doesNotMatch(args.join(' '), /(^| )(start-server|connect|mdns|getprop|kill-server)( |$)/);
+    f.logs.length = 0;
+    await gate(f.configure(), f.deps({ adbFactory: factory, adbRunner: () => { throw new Error('adb server is gone'); } }));
+    assert.ok(f.logs.some(line => /^HUB_GATE ok policy=[0-9a-f]{8} mac=metered s26=unknown /.test(line)), f.logs.join('\n'));
   } finally { await f.cleanup(); }
 });
 

@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { hostname, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { RESERVABLE, acquireLease, listLocks, listReservations, queueView, readOwner, releaseLease, reserve, runKey, withLock } from './lib/lock.mjs';
+import { RESERVABLE, acquireLease, listLocks, liveLease, listReservations, queueView, readOwner, releaseLease, reserve, runKey, withLock } from './lib/lock.mjs';
 import { readEvents } from './lib/events.mjs';
 import { loadPolicy } from './lib/policy.mjs';
 import { hermetic } from './test-fixtures.mjs';
@@ -476,5 +476,65 @@ test('the policy file gives the grace and the ceiling that reserve stamps into t
     assert.equal(entry.grace_ms, queue.grace_min * MIN);
     assert.equal(Date.parse(entry.expires_at) - Date.parse(entry.reserved_at), queue.reservation_ceiling_min * MIN);
     assert.deepEqual([queue.grace_min, queue.reservation_ceiling_min], [10, 180]);
+  } finally { f.cleanup(); }
+});
+
+// ---------------------------------------------------------------------------------------------------- yieldToLease (Story 3.1, AD-13)
+
+test('liveLease names a Lease that holds the lock, and nothing for a Job Hold, an expired Lease or a free lock', async () => {
+  const f = fixture();
+  try {
+    assert.equal(liveLease('adb', { env: f.plain, now: f.now }), null, 'nothing holds it');
+    await acquireLease('adb', { holder: 'agent-a', why: 'proof', forMs: MIN, id: 'holder', env: f.plain, log: f.log, now: f.now });
+    assert.equal(liveLease('adb', { env: f.plain, now: f.now })?.lease_id, 'holder');
+    assert.equal(liveLease('adb', { env: f.plain, now: () => T0 + 2 * MIN }), null, 'past its expiry it is not live');
+    releaseLease('adb', 'holder', { env: f.plain });
+    let job;
+    const held = withLock('adb', () => new Promise(done => { job = done; }), { env: f.runEnv(9), log: f.log, timers: fakeTimers() });
+    await until(() => readOwner(f.lock)?.kind === 'job', 'the Job Hold');
+    assert.equal(liveLease('adb', { env: f.plain }), null, 'a Job Hold is not a Lease');
+    job();
+    await held;
+  } finally { f.cleanup(); }
+});
+
+test('yieldToLease: a wait behind a Job Hold that a Lease then takes leaves the Queue with a cancel event and throws HUB_LOCK_YIELDED with the Lease', async () => {
+  const f = fixture();
+  try {
+    let job;
+    const held = withLock('adb', () => new Promise(done => { job = done; }), { env: f.runEnv(9), log: f.log, timers: fakeTimers(), pollMs: 5 });
+    await until(() => readOwner(f.lock)?.kind === 'job', 'the Job Hold');
+    // The Lease asked first, so it is served first when the Job Hold ends.
+    const leasing = acquireLease('adb', { holder: 'agent-a', why: 'device proof', forMs: 30 * MIN, id: 'first', waitMs: 10_000, env: f.plain, log: f.log, pollMs: 5 });
+    await until(() => queueView('adb', { env: f.plain }).some(entry => entry.kind === 'lease'), 'the Lease in line');
+    const yielding = withLock('adb', async () => assert.fail('plan must not take the lock'), { env: f.runEnv(5, 'plan'), log: f.log, pollMs: 5, timeoutMs: 10_000, timers: fakeTimers(), yieldToLease: true });
+    const outcome = yielding.then(() => null, error => error);
+    await until(() => queueView('adb', { env: f.plain }).some(entry => entry.kind === 'job'), 'the plan in line');
+    job();
+    await held;
+    await leasing;
+    const error = await outcome;
+    assert.equal(error?.code, 'HUB_LOCK_YIELDED', String(error));
+    assert.equal(error.owner.lease_id, 'first');
+    assert.match(error.message, /^host lock adb is held by lease first of agent-a/);
+    const mine = events(f).filter(event => event.claimant.job === 'plan').map(event => [event.event, event.reason]);
+    assert.deepEqual(mine, [['request', null], ['cancel', 'yield-to-lease']]);
+    assert.deepEqual(queueView('adb', { env: f.plain }), [], 'the plan left no ticket behind');
+    assert.equal(readOwner(f.lock).lease_id, 'first', 'the Lease still holds');
+  } finally { f.cleanup(); }
+});
+
+test('without yieldToLease the same wait keeps waiting for a Lease, and an expired Lease is reclaimed rather than yielded to', async () => {
+  const f = fixture();
+  try {
+    await acquireLease('adb', { holder: 'agent-a', why: 'proof', forMs: MIN, id: 'holder', env: f.plain, log: f.log });
+    await assert.rejects(withLock('adb', async () => {}, { env: f.runEnv(5, 'plan'), log: f.log, pollMs: 5, timeoutMs: 150, timers: fakeTimers() }), error => error.code === 'HUB_LOCK_TIMEOUT');
+    // The bare path of an unqueued name has the same option, and the same live check.
+    await acquireLease('s3-index', { holder: 'agent-a', why: 'proof', forMs: 5 * MIN, id: 'bare', env: f.plain, log: f.log });
+    await assert.rejects(withLock('s3-index', async () => {}, { env: f.plain, log: f.log, pollMs: 5, timeoutMs: 10_000, yieldToLease: true, timers: fakeTimers() }), error => error.code === 'HUB_LOCK_YIELDED' && error.owner.lease_id === 'bare');
+    let ran = false;
+    await withLock('adb', async () => { ran = true; }, { env: f.runEnv(6, 'plan'), log: f.log, pollMs: 5, timeoutMs: 10_000, timers: fakeTimers(), yieldToLease: true, now: () => Date.now() + 2 * MIN });
+    assert.equal(ran, true, 'the Lease had expired: reclaimed, not yielded to');
+    assert.ok(events(f).some(event => event.event === 'reclaim' && event.reason === 'expired'));
   } finally { f.cleanup(); }
 });

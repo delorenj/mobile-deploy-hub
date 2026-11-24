@@ -6,20 +6,20 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseConfig } from './lib/config.mjs';
 import { checkBump, levels, nextVersion, parseVersionInfo } from './lib/version.mjs';
 import { bumpTransaction, createGit, parseRemoteTag, parseStatus } from './lib/git.mjs';
-import { createAdb, findPhone, parseBaseApk, parseDeviceList, parseMdnsEndpoint, parsePackage, parseSha256 } from './lib/adb.mjs';
+import { createAdb, findPhone, parseBaseApk, parseDeviceList, parseMdnsEndpoint, parsePackage, parseSha256, peekInstalled } from './lib/adb.mjs';
 import { createIpad, pickApp, pickIpad } from './lib/devicectl.mjs';
 import { reachIpad } from './commands/common.mjs';
 import { bbEmitPath, correlationFor, deploymentEvent, emitArgs, sanitizeReason, targetOf, uuidv5 } from './lib/announce.mjs';
 import { loadDevices, parseDevices } from './lib/devices.mjs';
 import { parseManifest } from './lib/manifest.mjs';
 import { android, announce, plan, play, preflightIos, release } from './hub.mjs';
-import { listReservations, releaseReservation, reserve } from './lib/lock.mjs';
+import { acquireLease, listReservations, releaseLease, releaseReservation, reserve, updateLease } from './lib/lock.mjs';
 import { reserveFor } from './commands/common.mjs';
 import { readEvents } from './lib/events.mjs';
 import { checkPhone, lanesFrom, parseArguments, phone } from '../deploy.mjs';
@@ -330,6 +330,37 @@ test('adb output is parsed: devices, the package block, base.apk and sha256', ()
   assert.equal(parsePackage(dumpsys, 'io.missing'), null);
   assert.equal(parseBaseApk('package:/data/app/~~a==/io.example.app-b==/base.apk\npackage:/data/app/~~a==/io.example.app-b==/split_config.arm64_v8a.apk\n'), '/data/app/~~a==/io.example.app-b==/base.apk');
   assert.equal(parseSha256(`${'c'.repeat(64)}  /data/app/x/base.apk\n`), 'c'.repeat(64));
+});
+
+test('peekInstalled keeps to the device state, the recorded id and port, the env port and the package it is given (Story 3.1)', () => {
+  const run = (options, answer = () => '') => {
+    const calls = [];
+    const runner = (command, args, opts) => { calls.push({ args, tracking: opts.env.RUNNER_TRACKING_ID }); return answer(args); };
+    const result = peekInstalled({ pkg: 'io.example.app', serial: 'R5GL43A7PCH', env: { RUNNER_TRACKING_ID: 'job-1', ...options.env }, home: '/nonexistent', runner, ...options.rest });
+    return { result, calls };
+  };
+  const dumpsys = 'Packages:\n  Package [io.example.app] (1):\n    versionCode=4\n    versionName=0.2.1\n';
+  // (a) a listed S26 that is not in state `device` is unknown, and nothing else is asked
+  const offline = run({ env: {} }, () => 'List of devices attached\nadb-R5GL43A7PCH-zz._adb-tls-connect._tcp\toffline\n');
+  assert.equal(offline.result.state, 'unknown');
+  assert.deepEqual(offline.calls.map(call => call.args), [['-L', 'tcp:127.0.0.1:5037', 'devices']]);
+  // (b) a recorded id or port that is not usable is ignored: the default server, and a lookup
+  const junk = run({ env: {}, rest: { lease: { device: { adb_id: '-x y', adb_port: 70000 } } } }, () => 'List of devices attached\n');
+  assert.equal(junk.result.state, 'unknown');
+  assert.deepEqual(junk.calls.map(call => call.args), [['-L', 'tcp:127.0.0.1:5037', 'devices']]);
+  // (c) no recorded port: the environment's server port
+  const env5040 = run({ env: { ANDROID_ADB_SERVER_PORT: '5040' } }, () => 'List of devices attached\n');
+  assert.deepEqual(env5040.calls.map(call => call.args), [['-L', 'tcp:127.0.0.1:5040', 'devices']]);
+  assert.equal(env5040.result.adb_port, 5040);
+  // a usable id skips the lookup and reads the package
+  const read = run({ env: {}, rest: { lease: { device: { adb_id: 'adb-R5GL43A7PCH-zz._adb-tls-connect._tcp', adb_port: 5038 } } } }, () => dumpsys);
+  assert.deepEqual([read.result.state, read.result.installed], ['read', { versionCode: 4, versionName: '0.2.1' }]);
+  assert.deepEqual(read.calls.map(call => call.args), [['-L', 'tcp:127.0.0.1:5038', '-s', 'adb-R5GL43A7PCH-zz._adb-tls-connect._tcp', 'shell', 'dumpsys', 'package', 'io.example.app']]);
+  // (d) no package: unknown, no call at all
+  const calls = [];
+  const none = peekInstalled({ serial: 'R5GL43A7PCH', env: {}, home: '/nonexistent', runner: (...args) => { calls.push(args); return ''; } });
+  assert.deepEqual([none.state, calls.length], ['unknown', 0]);
+  for (const call of [...offline.calls, ...junk.calls, ...env5040.calls, ...read.calls]) assert.equal(call.tracking, '', 'the job\'s RUNNER_TRACKING_ID never reaches the adb server');
 });
 
 function fakeAdbApi({ listed, props, after = 0 }) {
@@ -698,6 +729,7 @@ test('a schema 2 manifest is strict: project, version read and bump, an APK lane
 
 // The S26 as a shell script: its state is a folder (the installed APK), every call is logged.
 const fakeAdb = state => `echo "$*" >> "${state}/calls.log"
+[ "$1" = "-L" ] && shift 2
 [ "$1" = "-s" ] && { id="$2"; shift 2; }
 case "$1" in
   start-server) exit 0 ;;
@@ -966,6 +998,152 @@ test('an away S26 is pending, not a stop: the plan still bumps, and the lane pub
     const laneAgain = await quiet(() => android(host.configure('android', ['--version', outAgain.version, '--android-code', outAgain.android_code, '--build-sha', outAgain.build_sha, '--bump-patch', outAgain.bump_patch]), { env: { ...host.env, HUB_ADB_LANE_WAIT_MS: '1' }, home: f.root }));
     assert.equal(laneAgain.delivery.status, 'pending', 'the unauthorized S26 lane publishes as pending');
     assert.equal(laneAgain.delivery.reason, "not on big-chungus's adb");
+  } finally { await f.cleanup(); }
+});
+
+// Story 3.1 (FR-9, AD-13): under a live Lease on `adb` the plan never takes the lock and never touches the adb server; it Peeks.
+const leaseOnS26 = async (host, device) => {
+  const lease = await acquireLease('adb', { holder: 'agent-a', why: 'device proof', forMs: 30 * 60_000, id: 'peek', env: host.env, log: () => {} });
+  if (device) assert.equal(updateLease('adb', lease.lease_id, { device }, { env: host.env, ino: lease.lock_ino }), true);
+  return lease;
+};
+const noServerCalls = host => assert.doesNotMatch(host.adbCalls(), /(^| )(start-server|connect|reconnect|mdns|getprop|kill-server)( |$)/m);
+
+test('a plan under a Lease with a recorded id peeks: one -L dumpsys call, no lock events, the receipt version, and the downgrade refusal still fires', async () => {
+  const f = await gitFixture();
+  try {
+    const host = await laneHost(f);
+    await host.installApk('io.example.app 0.2.1 4');
+    await leaseOnS26(host, { phone: 's26', serial: 'R5GL43A7PCH', adb_id: 'adb-R5GL43A7PCH-zz._adb-tls-connect._tcp', adb_port: 5038 });
+    const before = [...readEvents({ env: host.env })].length;
+    const logs = [];
+    const planned = await plan(host.configure('plan'), { env: host.env, home: f.root, fetchImpl: noLatest, log: line => logs.push(line) });
+    assert.equal(planned.s26, 'present');
+    assert.equal(planned.version, '0.2.2');
+    assert.deepEqual(host.adbCalls().trim().split('\n'), ['-L tcp:127.0.0.1:5038 -s adb-R5GL43A7PCH-zz._adb-tls-connect._tcp shell dumpsys package io.example.app']);
+    noServerCalls(host);
+    assert.equal([...readEvents({ env: host.env })].length, before, 'the plan wrote no request, acquire or release');
+    assert.ok(logs.some(line => /^HUB_S26_PEEK lease=peek adb=adb-R5GL43A7PCH-zz\S* port=5038 read 0\.2\.1 \(4\)/.test(line)), logs.join('\n'));
+    const receipt = JSON.parse(readFileSync(join(f.out, 'plan/hub-receipt-plan.json'), 'utf8'));
+    assert.deepEqual([receipt.devices.s26, receipt.devices.s26_state], [{ versionCode: 4, versionName: '0.2.1' }, 'present']);
+    // A peeked newer build still stops the plan before it spends a version.
+    await host.installApk('io.example.app 0.9.0 9');
+    await assert.rejects(plan(host.configure('plan'), { env: host.env, home: f.root, fetchImpl: noLatest, log: () => {} }), /already has io\.example\.app versionCode 9/);
+    noServerCalls(host);
+  } finally { await f.cleanup(); }
+});
+
+test('a plan under a Lease reads a phone without the package as present with no version, and says so', async () => {
+  const f = await gitFixture();
+  try {
+    const host = await laneHost(f);
+    await leaseOnS26(host, { phone: 's26', serial: 'R5GL43A7PCH', adb_id: 'adb-R5GL43A7PCH-zz._adb-tls-connect._tcp', adb_port: 5038 });
+    const logs = [];
+    const planned = await plan(host.configure('plan'), { env: host.env, home: f.root, fetchImpl: noLatest, log: line => logs.push(line) });
+    assert.equal(planned.s26, 'present');
+    assert.equal(planned.version, '0.2.2');
+    assert.ok(logs.some(line => /^HUB_S26_PEEK lease=peek adb=\S+ port=5038 read \(not installed\)$/.test(line)), logs.join('\n'));
+    assert.equal(JSON.parse(readFileSync(join(f.out, 'plan/hub-receipt-plan.json'), 'utf8')).devices.s26, null);
+    noServerCalls(host);
+  } finally { await f.cleanup(); }
+});
+
+test('a plan under a Lease with no recorded id looks the phone up with one -L devices call, then reads it', async () => {
+  const f = await gitFixture();
+  try {
+    const host = await laneHost(f);
+    await host.installApk('io.example.app 0.2.1 4');
+    await leaseOnS26(host, null);
+    const planned = await plan(host.configure('plan'), { env: host.env, home: f.root, fetchImpl: noLatest, log: () => {} });
+    assert.equal(planned.s26, 'present');
+    assert.deepEqual(host.adbCalls().trim().split('\n'), ['-L tcp:127.0.0.1:5037 devices', '-L tcp:127.0.0.1:5037 -s adb-R5GL43A7PCH-zz._adb-tls-connect._tcp shell dumpsys package io.example.app']);
+    noServerCalls(host);
+  } finally { await f.cleanup(); }
+});
+
+test('a plan under a Lease whose adb server or phone is gone reports the S26 unknown and still bumps', async () => {
+  const f = await gitFixture();
+  try {
+    const host = await laneHost(f);
+    await host.installApk('io.example.app 0.9.0 9');
+    await leaseOnS26(host, { phone: 's26', serial: 'R5GL43A7PCH', adb_id: 'adb-R5GL43A7PCH-zz._adb-tls-connect._tcp', adb_port: 5038 });
+    await script(join(f.root, 'bin/adb'), `echo "$*" >> "${host.state}/calls.log"\nexit 1`);
+    const logs = [];
+    const planned = await plan(host.configure('plan'), { env: host.env, home: f.root, fetchImpl: noLatest, log: line => logs.push(line) });
+    assert.equal(planned.s26, 'unknown');
+    assert.equal(planned.version, '0.2.2', 'no version to compare, so the plan goes ahead; the install-time guard decides');
+    assert.ok(logs.some(line => /^HUB_S26_PEEK lease=peek adb=\S+ port=5038 unknown \(/.test(line)), logs.join('\n'));
+    assert.match(host.adbCalls(), /^-L tcp:127\.0\.0\.1:5038 /m);
+    noServerCalls(host);
+    // No listing of the phone is unknown too.
+    await script(join(f.root, 'bin/adb'), `echo "$*" >> "${host.state}/calls.log"\n[ "$3" = devices ] && printf 'List of devices attached\\n'\nexit 0`);
+    await rm(join(host.state, 'calls.log'), { force: true });
+    releaseLease('adb', 'peek', { env: host.env });
+    await leaseOnS26(host, null);
+    const again = await plan(host.configure('plan'), { env: host.env, home: f.root, fetchImpl: noLatest, log: () => {} });
+    assert.equal(again.s26, 'unknown');
+    noServerCalls(host);
+  } finally { await f.cleanup(); }
+});
+
+// Another deploy's Job Hold on `adb`, written as that job would (a live pid on this host), and the Lease that may follow it.
+const holdS26 = async (host, owner) => {
+  const lock = join(host.env.HUB_LOCK_DIR, 'adb.lock');
+  await mkdir(lock, { recursive: true });
+  await writeFile(join(lock, 'owner.json'), JSON.stringify(owner));
+  return lock;
+};
+const otherJob = () => ({ pid: process.pid, host: hostname(), repo: 'delorenj/other', run: '1', started_at: new Date().toISOString(), format: 1, kind: 'job', attempt: '1', job: 'android' });
+// Resolves once the plan's ticket is in the `adb` Queue (it is waiting in withLock), so a change to the hold lands mid-wait.
+const queuedPlan = async host => {
+  const queue = join(host.env.HUB_LOCK_DIR, 'adb.queue');
+  for (let tries = 0; tries < 600; tries += 1) {
+    if (existsSync(queue) && readdirSync(queue).some(file => file.endsWith('.json'))) return;
+    await new Promise(done => setTimeout(done, 50));
+  }
+  assert.fail('the plan never queued on adb');
+};
+// The plan's own events on adb; the run's Reservation claim is not the plan's hold.
+const planEvents = host => [...readEvents({ env: host.env })].filter(event => event.claimant.repo === 'delorenj/example-app' && event.hold_kind !== 'reservation').map(event => [event.event, event.reason]);
+
+test('a plan behind another deploy\'s Job Hold waits in the Queue and then reads the S26 as before', async () => {
+  const f = await gitFixture();
+  try {
+    const host = await laneHost(f);
+    await host.installApk('io.example.app 0.2.1 4');
+    const lock = await holdS26(host, otherJob());
+    reserve('adb', { env: host.env, log: () => {} });
+    const planning = plan(host.configure('plan'), { env: host.env, home: f.root, fetchImpl: noLatest, log: () => {} });
+    await queuedPlan(host);
+    assert.equal(host.adbCalls(), '', 'nothing touches adb while the other job holds it');
+    await rm(lock, { recursive: true, force: true });
+    const planned = await planning;
+    assert.equal(planned.s26, 'present');
+    assert.match(host.adbCalls(), /^start-server$/m, 'a plan that holds adb finds the phone as it always has');
+    assert.deepEqual(planEvents(host).map(([event]) => event), ['request', 'acquire', 'release']);
+    assert.equal([...readEvents({ env: host.env })].find(event => event.event === 'request' && event.hold_kind === 'job').reservation, 'delorenj--example-app--777', 'the wait keeps its place through the run\'s Reservation');
+  } finally { await f.cleanup(); }
+});
+
+test('a plan queued behind a Job Hold that a Lease then takes leaves the Queue (cancel, yield-to-lease) and Peeks instead of waiting', async () => {
+  const f = await gitFixture();
+  try {
+    const host = await laneHost(f);
+    await host.installApk('io.example.app 0.2.1 4');
+    const lock = await holdS26(host, otherJob());
+    const logs = [];
+    const planning = plan(host.configure('plan'), { env: host.env, home: f.root, fetchImpl: noLatest, log: line => logs.push(line) });
+    await queuedPlan(host);
+    // The Job Hold ends and a Lease (recorded with no device: taken --no-connect) holds the phone before the plan's next poll.
+    const now = Date.now();
+    await writeFile(join(lock, 'owner.json'), JSON.stringify({ kind: 'lease', lease_id: 'late', holder: 'agent-b', why: 'proof', started_at: new Date(now).toISOString(), expires_at: new Date(now + 30 * 60_000).toISOString(), host: hostname() }));
+    const planned = await planning;
+    assert.equal(planned.s26, 'present');
+    assert.deepEqual(host.adbCalls().trim().split('\n'), ['-L tcp:127.0.0.1:5037 devices', '-L tcp:127.0.0.1:5037 -s adb-R5GL43A7PCH-zz._adb-tls-connect._tcp shell dumpsys package io.example.app']);
+    noServerCalls(host);
+    assert.deepEqual(planEvents(host), [['request', null], ['cancel', 'yield-to-lease']]);
+    assert.ok(logs.some(line => /^HUB_S26_PEEK lease=late /.test(line)), logs.join('\n'));
+    assert.equal(JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8')).lease_id, 'late', 'the Lease is untouched');
   } finally { await f.cleanup(); }
 });
 
