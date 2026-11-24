@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ALIVE_MS, QUEUED, TICKET_ABSENT_MS, acquireLease, buildTicket, isQueued, jobLeaseId, listLocks, listWaiters, poolRequest, processStart as processStartOf, queueView, releaseLease, sameHost, ticketKind, ticketStaleness, updateLease, withLock } from '../ci/lib/lock.mjs';
@@ -981,5 +981,41 @@ test('a Pool request writes one request and one ending; a try tagged with it nam
     }
     assert.deepEqual(endings.map(pair => pair[1]), [['timeout', 'deadline'], ['timeout', 'away'], ['cancel', 'error'], ['cancel', 'aborted'], ['cancel', 'released']]);
     assert.equal(events(f).filter(event => event.request === 'e-1').length, 10, 'five requests, five endings, never six');
+  } finally { f.cleanup(); }
+});
+
+// Review (independent) of Story 2.2: tries write no ticket, so every try races the others' mkdir. A loser that reads the lock
+// at the instant its holder released it (owner null, the directory gone: verdict `gone`) used to "reclaim" it, and the retire
+// would rename whatever fresh, ownerless directory a third taker had just made there, stealing a lock it never judged: a bogus
+// `reclaim` event, a taker whose owner write died with ENOENT, and under load two holders at once. `gone` means nothing is
+// there to retire. A dangling symlink is the deterministic stand-in: mkdir says EEXIST, the owner is unreadable and stat says
+// gone; the beforeRetire seam is where a third taker would land its fresh directory.
+const dangling = f => {
+  mkdirSync(join(f.root, 'locks'), { recursive: true });
+  symlinkSync(join(f.root, 'nothing-here'), f.lock);
+  const calls = [];
+  return { calls, beforeRetire: step => { calls.push(step); rmSync(f.lock, { force: true }); mkdirSync(f.lock); } };
+};
+
+test('a try that finds the lock gone under it does not retire it: a fresh ownerless directory is never renamed away', async () => {
+  const f = fixture();
+  try {
+    const seam = dangling(f);
+    await assert.rejects(lease(f, { id: 'tries', beforeRetire: seam.beforeRetire }), error => error.code === 'HUB_LOCK_TIMEOUT');
+    assert.deepEqual(seam.calls, [], 'nothing was judged, so nothing was retired');
+    assert.deepEqual(events(f), [], 'no reclaim of a lock that was never stale');
+    assert.deepEqual(tombs(f), []);
+  } finally { f.cleanup(); }
+});
+
+test('a withLock caller that finds the lock gone under it does not retire it either', async () => {
+  const f = fixture();
+  try {
+    const seam = dangling(f);
+    let clock = Date.now();
+    await assert.rejects(withLock('adb', async () => { throw new Error('must not run'); }, { env: f.env, log: f.log, timeoutMs: 1000, pollMs: 1, sleep: async () => {}, now: () => (clock += 400), beforeRetire: seam.beforeRetire }), /host lock adb is held/);
+    assert.deepEqual(seam.calls, []);
+    assert.deepEqual(events(f).map(event => event.event), ['request', 'timeout'], 'no reclaim of a lock that was never stale');
+    assert.deepEqual(tombs(f), []);
   } finally { f.cleanup(); }
 });

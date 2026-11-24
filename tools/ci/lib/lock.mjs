@@ -119,6 +119,7 @@ function note(name, body, { env, at, hostId }) {
 }
 
 let lastTomb = 0;
+const VANISHED_RETRIES = 3;
 
 // Retires a lock: renames <name>.lock to <name>.lock.tomb-<ms>-<pid> (a name that never ends in .lock, so it never blocks
 // the lock name, not even for an older pinned version's bare mkdir, and listLocks never lists it). The rename decides
@@ -191,6 +192,7 @@ export async function withLock(name, fn, {
   const deadline = requested + timeoutMs;
   note(name, eventOf('request', name, { ...me, ...more }, { deadline_at: iso(deadline) }), { ...seams, at: requested });
   let waiting = false;
+  let vanished = 0;
   let mine;
   for (;;) {
     try {
@@ -206,8 +208,11 @@ export async function withLock(name, fn, {
     }
     const owner = readOwner(path);
     const verdict = staleness(path, owner, { now, staleMs, host, hostId });
-    if (verdict) {
-      if (retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, hostId, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
+    // `gone`: the lock vanished between the mkdir and this read (its holder just released it). Nothing is left to retire, and a
+    // retire would rename whatever a third taker made there since (a try writes no ticket, so takers race the mkdir). Go round
+    // again; after a few such rounds it waits like any held lock, so a path that is not a lock at all never spins.
+    if (verdict && (verdict !== 'gone' || (vanished += 1) <= VANISHED_RETRIES)) {
+      if (verdict !== 'gone' && retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, hostId, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
       continue;
     }
     const at = now();
@@ -542,6 +547,7 @@ export async function acquireLease(name, {
   const view = () => queueView(name, { env, prune: true, now, host, hostId, processStart: startOf });
   const cancelled = text => failure('HUB_LEASE_CANCELLED', `lease ${lease_id} ${text} ${name}`);
   let waiting = false;
+  let vanished = 0;
   let failed = true;
   try {
     for (;;) {
@@ -598,8 +604,9 @@ export async function acquireLease(name, {
         if (blockers.length === 0) {
           const owner = readOwner(path);
           const verdict = staleness(path, owner, { now, staleMs, host, hostId });
-          if (verdict) {
-            if (retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, hostId, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
+          if (verdict && (verdict !== 'gone' || (vanished += 1) <= VANISHED_RETRIES)) {
+            // `gone`: see withLock. Nothing is left to retire; round again.
+            if (verdict !== 'gone' && retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, hostId, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
             continue;
           }
           if (now() >= deadline) throw timedOut(`host lock ${name} is held by ${describe(owner)}; gave up after ${Math.round(waitMs / 1000)}s`, owner);

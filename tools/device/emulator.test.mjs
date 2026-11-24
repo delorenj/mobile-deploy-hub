@@ -13,7 +13,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hostId } from '../ci/lib/events.mjs';
 import { releaseLease, withLock } from '../ci/lib/lock.mjs';
-import { choosePorts, doomed, liveStart, portsInUse, releaseEmulator, resolveImage, stopProcesses } from './emulator.mjs';
+import { choosePorts, doomed, isEmulatorLease, liveStart, portsInUse, releaseEmulator, resolveImage, stopProcesses } from './emulator.mjs';
 import { inventory } from './inventory.mjs';
 import { main } from './hub-device.mjs';
 
@@ -831,4 +831,25 @@ test('an emulator request that finds the Pool full ends in one Pool timeout, and
     await f.run(['release', 'emulator', first]);
     f.clean();
   } finally { f.cleanup(); }
+});
+
+// Story 2.2 (AD-1): the gate's waiters are read through queueView, not parsed here. A live ticket and a dead one (not yet
+// pruned by an acquirer) both keep their lease id taken; an id nobody waits under is free.
+test('isEmulatorLease sees a lease id waiting on the gate, live or dead, through queueView', () => {
+  const root = mkdtempSync(join(tmpdir(), 'hub-gate-'));
+  try {
+    const env = { HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events') };
+    const queue = join(env.HUB_LOCK_DIR, 'emulator.queue');
+    mkdirSync(queue, { recursive: true });
+    const dead = spawnSync(process.execPath, ['-e', '']).pid;
+    const ticket = (file, body) => writeFileSync(join(queue, file), JSON.stringify({ holder: 'a', why: 'w', host: hostname(), enqueued_at: new Date().toISOString(), ...body }));
+    ticket('000000000000010-000000-00000009.json', { lease_id: 'live-waiter', pid: process.pid });
+    ticket('000000000000020-000000-00000009.json', { lease_id: 'dead-waiter', pid: dead });
+    writeFileSync(join(queue, '000000000000030-000000-00000009.json'), 'not json');
+    assert.equal(isEmulatorLease(env, 'live-waiter'), true);
+    assert.equal(isEmulatorLease(env, 'dead-waiter'), true, 'a dead ticket still holds its id until an acquirer prunes it');
+    assert.equal(isEmulatorLease(env, 'nobody'), false);
+    assert.equal(isEmulatorLease(env, ''), false);
+    assert.ok(readdirSync(queue).length === 3, 'looking prunes nothing');
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

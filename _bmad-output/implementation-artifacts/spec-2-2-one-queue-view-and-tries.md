@@ -93,3 +93,17 @@ context:
 **Commands:**
 - `node --test tools/device/lease.test.mjs tools/device/hub-device.test.mjs tools/device/emulator.test.mjs tools/catchup/catchup.test.mjs` -- expected: all pass
 - `heavy mise run check` -- expected: green
+
+## Review (independent)
+
+Reviewer re-read the commit `a8f8763` against epics-v1a "Story 2.2" and AD-4, AD-6, AD-9 without trusting the builder summary.
+
+**Checked, no defect:** every AC of Story 2.2 maps to code and a test (view order, shape, `kind`, room for Reservation entries; give-back by tombstone with no event; a try writes no ticket and no queue directory; a failed try writes nothing; Pool `request` plus one ending with `waited_ms` from the outer request; `emulator.mjs` and `hub-device status`, `--id` and `release` lookups through `queueView`; timeout wording, exit codes and `HUB_DEVICE_*` text unchanged). The re-check mutation fails its test as claimed. Tests are hermetic (temp `HUB_LOCK_DIR` and `HUB_EVENT_DIR`, injected clocks). No tuning value moved outside `policy.json`. Compatibility with pinned v1.2.43 readers holds: ticket name and body untouched, a give-back is a tombstone outside `*.lock`, and 3 old-code waiters mixed with new waiters and tries on one lock dir (stress, 3 runs) gave no double hold, no stray tomb and request/acquire/release counts in step.
+
+**Confirmed and fixed (1):** ticketless tries race the `mkdir` of every other taker, which the old per-try ticket had serialised. A loser that read the lock at the instant its holder released it saw `owner` null and `stat` failing (`staleness` verdict `gone`) and called `retire(path, null)`. `retire` compares the owner it reads now with the owner it judged, null and null, so a fresh ownerless directory made by a third taker in between was renamed away as "stale". Effects, reproduced with 8 try workers on one lock (5 and 17 error lines per run before, 0 in 7 runs after): two holders at once, a taker dying with `ENOENT` on its owner write, and a bogus `reclaim` event. The same hole was in `withLock`. `acquireLease` and `withLock` now retire nothing on `gone` (nothing is left to retire) and go round again, at most 3 times per call before a path that is not a lock waits like a held one, so a dangling path never spins. Regression tests (dangling symlink as the deterministic stand-in, `beforeRetire` as the third taker): "a try that finds the lock gone under it does not retire it" and its `withLock` twin; both fail on the pre-fix code.
+
+**Test gap closed:** the AC "`emulator.mjs:329-332` reads waiters through `queueView`" had no test on the gate-ticket arm of `isEmulatorLease`; added (live ticket, dead ticket, junk file, free id, no pruning).
+
+**Dismissed:** a try giving back a lock for a ticket that arrived after it (AD-6 says a blocking entry that "now sits ahead", and a try has no place, so it fails); stale tickets counted in status places (the old numbering, kept on purpose); `doomed()` on `sameHost` (hostname fallback when ids differ is AD-8 as written); event body lacking null `pool`/`request` keys on lock-level events (every earlier event already omits keys that are null).
+
+**Left for later (deferred-work.md):** a Pool request that probes an away phone has one tagged `acquire` per probe plus its closing `timeout`, and a phone request that fails after a take (`HUB_LEASE_CANCELLED`, abort) writes a `cancel` after its tagged `acquire`; AD-4's "one `acquire` or `timeout`" holds only for a request whose probes were all kept or all untaken.
