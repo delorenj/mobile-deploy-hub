@@ -39,8 +39,8 @@ import { sanitizeReason } from '../ci/lib/announce.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
 import { createDevicectl, createIpad } from '../ci/lib/devicectl.mjs';
 import { runBounded } from '../ci/lib/exec.mjs';
-import { apkKey, compareRelease, compareSemver, inflightKey, ipaKey, latestKey, platforms, serializeLatest, updateDevice, validateLatest } from '../ci/lib/latest.mjs';
-import { withLock } from '../ci/lib/lock.mjs';
+import { apkKey, compareRelease, compareSemver, inflightKey, ipaKey, isBusyPending, latestKey, platforms, serializeLatest, updateDevice, validateLatest } from '../ci/lib/latest.mjs';
+import { checkDelivery, withLock } from '../ci/lib/lock.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { sha256File } from '../ci/lib/receipt.mjs';
 import { createS3, publishPages, writerCredentials } from '../ci/lib/s3.mjs';
@@ -61,6 +61,10 @@ export const iosBusyCapMs = 45 * 60_000;
 // The flap guard: a device displaced again and again (a TestFlight auto-update fighting the hub) is repaired this many
 // times per UTC day per app, then only logged.
 export const iosRepairsPerDay = 3;
+// The watchdog stops a pass at passLimitMs. The reserve is what a pass still needs after it wins the lock (download, install,
+// readback, record), so a long wait never runs into the watchdog.
+export const passLimitMs = 45 * 60_000;
+export const passReserveMs = 10 * 60_000;
 
 const stamp = date => date.toISOString().replace(/\.\d{3}Z$/, 'Z');
 const oneLine = error => sanitizeReason(error?.message ?? error, 'failed').replace(/\s+/g, ' ').slice(0, 240);
@@ -85,6 +89,9 @@ export function settingsFrom(policy) {
     lanCidr: policy.mac.lan_cidr,
     // A1 event.catch_up: whether a catch-up install sends its event at all.
     events: policy.event.catch_up !== false,
+    // Story 3.3 (AD-11): the short attempt every pass makes, and how long a contention-pending build stays in line for its turn.
+    attemptMs: policy.queue.catchup_attempt_s * 1000,
+    pendingWaitMs: policy.queue.catchup_pending_wait_min * 60_000,
   };
 }
 
@@ -418,6 +425,45 @@ export function inflightHolds(inflight, block, now, platform) {
   return !Number.isFinite(since) || now.getTime() - since < inflightStaleMs;
 }
 
+// How long, and for which delivery, a pass waits in the Queue (FR-30, AD-15). A contention-pending build (Story 3.2: `S26 busy`)
+// stays in line for its turn, up to the policy's pending wait and never past the pass limit less its reserve. Anything else gets
+// the short attempt. The ticket names one delivery: the contention-pending build, else the first build that is not settled.
+export function catchupWait(work, { settings, elapsedMs = 0, attemptMs = settings.attemptMs } = {}) {
+  const pending = work.find(item => isBusyPending(item.block?.device)) ?? null;
+  const named = pending ?? work.find(item => !item.settled) ?? null;
+  let delivery = null;
+  if (named) {
+    try { delivery = checkDelivery({ repo: named.app.repo, run: String(named.block.run.id), version: named.block.version }); } catch { delivery = null; }
+  }
+  const ms = pending ? Math.max(attemptMs, Math.min(settings.pendingWaitMs, passLimitMs - passReserveMs - elapsedMs)) : attemptMs;
+  return { ms, pending, delivery };
+}
+
+const waitText = ms => (ms >= 60_000 ? `${Math.round(ms / 60_000)} min` : `${Math.round(ms / 1000)} s`);
+
+// The lock options a pass waits with, and the line that says a contention-pending build is staying in line.
+function queueWait(ctx, work, { platform, lock }) {
+  const wait = catchupWait(work, { settings: ctx.settings, elapsedMs: ctx.now().getTime() - ctx.startedAt, attemptMs: ctx.lockWaitMs ?? ctx.settings.attemptMs });
+  if (wait.pending) ctx.log(`HUB_CATCHUP_WAIT ${platform} ${wait.pending.app.slug} ${wait.pending.block.version}: contention-pending; waiting up to ${waitText(wait.ms)} for its turn on ${lock}`);
+  return { wait, options: { timeoutMs: wait.ms, pollMs: 100, delivery: wait.delivery, timeoutReason: 'catchup-idle' } };
+}
+
+// A wait that ended without the lock is not an error: the pass is idle and the next one tries again (AD-5: by code, never text).
+// Anything else is rethrown. The timeout's event is already written, and the ticket already gone, by the lock.
+function idleOnQueue(ctx, error, { platform, lock, items, waitedMs }) {
+  if (error?.code === 'HUB_LOCK_TIMEOUT') {
+    const holder = error.holds?.[0];
+    const who = holder ? `${holder.kind}${holder.holder ? ` ${holder.holder}` : ''}` : 'another holder';
+    ctx.log(`HUB_CATCHUP_IDLE ${platform} ${ctx.mode}: ${items} pending; ${lock} stayed held for ${waitText(waitedMs)} (${who}); next pass`);
+    return true;
+  }
+  if (error?.code === 'HUB_LEASE_CANCELLED') {
+    ctx.log(`HUB_CATCHUP_IDLE ${platform} ${ctx.mode}: ${items} pending; its place in the ${lock} queue was released; next pass`);
+    return true;
+  }
+  return false;
+}
+
 // The pending builds no deploy is publishing right now; the others are logged and left for a later pass.
 async function notInFlight(ctx, listed, platform) {
   const work = [];
@@ -452,6 +498,7 @@ export async function androidPass(ctx) {
     return { errors, results: [] };
   }
   let results = null;
+  const { wait, options } = queueWait(ctx, work, { platform: 'android', lock: 'adb' });
   try {
     results = await ctx.lock('adb', async () => {
       let id;
@@ -461,13 +508,21 @@ export async function androidPass(ctx) {
         ctx.log(`HUB_CATCHUP_IDLE android ${ctx.mode}: ${work.map(item => `${item.app.slug} ${describe(item.block.version, item.block.code)}`).join(', ')} pending; the S26 is away (${oneLine(error).slice(0, 120)})`);
         return null;
       }
+      // A long wait can outlast a deploy that started meanwhile: read inflight.json again before installing an older build.
+      let todo = work;
+      if (wait.ms > (ctx.lockWaitMs ?? ctx.settings.attemptMs)) {
+        const again = await notInFlight(ctx, work, 'android');
+        errors += again.errors;
+        todo = again.work;
+        if (todo.length === 0) return [];
+      }
       const found = [];
-      for (const item of work) found.push(await androidApp(ctx, item, id));
+      for (const item of todo) found.push(await androidApp(ctx, item, id));
       return found;
-    }, { timeoutMs: ctx.lockWaitMs ?? 5_000, pollMs: 100 });
+    }, options);
   } catch (error) {
-    if (!/host lock adb is held/.test(error.message)) throw error;
-    ctx.log(`HUB_CATCHUP_IDLE android ${ctx.mode}: a deploy is using the S26 (adb lock); next pass`);
+    const items = work.map(item => `${item.app.slug} ${describe(item.block.version, item.block.code)}`).join(', ');
+    if (!idleOnQueue(ctx, error, { platform: 'android', lock: 'adb', items, waitedMs: wait.ms })) throw error;
     return { errors, results: [] };
   }
   if (!results) return { errors, results: [] };
@@ -570,6 +625,7 @@ export async function iosPass(ctx) {
   const describeItems = items => items.map(item => `${item.app.slug} ${describe(item.block.version, item.block.build)}`).join(', ');
   const waiting = work.some(item => !item.settled) ? `${describeItems(work.filter(item => !item.settled))} pending` : `${describeItems(work)} to check`;
   let results = null;
+  const { wait, options } = queueWait(ctx, work, { platform: 'ios', lock: 'mac-ios' });
   try {
     results = await ctx.lock('mac-ios', async () => {
       let found;
@@ -583,13 +639,19 @@ export async function iosPass(ctx) {
         ctx.log(`HUB_CATCHUP_IDLE ios ${ctx.mode}: ${waiting}; the iPad is unavailable to devicectl (away or asleep)`);
         return null;
       }
+      let todo = work;
+      if (wait.ms > (ctx.lockWaitMs ?? ctx.settings.attemptMs)) {
+        const again = await notInFlight(ctx, work, 'ios');
+        errors += again.errors;
+        todo = again.work;
+        if (todo.length === 0) return [];
+      }
       const done = [];
-      for (const item of work) done.push(await iosApp(ctx, item));
+      for (const item of todo) done.push(await iosApp(ctx, item));
       return done;
-    }, { timeoutMs: ctx.lockWaitMs ?? 5_000, pollMs: 100 });
+    }, options);
   } catch (error) {
-    if (!/host lock mac-ios is held/.test(error.message)) throw error;
-    ctx.log(`HUB_CATCHUP_IDLE ios ${ctx.mode}: an iOS deploy is using the iPad (mac-ios lock); next pass`);
+    if (!idleOnQueue(ctx, error, { platform: 'ios', lock: 'mac-ios', items: waiting.replace(/ (pending|to check)$/, ''), waitedMs: wait.ms })) throw error;
     return { errors, results: [] };
   }
   if (!results) return { errors, results: [] };
@@ -849,6 +911,7 @@ function base({ env, home, log, now, settings, devices, lockWaitMs }) {
     settings,
     devices,
     lockWaitMs,
+    startedAt: now().getTime(),
     mode: readMode({ env, home }),
     journal: createJournal({ env, home, now }),
     // The catch-up is a hub job, never a deploy: its holds and short attempts are recorded as `hub-job` (FR-7).
@@ -905,7 +968,7 @@ export function linuxContext({
   emit = event => sendCatchupEvent({ event, env, home }),
   pages,
   adbWaitMs = 20_000,
-  lockWaitMs = 5_000,
+  lockWaitMs,
 } = {}) {
   // A read of what the bucket policy keeps private (a device APK) is signed with the writer's keys; the pointers are
   // anonymous, so an idle pass never asks 1Password for them (lib/access.mjs).
@@ -1019,7 +1082,7 @@ export function macContext({
   metered = () => macMetered({ lanCidr: settings.lanCidr, run, env }),
   unpack = ipa => unpackIpa(ipa, { run, env }),
   report,
-  lockWaitMs = 5_000,
+  lockWaitMs,
 } = {}) {
   const cache = join(home, 'Library/Caches/mobile-deploy-hub/catchup');
   const outbox = join(home, devices.mac?.outbox ?? 'Library/Caches/mobile-deploy-hub/outbox');
@@ -1074,7 +1137,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     console.log(`catch-up mode on this host: ${mode}${mode === 'live' ? ' (passes install pending builds)' : ' (passes only log what they would do)'}`);
     return 0;
   }
-  const watchdog = setTimeout(() => { console.error('catchup.mjs: a pass ran for 45 minutes; stopping it'); process.exit(3); }, 45 * 60_000);
+  const watchdog = setTimeout(() => { console.error(`catchup.mjs: a pass ran for ${passLimitMs / 60_000} minutes; stopping it`); process.exit(3); }, passLimitMs);
   watchdog.unref();
   if (command === 'android') {
     requireHost('linux', command);
