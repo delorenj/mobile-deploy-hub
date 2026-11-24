@@ -10,6 +10,9 @@ import { RUNNER_WORKER, jobDeadline, jobStart, jobTimeoutMs, systemProcess } fro
 import { acquireLease, releaseLease, withLock } from './lib/lock.mjs';
 import { loadPolicy } from './lib/policy.mjs';
 import { readEvents } from './lib/events.mjs';
+import { hermetic } from './test-fixtures.mjs';
+
+hermetic();
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const T0 = Date.parse('2026-11-23T10:00:00Z');
@@ -172,18 +175,38 @@ test('only a deploy job with an allowance is cut: no env, deliver-*, the catch-u
   } finally { f.cleanup(); }
 });
 
-test('with no policy and no start injected, a job reads the repo policy and its own process start (AD-11, AD-12)', async () => {
+test('with no policy and no start injected, a job reads the repo policy and the process tree\'s own job start (AD-11, AD-12)', async () => {
   const f = fixture({ HUB_JOB_TIMEOUT_MINUTES: '45', GITHUB_JOB: 'android' });
   try {
     const began = Date.now();
     await holder(f, began);
     let clock = began;
-    // job_start is this test process's own start (no Runner.Worker above it), so the deadline is (start + 45 - 2 - 15) = about 28
-    // minutes from now: the repo's own allowance and margin, well before the caller's 45.
+    // job_start is whatever the default lookup finds for this test process: its nearest Runner.Worker ancestor when CI runs the
+    // suite inside a job (the hosted check), else its own start. The test asks the same helper rather than assuming which, so it
+    // holds on a laptop and in CI alike; the repo's own allowance and margin (45 - 2 - 15 = 28 min) are what it pins.
+    const start = jobStart();
     await assert.rejects(
       withLock('adb', async () => {}, { env: f.env, log: () => {}, now: () => clock, sleep: async () => { clock += MIN; }, timeoutMs: 45 * MIN, timers: fakeTimers() }),
-      error => error.code === 'HUB_LOCK_TIMEOUT' && /gave up after 2\d min, ahead of this job's 45-minute timeout/.test(error.message));
-    assert.ok(clock - began < 29 * MIN && clock - began >= 25 * MIN, `waited ${(clock - began) / MIN} min`);
+      error => error.code === 'HUB_LOCK_TIMEOUT' && /ahead of this job's 45-minute timeout/.test(error.message));
+    const expected = start + 28 * MIN;
+    assert.ok(clock >= expected && clock < expected + MIN, `waited to ${new Date(clock).toISOString()}, the deadline is ${new Date(expected).toISOString()}`);
+    assert.ok(clock < began + 28 * MIN + MIN, 'never later than 28 minutes from now (the job cannot have started after it asked)');
+  } finally { f.cleanup(); }
+});
+
+test('a job that arrives after its deadline and finds the device held gives up at once, naming the holder, and leaves no ticket', async () => {
+  const f = fixture({ HUB_JOB_TIMEOUT_MINUTES: '20' });
+  try {
+    await holder(f);
+    let clock = T0 + 16 * MIN;
+    let slept = 0;
+    await assert.rejects(
+      withLock('adb', async () => { throw new Error('must not run'); }, { env: f.env, log: () => {}, now: () => clock, sleep: async () => { slept += 1; clock += MIN; }, timeoutMs: 20 * MIN, timers: fakeTimers(), policy, deadlineSeams: { startedMs: T0 } }),
+      error => error.code === 'HUB_LOCK_TIMEOUT' && /held by lease held of agent-a .*; gave up after 0 min, ahead of this job's 20-minute timeout\./.test(error.message));
+    assert.equal(slept, 0, 'it never slept: the deadline had passed');
+    assert.deepEqual(readdirSync(join(f.root, 'locks/adb.queue')), []);
+    const mine = events(f).filter(event => event.hold_kind === 'job');
+    assert.deepEqual(mine.map(event => event.event), ['request', 'timeout'], 'each event exactly once');
   } finally { f.cleanup(); }
 });
 
@@ -214,6 +237,14 @@ test('mobile-deploy.yml: each job that waits for a device sets HUB_JOB_TIMEOUT_M
       assert.equal(set, undefined, `${name} never waits for a device lock here, so it sets no job timeout`);
     }
     assert.ok(!/^ {6}HUB_[A-Z_]*(?<!MINUTES): /m.test(env), `${name}: the job env carries no other HUB_ value (policy is never an env)`);
+  }
+});
+
+test('mobile-deploy.yml: the margin and each allowance leave every waiting job a positive wait inside its own timeout-minutes', () => {
+  const blocks = jobBlocks();
+  for (const [job, allowance] of Object.entries(policy.queue.hold_allowance_min)) {
+    const timeout = Number(/^ {4}timeout-minutes: (\d+)$/m.exec(blocks.get(job))?.[1]);
+    assert.ok(timeout - policy.queue.wait_margin_min - allowance > 0, `${job}: ${timeout} - margin ${policy.queue.wait_margin_min} - allowance ${allowance} leaves no time to wait`);
   }
 });
 

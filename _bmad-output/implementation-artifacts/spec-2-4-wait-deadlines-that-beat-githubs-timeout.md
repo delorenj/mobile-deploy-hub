@@ -87,3 +87,19 @@ context:
 **Commands:**
 - `node --test tools/ci/deadline.test.mjs tools/ci/policy.test.mjs tools/ci/hub.test.mjs tools/device/lease.test.mjs` -- expected: all pass
 - `heavy mise run check` -- expected: green
+
+## Review (independent)
+
+Checked against Story 2.4's ACs in epics-v1a.md and AD-11, AD-12, AD-21, reading `e558bd8` rather than its summary.
+
+- ACs: the workflow equality test (a mismatch fails it), the strict `queue` block (missing and unknown keys, non-integers and non-objects rejected; spot-checked arrays, null, 1e400), the helper formula and its injectable inputs, `deadline_at` on the ticket and on `request`/`acquire`/`timeout`, and the removal of exactly the `android` and `ios` groups all hold. Disabling the cap fails the new tests.
+- Protocol and compatibility: the story writes no new on-disk state. `deadline_at` is an existing ticket key; ticket liveness (`ticketStaleness`) never reads it, so a capped waiter's ticket cannot be pruned early or stranded, and a v1.2.43 reader sees the same file shape. No new mkdir, rename or tombstone path was added; the capped wait reuses the existing loop, so event exactly-once (one `request`, one terminal event by the waiter's own unlink) is unchanged. A deadline already past still takes a free lock with an empty Queue (tested) and times out at once, ticket removed, behind a holder (new test).
+- Pinned hubs: the reusable workflow's composite action is pinned at a tag, so the `HUB_JOB_TIMEOUT_MINUTES` env is inert until Story 2.8 re-pins; it cannot affect a pinned run.
+- Policy: the margin and allowances are read only from `policy.json` (`queueJobs` names jobs, not tuning); no env or caller supplies them.
+- Dismissed: the new `HUB_LOCK_DEADLINE` log line appears only on capped waits (a case that did not exist before), so no existing output changed; ios's second `mac-ios` take and `deliver-*` waits stay in deferred-work.md.
+
+Confirmed and fixed (test-only):
+1. The "no policy and no start injected" test read the real process tree and asserted a 25 to 29 minute window from the test's own start. Inside a CI job the nearest `Runner.Worker` is the job (check.yml runs the suite on a hosted runner), so a job already more than 3 minutes old would fail it. It now asks `jobStart()` for the expected deadline.
+2. `deadline.test.mjs` did not call `hermetic()`; it does now.
+3. No test covered a job arriving after its deadline behind a holder; added (immediate timeout, "0 min", no sleep, no ticket, one `request` and one `timeout`).
+4. Nothing stopped a later tuning change (margin plus allowance at or over a job's `timeout-minutes`) from making every wait time out at once; a workflow test now requires a positive wait for each waiting job.
