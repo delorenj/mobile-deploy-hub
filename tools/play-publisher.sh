@@ -9,7 +9,8 @@
 # Default project: hub-play-publishers (one shared project, one provider + one SA
 # per app). The last step is manual and printed at the end: invite the service
 # account in Play Console > Users and permissions with release rights on the app.
-# A brand-new Play app still needs its first bundle uploaded by hand in Console.
+# A brand-new Play app needs no Console upload: once invited, the account's API upload
+# creates the first bundle too (TOLT, 2026-11-23: io.lasertoast.tolt code 31 went up this way).
 set -euo pipefail
 repo="${1:?usage: play-publisher.sh <owner/repo> [gcp-project]}"
 project="${2:-hub-play-publishers}"
