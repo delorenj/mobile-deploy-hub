@@ -7,7 +7,7 @@ paradigm: 'shared library over a file-system protocol (one lock library, on-disk
 scope: 'v1a of the Hub Resource Registry: Event Log, deploy jobs and the catch-up in the Queue, Reservations, the Peek, pending instead of red, no extension while others wait, the ios-lane Queue, position and ETA, CLI compatibility, the frozen ticket format'
 status: final
 created: '2026-11-23'
-updated: '2026-11-23'
+updated: '2026-11-24'
 binds: [FR-7, FR-8, FR-9, FR-12, FR-13, FR-15, FR-16, FR-17, FR-30, FR-31, NFR-1, NFR-2, NFR-3, NFR-4, NFR-5]
 sources:
   - _bmad-output/planning-artifacts/prds/prd-mobile-deploy-hub-2026-11-21/prd.md
@@ -367,6 +367,17 @@ Arrows mean "may import or write". Nothing points back up. Only `lock.mjs` write
   - `plan` keeps its group: a newer pending run of a repo supersedes an older one, and SM-1 does not count that.
   - `ios-export` and `deliver-*` keep theirs.
 
+### AD-22: iOS contention is red, and reported the way every lane reports it [ADOPTED]
+
+- **Binds:** `ios.mjs`, receipts, the Mac's Event Log; FR-30 (the iOS deviation), FR-12.
+- **Prevents:** a second, iOS-only contention shape beside Android's, and an installed iPad reported `failed` because a later step waited too long.
+- **Rule:**
+  - FR-30 does not apply to iOS in v1: `mac-ios` wraps the build, so a wait that runs out leaves nothing to deliver. The iOS job fails with `HUB_LOCK_TIMEOUT`.
+  - Both `mac-ios` takes pass `timeoutReason: 'ios-lane-contention'`, so the lock writes the one `timeout` event on the Mac.
+  - The receipt carries `contention {lock, reason, blocked_by}` built from `holdsOf`, the record AD-14 gives Android. Any lane that reports contention uses this record.
+  - A store-IPA take that times out after a verified iPad install leaves the iPad delivery `installed`; only the store step reports the contention.
+  - Revisit: 2 or more `ios-lane-contention` timeouts in any 14 days put the build/lane split (§7.2) on the v1b plan.
+
 ## Consistency Conventions
 
 | Concern | Convention |
@@ -445,18 +456,14 @@ flowchart LR
 | FR-13 CLI compatibility | `hub-device.mjs` | AD-9 (read-only status), AD-17 |
 | FR-15 / FR-16 ETA and the wait line | `eta.mjs`; logging in `lock.mjs`; `hub-device` | AD-17, AD-18 |
 | FR-17 Event Log | `events.mjs`, `lock.mjs` | AD-4, AD-9, AD-10, AD-19 |
-| FR-30 pending, not red | `android.mjs`, `latest.mjs`, receipt, `catchup.mjs` | AD-13, AD-14, AD-15; iOS is Open Question 1 |
+| FR-30 pending, not red | `android.mjs`, `latest.mjs`, receipt, `catchup.mjs` | AD-13, AD-14, AD-15; iOS: AD-22 |
 | FR-31 no extension while others wait | `lock.mjs` `extendLease`/`acquireLease`; `hub-device` | AD-11, AD-16 |
 | NFR-1 / NFR-2 one implementation, pinned runs | `lock.mjs`; release process | AD-1, AD-2, AD-3, AD-6, AD-8, AD-20 |
 | NFR-3 no new clock | all | AD-19 |
 
 ## Open Questions
 
-1. **FR-30 on iOS (a PRD deviation, for Jarad).**
-   - **Why it can't go pending:** `mac-ios` wraps the Xcode build, export and install (`ios.mjs:276`). An `ios-lane` wait that runs out leaves no artifact for the catch-up to install, and a timeout on the store-IPA take (`ios.mjs:390`) after an installed iPad marks that iPad `failed`.
-   - **What v1a does instead:** it ships iOS contention as a red iOS job with `HUB_LOCK_TIMEOUT` naming the holders. The second take reports the iPad as already installed.
-   - **Why it should be rare:** the preflight Reservation, the 60-min Lease cap and the 120-min job timeout.
-   - **What a full fix needs:** splitting the build from the `ios-lane` Hold, which §7.2 defers.
+None. Open Question 1 (FR-30 on iOS) was resolved by Jarad on 2026-11-24 as AD-22.
 
 ## Deferred
 
@@ -465,6 +472,7 @@ flowchart LR
   - Status on big-chungus showing `mac-ios` waiters. In v1a, the Mac's Queue is visible only on the Mac.
   - Cross-host Event Log merge and history queries (FR-18). Each host's log stays local in v1a.
 - **v1b/v1c, with FR-10 and FR-11:** the `extend` CLI verb and Jarad's override. AD-16 fixes the rule they must call.
+- **When AD-22's revisit trigger fires:** splitting the Mac's build from the iPad Hold (two Resources), which makes FR-30 true on iOS.
 - **v2:**
   - Remote waiting, Heartbeats and fencing. AD-3 reserves `kind: remote` and `expires_at`, and states when v2 may write them.
 - **Once the log passes 100 MB:** Event Log rotation and compaction. Monthly files leave room for it without a format change.

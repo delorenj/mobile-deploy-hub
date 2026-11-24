@@ -151,7 +151,7 @@ Deploy jobs, the catch-up and Leases wait in one fair FIFO per device. A deploy 
 
 When the S26 is held, plan still learns the installed version without disturbing the leaseholder. A delivery whose wait runs out goes pending, and the catch-up installs it in its turn, instead of the run going red. A newer build already on the device is refused, and the refusal names who installed it.
 **FRs covered:** FR-9 (Peek), FR-30
-**Decisions:** AD-13, AD-14, AD-15; iOS behaviour per Open Question 1
+**Decisions:** AD-13, AD-14, AD-15, AD-22 (iOS contention is red; Jarad, 2026-11-24)
 
 ### Epic 4: Know where you stand and how long it'll be
 
@@ -723,7 +723,7 @@ So that a skipped delivery is explained, not silent (FR-30).
 
 As Jarad,
 I want an iOS job that couldn't get the `ios-lane` in time to fail clearly, naming who held it,
-So that the known v1a gap (Open Question 1) is visible and countable rather than mysterious.
+So that the known v1 gap (AD-22, accepted by Jarad 2026-11-24) is visible and countable rather than mysterious.
 
 **Acceptance Criteria:**
 
@@ -741,6 +741,14 @@ So that the known v1a gap (Open Question 1) is visible and countable rather than
 **Given** the job's deadline
 **When** it is computed
 **Then** it reserves the allowance for both takes (story 2.4).
+
+**Given** either `mac-ios` take times out
+**When** the receipt is written
+**Then** it carries `contention {lock: 'mac-ios', reason: 'ios-lane-contention', blocked_by}` built with `holdsOf`, the same record Android's 3.2 writes (one shape for every lane), and the lock writes the `timeout` event through `withLock`'s `timeoutReason`, never a second event.
+
+**Given** story 3.5 is on main
+**When** it ships
+**Then** it ships as a hub release (`mise run release -- X.Y.Z` from a clean clone of main, then `hosts:install` from the tag on both hosts).
 
 ---
 

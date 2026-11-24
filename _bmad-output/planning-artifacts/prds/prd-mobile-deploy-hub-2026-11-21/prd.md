@@ -209,6 +209,8 @@ When a deploy job's wait budget runs out because the Resource is held, its deliv
 - The catch-up installs a pending build once the Resource frees, in its turn in the Queue, as it does today for a device that comes back.
 - If the installed version on the device has moved above the planned one since the Peek (for example, an agent installed a higher dev build), the delivery is refused as today, the version is not reused, and the refusal names who installed it if the Event Log knows.
 
+**iOS deviation (Jarad, 2026-11-24):** iOS does not go pending in v1. The Mac's `ios-lane` Hold wraps the build, so a wait that runs out leaves nothing to install. The iOS job goes red and names the holders (architecture AD-22). It is revisited when the Event Log shows 2 or more iOS contention timeouts in 14 days.
+
 #### FR-10: Leases with expiry and extension
 
 An agent or a person can take a Lease for a stated duration (up to 48 hours, as today), extend it, and release it.
