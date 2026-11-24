@@ -572,6 +572,38 @@ test('a busy-pending build whose holder outlasts the pending wait is idle: a cod
   } finally { host.cleanup(); }
 });
 
+test('a long wait reads inflight.json again in the hold: a deploy that started meanwhile keeps the older build off the S26', async () => {
+  const host = linuxHost({ settings: { ...settingsFrom(policy), pendingWaitMs: 5_000 } });
+  try {
+    publish(host.s3, { latest: latestDoc({ android: androidBlock({ device: busyDevice }) }), apk: apkText() });
+    host.phone.install(apkText({ version: '0.2.1', code: 3 }));
+    const { release, held } = await holdAdb(host);
+    const pass = androidPass(host.ctx);
+    await new Promise(done => setTimeout(done, 150));
+    host.s3.put(`${slug}/inflight.json`, { version: '0.2.3', run: '37950000000', started_at: '2026-10-10T11:50:00Z', platforms: ['android'] });
+    release();
+    await held;
+    const out = await pass;
+    assert.equal(out.errors, 0);
+    assert.equal(host.phone.installed(), apkText({ version: '0.2.1', code: 3 }), 'the older build was not installed');
+    assert.equal(host.lines(/^HUB_CATCHUP_IDLE tower-of-lost-things android 0\.2\.2 \(4\): deploy run .* is publishing 0\.2\.3/).length, 1);
+    assert.equal(latestOf(host.s3).android.device.status, 'pending');
+  } finally { host.cleanup(); }
+});
+
+test('the pending wait is bounded by what the pass has already used: a pass started 20 minutes ago waits 15', async () => {
+  const host = linuxHost();
+  try {
+    publish(host.s3, { latest: latestDoc({ android: androidBlock({ device: busyDevice }) }), apk: apkText() });
+    host.phone.install(apkText({ version: '0.2.1', code: 3 }));
+    host.ctx.startedAt = now().getTime() - 20 * 60_000;
+    assert.equal(host.ctx.settings.pendingWaitMs, 30 * 60_000, 'the shipped wait');
+    await androidPass(host.ctx);
+    assert.equal(host.lines(new RegExp(`^HUB_CATCHUP_WAIT android tower-of-lost-things 0\\.2\\.2: contention-pending; waiting up to ${(passLimitMs - passReserveMs) / 60_000 - 20} min for its turn on adb`)).length, 1);
+    assert.equal(latestOf(host.s3).android.device.status, 'installed', 'the lock was free, so it installed at once');
+  } finally { host.cleanup(); }
+});
+
 test('a pending build that is not contention-pending (the S26 was away) waits only the short attempt', async () => {
   const host = linuxHost({ settings: { ...settingsFrom(policy), pendingWaitMs: 5_000 } });
   try {

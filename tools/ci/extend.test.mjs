@@ -91,6 +91,9 @@ test('a dead waiter does not block; a deploy job that waits does, whatever its k
     assert.equal(extend(f, MIN).expires_at, at(T0 + 21 * MIN));
     putTicket(f, T0 + 3 * MIN, { kind: 'job', lease_id: 'job:delorenj/app#7.1/android', holder: null, why: 'android', repo: 'delorenj/app', run: '7', attempt: '1', job: 'android' });
     assert.throws(() => extend(f, MIN), refused('HUB_LEASE_EXTEND_REFUSED', /cannot be extended while 1 waiter waits: 1\. job:delorenj\/app#7\.1\/android \(android\)$/));
+    // The catch-up's ticket (Story 3.3) blocks the same way: a hub-job that waits is a waiter.
+    putTicket(f, T0 + 4 * MIN, { kind: 'hub-job', lease_id: 'job:local/catch-up', holder: 'catch-up', why: 'catch-up install' });
+    assert.throws(() => extend(f, MIN), refused('HUB_LEASE_EXTEND_REFUSED', /cannot be extended while 2 waiters wait: 1\. job:delorenj\/app#7\.1\/android \(android\), 2\. catch-up \(catch-up install\)$/));
   } finally { f.cleanup(); }
 });
 

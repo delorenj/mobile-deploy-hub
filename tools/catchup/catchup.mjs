@@ -1137,7 +1137,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     console.log(`catch-up mode on this host: ${mode}${mode === 'live' ? ' (passes install pending builds)' : ' (passes only log what they would do)'}`);
     return 0;
   }
-  const watchdog = setTimeout(() => { console.error('catchup.mjs: a pass ran for 45 minutes; stopping it'); process.exit(3); }, passLimitMs);
+  const watchdog = setTimeout(() => { console.error(`catchup.mjs: a pass ran for ${passLimitMs / 60_000} minutes; stopping it`); process.exit(3); }, passLimitMs);
   watchdog.unref();
   if (command === 'android') {
     requireHost('linux', command);
