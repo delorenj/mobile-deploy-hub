@@ -31,7 +31,7 @@ The shared deploy pipeline every mobile app calls: a reusable workflow (`.github
 ## Known pitfalls
 
 - Run `hub-device status --json` to learn which phones and emulators are reachable and free; `devices.json` says what is declared, not what is available.
-- Deploy jobs' `withLock` does not join the FIFO lease queue, so queued or long `adb` leases can starve a deploy until its 20-minute lock limit. For long holds, lease `s24` or an emulator, not `s26`.
+- Since v1.2.46 deploy jobs and the catch-up wait in the same FIFO as Leases, and a Lease on `adb` (`s26`) or `mac-ios` is capped at 60 min and cannot be extended while anyone waits. For long holds, lease `s24` or an emulator. Runs on hub pins older than v1.2.46 still take `adb` with a bare `mkdir` and can jump the line until they age out.
 - Recurring hub work is a project candybar in `.candybars/` (the iPad catch-up is `.candybars/mobile-deploy-hub-ios-catchup/`, which kickstarts the Mac's interval-free LaunchAgent over ssh); never add a `.timer` or a launchd `StartInterval`.
 - Take a lease as `vars="$(hub-device lease …)" && eval "$vars"`; never `eval` its output unchecked: on exit 75 the output is a `HUB_DEVICE_AWAY` line, which would run as a command.
 
