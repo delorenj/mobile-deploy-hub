@@ -278,7 +278,7 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
     const needsStoreTake = Boolean(config.testflight && spec.store?.build);
     await withLock('mac-ios', async () => {
       track.stage = 'preflight';
-      checkDisk(home, devices);
+      checkDisk(home, devices, { log });
       if (!canBuild) {
         delivery.reason = 'dry run without dry_handoff: the IPA was not built';
         notes.push('dry run without dry_handoff: the Xcode project stayed on big-chungus, so the iPad build and its IPA checks did not run');

@@ -4,6 +4,14 @@ One section per hub release, headed `## vX.Y.Z`. `mise run release -- X.Y.Z` (`t
 
 A section is plain text read in a terminal: everything after its heading up to the next `## ` heading. Use `###` for sub-headings and `-` lists; do not start a section line with `## `.
 
+## v1.2.48
+
+v1.2.47 plus the Mac disk fix. v1.2.47 was tagged and rolled back, never on `v1`: green-in-between's release dry run stopped in `preflight-ios` with the Mac at 14.9 of the 15 GiB floor. Everything in the v1.2.47 section below ships in this pin; install it on both hosts (`mise run hosts:install`).
+
+### What changed
+
+- The iOS disk check frees stale DerivedData before it refuses. Every CI checkout path gets its own Xcode DerivedData folder (`<Project>-<28 letters>`, ~200 MB each), so every iOS run of every app left one behind until the Mac hit the floor (v1.2.4 died on it too). When `preflight-ios` or the `ios` job finds less than `mac.min_free_gib` free, it removes those per-project folders, oldest first and none used within a day, until there are 5 GiB above the floor, and logs `HUB_DISK_PRUNED <n> DerivedData folder(s) unused for a day; <free> GiB free now`. Xcode's shared caches (`ModuleCache.noindex`, SDK caches) are never touched, and a disk still short after that refuses as before.
+
 ## v1.2.47
 
 Epic 3 (deliveries survive contention) and Epic 4 (know where you stand and how long it will be), on top of v1.2.46. The Queue protocol and the Event Log format are unchanged; nothing here needs both hosts on the same hub version at the same instant, but install it on both (`mise run hosts:install`).

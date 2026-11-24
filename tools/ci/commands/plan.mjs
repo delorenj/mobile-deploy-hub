@@ -47,7 +47,7 @@ export async function preflightIos(config, { env = process.env, home = homedir()
     // The iPad lane is in scope (the gate skipped this job otherwise): reserve the run's place on the Mac's `mac-ios` (FR-9, AD-7),
     // on the Mac's own disk, before the checks that can take a while. Never fatal.
     reserveFor('mac-ios', { reserver, env, log });
-    const free = checkDisk(home, devices);
+    const free = checkDisk(home, devices, { log });
     notes.push(`${free.toFixed(1)} GiB free`);
     log(run('xcodebuild', ['-version'], { env }).trim());
     const signer = devices.apple.dev_signer_sha1;

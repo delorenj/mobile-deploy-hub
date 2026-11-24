@@ -214,9 +214,44 @@ export function requirePlan(config) {
   if (!semver.test(config.version)) throw new Error('this lane needs the plan\'s version (HUB_VERSION)');
 }
 
-export function checkDisk(path, devices) {
-  const free = freeGiB(path);
-  if (free < devices.mac.min_free_gib) throw new Error(`the Mac has ${free.toFixed(1)} GiB free; an iOS build needs ${devices.mac.min_free_gib} GiB. Free space (old Xcode archives, DerivedData) and run again`);
+// The Mac's Xcode DerivedData: every CI checkout path gets its own <Project>-<28 letters> folder, so each iOS run of every
+// app leaves ~200 MB behind and the disk fills until preflight refuses (green-in-between's v1.2.47 release dry run, 14.9 of
+// 15 GiB). When the disk is short, checkDisk removes those per-project folders, oldest first and none used within a day
+// (a build in flight keeps its own fresh), until there is headroom. Xcode's shared caches (ModuleCache.noindex, SDK caches)
+// are never touched. A cache only: Xcode rebuilds a removed folder on the next build.
+export const derivedDataDir = home => join(home, 'Library/Developer/Xcode/DerivedData');
+const derivedProject = /^.+-[a-z]{28}$/;
+export const pruneHeadroomGiB = 5;
+export function pruneDerivedData({ home = homedir(), enough = () => false, minAgeMs = 86_400_000, now = Date.now() } = {}) {
+  const root = derivedDataDir(home);
+  let entries = [];
+  try { entries = readdirSync(root, { withFileTypes: true }); } catch { return []; }
+  const usedAt = path => { try { return statSync(join(path, 'info.plist')).mtimeMs; } catch { return statSync(path).mtimeMs; } };
+  const stale = entries
+    .filter(entry => entry.isDirectory() && derivedProject.test(entry.name))
+    .map(entry => ({ name: entry.name, path: join(root, entry.name), at: usedAt(join(root, entry.name)) }))
+    .filter(entry => now - entry.at > minAgeMs)
+    .sort((a, b) => a.at - b.at);
+  const removed = [];
+  for (const entry of stale) {
+    if (enough()) break;
+    rmSync(entry.path, { recursive: true, force: true });
+    removed.push(entry.name);
+  }
+  return removed;
+}
+
+export function checkDisk(path, devices, { home = path, log = console.log, freeOf = freeGiB, now = Date.now() } = {}) {
+  const min = devices.mac.min_free_gib;
+  let free = freeOf(path);
+  if (free < min) {
+    const removed = pruneDerivedData({ home, now, enough: () => freeOf(path) >= min + pruneHeadroomGiB });
+    if (removed.length) {
+      free = freeOf(path);
+      log(`HUB_DISK_PRUNED ${removed.length} DerivedData folder(s) unused for a day; ${free.toFixed(1)} GiB free now`);
+    }
+  }
+  if (free < min) throw new Error(`the Mac has ${free.toFixed(1)} GiB free; an iOS build needs ${devices.mac.min_free_gib} GiB. Free space (old Xcode archives, DerivedData) and run again`);
   return free;
 }
 
