@@ -588,13 +588,17 @@ test('lease --wait behind a deploy job prints the wait line on stderr; stdout ho
     let done;
     const job = withLock('adb', () => new Promise(resolve => { done = resolve; }), { env: f.env, log: () => {} });
     await settle(20);
-    const waiting = f.run(['lease', 's26', '--for', '10m', '--why', 'wait line', '--no-connect', '--id', 'wait-line', '--wait', '30s']);
-    await settle(120);
+    const seen = [];
+    const waiting = f.run(['lease', 's26', '--for', '10m', '--why', 'wait line', '--no-connect', '--id', 'wait-line', '--wait', '30s'], { stderr: line => seen.push(line) });
+    // Release the job only once the CLI is queued and has printed its wait line, whatever the machine's speed.
+    for (let tries = 0; tries < 1000 && !(queued(f).length === 1 && seen.some(line => line.startsWith('HUB_LOCK_WAIT'))); tries += 1) await settle(10);
+    assert.ok(seen.some(line => line.startsWith('HUB_LOCK_WAIT')), 'the wait line appeared while the job held the lock');
+    await settle(30);
     done();
     await job;
     const result = await waiting;
-    assert.equal(result.code, 0, result.err.join('\n'));
-    const lines = result.err.filter(line => line.startsWith('HUB_LOCK_WAIT'));
+    assert.equal(result.code, 0, seen.join('\n'));
+    const lines = seen.filter(line => line.startsWith('HUB_LOCK_WAIT'));
     assert.equal(lines.length, 1, 'one wait line while nothing changes');
     assert.match(lines[0], /^HUB_LOCK_WAIT adb held by .+ \(pid \d+, since \S+\) position=1 eta=\S+/);
     assert.ok(result.out.length > 0 && result.out.every(line => /^export /.test(line)), `stdout is export lines only: ${result.out.join(' | ')}`);

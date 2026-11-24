@@ -3,10 +3,10 @@
 // position change or every ETA_REFRESH_MS. A fake clock drives the polls through the injected `sleep`.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ETA_REFRESH_MS, acquireLease, releaseLease, withLock } from './lib/lock.mjs';
+import { ETA_REFRESH_MS, acquireLease, buildTicket, releaseLease, withLock } from './lib/lock.mjs';
 import { hermetic } from './test-fixtures.mjs';
 
 hermetic(); // offline, outside any workflow job, scratch HUB_EVENT_DIR and HUB_LOCK_DIR (test-fixtures.mjs)
@@ -22,6 +22,7 @@ function fixture() {
   const env = { HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events'), GITHUB_REPOSITORY: 'delorenj/example', GITHUB_RUN_ID: '9', GITHUB_RUN_ATTEMPT: '1', GITHUB_JOB: 'android' };
   return { root, env, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
+const existsQueue = (f, count) => { try { return readdirSync(join(f.env.HUB_LOCK_DIR, 'adb.queue')).filter(name => name.endsWith('.json')).length === count; } catch { return false; } };
 const settle = ms => new Promise(done => setTimeout(done, ms));
 const until = async (check, what) => {
   for (let tries = 0; tries < 1000; tries += 1) { if (check()) return; await settle(10); }
@@ -128,5 +129,70 @@ test('an ETA that fails on a recompute logs HUB_ETA_FAILED once, prints eta=?, a
     assert.match(lines[0], / position=1 eta=0s-1h00m low-data$/);
     assert.match(lines[1], / position=1 eta=\?$/);
     assert.equal(logs.filter(line => line.startsWith('HUB_ETA_FAILED')).length, 1, 'once per waiter, however many recomputes fail');
+  } finally { f.cleanup(); }
+});
+
+test('the print gate: a time-triggered recompute that moves the range by under a minute at the same position prints nothing', async () => {
+  const f = fixture();
+  try {
+    let clock = Date.now();
+    const start = clock;
+    const now = () => clock;
+    // The lock is free; the only blocker ahead is a job ticket of this live process, named earlier than the waiter's. Its ETA is the
+    // constant job allowance (android, 15 min), so every recompute gives the same range.
+    const queue = join(f.env.HUB_LOCK_DIR, 'adb.queue');
+    const ahead = join(queue, `${String(clock - 1000).padStart(15, '0')}-000000-${String(process.pid).padStart(8, '0')}.json`);
+    mkdirSync(queue, { recursive: true });
+    writeFileSync(ahead, JSON.stringify(buildTicket('job', { env: f.env, requested: clock - 1000, deadline: clock + 4 * 60 * MIN, hostId: HOST_ID })));
+    const logs = [];
+    const afterEta = [];
+    const sleep = async ms => {
+      clock += ms;
+      if (clock - start >= 6 * MIN) rmSync(ahead, { force: true });
+    };
+    const taken = await acquireLease('adb', {
+      holder: 'waiter', why: 'queued', forMs: 5 * MIN, waitMs: 2 * 60 * MIN, id: 'waiter', env: f.env, log: line => logs.push(line),
+      pollMs: 10_000, sleep, now, hostId: HOST_ID, policy: policyOf(), afterEta: () => afterEta.push(clock),
+    });
+    assert.equal(taken.lease_id, 'waiter');
+    assert.equal(afterEta.length, 1, 'the 5-minute mark recomputed');
+    const lines = waitLines(logs);
+    assert.equal(lines.length, 1, lines.join('\n'));
+    assert.match(lines[0], / position=2 eta=0s-15m low-data$/);
+  } finally { f.cleanup(); }
+});
+
+test('the print gate: a position change prints even when the range moved by under a minute', async () => {
+  const f = fixture();
+  try {
+    await holdFor(f, 'held', 30 * MIN, Date.now);
+    const logs = [];
+    const recomputes = [];
+    const common = { holder: 'waiter', why: 'queued', env: f.env, pollMs: 5, hostId: HOST_ID, policy: policyOf(), waitMs: 60_000 };
+    // The waiter ahead states 30 s, so its leaving moves the waiter's range by 30 s: under the minute that alone would print.
+    const one = acquireLease('adb', { ...common, forMs: 30_000, id: 'one', log: () => {} });
+    await until(() => existsQueue(f, 1), 'the first waiter is queued');
+    const two = acquireLease('adb', { ...common, forMs: 5 * MIN, id: 'two', log: line => logs.push(line), afterEta: () => recomputes.push(1) });
+    await until(() => waitLines(logs).length === 1, 'the second waiter prints');
+    assert.match(waitLines(logs)[0], / position=2 eta=/);
+    releaseLease('adb', 'one', { env: f.env });
+    await assert.rejects(one, error => error.code === 'HUB_LEASE_CANCELLED');
+    await until(() => waitLines(logs).length === 2, 'the position change prints');
+    assert.match(waitLines(logs)[1], / position=1 eta=/);
+    assert.equal(recomputes.length, 1);
+    releaseLease('adb', 'held', { env: f.env });
+    assert.equal((await two).lease_id, 'two');
+  } finally { f.cleanup(); }
+});
+
+test('a try has no wait line: neither an acquireLease try nor a withLock try logs HUB_LOCK_WAIT or HUB_ETA_FAILED', async () => {
+  const f = fixture();
+  try {
+    await holdFor(f, 'held', 30 * MIN, Date.now);
+    const logs = [];
+    const log = line => logs.push(line);
+    await assert.rejects(acquireLease('adb', { holder: 'try', why: 'try', forMs: MIN, waitMs: 0, id: 'try', env: f.env, log, hostId: HOST_ID, policy: policyOf() }), error => error.code === 'HUB_LOCK_TIMEOUT');
+    await assert.rejects(withLock('adb', async () => {}, { env: f.env, log, timeoutMs: 0, hostId: HOST_ID, timers, policy: policyOf() }), error => error.code === 'HUB_LOCK_TIMEOUT');
+    assert.deepEqual(logs.filter(line => /^HUB_(LOCK_WAIT|ETA_FAILED)/.test(line)), []);
   } finally { f.cleanup(); }
 });
