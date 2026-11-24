@@ -12,8 +12,8 @@
 // (HUB_EMULATOR_LEASE=<lease_id>.<nonce>, the nonce kept in the record), recorded, and stopped the same way. The emulator
 // runs with its own TMPDIR and XDG_RUNTIME_DIR, so it never shares a netsimd or discovery file with somebody else's emulator.
 //
-// There is no timer: every hub-device invocation first reaps the records whose lease expired, whose holder is gone, or
-// whose slot no longer holds them.
+// There is no timer: an emulator acquire (lease or run) first reaps the records whose lease expired, whose holder is gone, or
+// whose slot no longer holds them. `hub-device status` never reaps.
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, writeFileSync } from 'node:fs';
@@ -288,7 +288,7 @@ export function doomed(record, owner, now = Date.now()) {
 
 const describePids = pids => (pids.length ? pids.join(',') : 'none');
 
-// The lazy reaper every hub-device invocation runs first. Reapers take turns on the emulator-reaper lock; with wait false a
+// The lazy reaper every emulator acquire runs first (never `status`). Reapers take turns on the emulator-reaper lock; with wait false a
 // reaper that finds the lock busy leaves the work to the one holding it.
 export async function reap({ env = process.env, log = () => {}, graceMs, sleep, now = Date.now, wait = true } = {}) {
   const victims = () => listRecords(env).map(record => ({ record, why: doomed(record, readOwnerOf(record.slot, env), now()) })).filter(victim => victim.why);
@@ -481,7 +481,7 @@ export async function provision({
   const image = resolveImage(profileName, { env });
   const { profile } = image;
   const deadline = now() + waitMs;
-  // hub-device's main() has just reaped; the gate loop below reaps again without waiting on another reaper.
+  // The acquire path has just reaped; the gate loop below reaps again without waiting on another reaper.
   try {
     await acquireLease(GATE, { id, holder, why: `next for an emulator: ${why}`, forMs: Math.min(MAX_LEASE_MS, waitMs + 600_000), waitMs, holderPid: process.pid, env, log, pollMs, sleep, now, signal });
   } catch (error) {

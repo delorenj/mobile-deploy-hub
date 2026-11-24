@@ -12,7 +12,8 @@
 // the JSON says which one a `phone` lease took.
 //
 // `emulator` is a throwaway emulator from a small pool instead (emulator.mjs): made for the lease, with its own AVD and adb
-// server, and torn down at release or expiry. Every invocation first reaps the pool's expired and abandoned leases.
+// server, and torn down at release or expiry. Acquiring an emulator (lease or run) first reaps the pool's expired and abandoned
+// leases; `status` reaps nothing and writes nothing (FR-13).
 //
 //   hub-device lease s24|s26|phone --for 30m --why "device proof" [--wait 2m] [--no-connect] [--id ID] [--pid N] [--holder WHO]
 //                    [--env-serial NAME]... [--json] [--verbose]
@@ -270,6 +271,12 @@ function emulatorLine(record) {
   return `stopped pids ${record.result.signalled.join(',') || 'none (already gone)'}, deleted AVD ${record.record?.avd?.name ?? '-'}, freed ports ${record.record ? `${record.record.console_port},${record.record.adb_port},${record.record.adb_server_port}` : '-'}`;
 }
 
+// The lazy reaper, on the emulator acquire paths only: expired and abandoned emulator leases are torn down (their recorded
+// pids only). `status` never calls it. A reaper that fails is a warning, never a failed acquire.
+async function reapBeforeAcquire({ env, stderr, log, emulator }) {
+  try { await reap({ env, log, graceMs: emulator.graceMs, wait: false }); } catch (error) { stderr(`hub-device: warning: the emulator reaper failed: ${error.message}`); }
+}
+
 async function leaseEmulator(parsed, context) {
   const { stdout, env, signals, timing } = context;
   const { forMs, why, waitMs, holderPid } = setup(parsed, { needForWhy: true, fleet: context.fleet, env: context.env });
@@ -282,6 +289,7 @@ async function leaseEmulator(parsed, context) {
   const names = ['SIGINT', 'SIGTERM', 'SIGHUP'];
   for (const name of names) signals.on(name, onSignal);
   try {
+    await reapBeforeAcquire(context);
     const { lease: record, record: emulator } = await provision({ id, holder, why, forMs, waitMs, holderPid, profileName: profile, pool, env, log: context.log, signal: abort.signal, sleep: timing.sleep, now: timing.now, pollMs: timing.leasePollMs, ...context.emulator });
     if (received) {
       await releaseEmulator(id, { env, log: context.log, graceMs: context.emulator.graceMs });
@@ -589,6 +597,7 @@ async function runEmulator(parsed, context) {
   };
   signals.once('exit', lastResort);
   try {
+    await reapBeforeAcquire(context);
     const { record } = await provision({ id, holder, why, forMs, waitMs, holderPid: holderPid ?? process.pid, profileName: profile, pool, env, log: context.log, signal: abort.signal, sleep: timing.sleep, now: timing.now, pollMs: timing.leasePollMs, ...context.emulator });
     if (received) return 128 + constants.signals[received];
     const childEnv = { ...env, ...emulatorExports(record, parsed.envSerial) };
@@ -696,10 +705,6 @@ export async function main(argv, {
     parsed = parseArgs(argv);
     // The phones this checkout's devices.json names; a broken one is a tool failure, named like any other.
     context.fleet = fleetOf(loadDevices(env));
-    // The lazy reaper: before anything else, expired and abandoned emulator leases are torn down (their recorded pids only).
-    if (['lease', 'release', 'status', 'run'].includes(parsed.words[0])) {
-      try { await reap({ env, log: context.log, graceMs: emulator.graceMs, wait: false }); } catch (error) { stderr(`hub-device: warning: the emulator reaper failed: ${error.message}`); }
-    }
     switch (parsed.words[0]) {
       case 'lease': return await lease(parsed, context);
       case 'release': return await release(parsed, context);

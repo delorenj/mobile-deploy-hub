@@ -316,7 +316,7 @@ test('teardown signals only a recorded process that is still itself (pid and sta
   } finally { for (const child of [a, b, c, stubborn]) child.kill('SIGKILL'); }
 });
 
-test('the reaper: any invocation tears down an expired lease, a lease whose holder died and an orphaned record, and leaves a live one alone', async () => {
+test('the reaper: an emulator acquire tears down an expired lease, a lease whose holder died and an orphaned record, and leaves a live one alone', async () => {
   const f = fixture();
   try {
     f.env.HUB_EMULATOR_POOL = '3';
@@ -332,20 +332,24 @@ test('the reaper: any invocation tears down an expired lease, a lease whose hold
     holder.kill('SIGKILL');
     await waitFor(() => gone(holder.pid));
     await settle(1100);
-    const status = await f.run(['status']);
-    assert.equal(status.code, 0);
+    const TRIGGER = uid('trigger');
+    const status = await f.run(['lease', 'emulator', '--for', '30m', '--why', 'reap trigger', '--id', TRIGGER]);
+    assert.equal(status.code, 0, status.err.join('\n'));
     const text = status.err.join('\n');
     assert.match(text, new RegExp(`^HUB_EMULATOR_REAPED ${SHORT} emulator-2 \\(expired\\): stopped pids [\\d,]+, deleted AVD hub-${SHORT}`, 'm'));
     assert.match(text, new RegExp(`^HUB_EMULATOR_REAPED ${TIED} emulator-3 \\(holder gone\\)`, 'm'));
     for (const entry of doomedPids) assert.ok(gone(entry.pid), `${entry.role} ${entry.pid} reaped`);
-    assert.deepEqual(f.records(), [`${LIVE}.json`]);
+    assert.deepEqual(f.records().sort(), [`${LIVE}.json`, `${TRIGGER}.json`].sort());
     for (const entry of f.record(LIVE).pids) assert.equal(liveStart(entry.pid), entry.start, 'the live lease was not touched');
-    assert.match(status.out.join('\n'), new RegExp(`emulator \\(emulator-1\\)  LEASE ${LIVE} .* emulator-\\d+ adb-server=\\d+`));
+    assert.equal((await f.run(['release', 'emulator', TRIGGER])).code, 0);
+    assert.match((await f.run(['status'])).out.join('\n'), new RegExp(`emulator \\(emulator-1\\)  LEASE ${LIVE} .* emulator-\\d+ adb-server=\\d+`));
     // a record whose slot no longer holds it (reclaimed under it) is orphaned and goes too
     releaseLease('emulator-1', LIVE, { env: f.env });
-    const reaped = await f.run(['status', '--json']);
+    const AFTER = uid('after');
+    const reaped = await f.run(['lease', 'emulator', '--for', '30m', '--why', 'reap trigger', '--id', AFTER]);
     assert.match(reaped.err.join('\n'), new RegExp(`^HUB_EMULATOR_REAPED ${LIVE} emulator-1 \\(orphaned\\)`, 'm'));
-    assert.deepEqual(JSON.parse(reaped.out.join('\n')).emulators, []);
+    assert.equal((await f.run(['release', 'emulator', AFTER])).code, 0);
+    assert.deepEqual(JSON.parse((await f.run(['status', '--json'])).out.join('\n')).emulators, []);
     assert.ok(await refused(Number(live.ANDROID_ADB_SERVER_PORT)));
     assert.equal(doomed({ host: 'elsewhere', lease_id: 'x' }, null), null, 'another host\'s record is never judged here');
     f.clean();
@@ -599,6 +603,78 @@ test('a lease released while its emulator boots ends the maker as CANCELLED, not
   } finally { f.cleanup(); }
 });
 
+// Every path under the dirs with its type and, for a file, its bytes: a change to anything shows up as a difference.
+const snapshot = (...dirs) => {
+  const seen = {};
+  const walk = path => {
+    let entries;
+    try { entries = readdirSync(path, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const full = join(path, entry.name);
+      if (entry.isDirectory()) { seen[full] = 'dir'; walk(full); } else seen[full] = readFileSync(full, 'utf8');
+    }
+  };
+  for (const dir of dirs) { seen[dir] = existsSync(dir) ? 'dir' : 'absent'; walk(dir); }
+  return seen;
+};
+const logged = f => { try { return readFileSync(join(f.root, 'events', readdirSync(join(f.root, 'events')).find(name => name.endsWith('.jsonl'))), 'utf8').trim().split('\n').map(line => JSON.parse(line)); } catch { return []; } };
+
+test('status is read-only: a dead lease is neither reaped nor logged by looking; the next emulator lease or run reaps it', async () => {
+  const f = fixture();
+  try {
+    f.env.HUB_EMULATOR_POOL = '3';
+    const holder = sleeper();
+    const [SHORT, TIED, GONE] = [uid('short'), uid('tied'), uid('gone')];
+    assert.equal((await f.run(['lease', 'emulator', '--for', '1s', '--why', 'short', '--id', SHORT])).code, 0);
+    assert.equal((await f.run(['lease', 'emulator', '--for', '30m', '--why', 'tied', '--id', TIED, '--pid', String(holder.pid)])).code, 0);
+    assert.equal((await f.run(['lease', 'emulator', '--for', '30m', '--why', 'orphan', '--id', GONE])).code, 0);
+    holder.kill('SIGKILL');
+    await waitFor(() => gone(holder.pid));
+    releaseLease('emulator-3', GONE, { env: f.env });   // its record stays: an orphan
+    await settle(1100);
+    const eventsBefore = logged(f).length;
+    const before = snapshot(join(f.root, 'locks'), join(f.root, 'events'));
+    assert.ok(Object.keys(before).some(path => path.endsWith(`${SHORT}.json`)), 'the dead leases have records');
+    for (const argv of [['status'], ['status', '--json']]) {
+      const looked = await f.run(argv);
+      assert.equal(looked.code, 0, looked.err.join('\n'));
+      assert.doesNotMatch(looked.err.join('\n'), /HUB_EMULATOR_REAP/);
+    }
+    assert.deepEqual(snapshot(join(f.root, 'locks'), join(f.root, 'events')), before, 'status changed nothing: no lock dir entry, record or event');
+    assert.equal(logged(f).length, eventsBefore);
+    for (const entry of [...f.record(SHORT).pids, ...f.record(TIED).pids]) assert.equal(liveStart(entry.pid), entry.start, 'status stopped nothing');
+
+    // the next acquire reaps, and the reap's release is logged then
+    const leased = await f.run(['lease', 'emulator', '--for', '1m', '--why', 'acquire reaps', '--id', uid('next')]);
+    assert.equal(leased.code, 0, leased.err.join('\n'));
+    const text = leased.err.join('\n');
+    for (const [id, slot, why] of [[SHORT, 'emulator-1', 'expired'], [TIED, 'emulator-2', 'holder gone'], [GONE, 'emulator-3', 'orphaned']]) {
+      assert.match(text, new RegExp(`^HUB_EMULATOR_REAPED ${id} ${slot} \\(${why}\\)`, 'm'));
+    }
+    assert.ok(logged(f).some(event => event.event === 'release' && event.lock === 'emulator-1'), 'the reaped slot\'s release was logged on the acquire path');
+    assert.deepEqual(f.records().sort(), [`${f.exportsOf(leased.out).HUB_LEASE_ID}.json`]);
+    assert.equal((await f.run(['release', 'emulator', f.exportsOf(leased.out).HUB_LEASE_ID])).code, 0);
+  } finally { f.cleanup(); }
+});
+
+test('run emulator reaps a dead lease on its acquire path too', async () => {
+  const f = fixture();
+  try {
+    f.env.HUB_EMULATOR_POOL = '1';
+    const id = uid('short');
+    assert.equal((await f.run(['lease', 'emulator', '--for', '1s', '--why', 'short', '--id', id])).code, 0);
+    await settle(1100);
+    const before = snapshot(join(f.root, 'locks'), join(f.root, 'events'));
+    assert.equal((await f.run(['status'])).code, 0);
+    assert.deepEqual(snapshot(join(f.root, 'locks'), join(f.root, 'events')), before);
+    const ran = await f.run(['run', 'emulator', '--for', '1m', '--why', 'run reaps', '--', NODE, '-e', '0']);
+    assert.equal(ran.code, 0, ran.err.join('\n'));
+    assert.match(ran.err.join('\n'), new RegExp(`^HUB_EMULATOR_REAPED ${id} emulator-1 \\(expired\\)`, 'm'));
+    assert.ok(logged(f).some(event => event.event === 'release' && event.lock === 'emulator-1'));
+    f.clean();
+  } finally { f.cleanup(); }
+});
+
 test('--wait 0 stays prompt while another process holds the reaper lock over a doomed lease', async () => {
   const f = fixture();
   let done = () => {};
@@ -616,8 +692,9 @@ test('--wait 0 stays prompt while another process holds the reaper lock over a d
     assert.match(busy.err.join('\n'), new RegExp(`the emulator pool is full \\(1 of 1: ${id} of tester@`), 'the doomed lease keeps its slot until it is torn down');
     done();
     await reaper;
-    const status = await f.run(['status']);
-    assert.match(status.err.join('\n'), new RegExp(`^HUB_EMULATOR_REAPED ${id} emulator-1 \\(expired\\)`, 'm'));
+    const next = await f.run(['lease', 'emulator', '--for', '1m', '--why', 'after the reaper', '--id', uid('next')]);
+    assert.match(next.err.join('\n'), new RegExp(`^HUB_EMULATOR_REAPED ${id} emulator-1 \\(expired\\)`, 'm'));
+    assert.equal((await f.run(['release', 'emulator', f.exportsOf(next.out).HUB_LEASE_ID])).code, 0);
     f.clean();
   } finally { done(); f.cleanup(); }
 });
@@ -686,7 +763,9 @@ test('--for runs from READY: a boot longer than the lease never expires it mid-b
     const left = Date.parse(f.owner('emulator-1').expires_at) - Date.now();
     assert.ok(left > 0 && left <= 1000, `expires ${left}ms from now`);
     await settle(1100);
-    assert.match((await f.run(['status'])).err.join('\n'), new RegExp(`^HUB_EMULATOR_REAPED ${id} emulator-1 \\(expired\\)`, 'm'));
+    const next = await f.run(['lease', 'emulator', '--for', '1m', '--why', 'after the slow boot', '--id', uid('next')]);
+    assert.match(next.err.join('\n'), new RegExp(`^HUB_EMULATOR_REAPED ${id} emulator-1 \\(expired\\)`, 'm'));
+    assert.equal((await f.run(['release', 'emulator', f.exportsOf(next.out).HUB_LEASE_ID])).code, 0);
     f.clean();
   } finally { f.cleanup(); }
 });
