@@ -20,8 +20,8 @@ import { readEvents } from '../ci/lib/events.mjs';
 import { compareBuild, validateLatest } from '../ci/lib/latest.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import {
-  androidPass, androidPlan, compareIos, createJournal, hubWriter, iosRepairsPerDay, inCidr, iosPass, iosPlan, latestProblems, linuxContext,
-  loadSettings, macContext, parseRecordArgs, readMode, reasonText, record, recordArgs, retry, serviceAccountEnv, settingsFrom, sshRecordCommand, withFallback, writeMode,
+  androidPass, androidPlan, catchupWait, compareIos, createJournal, hubWriter, iosRepairsPerDay, inCidr, iosPass, iosPlan, latestProblems, linuxContext,
+  loadSettings, macContext, parseRecordArgs, passLimitMs, passReserveMs, readMode, reasonText, record, recordArgs, retry, serviceAccountEnv, settingsFrom, sshRecordCommand, withFallback, writeMode,
 } from './catchup.mjs';
 import { catchupEvent, producer, sendCatchupEvent } from './report.mjs';
 import { presignedFacts } from '../ci/lib/sigv4.mjs';
@@ -140,7 +140,7 @@ case "$1" in
 esac`;
 
 // big-chungus: fake adb and build tools, a lock folder the "deploy" shares, and a linux context over the fake S3.
-function linuxHost({ mode = 'live', s3 = fakeS3(), emit, writer, pages = async () => {} } = {}) {
+function linuxHost({ mode = 'live', s3 = fakeS3(), emit, writer, pages = async () => {}, settings = settingsFrom(policy), lockWaitMs = 300 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'hub-catchup-'));
   const state = join(root, 'phone');
   const bin = join(root, 'bin');
@@ -156,9 +156,9 @@ function linuxHost({ mode = 'live', s3 = fakeS3(), emit, writer, pages = async (
   const bus = { down: false };
   const ctx = linuxContext({
     env, home: root, log: line => logs.push(line), now, devices, fetchImpl: s3.fetchImpl, writer: writer ? writer({ env, home: root }) : s3.writer,
-    settings: settingsFrom(policy),
+    settings,
     emit: emit ?? (event => { if (bus.down) throw new Error('bb-emit --strict refused the event:\nNATS 127.0.0.1:4222 refused the connection'); events.push(event); }),
-    pages: pages ?? undefined, adbWaitMs: 300, lockWaitMs: 300,
+    pages: pages ?? undefined, adbWaitMs: 300, lockWaitMs,
   });
   const phone = {
     install: text => writeFileSync(join(state, 'apps', `${text.split(' ')[0]}.apk`), text),
@@ -502,9 +502,9 @@ test('the catch-up queues as a hub-job: it waits its turn behind the deploy, and
     while (!release) await new Promise(done => setTimeout(done, 10));
     await androidPass(host.ctx);
     assert.equal(host.phone.calls(), '', 'the deploy has the S26');
-    assert.equal(host.lines(/HUB_CATCHUP_IDLE android live: a deploy is using the S26 \(adb lock\)/).length, 1);
+    assert.equal(host.lines(/HUB_CATCHUP_IDLE android live: tower-of-lost-things 0\.2\.2 \(4\) pending; adb stayed held for .* \(job delorenj\/gruvato#7\); next pass/).length, 1);
     const mine = [...readEvents({ env: host.env })].filter(event => event.claimant.kind === 'hub-job');
-    assert.deepEqual(mine.map(event => [event.event, event.hold_kind, event.reason]), [['request', 'job', null], ['timeout', 'job', 'deadline']]);
+    assert.deepEqual(mine.map(event => [event.event, event.hold_kind, event.reason]), [['request', 'job', null], ['timeout', 'job', 'catchup-idle']]);
     assert.match(mine[1].blocked_by, /^delorenj\/gruvato run 7/);
     assert.deepEqual(readdirSync(join(host.env.HUB_LOCK_DIR, 'adb.queue')), [], 'the catch-up left the Queue when it gave up');
     release();
@@ -513,6 +513,137 @@ test('the catch-up queues as a hub-job: it waits its turn behind the deploy, and
     await androidPass(host.ctx);
     assert.deepEqual([...readEvents({ env: host.env })].filter(event => event.claimant.kind === 'hub-job').map(event => event.event), ['request', 'timeout', 'request', 'acquire', 'release']);
   } finally { host.cleanup(); }
+});
+
+// Story 3.3 (FR-30, AD-15): a contention-pending build stays in line for its turn; anything else makes only the short attempt. The
+// ticket and every event of that hold carry the delivery, and a timeout is a coded hub-job `catchup-idle`.
+const busyDevice = { reason: 'S26 busy' };
+const deployEnv = host => ({ ...host.env, GITHUB_REPOSITORY: 'delorenj/gruvato', GITHUB_RUN_ID: '7', GITHUB_JOB: 'android' });
+const deliveryOf = { repo, run: runId, version: '0.2.2' };
+const holdAdb = async host => {
+  let release;
+  const held = withLock('adb', () => new Promise(done => { release = done; }), { env: deployEnv(host), log: () => {} });
+  while (!release) await new Promise(done => setTimeout(done, 10));
+  return { release, held };
+};
+const hubEvents = host => [...readEvents({ env: host.env })].filter(event => event.claimant.kind === 'hub-job');
+
+test('a busy-pending build waits past the short attempt and installs in its turn, its hold tagged with the delivery', async () => {
+  const host = linuxHost({ settings: { ...settingsFrom(policy), pendingWaitMs: 5_000 } });
+  try {
+    publish(host.s3, { latest: latestDoc({ android: androidBlock({ device: busyDevice }) }), apk: apkText() });
+    host.phone.install(apkText({ version: '0.2.1', code: 3 }));
+    const { release, held } = await holdAdb(host);
+    setTimeout(release, 900);
+    const started = Date.now();
+    const pass = androidPass(host.ctx);
+    await new Promise(done => setTimeout(done, 150));
+    const ticketDir = join(host.env.HUB_LOCK_DIR, 'adb.queue');
+    const tickets = readdirSync(ticketDir).map(file => JSON.parse(readFileSync(join(ticketDir, file), 'utf8')));
+    assert.deepEqual(tickets.map(ticket => [ticket.kind, ticket.delivery]), [['hub-job', deliveryOf]], 'the ticket names the delivery');
+    await pass;
+    await held;
+    assert.ok(Date.now() - started > 600, 'it waited well past the 300 ms attempt');
+    assert.equal(host.lines(/^HUB_CATCHUP_WAIT android tower-of-lost-things 0\.2\.2: contention-pending; waiting up to 5 s for its turn on adb/).length, 1);
+    assert.equal(host.phone.installed(), apkText());
+    assert.deepEqual([latestOf(host.s3).android.device.status, latestOf(host.s3).android.device.by], ['installed', 'catch-up']);
+    const mine = hubEvents(host);
+    assert.deepEqual(mine.map(event => event.event), ['request', 'acquire', 'release']);
+    assert.deepEqual(mine.map(event => event.delivery), [deliveryOf, deliveryOf, deliveryOf]);
+  } finally { host.cleanup(); }
+});
+
+test('a busy-pending build whose holder outlasts the pending wait is idle: a coded catchup-idle hub-job timeout, the queue empty', async () => {
+  const host = linuxHost({ settings: { ...settingsFrom(policy), pendingWaitMs: 700 } });
+  try {
+    publish(host.s3, { latest: latestDoc({ android: androidBlock({ device: busyDevice }) }), apk: apkText() });
+    host.phone.install(apkText({ version: '0.2.1', code: 3 }));
+    const { release, held } = await holdAdb(host);
+    const out = await androidPass(host.ctx);
+    assert.equal(out.errors, 0);
+    assert.equal(host.phone.calls(), '');
+    assert.equal(host.lines(/^HUB_CATCHUP_IDLE android live: tower-of-lost-things 0\.2\.2 \(4\) pending; adb stayed held for .* \(job delorenj\/gruvato#7\); next pass/).length, 1);
+    const mine = hubEvents(host);
+    assert.deepEqual(mine.map(event => [event.event, event.reason, event.claimant.kind, event.delivery]), [['request', null, 'hub-job', deliveryOf], ['timeout', 'catchup-idle', 'hub-job', deliveryOf]]);
+    assert.ok(mine[1].waited_ms >= 700, `waited ${mine[1].waited_ms} ms`);
+    assert.deepEqual(readdirSync(join(host.env.HUB_LOCK_DIR, 'adb.queue')), []);
+    release();
+    await held;
+  } finally { host.cleanup(); }
+});
+
+test('a pending build that is not contention-pending (the S26 was away) waits only the short attempt', async () => {
+  const host = linuxHost({ settings: { ...settingsFrom(policy), pendingWaitMs: 5_000 } });
+  try {
+    publish(host.s3, { latest: latestDoc(), apk: apkText() });
+    const { release, held } = await holdAdb(host);
+    await androidPass(host.ctx);
+    const timeout = hubEvents(host).find(event => event.event === 'timeout');
+    assert.equal(timeout.reason, 'catchup-idle');
+    assert.ok(timeout.waited_ms < 2_000, `waited ${timeout.waited_ms} ms`);
+    assert.equal(host.lines(/HUB_CATCHUP_WAIT/).length, 0);
+    release();
+    await held;
+  } finally { host.cleanup(); }
+});
+
+test('an operator who removes the catch-up\'s ticket mid-wait idles the pass without an error', async () => {
+  const host = linuxHost({ settings: { ...settingsFrom(policy), pendingWaitMs: 5_000 } });
+  try {
+    publish(host.s3, { latest: latestDoc({ android: androidBlock({ device: busyDevice }) }), apk: apkText() });
+    const { release, held } = await holdAdb(host);
+    const ticketDir = join(host.env.HUB_LOCK_DIR, 'adb.queue');
+    const pass = androidPass(host.ctx);
+    for (;;) {
+      await new Promise(done => setTimeout(done, 20));
+      const files = readdirSync(ticketDir).filter(file => file.endsWith('.json'));
+      if (files.length > 0) { rmSync(join(ticketDir, files[0])); break; }
+    }
+    const out = await pass;
+    assert.equal(out.errors, 0);
+    assert.equal(host.lines(/HUB_CATCHUP_IDLE android live: .* pending; its place in the adb queue was released; next pass/).length, 1);
+    release();
+    await held;
+  } finally { host.cleanup(); }
+});
+
+test('catchupWait: the pending wait is bounded by the pass limit less its reserve, never below the attempt; the shipped wait fits', () => {
+  const settings = settingsFrom(policy);
+  assert.deepEqual([settings.attemptMs, settings.pendingWaitMs], [5_000, 30 * 60_000]);
+  assert.ok(settings.pendingWaitMs <= passLimitMs - passReserveMs, 'the shipped pending wait fits inside the pass limit less the reserve');
+  const busy = { app: { repo }, block: androidBlock({ device: busyDevice }) };
+  const away = { app: { repo }, block: androidBlock() };
+  assert.deepEqual(catchupWait([busy], { settings }), { ms: 30 * 60_000, pending: busy, delivery: deliveryOf });
+  assert.equal(catchupWait([busy], { settings, elapsedMs: 20 * 60_000 }).ms, passLimitMs - passReserveMs - 20 * 60_000);
+  assert.equal(catchupWait([busy], { settings, elapsedMs: passLimitMs }).ms, 5_000, 'never below the attempt');
+  assert.equal(catchupWait([busy], { settings, attemptMs: 300 }).ms, 30 * 60_000);
+  const short = catchupWait([away], { settings, attemptMs: 300 });
+  assert.deepEqual([short.ms, short.pending, short.delivery], [300, null, deliveryOf]);
+  assert.equal(catchupWait([away, busy], { settings }).pending, busy, 'the contention-pending build sets the wait');
+  assert.deepEqual(catchupWait([{ app: { repo }, block: iosBlock(), settled: true }], { settings }).delivery, null, 'a settled build names no delivery');
+  assert.equal(catchupWait([], { settings }).ms, 5_000);
+});
+
+test('the iPad pass queues on mac-ios for the short attempt, its ticket and events carry the iOS build\'s delivery', async () => {
+  const mac = macHost();
+  try {
+    publish(mac.linux.s3, { latest: latestDoc({ android: androidBlock({ status: 'installed', by: 'deploy' }), ios: iosBlock() }), ipa: ipaText() });
+    mac.ipadState.installed = { version: '0.2.1', build: '4' };
+    let release;
+    const held = withLock('mac-ios', () => new Promise(done => { release = done; }), { env: { ...mac.env, GITHUB_REPOSITORY: 'delorenj/gruvato', GITHUB_RUN_ID: '9', GITHUB_JOB: 'ios' }, log: () => {} });
+    while (!release) await new Promise(done => setTimeout(done, 10));
+    const pass = iosPass(mac.ctx);
+    await new Promise(done => setTimeout(done, 100));
+    const ticketDir = join(mac.env.HUB_LOCK_DIR, 'mac-ios.queue');
+    const tickets = readdirSync(ticketDir).map(file => JSON.parse(readFileSync(join(ticketDir, file), 'utf8')));
+    assert.deepEqual(tickets.map(ticket => [ticket.kind, ticket.delivery]), [['hub-job', { repo, run: runId, version: '0.2.2' }]]);
+    await pass;
+    assert.equal(mac.lines(/^HUB_CATCHUP_IDLE ios live: .* pending; mac-ios stayed held for .*; next pass/).length, 1);
+    const mine = [...readEvents({ env: mac.env })].filter(event => event.claimant.kind === 'hub-job');
+    assert.deepEqual(mine.map(event => [event.event, event.reason, event.delivery?.version]), [['request', null, '0.2.2'], ['timeout', 'catchup-idle', '0.2.2']]);
+    release();
+    await held;
+  } finally { mac.cleanup(); }
 });
 
 test('the locks are the deploy jobs\' locks: a held adb lock idles the pass, record waits for s3-<slug>', async () => {
@@ -525,7 +656,7 @@ test('the locks are the deploy jobs\' locks: a held adb lock idles the pass, rec
     while (!release) await new Promise(done => setTimeout(done, 10));
     await androidPass(host.ctx);
     assert.equal(host.phone.calls(), '', 'the deploy has the S26');
-    assert.equal(host.lines(/HUB_CATCHUP_IDLE android live: a deploy is using the S26 \(adb lock\)/).length, 1);
+    assert.equal(host.lines(/HUB_CATCHUP_IDLE android live: .* pending; adb stayed held for/).length, 1);
     release();
     await held;
 

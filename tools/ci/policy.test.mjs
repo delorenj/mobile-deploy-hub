@@ -157,7 +157,7 @@ test('a testflight block is parsed strictly: groups are plain unique names, the 
 
 test('the queue block is strict: the margin and one allowance per waiting job, nothing else, every value a whole number of minutes', () => {
   const base = JSON.parse(source);
-  assert.deepEqual(base.queue, { wait_margin_min: 2, hold_allowance_min: { plan: 5, android: 15, ios: 60 }, grace_min: 10, reservation_ceiling_min: 180, deploy_target_lease_max_min: 60 });
+  assert.deepEqual(base.queue, { wait_margin_min: 2, hold_allowance_min: { plan: 5, android: 15, ios: 60 }, grace_min: 10, reservation_ceiling_min: 180, deploy_target_lease_max_min: 60, catchup_attempt_s: 5, catchup_pending_wait_min: 30 });
   assert.deepEqual(loadPolicy().policy.queue, base.queue);
   assert.deepEqual([...queueJobs], ['plan', 'android', 'ios']);
   const bad = {
@@ -191,6 +191,14 @@ test('the queue block is strict: the margin and one allowance per waiting job, n
     'a negative Lease cap': p => { p.queue.deploy_target_lease_max_min = -60; },
     'a fractional Lease cap': p => { p.queue.deploy_target_lease_max_min = 0.5; },
     'a Lease cap as text': p => { p.queue.deploy_target_lease_max_min = '60'; },
+    'no catch-up attempt (Story 3.3)': p => { delete p.queue.catchup_attempt_s; },
+    'a catch-up attempt of zero': p => { p.queue.catchup_attempt_s = 0; },
+    'a fractional catch-up attempt': p => { p.queue.catchup_attempt_s = 2.5; },
+    'a catch-up attempt as text': p => { p.queue.catchup_attempt_s = '5'; },
+    'no catch-up pending wait (Story 3.3)': p => { delete p.queue.catchup_pending_wait_min; },
+    'a catch-up pending wait of zero': p => { p.queue.catchup_pending_wait_min = 0; },
+    'a fractional catch-up pending wait': p => { p.queue.catchup_pending_wait_min = 0.5; },
+    'a catch-up pending wait as text': p => { p.queue.catchup_pending_wait_min = '30'; },
   };
   for (const [name, change] of Object.entries(bad)) {
     const copy = structuredClone(base);
@@ -203,5 +211,7 @@ test('the queue block is strict: the margin and one allowance per waiting job, n
   copy.queue.grace_min = 5;
   copy.queue.reservation_ceiling_min = 240;
   copy.queue.deploy_target_lease_max_min = 30;
+  copy.queue.catchup_attempt_s = 8;
+  copy.queue.catchup_pending_wait_min = 20;
   assert.doesNotThrow(() => parsePolicy(JSON.stringify(copy)), 'a tuning change is a valid release, not a parse error');
 });
