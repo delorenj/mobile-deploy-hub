@@ -48,6 +48,16 @@ export function readOwner(path) {
 export const isLease = owner => owner?.kind === 'lease';
 const expiresAt = owner => (isLease(owner) ? Date.parse(owner.expires_at) : NaN);
 
+// The live Lease holding `name`, or null (AD-13): the owner record when a Lease holds it and its expiry and holder have not
+// passed. A Lease is judged by expiry and holder only, never by age (staleMs Infinity). Reads only; never throws.
+export function liveLease(name, { env = process.env, now = Date.now, host = hostname(), hostId = machineId() } = {}) {
+  try {
+    const path = join(lockDir(env), `${name}.lock`);
+    const owner = readOwner(path);
+    return isLease(owner) && staleness(path, owner, { now, staleMs: Infinity, host, hostId }) === null ? owner : null;
+  } catch { return null; }
+}
+
 const describe = owner => {
   if (!owner) return 'an unknown holder';
   if (isLease(owner)) return `lease ${owner.lease_id} of ${owner.holder ?? 'someone'}${owner.why ? ` (${owner.why})` : ''} until ${owner.expires_at}`;
@@ -194,10 +204,11 @@ export async function withLock(name, fn, {
   policy = null,
   deadlineSeams = {},
   endsReservation = false,
+  yieldToLease = false,
 } = {}) {
   if (!/^[a-z0-9-]+$/.test(name)) throw new Error(`bad lock name "${name}"`);
   if (kind !== 'job' && kind !== 'hub-job') throw new Error(`bad lock holder kind "${kind}" (job or hub-job)`);
-  if (isQueued(name)) return queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams, endsReservation });
+  if (isQueued(name)) return queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams, endsReservation, yieldToLease });
   const dir = lockDir(env);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${name}.lock`);
@@ -225,12 +236,16 @@ export async function withLock(name, fn, {
       if (verdict !== 'gone' && retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, hostId, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
       continue;
     }
+    if (yieldToLease && isLease(owner)) throw yielded(name, owner);
     if (now() >= deadline) throw failure('HUB_LOCK_TIMEOUT', `${heldText(name, owner)}; gave up after ${Math.round(timeoutMs / 60_000)} min. Another deploy is using the device; run again when it finishes.`);
     if (!waiting) { log(`HUB_LOCK_WAIT ${name} held by ${describe(owner)}`); waiting = true; }
     await sleep(pollMs);
   }
   return runHeld(name, path, mine, fn, { env, now, log, hostId, timers });
 }
+
+// A wait that gave way to a Lease (`yieldToLease`): the holder is on the error, so the caller can read around it (AD-13).
+const yielded = (name, owner) => Object.assign(failure('HUB_LOCK_YIELDED', `${heldText(name, owner)}; yielded to the Lease`), { owner });
 
 // owner.json keeps every key older versions read (pid, host, repo, run, started_at) and adds the AD-2 keys after them.
 function jobIdentity({ env, host, hostId, kind }) {
@@ -814,7 +829,7 @@ export function poolRequest(pool, { id = newLeaseId(), holder, why, forMs = null
 // `timeoutMs` of 0 or less is a try: no ticket, no event unless it acquires. Events (AD-9) follow acquireLease's: `request` once
 // the ticket is in place, `acquire` once the ticket is claimed, and `timeout` or `cancel` once this waiter's own unlink of its
 // ticket succeeds. A wait that runs out throws HUB_LOCK_TIMEOUT, wording `host lock <name> is held ...` as before.
-async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams, endsReservation }) {
+async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams, endsReservation, yieldToLease }) {
   const dir = lockDir(env);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${name}.lock`);
@@ -854,6 +869,12 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
     if (tryOnly) return failure('HUB_LOCK_TIMEOUT', message);
     if (!leave('timeout', { reason: 'deadline', blocked_by: describe(owner) })) return cancelled('was released while it waited for');
     return failure('HUB_LOCK_TIMEOUT', message);
+  };
+  // With `yieldToLease`, a live Lease on the lock ends the wait: the ticket leaves with a cancel event and the caller reads around it.
+  const yieldTo = owner => {
+    if (!yieldToLease || !isLease(owner) || staleness(path, owner, { now, staleMs: Infinity, host, hostId }) !== null) return;
+    if (ticketFile && !leave('cancel', { reason: 'yield-to-lease', blocked_by: describe(owner) })) throw cancelled('was released while it waited for');
+    throw yielded(name, owner);
   };
   const view = () => queueView(name, { env, prune: true, now, host, hostId, processStart: start });
   const gaveUp = capped
@@ -913,6 +934,7 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
             if (verdict !== 'gone' && retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, hostId, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
             continue;
           }
+          yieldTo(owner);
           if (now() >= deadline) throw timedOut(`${heldText(name, owner)}; ${gaveUp}`, owner);
           if (!waiting) { log(`HUB_LOCK_WAIT ${name} held by ${describe(owner)}`); waiting = true; }
         }
@@ -920,6 +942,7 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
       if (blockers.length > 0) {
         startGrace(name, current, { env, now, hostId, own: tryOnly ? reserved?.key ?? null : null });
         const owner = readOwner(path);
+        yieldTo(owner);
         if (now() >= deadline) throw timedOut(`${heldText(name, owner, blockers, selfText)}; ${gaveUp}`, owner);
         if (!waiting) { log(`HUB_LOCK_WAIT ${name} queued behind ${blockers.length} (${describe(owner)})`); waiting = true; }
       }

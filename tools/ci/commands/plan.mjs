@@ -19,10 +19,10 @@ import { devProfile, identities, installedProfiles, signingProbe } from '../lib/
 import { hookEnvironment } from '../lib/config.mjs';
 import { createDevicectl, createIpad } from '../lib/devicectl.mjs';
 import { loadDevices } from '../lib/devices.mjs';
-import { attempt, hook, hookOutput, run } from '../lib/exec.mjs';
+import { attempt, hook, hookOutput, run, runBounded } from '../lib/exec.mjs';
 import { bumpTransaction, createGit } from '../lib/git.mjs';
 import { compareBuild, compareSemver, inflightKey, latestKey, parseLatest } from '../lib/latest.mjs';
-import { releaseReservation, reserve, withLock } from '../lib/lock.mjs';
+import { liveLease, releaseReservation, reserve, withLock } from '../lib/lock.mjs';
 import { loadManifest } from '../lib/manifest.mjs';
 import { authoredNotes } from '../lib/release-notes.mjs';
 import { buildReceipt, setOutputs, writeReceipt } from '../lib/receipt.mjs';
@@ -30,7 +30,7 @@ import { jobWriter, readObject } from '../lib/s3.mjs';
 import { parseVersionInfo } from '../lib/version.mjs';
 import { checkCaller, refusal } from '../lib/caller.mjs';
 import { defaultGroups, groupsLabel, iosVersionOf, tagOnlyOf, tagPrefixOf, testflightPolicyOf } from '../lib/policy.mjs';
-import { checkDisk, checkSecrets, firstLine, guarded, isoNow, policyBanner, reachIpad, readMacLink, releaseFor, reserveFor, runOf, short, testflightHookEnv } from './common.mjs';
+import { checkDisk, checkSecrets, firstLine, guarded, isoNow, peekS26, policyBanner, reachIpad, readMacLink, releaseFor, reserveFor, runOf, short, testflightHookEnv } from './common.mjs';
 import { callerReader, checkPins } from './gate.mjs';
 
 // ---------------------------------------------------------------------------------------------------- preflight-ios
@@ -168,7 +168,7 @@ async function eventPreflight({ config, manifest, devices, version, androidCode,
 // Away is the code findPhone attaches, never its wording: the message names the reason (absent, unauthorized, offline).
 const notOnAdb = error => error?.code === 'HUB_PHONE_AWAY';
 
-export async function plan(config, { env = process.env, home = homedir(), fetchImpl = fetch, s3Factory = null, log = console.log, macLinkNow = null, releaser = releaseReservation } = {}) {
+export async function plan(config, { env = process.env, home = homedir(), fetchImpl = fetch, s3Factory = null, log = console.log, macLinkNow = null, releaser = releaseReservation, adbRunner = runBounded } = {}) {
   const { policy } = policyBanner(log);
   const manifest = await loadManifest(config.cwd, config.manifest);
   // The manifest as dispatched (github.sha): the bump must land on a main whose manifest the gate checked.
@@ -228,23 +228,42 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
     const latestText = await readObject(policy, latestKey(manifest.project.slug), { fetchImpl, env });
     const latest = latestText === null ? null : parseLatest(latestText, { slug: manifest.project.slug });
 
-    // The S26, waited for; away is pending, not a stop. A wrong device still stops the run.
+    // The S26, waited for; away is pending, not a stop. A wrong device still stops the run. Under a live Lease on `adb` the plan
+    // never waits and never touches the server: it Peeks (Story 3.1, AD-13). A Job Hold of another deploy is still waited for
+    // in the Queue, and a Lease that takes `adb` meanwhile ends that wait (yieldToLease).
     let phone = null;
     let s26 = 'n/a';
     if (scope.android) {
-      try {
-        phone = await withLock('adb', async () => {
-          const adb = createAdb({ env, home });
-          const id = await findPhone(adb, { serial: devices.android.serial, model: devices.android.model, waitMs: Number(env.HUB_ADB_WAIT_MS) || policy.devices.android_wait_s * 1000 });
-          return adb.installed(id, manifest.android.package);
-        }, { env, timeoutMs: 20 * 60_000 });
-        s26 = 'present';
-        notes.push(`S26 ${devices.android.model}: ${phone ? `${manifest.android.package} ${phone.versionName} (${phone.versionCode}) installed` : `${manifest.android.package} not installed`}`);
-      } catch (error) {
-        if (!notOnAdb(error)) throw error;
-        s26 = 'away';
-        log(`HUB_S26_PENDING the S26 is not on big-chungus's adb after ${policy.devices.android_wait_s}s; the bump goes ahead and the S26 delivery will be pending`);
-        notes.push('S26: away (pending); the build is published for a later install');
+      const peek = lease => {
+        const result = peekS26({ lease, manifest, devices, env, home, log, adbRunner });
+        s26 = result.state === 'read' ? 'present' : 'unknown';
+        phone = result.state === 'read' ? result.installed : null;
+        notes.push(result.state === 'read'
+          ? `S26 ${devices.android.model}: peeked under lease ${lease.lease_id ?? '-'} of ${lease.holder ?? 'someone'} (adb port ${result.adb_port}); ${phone ? `${manifest.android.package} ${phone.versionName ?? '-'} (${phone.versionCode}) installed` : `${manifest.android.package} not installed`}`
+          : `S26 ${devices.android.model}: held by lease ${lease.lease_id ?? '-'} of ${lease.holder ?? 'someone'}; its version is unknown (${result.reason}), so the downgrade guard falls to install time`);
+      };
+      const leased = liveLease('adb', { env });
+      if (leased) {
+        peek(leased);
+      } else {
+        try {
+          phone = await withLock('adb', async () => {
+            const adb = createAdb({ env, home });
+            const id = await findPhone(adb, { serial: devices.android.serial, model: devices.android.model, waitMs: Number(env.HUB_ADB_WAIT_MS) || policy.devices.android_wait_s * 1000 });
+            return adb.installed(id, manifest.android.package);
+          }, { env, timeoutMs: 20 * 60_000, yieldToLease: true });
+          s26 = 'present';
+          notes.push(`S26 ${devices.android.model}: ${phone ? `${manifest.android.package} ${phone.versionName} (${phone.versionCode}) installed` : `${manifest.android.package} not installed`}`);
+        } catch (error) {
+          if (error?.code === 'HUB_LOCK_YIELDED') {
+            peek(error.owner);
+          } else {
+            if (!notOnAdb(error)) throw error;
+            s26 = 'away';
+            log(`HUB_S26_PENDING the S26 is not on big-chungus's adb after ${policy.devices.android_wait_s}s; the bump goes ahead and the S26 delivery will be pending`);
+            notes.push('S26: away (pending); the build is published for a later install');
+          }
+        }
       }
     }
     const ipadKnown = scope.ios && !['', 'unreachable', 'absent'].includes(config.ipadVersion);

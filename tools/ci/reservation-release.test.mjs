@@ -144,6 +144,9 @@ test('a grace stamp that lands after a release fails with ENOENT and is ignored:
 test('a hold that ends well with endsReservation renames the Reservation away before the lock is freed: the Reservation\'s release event comes before the job\'s', async () => {
   const f = fixture();
   try {
+    // withLock reads the Reservation on the real clock: stamp it now, not at the fixed T0 (which falls past its ceiling a few
+    // hours after T0's date, and turned this test red on that day).
+    f.clock.at = Date.now();
     take(f, f.runEnv(5, 'gate'));
     let during = null;
     await withLock('adb', async () => { during = existsSync(join(f.reservations('adb'), KEY)); }, { env: f.runEnv(5, 'android'), log: f.log, pollMs: 5, timeoutMs: 10_000, timers: fakeTimers(), endsReservation: true });

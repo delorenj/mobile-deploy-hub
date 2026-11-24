@@ -16,14 +16,15 @@ import { checkApp } from '../../conformance.mjs';
 import { createAdb, findPhone } from '../lib/adb.mjs';
 import { checkCaller, refusal } from '../lib/caller.mjs';
 import { loadDevices } from '../lib/devices.mjs';
-import { attempt } from '../lib/exec.mjs';
+import { attempt, runBounded } from '../lib/exec.mjs';
 import { latestKey, parseLatest } from '../lib/latest.mjs';
 import { editionsOf, loadManifest } from '../lib/manifest.mjs';
+import { liveLease } from '../lib/lock.mjs';
 import { macEstimate, tailscaleStatus } from '../lib/metered.mjs';
 import { appFor, bundleSplitOf, editionPinOf, groupsLabel, requiredTargets, testflightPolicyOf } from '../lib/policy.mjs';
 import { buildReceipt, setOutputs, writeReceipt } from '../lib/receipt.mjs';
 import { jobWriter, probe, readObject } from '../lib/s3.mjs';
-import { guarded, policyBanner, readCatchupMode, readMacLink, releaseRef, reserveFor } from './common.mjs';
+import { guarded, peekS26, policyBanner, readCatchupMode, readMacLink, releaseRef, reserveFor } from './common.mjs';
 
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
@@ -135,7 +136,11 @@ function testflightWhy({ policy, manifest, required, scope, iosLane, storePrefli
   return `a store app (ios.store)${storePreflight ? ', with the ios.store.preflight hook on the Mac' : ''}; ${policy.completion.required.testflight === 'store' ? 'the caller\'s testflight input is not read' : 'the caller requested TestFlight'}`;
 }
 
-async function quickS26({ env, home, devices, adbFactory }) {
+// The gate's S26 probe. Under a live Lease on `adb` it only Peeks (Story 3.1, AD-13): findPhone starts the server and connects,
+// which could disturb the leaseholder's session. A Peek that read is `present`, any other outcome `unknown`; never a throw.
+async function quickS26({ env, home, devices, adbFactory, manifest, adbRunner, log }) {
+  const lease = liveLease('adb', { env });
+  if (lease) return peekS26({ lease, manifest, devices, env, home, log, adbRunner }).state === 'read' ? 'present' : 'unknown';
   try {
     await findPhone(adbFactory({ env, home }), { serial: devices.android.serial, model: devices.android.model, waitMs: Number(env.HUB_GATE_ADB_WAIT_MS) || 6000, pollMs: 2000, nudgeEvery: 2, log: () => {} });
     return 'present';
@@ -148,7 +153,7 @@ async function quickS26({ env, home, devices, adbFactory }) {
 
 export async function gate(config, {
   env = process.env, home = homedir(), fetchImpl = fetch, log = console.log, s3Factory = null,
-  tailscale = () => tailscaleStatus({ env }), macProbe = null, runnerStatus = null, adbFactory = createAdb,
+  tailscale = () => tailscaleStatus({ env }), macProbe = null, runnerStatus = null, adbFactory = createAdb, adbRunner = runBounded,
   policyFile = undefined, reserver = undefined,
 } = {}) {
   const loaded = policyBanner(log, policyFile);
@@ -175,7 +180,7 @@ export async function gate(config, {
       throw refusal('s3', `the build directory's ${latestKey(app.slug)} cannot be read or is invalid (${error.message}); deliver and the catch-up depend on it`);
     }
 
-    const s26 = scope.android ? await quickS26({ env, home, devices, adbFactory }) : 'n/a';
+    const s26 = scope.android ? await quickS26({ env, home, devices, adbFactory, manifest, adbRunner, log }) : 'n/a';
     let link = { link: 'n/a', addr: null, reason: 'the iPad is out of scope', catchup: null };
     let iosLane = 'skip-platform';
     if (scope.ios) {
