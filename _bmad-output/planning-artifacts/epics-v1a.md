@@ -1,6 +1,7 @@
 ---
 status: final
 release: v1a
+board: MOBI (epics MOBI-23, MOBI-29, MOBI-38, MOBI-44; stories MOBI-24..28, 30..37, 39..43, 45..47)
 stepsCompleted: [step-01-validate-prerequisites, step-02-design-epics, step-03-create-stories, step-04-final-validation]
 inputDocuments:
   - _bmad-output/planning-artifacts/prds/prd-mobile-deploy-hub-2026-11-21/prd.md
