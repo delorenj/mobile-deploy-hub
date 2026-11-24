@@ -210,7 +210,9 @@ test('a waiter that times out leaves the queue; a queued lease says how many are
     await lease(f, { id: 'holder' });
     const first = lease(f, { id: 'one', waitMs: 10_000 });
     await settle(10);
-    await assert.rejects(lease(f, { id: 'two', waitMs: 40 }), /has 1 waiter ahead of lease two/);
+    // INTENDED CHANGE (Story 2.3, AD-5): a queued Lease's timeout starts `host lock <name> is held` like every other wait on a
+    // Queued lock, then names the waiters ahead with their places (it was `host lock adb has 1 waiter ahead of lease two (held by ...)`).
+    await assert.rejects(lease(f, { id: 'two', waitMs: 40 }), /host lock adb is held by lease holder of agent-a \(device proof\) until .*; 1 waiter ahead of lease two \(1\. agent-a \(device proof\)\); gave up after 0s/);
     assert.deepEqual(listWaiters('adb', { env: f.env }).map(waiter => waiter.lease_id), ['one']);
     releaseLease('adb', 'one', { env: f.env });
     await assert.rejects(first, error => error.code === 'HUB_LEASE_CANCELLED');
@@ -281,6 +283,11 @@ const otherProcess = (f, body) => {
   const child = spawnSync(process.execPath, ['--input-type=module', '-e', `const lock = await import(${JSON.stringify(lockUrl)}); ${body}`], { env: { PATH: process.env.PATH, HUB_LOCK_DIR: f.env.HUB_LOCK_DIR, HUB_EVENT_DIR: f.env.HUB_EVENT_DIR }, encoding: 'utf8' });
   assert.equal(child.status, 0, child.stderr);
 };
+// Since Story 2.3 a withLock caller on a Queued name waits in line, so the other process the seams below spawn must stand AHEAD of
+// the parent (a child that queued behind a parent blocked in spawnSync would wait forever). Tickets sort by request time, so the
+// parent asks the time two seconds late: its ticket sorts after the child's, which is the interleaving these tests mean (the
+// child reached the lock first). Nothing else reads this clock here: the stale holder is judged by its pid.
+const late = () => Date.now() + 2000;
 const staleJob = (f, run = '41') => {
   mkdirSync(f.lock, { recursive: true });
   writeFileSync(join(f.lock, 'owner.json'), JSON.stringify({ pid: deadPid(), host: hostname(), repo: 'delorenj/gruvato', run, started_at: new Date(Date.now() - 5000).toISOString() }));
@@ -338,8 +345,8 @@ test('two reclaimers race on one stale lock: one reclaim event, and the loser ne
     staleJob(f);
     let raced = false;
     // B judged the job stale. Before its rename, A (another process) reclaims it too and takes the lock as a lease.
-    const beforeRetire = step => { if (step === 'rename' && !raced) { raced = true; otherProcess(f, "await lock.acquireLease('adb', { holder: 'agent-c', why: 'third', forMs: 60000, id: 'third', pollMs: 5, log: () => {} });"); } };
-    await assert.rejects(withLock('adb', async () => { throw new Error('B must not run'); }, { env: f.env, log: f.log, timeoutMs: 60, pollMs: 5, beforeRetire }), /held by lease third/);
+    const beforeRetire = step => { if (step === 'rename' && !raced) { raced = true; otherProcess(f, "await lock.acquireLease('adb', { holder: 'agent-c', why: 'third', forMs: 60000, id: 'third', waitMs: 5000, pollMs: 5, log: () => {} });"); } };
+    await assert.rejects(withLock('adb', async () => { throw new Error('B must not run'); }, { env: f.env, log: f.log, timeoutMs: 60, pollMs: 5, beforeRetire, now: late }), /held by lease third/);
     assert.ok(raced);
     assert.equal(owner(f).lease_id, 'third', "the third process's lock survives B's rename");
     const got = holds(f);
@@ -363,7 +370,7 @@ test('the same race through acquireLease: the losing lease reclaimer writes noth
       mkdirSync(f.lock);
       writeFileSync(join(f.lock, 'owner.json'), JSON.stringify(third));
     };
-    await assert.rejects(lease(f, { id: 'loser', waitMs: 60, beforeRetire }), error => error.code === 'HUB_LOCK_TIMEOUT' && /held by delorenj\/third run 3/.test(error.message));
+    await assert.rejects(lease(f, { id: 'loser', waitMs: 60, beforeRetire, now: late }), error => error.code === 'HUB_LOCK_TIMEOUT' && /held by delorenj\/third run 3/.test(error.message));
     assert.deepEqual(owner(f), third);
     assert.deepEqual(holds(f).map(event => event.event), ['reclaim', 'release']);
     assert.deepEqual(tombs(f), []);
@@ -378,7 +385,7 @@ test('a rename that finds the lock gone writes nothing and is not an error', asy
     // A reclaims, runs and releases before B renames: B's rename hits ENOENT, and B then takes the free lock.
     const beforeRetire = step => { if (step === 'rename' && !raced) { raced = true; otherProcess(f, "await lock.withLock('adb', async () => {}, { log: () => {}, pollMs: 5 });"); } };
     const ran = [];
-    await withLock('adb', async () => { ran.push('B'); }, { env: f.env, log: f.log, timeoutMs: 2000, pollMs: 5, beforeRetire });
+    await withLock('adb', async () => { ran.push('B'); }, { env: f.env, log: f.log, timeoutMs: 2000, pollMs: 5, beforeRetire, now: late });
     assert.deepEqual(ran, ['B']);
     assert.deepEqual(holds(f).map(event => [event.event, event.reason]), [['reclaim', 'holder-gone'], ['release', 'done'], ['release', 'done']]);
     assert.ok(!existsSync(f.lock));
@@ -393,10 +400,10 @@ test('a lock retaken between the rename and the put-back is dropped with HUB_LOC
     let raced = false;
     const fourth = { pid: process.pid, host: hostname(), started_at: new Date().toISOString(), kind: 'lease', lease_id: 'fourth', holder: 'agent-d', why: 'd', expires_at: new Date(Date.now() + 60_000).toISOString() };
     const beforeRetire = step => {
-      if (step === 'rename' && !raced) { raced = true; otherProcess(f, "await lock.acquireLease('adb', { holder: 'agent-c', why: 'third', forMs: 60000, id: 'third', pollMs: 5, log: () => {} });"); }
+      if (step === 'rename' && !raced) { raced = true; otherProcess(f, "await lock.acquireLease('adb', { holder: 'agent-c', why: 'third', forMs: 60000, id: 'third', waitMs: 5000, pollMs: 5, log: () => {} });"); }
       if (step === 'restore') { mkdirSync(f.lock); writeFileSync(join(f.lock, 'owner.json'), JSON.stringify(fourth)); }
     };
-    await assert.rejects(withLock('adb', async () => {}, { env: f.env, log: f.log, timeoutMs: 60, pollMs: 5, beforeRetire }), /held by lease fourth/);
+    await assert.rejects(withLock('adb', async () => {}, { env: f.env, log: f.log, timeoutMs: 60, pollMs: 5, beforeRetire, now: late }), /held by lease fourth/);
     assert.ok(f.logs.some(line => /^HUB_LOCK_LOST adb lease third of agent-c/.test(line)));
     assert.equal(owner(f).lease_id, 'fourth');
     assert.deepEqual(holds(f).map(event => event.event), ['reclaim'], "only A's reclaim");
@@ -594,7 +601,8 @@ test('withLock: the catch-up is a hub-job, a failed fn releases with reason erro
     let clock = T0;
     await lease(f, { id: 'held', forMs: 3600_000 });
     await assert.rejects(withLock('adb', async () => {}, { env: f.env, log: f.log, now: () => clock, sleep: async () => { clock += 60_000; }, timeoutMs: 120_000, timers: fakeTimers() }),
-      error => error.code === undefined && /^host lock adb is held by lease held of agent-a \(device proof\) until .*; gave up after 2 min\. Another deploy is using the device; run again when it finishes\.$/.test(error.message));
+      // INTENDED CHANGE (Story 2.3): the timeout is coded now (it was uncoded on purpose in Story 1.4); the wording is the same.
+      error => error.code === 'HUB_LOCK_TIMEOUT' && /^host lock adb is held by lease held of agent-a \(device proof\) until .*; gave up after 2 min\. Another deploy is using the device; run again when it finishes\.$/.test(error.message));
     const timedOut = events(f).filter(event => event.hold_kind === 'job').slice(3);
     assert.deepEqual(timedOut.map(event => [event.event, event.claimant.kind, event.waited_ms, event.reason]), [['request', 'deploy', null, null], ['timeout', 'deploy', 120_000, 'deadline']]);
     assert.match(timedOut[1].blocked_by, /^lease held of agent-a/);
@@ -920,7 +928,7 @@ test('a try writes no ticket: it takes a free lock with one acquire, and fails w
     releaseLease('adb', 'tried', { env: f.env });
     putTicket(f, '000000000000001-000000-00000009.json', { lease_id: 'waiting' });
     const before = events(f).length;
-    await assert.rejects(lease(f, { id: 'jumper' }), error => error.code === 'HUB_LOCK_TIMEOUT' && /^host lock adb has 1 waiter ahead of lease jumper \(held by an unknown holder\); gave up after 0s$/.test(error.message));
+    await assert.rejects(lease(f, { id: 'jumper' }), error => error.code === 'HUB_LOCK_TIMEOUT' && /^host lock adb is held by an unknown holder; 1 waiter ahead of lease jumper \(1\. someone \(waiting\)\); gave up after 0s$/.test(error.message));
     assert.ok(!existsSync(f.lock), 'it did not take the lock');
     assert.deepEqual(readdirSync(join(f.root, 'locks/adb.queue')), ['000000000000001-000000-00000009.json'], 'and left no ticket');
     assert.equal(events(f).length, before, 'the failed tries wrote no event');
@@ -1017,5 +1025,178 @@ test('a withLock caller that finds the lock gone under it does not retire it eit
     assert.deepEqual(seam.calls, []);
     assert.deepEqual(events(f).map(event => event.event), ['request', 'timeout'], 'no reclaim of a lock that was never stale');
     assert.deepEqual(tombs(f), []);
+  } finally { f.cleanup(); }
+});
+
+// ---- Story 2.3: deploy jobs and the catch-up join the Queue (AD-4, AD-5, AD-15) ----
+
+const jobEnv = (f, job, attempt = '1') => ({ ...f.env, GITHUB_JOB: job, GITHUB_RUN_ATTEMPT: attempt });
+const asJob = (f, job, extra = {}) => withLock('adb', async () => { extra.served?.push(job); }, { env: jobEnv(f, job), log: f.log, pollMs: 5, timeoutMs: 10_000, timers: fakeTimers(), ...extra });
+const queueOf = (f, name = 'adb') => queueView(name, { env: f.env }).map(entry => [entry.place, entry.kind, entry.lease_id]);
+
+test('a Queued withLock waits as a job ticket with the run identity, and the ticket is gone once it has the lock', async () => {
+  const f = fixture();
+  try {
+    await lease(f, { id: 'holder' });
+    const waiting = asJob(f, 'android', { env: jobEnv(f, 'android', '2') });
+    await settle(30);
+    const [ticket] = queueView('adb', { env: f.env });
+    assert.deepEqual({ format: ticket.format, kind: ticket.kind, lease_id: ticket.lease_id, holder: ticket.holder, why: ticket.why, pid: ticket.pid, host: ticket.host, repo: ticket.repo, run: ticket.run, attempt: ticket.attempt, job: ticket.job },
+      { format: 1, kind: 'job', lease_id: 'job:delorenj/example#9.2/android', holder: 'delorenj/example#9', why: 'android', pid: process.pid, host: hostname(), repo: 'delorenj/example', run: '9', attempt: '2', job: 'android' });
+    assert.match(ticket.enqueued_at, /^\d{4}-\d\d-\d\dT/);
+    releaseLease('adb', 'holder', { env: f.env });
+    await waiting;
+    assert.deepEqual(queueOf(f), [], 'the ticket left the queue with the take');
+    assert.ok(!existsSync(f.lock));
+    assert.deepEqual(events(f).filter(event => event.hold_kind === 'job').map(event => [event.event, event.claimant.kind, event.claimant.job]), [['request', 'deploy', 'android'], ['acquire', 'deploy', 'android'], ['release', 'deploy', 'android']]);
+  } finally { f.cleanup(); }
+});
+
+test('a deploy job enqueued before a Lease is served first, and the reverse', async () => {
+  const f = fixture();
+  try {
+    for (const order of [['job', 'lease'], ['lease', 'job']]) {
+      await lease(f, { id: 'holder' });
+      const served = [];
+      const start = kind => (kind === 'job'
+        ? asJob(f, 'job', { served })
+        : lease(f, { id: 'later', waitMs: 10_000 }).then(() => { served.push('lease'); releaseLease('adb', 'later', { env: f.env }); }));
+      const first = start(order[0]);
+      await settle(25);
+      const second = start(order[1]);
+      await settle(25);
+      assert.deepEqual(queueOf(f).map(([place, kind]) => [place, kind === 'job' ? 'job' : 'lease']), [[1, order[0]], [2, order[1]]], `${order.join(' then ')} wait in that order`);
+      releaseLease('adb', 'holder', { env: f.env });
+      await Promise.all([first, second]);
+      assert.deepEqual(served, order, `${order[0]} came first and is served first`);
+      assert.deepEqual(queueOf(f), []);
+    }
+  } finally { f.cleanup(); }
+});
+
+test('a free Resource with an empty Queue is taken at once: no sleep, one request, acquire and release, no ticket left', async () => {
+  const f = fixture();
+  try {
+    const ran = [];
+    await withLock('adb', async () => { ran.push('job'); }, { env: jobEnv(f, 'android'), log: f.log, now: () => T0, timers: fakeTimers(), sleep: async () => { throw new Error('a free lock is not waited for'); } });
+    assert.deepEqual(ran, ['job']);
+    assert.deepEqual(events(f).map(event => [event.event, event.waited_ms]), [['request', null], ['acquire', 0], ['release', null]]);
+    assert.deepEqual(queueOf(f), []);
+    assert.ok(!existsSync(f.lock));
+  } finally { f.cleanup(); }
+});
+
+test('the iOS jobs and the iPad catch-up share one mac-ios FIFO, served in arrival order from tickets on this host', async () => {
+  const f = fixture();
+  try {
+    await acquireLease('mac-ios', { holder: 'agent-a', why: 'iPad proof', forMs: 60_000, id: 'ipad', env: f.env, log: f.log, pollMs: 5 });
+    const served = [];
+    const wants = (kind, job) => withLock('mac-ios', async () => { served.push(`${kind}:${job}`); }, { env: jobEnv(f, job), log: f.log, kind, pollMs: 5, timeoutMs: 10_000, timers: fakeTimers() });
+    const waiting = [];
+    for (const [kind, job] of [['job', 'ios'], ['hub-job', 'catchup'], ['job', 'ios-second']]) { waiting.push(wants(kind, job)); await settle(25); }
+    assert.deepEqual(queueView('mac-ios', { env: f.env }).map(entry => [entry.place, entry.kind, entry.job]), [[1, 'job', 'ios'], [2, 'hub-job', 'catchup'], [3, 'job', 'ios-second']]);
+    const [catchup] = queueView('mac-ios', { env: f.env }).filter(entry => entry.kind === 'hub-job');
+    assert.deepEqual([catchup.holder, catchup.why, catchup.host, catchup.lease_id], ['catch-up', 'catch-up install', hostname(), 'job:delorenj/example#9.1/catchup']);
+    releaseLease('mac-ios', 'ipad', { env: f.env });
+    await Promise.all(waiting);
+    assert.deepEqual(served, ['job:ios', 'hub-job:catchup', 'job:ios-second']);
+    assert.deepEqual(queueOf(f, 'mac-ios'), []);
+  } finally { f.cleanup(); }
+});
+
+test('a Queued withLock that runs out is HUB_LOCK_TIMEOUT: `host lock <name> is held`, the holder, the waiters ahead with their places; the catch-up\'s is a hub-job timeout', async () => {
+  const f = fixture();
+  try {
+    let clock = T0;
+    const now = () => clock;
+    await lease(f, { id: 'held', forMs: 3600_000, now });
+    putTicket(f, '000000000000001-000000-00000009.json', { lease_id: 'ahead-1', holder: 'agent-b', why: 'first in line' });
+    putTicket(f, '000000000000002-000000-00000009.json', { lease_id: 'ahead-2', holder: 'agent-c', why: 'second in line' });
+    await assert.rejects(withLock('adb', async () => { throw new Error('must not run'); }, { env: jobEnv(f, 'catchup'), log: f.log, now, kind: 'hub-job', sleep: async () => { clock += 1000; }, timeoutMs: 3000, pollMs: 1000, timers: fakeTimers() }), error => {
+      assert.equal(error.code, 'HUB_LOCK_TIMEOUT');
+      assert.match(error.message, /^host lock adb is held by lease held of agent-a \(device proof\) until .*; 2 waiters ahead of catch-up job:delorenj\/example#9\.1\/catchup \(1\. agent-b \(first in line\), 2\. agent-c \(second in line\)\); gave up after 0 min\. Another deploy is using the device; run again when it finishes\.$/);
+      assert.match(error.message, /host lock adb is held/, 'the catch-up regexes (catchup.mjs, mac-ios the same) still match');
+      return true;
+    });
+    const mine = events(f).filter(event => event.claimant.kind === 'hub-job');
+    assert.deepEqual(mine.map(event => [event.event, event.hold_kind, event.waited_ms, event.reason]), [['request', 'job', null, null], ['timeout', 'job', 3000, 'deadline']]);
+    assert.match(mine[1].blocked_by, /^lease held of agent-a/);
+    assert.deepEqual(queueOf(f).map(([place, kind]) => [place, kind]), [[1, 'lease'], [2, 'lease']], 'its own ticket left; the others kept their places');
+    // a job from a deploy run says the same thing under its own kind
+    await assert.rejects(withLock('adb', async () => {}, { env: jobEnv(f, 'android'), log: f.log, now, sleep: async () => { clock += 1000; }, timeoutMs: 1000, pollMs: 1000, timers: fakeTimers() }),
+      error => error.code === 'HUB_LOCK_TIMEOUT' && /^host lock adb is held by lease held of agent-a/.test(error.message));
+    assert.deepEqual(events(f).filter(event => event.claimant.kind === 'deploy').map(event => event.event), ['request', 'timeout']);
+  } finally { f.cleanup(); }
+});
+
+test('withLock on an internal name keeps the bare path: no ticket, no queue, no event; its timeout is coded with today\'s wording', async () => {
+  const f = fixture();
+  try {
+    const path = join(f.root, 'locks/s3-index.lock');
+    mkdirSync(path, { recursive: true });
+    writeFileSync(join(path, 'owner.json'), JSON.stringify({ pid: process.pid, host: hostname(), repo: 'delorenj/other', run: '5', started_at: new Date().toISOString() }));
+    await assert.rejects(withLock('s3-index', async () => {}, { env: f.env, log: f.log, timeoutMs: 30, pollMs: 5 }),
+      error => error.code === 'HUB_LOCK_TIMEOUT' && /^host lock s3-index is held by delorenj\/other run 5 \(pid \d+, since .*\); gave up after 0 min\. Another deploy is using the device; run again when it finishes\.$/.test(error.message));
+    assert.ok(!existsSync(join(f.root, 'locks/s3-index.queue')), 'no queue');
+    assert.ok(!existsSync(f.env.HUB_EVENT_DIR), 'no event');
+  } finally { f.cleanup(); }
+});
+
+test('a Queued withLock try (timeoutMs 0) writes no ticket and no event unless it takes the lock, and a waiter ahead keeps it out', async () => {
+  const f = fixture();
+  try {
+    const ran = [];
+    await withLock('adb', async () => { ran.push('free'); }, { env: f.env, log: f.log, timeoutMs: 0, timers: fakeTimers() });
+    assert.deepEqual(ran, ['free']);
+    assert.ok(!existsSync(join(f.root, 'locks/adb.queue')), 'a try never makes the queue directory');
+    assert.deepEqual(events(f).map(event => event.event), ['acquire', 'release']);
+    putTicket(f, '000000000000001-000000-00000009.json', { lease_id: 'waiting' });
+    const before = events(f).length;
+    await assert.rejects(withLock('adb', async () => { throw new Error('must not run'); }, { env: f.env, log: f.log, timeoutMs: 0, timers: fakeTimers() }),
+      error => error.code === 'HUB_LOCK_TIMEOUT' && /^host lock adb is held by an unknown holder; 1 waiter ahead of this job \(1\. someone \(waiting\)\); gave up after 0 min\./.test(error.message));
+    assert.ok(!existsSync(f.lock), 'a free lock is not the try\'s to take while anyone waits');
+    assert.deepEqual(readdirSync(join(f.root, 'locks/adb.queue')), ['000000000000001-000000-00000009.json']);
+    assert.equal(events(f).length, before);
+    assert.deepEqual(tombs(f), []);
+  } finally { f.cleanup(); }
+});
+
+test('a Queued withLock that wins the mkdir while a blocking ticket lands ahead gives the lock back by tombstone and keeps waiting (AD-6 re-check)', async () => {
+  const f = fixture();
+  try {
+    let ahead = null;
+    const seen = [];
+    const ran = [];
+    await withLock('adb', async () => { ran.push('job'); assert.ok(existsSync(f.lock)); }, {
+      env: jobEnv(f, 'android'), log: f.log, pollMs: 1, timeoutMs: 10_000, timers: fakeTimers(),
+      afterTake: () => { ahead ??= putTicket(f, '000000000000001-000000-00000009.json', { lease_id: 'jumper' }); },
+      sleep: async () => { seen.push(existsSync(f.lock)); rmSync(ahead, { force: true }); },
+    });
+    assert.deepEqual(seen, [false], 'the lock was given back while the blocker stood ahead');
+    assert.deepEqual(ran, ['job'], 'and taken again once it left');
+    assert.deepEqual(events(f).map(event => event.event), ['request', 'acquire', 'release'], 'the give-back is no event; one acquire');
+    assert.deepEqual(tombs(f), []);
+    assert.deepEqual(queueOf(f), []);
+  } finally { f.cleanup(); }
+});
+
+test('a Queued withLock whose ticket is released while it waits is cancelled, not served; an error ends its wait as one cancel', async () => {
+  const f = fixture();
+  try {
+    await lease(f, { id: 'holder' });
+    const waiting = asJob(f, 'android');
+    await settle(30);
+    const [ticket] = queueView('adb', { env: f.env });
+    assert.equal(releaseLease('adb', ticket.lease_id, { env: f.env }).cancelled, 1);
+    await assert.rejects(waiting, error => error.code === 'HUB_LEASE_CANCELLED' && /^job job:delorenj\/example#9\.1\/android was released while it waited for adb$/.test(error.message));
+    assert.deepEqual(queueOf(f), []);
+    assert.equal(owner(f).lease_id, 'holder', 'the holder was not touched');
+    assert.deepEqual(events(f).filter(event => event.claimant.job === 'android' || event.lease_id === ticket.lease_id).map(event => [event.event, event.reason, event.lease_id]), [['request', null, null], ['cancel', 'released', ticket.lease_id]], 'the release wrote the one cancel; the waiter, finding its ticket gone, wrote none');
+    // an error while waiting (the lock path is not a directory we can take) leaves one cancel
+    releaseLease('adb', 'holder', { env: f.env });
+    const failing = asJob(f, 'ios', { afterTake: () => { throw new Error('boom'); } });
+    await assert.rejects(failing, /boom/);
+    assert.deepEqual(queueOf(f), []);
+    assert.deepEqual(events(f).filter(event => event.claimant.job === 'ios').map(event => [event.event, event.reason]), [['request', null], ['cancel', 'error']]);
   } finally { f.cleanup(); }
 });

@@ -489,6 +489,32 @@ test('record leaves a newer pointer alone, and still reports the install it was 
   } finally { host.cleanup(); }
 });
 
+// Story 2.3 (AD-15): the catch-up stands in the Queue as a hub-job. It waits behind a deploy job's hold and a waiter ahead of it,
+// its timeout is coded and keeps the `host lock adb is held` prefix its own regexes read, and the Event Log records it as a
+// hub-job timeout.
+test('the catch-up queues as a hub-job: it waits its turn behind the deploy, and its idle pass is a hub-job timeout', async () => {
+  const host = linuxHost();
+  try {
+    publish(host.s3, { latest: latestDoc(), apk: apkText() });
+    host.phone.install(apkText({ version: '0.2.1', code: 3 }));
+    let release;
+    const held = withLock('adb', () => new Promise(done => { release = done; }), { env: { ...host.env, GITHUB_REPOSITORY: 'delorenj/gruvato', GITHUB_RUN_ID: '7', GITHUB_JOB: 'android' }, log: () => {} });
+    while (!release) await new Promise(done => setTimeout(done, 10));
+    await androidPass(host.ctx);
+    assert.equal(host.phone.calls(), '', 'the deploy has the S26');
+    assert.equal(host.lines(/HUB_CATCHUP_IDLE android live: a deploy is using the S26 \(adb lock\)/).length, 1);
+    const mine = [...readEvents({ env: host.env })].filter(event => event.claimant.kind === 'hub-job');
+    assert.deepEqual(mine.map(event => [event.event, event.hold_kind, event.reason]), [['request', 'job', null], ['timeout', 'job', 'deadline']]);
+    assert.match(mine[1].blocked_by, /^delorenj\/gruvato run 7/);
+    assert.deepEqual(readdirSync(join(host.env.HUB_LOCK_DIR, 'adb.queue')), [], 'the catch-up left the Queue when it gave up');
+    release();
+    await held;
+    // free again: it is taken at once, as a hub-job, and the pass goes ahead
+    await androidPass(host.ctx);
+    assert.deepEqual([...readEvents({ env: host.env })].filter(event => event.claimant.kind === 'hub-job').map(event => event.event), ['request', 'timeout', 'request', 'acquire', 'release']);
+  } finally { host.cleanup(); }
+});
+
 test('the locks are the deploy jobs\' locks: a held adb lock idles the pass, record waits for s3-<slug>', async () => {
   const host = linuxHost();
   try {

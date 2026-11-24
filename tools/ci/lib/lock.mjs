@@ -165,10 +165,16 @@ function retire(name, path, judged, { as = null, reason = null, env = process.en
   return true;
 }
 
+// A deploy job's or the catch-up's hold of a host lock. A Queued name (AD-4) joins the FIFO as a `job` or `hub-job` ticket
+// and is served in order through queueView; every other name (s3-*, s3-index, emulator-reaper) is the bare mkdir path with no
+// ticket and no event. Either way a wait that runs out throws code HUB_LOCK_TIMEOUT with a message that starts
+// `host lock <name> is held` (AD-5), so a catch-up from before this change still reads it.
+export const JOB_POLL_MS = 2000;
+
 export async function withLock(name, fn, {
   env = process.env,
   timeoutMs = 15 * 60_000,
-  pollMs = 2000,
+  pollMs = JOB_POLL_MS,
   staleMs = 4 * 3600_000,
   log = console.log,
   sleep = ms => new Promise(done => setTimeout(done, ms)),
@@ -178,30 +184,26 @@ export async function withLock(name, fn, {
   host = hostname(),
   timers = { setInterval, clearInterval },
   beforeRetire,
+  afterTake = () => {},
+  processStart: startOf = processStart,
 } = {}) {
   if (!/^[a-z0-9-]+$/.test(name)) throw new Error(`bad lock name "${name}"`);
   if (kind !== 'job' && kind !== 'hub-job') throw new Error(`bad lock holder kind "${kind}" (job or hub-job)`);
+  if (isQueued(name)) return queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf });
   const dir = lockDir(env);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${name}.lock`);
-  // owner.json keeps every key older versions read (pid, host, repo, run, started_at) and adds the AD-2 keys after them.
-  const me = { pid: process.pid, host, repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null };
-  const more = { format: OWNER_FORMAT, kind, attempt: env.GITHUB_RUN_ATTEMPT ?? null, job: env.GITHUB_JOB ?? null, host_id: hostId };
-  const seams = { env, hostId };
-  const requested = now();
-  const deadline = requested + timeoutMs;
-  note(name, eventOf('request', name, { ...me, ...more }, { deadline_at: iso(deadline) }), { ...seams, at: requested });
+  const { me, more } = jobIdentity({ env, host, hostId, kind });
+  const deadline = now() + timeoutMs;
   let waiting = false;
   let vanished = 0;
   let mine;
   for (;;) {
     try {
       mkdirSync(path);
-      // started_at is when the lock was taken, not when the wait began, so a release's held_ms is the hold alone.
-      const taken = now();
-      mine = { ...me, started_at: new Date(taken).toISOString(), ...more };
+      // started_at is when the lock was taken, not when the wait began.
+      mine = { ...me, started_at: new Date(now()).toISOString(), ...more };
       writeFileSync(join(path, 'owner.json'), JSON.stringify(mine));
-      note(name, eventOf('acquire', name, mine, { deadline_at: iso(deadline), waited_ms: Math.max(0, taken - requested) }), { ...seams, at: taken });
       break;
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
@@ -215,14 +217,23 @@ export async function withLock(name, fn, {
       if (verdict !== 'gone' && retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, hostId, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
       continue;
     }
-    const at = now();
-    if (at >= deadline) {
-      note(name, eventOf('timeout', name, { ...me, ...more }, { deadline_at: iso(deadline), waited_ms: Math.max(0, at - requested), reason: 'deadline', blocked_by: describe(owner) }), { ...seams, at });
-      throw new Error(`host lock ${name} is held by ${describe(owner)}; gave up after ${Math.round(timeoutMs / 60_000)} min. Another deploy is using the device; run again when it finishes.`);
-    }
+    if (now() >= deadline) throw failure('HUB_LOCK_TIMEOUT', `${heldText(name, owner)}; gave up after ${Math.round(timeoutMs / 60_000)} min. Another deploy is using the device; run again when it finishes.`);
     if (!waiting) { log(`HUB_LOCK_WAIT ${name} held by ${describe(owner)}`); waiting = true; }
     await sleep(pollMs);
   }
+  return runHeld(name, path, mine, fn, { env, now, log, hostId, timers });
+}
+
+// owner.json keeps every key older versions read (pid, host, repo, run, started_at) and adds the AD-2 keys after them.
+function jobIdentity({ env, host, hostId, kind }) {
+  return {
+    me: { pid: process.pid, host, repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null },
+    more: { format: OWNER_FORMAT, kind, attempt: env.GITHUB_RUN_ATTEMPT ?? null, job: env.GITHUB_JOB ?? null, host_id: hostId },
+  };
+}
+
+// Runs fn under a lock this process just took (`mine` is its owner record), then gives it back with a `release` event.
+async function runHeld(name, path, mine, fn, { env, now, log, hostId, timers }) {
   log(`HUB_LOCK ${name}`);
   // The liveness touch (AD-19): the only in-process interval, unref'd so it never keeps a process alive. It touches only
   // while owner.json is still this take, so a lock that changed hands is never touched by its old holder.
@@ -251,7 +262,7 @@ export async function withLock(name, fn, {
   } finally {
     if (timer) timers.clearInterval(timer);
     const owner = readOwner(path);
-    if (owner?.pid === me.pid && !isLease(owner)) retire(name, path, owner, { as: 'release', reason: failed ? 'error' : 'done', env, now, log, hostId });
+    if (owner?.pid === mine.pid && !isLease(owner)) retire(name, path, owner, { as: 'release', reason: failed ? 'error' : 'done', env, now, log, hostId });
   }
 }
 
@@ -419,6 +430,40 @@ export function queueView(name, { env = process.env, now = Date.now, policy = nu
 // ticket and so no place; it takes a free lock only when nothing waits).
 const blockersAhead = (view, file = null) => view.filter(entry => entry.blocking && (file === null || inOrder(entry, { file }) < 0));
 
+// The AD-5 wording of every timeout on a Queued lock: `host lock <name> is held by <holder>`, then (when a Claimant waits ahead
+// of this one) how many and who, each with its place. Callers add what the wait gave up on.
+const waiterText = entry => `${entry.place}. ${entry.holder ?? entry.lease_id}${entry.why ? ` (${entry.why})` : ''}`;
+function heldText(name, owner, blockers = [], self = null) {
+  const ahead = blockers.length;
+  const list = ahead > 0 ? `; ${ahead} waiter${ahead === 1 ? '' : 's'} ahead${self ? ` of ${self}` : ''} (${blockers.map(waiterText).join(', ')})` : '';
+  return `host lock ${name} is held by ${describe(owner)}${list}`;
+}
+
+// Writes a ticket into <name>.queue/, write-then-rename so a reader never sees half of it, and returns its file name and path.
+function writeTicket(name, body, { env, requested }) {
+  const queue = queuePath(name, env);
+  mkdirSync(queue, { recursive: true });
+  const file = `${String(requested).padStart(15, '0')}-${String(ticketCounter++).padStart(6, '0')}-${String(process.pid).padStart(8, '0')}.json`;
+  const path = join(queue, file);
+  const pending = `${path}.tmp`;
+  writeFileSync(pending, JSON.stringify(body), { flag: 'wx' });
+  renameSync(pending, path);
+  return { file, path };
+}
+
+// A process start read at most once per pid in JOB_POLL_MS: a Mac pass spawns `ps` per ticket otherwise (AD "liveness cost").
+function cachedStart(startOf, now) {
+  const seen = new Map();
+  return pid => {
+    const at = now();
+    const hit = seen.get(pid);
+    if (hit && at >= hit.at && at - hit.at < JOB_POLL_MS) return hit.start;
+    const start = startOf(pid);
+    seen.set(pid, { at, start });
+    return start;
+  };
+}
+
 // A fresh lease id, for a caller that must name its request before the first take (a Pool request).
 export const newLeaseId = () => `l-${randomBytes(6).toString('hex')}`;
 
@@ -461,6 +506,124 @@ export function poolRequest(pool, { id = newLeaseId(), holder, why, forMs = null
       }
     },
   };
+}
+
+// A Queued withLock (AD-4, AD-6): the same wait as a Lease's, for a deploy job or the catch-up. A wait writes a `job` or `hub-job`
+// ticket (identity from GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, GITHUB_JOB) and takes the lock only when nothing
+// that blocks is ahead of it; after the mkdir it reads the view again and gives the lock back by tombstone if something now is.
+// `timeoutMs` of 0 or less is a try: no ticket, no event unless it acquires. Events (AD-9) follow acquireLease's: `request` once
+// the ticket is in place, `acquire` once the ticket is claimed, and `timeout` or `cancel` once this waiter's own unlink of its
+// ticket succeeds. A wait that runs out throws HUB_LOCK_TIMEOUT, wording `host lock <name> is held ...` as before.
+async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf }) {
+  const dir = lockDir(env);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, `${name}.lock`);
+  const { me, more } = jobIdentity({ env, host, hostId, kind });
+  const asked = { ...me, ...more };
+  const seams = { env, hostId };
+  const requested = now();
+  const deadline = requested + timeoutMs;
+  const tryOnly = !(timeoutMs > 0);
+  const start = cachedStart(startOf, now);
+  let ticket = null;
+  let ticketFile = null;
+  let selfText = 'this job';
+  if (!tryOnly) {
+    const body = buildTicket(kind, { env, requested, deadline, host, hostId, processStart: startOf });
+    selfText = `${kind === 'hub-job' ? 'catch-up' : 'job'} ${body.lease_id}`;
+    ({ file: ticket, path: ticketFile } = writeTicket(name, body, { env, requested }));
+    note(name, eventOf('request', name, asked, { deadline_at: iso(deadline) }), { ...seams, at: requested });
+  }
+  let left = false;
+  const leave = (as, fields) => {
+    try { unlinkSync(ticketFile); } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+    left = true;
+    const at = now();
+    note(name, eventOf(as, name, asked, { deadline_at: iso(deadline), waited_ms: Math.max(0, at - requested), ...fields }), { ...seams, at });
+    return true;
+  };
+  const cancelled = text => failure('HUB_LEASE_CANCELLED', `${selfText} ${text} ${name}`);
+  const timedOut = (message, owner) => {
+    if (tryOnly) return failure('HUB_LOCK_TIMEOUT', message);
+    if (!leave('timeout', { reason: 'deadline', blocked_by: describe(owner) })) return cancelled('was released while it waited for');
+    return failure('HUB_LOCK_TIMEOUT', message);
+  };
+  const view = () => queueView(name, { env, prune: true, now, host, hostId, processStart: start });
+  const gaveUp = `gave up after ${Math.round(timeoutMs / 60_000)} min. Another deploy is using the device; run again when it finishes.`;
+  let waiting = false;
+  let vanished = 0;
+  let failed = true;
+  let mine = null;
+  try {
+    for (;;) {
+      if (ticketFile) { try { statSync(ticketFile); } catch { throw cancelled('was released while it waited for'); } }
+      const current = view();
+      if (ticket && !current.some(entry => entry.file === ticket)) throw cancelled('lost its place in the queue for');
+      let blockers = blockersAhead(current, ticket);
+      if (blockers.length === 0) {
+        const started = now();
+        const record = { ...me, started_at: new Date(started).toISOString(), ...more };
+        let taken = false;
+        try {
+          mkdirSync(path);
+          writeOwner(path, record);
+          taken = true;
+        } catch (error) {
+          if (error.code !== 'EEXIST') throw error;
+        }
+        if (taken) {
+          afterTake();
+          blockers = blockersAhead(view(), ticket);
+          if (blockers.length > 0) {
+            retire(name, path, record, { env, now, log, hostId, beforeRetire });
+            taken = false;
+          }
+        }
+        if (taken) {
+          if (ticketFile) {
+            try {
+              unlinkSync(ticketFile);
+            } catch (error) {
+              if (error.code !== 'ENOENT') throw error;
+              retire(name, path, record, { env, now, log, hostId });
+              throw cancelled('was released while it was being taken for');
+            }
+          }
+          left = true;
+          note(name, eventOf('acquire', name, record, { deadline_at: iso(deadline), waited_ms: Math.max(0, started - requested) }), { ...seams, at: started });
+          mine = record;
+          failed = false;
+          break;
+        }
+        if (blockers.length === 0) {
+          const owner = readOwner(path);
+          const verdict = staleness(path, owner, { now, staleMs, host, hostId });
+          if (verdict && (verdict !== 'gone' || (vanished += 1) <= VANISHED_RETRIES)) {
+            // `gone`: see withLock's bare path. Nothing is left to retire; round again.
+            if (verdict !== 'gone' && retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, hostId, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
+            continue;
+          }
+          if (now() >= deadline) throw timedOut(`${heldText(name, owner)}; ${gaveUp}`, owner);
+          if (!waiting) { log(`HUB_LOCK_WAIT ${name} held by ${describe(owner)}`); waiting = true; }
+        }
+      }
+      if (blockers.length > 0) {
+        const owner = readOwner(path);
+        if (now() >= deadline) throw timedOut(`${heldText(name, owner, blockers, selfText)}; ${gaveUp}`, owner);
+        if (!waiting) { log(`HUB_LOCK_WAIT ${name} queued behind ${blockers.length} (${describe(owner)})`); waiting = true; }
+      }
+      await sleep(pollMs);
+    }
+  } finally {
+    // Anything else that ends the wait (an error) leaves the queue as a cancel.
+    if (ticketFile) {
+      if (failed && !left) {
+        try { leave('cancel', { reason: 'error' }); } catch { /* the rmSync below still clears it */ }
+      }
+      rmSync(ticketFile, { force: true });
+    }
+  }
+  return runHeld(name, path, mine, fn, { env, now, log, hostId, timers });
 }
 
 // Takes the lock as a lease and returns the record. Waiters are served first in, first out, through queueView: a waiter
@@ -515,13 +678,7 @@ export async function acquireLease(name, {
   let ticket = null;
   let ticketFile = null;
   if (!tryOnly) {
-    const queue = queuePath(name, env);
-    mkdirSync(queue, { recursive: true });
-    ticket = `${String(requested).padStart(15, '0')}-${String(ticketCounter++).padStart(6, '0')}-${String(process.pid).padStart(8, '0')}.json`;
-    ticketFile = join(queue, ticket);
-    const pending = `${ticketFile}.tmp`;
-    writeFileSync(pending, JSON.stringify(buildTicket('lease', { env, requested, deadline, lease_id, holder, why, host, hostId, processStart: startOf })), { flag: 'wx' });
-    renameSync(pending, ticketFile);
+    ({ file: ticket, path: ticketFile } = writeTicket(name, buildTicket('lease', { env, requested, deadline, lease_id, holder, why, host, hostId, processStart: startOf }), { env, requested }));
   }
   const attempt = env.GITHUB_RUN_ATTEMPT ?? null;
   const job = env.GITHUB_JOB ?? null;
@@ -609,13 +766,13 @@ export async function acquireLease(name, {
             if (verdict !== 'gone' && retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, hostId, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
             continue;
           }
-          if (now() >= deadline) throw timedOut(`host lock ${name} is held by ${describe(owner)}; gave up after ${Math.round(waitMs / 1000)}s`, owner);
+          if (now() >= deadline) throw timedOut(`${heldText(name, owner)}; gave up after ${Math.round(waitMs / 1000)}s`, owner);
           if (!waiting) { log(`HUB_LOCK_WAIT ${name} held by ${describe(owner)}`); waiting = true; }
         }
       }
       if (blockers.length > 0) {
         const ahead = blockers.length;
-        if (now() >= deadline) { const owner = readOwner(path); throw timedOut(`host lock ${name} has ${ahead} waiter${ahead === 1 ? '' : 's'} ahead of lease ${lease_id} (held by ${describe(owner)}); gave up after ${Math.round(waitMs / 1000)}s`, owner); }
+        if (now() >= deadline) { const owner = readOwner(path); throw timedOut(`${heldText(name, owner, blockers, `lease ${lease_id}`)}; gave up after ${Math.round(waitMs / 1000)}s`, owner); }
         if (!waiting) { log(`HUB_LOCK_WAIT ${name} queued behind ${ahead} (${describe(readOwner(path))})`); waiting = true; }
       }
       await pause(pollMs, { signal, sleep });
