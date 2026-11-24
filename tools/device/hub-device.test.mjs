@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createAdb, findPhone } from '../ci/lib/adb.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
-import { acquireLease, releaseLease, withLock } from '../ci/lib/lock.mjs';
+import { acquireLease, releaseLease, reserve, withLock } from '../ci/lib/lock.mjs';
 import { readEvents } from '../ci/lib/events.mjs';
 import { runAdb } from './async-adb.mjs';
 import { inventory } from './inventory.mjs';
@@ -881,6 +881,31 @@ test('the inventory marks the hub\'s own adb server managed and everything else 
     assert.deepEqual(found.xvfb.map(({ display, pid, managed }) => [display, pid, managed]), [[':100', 300, false], [':101', 2400, true]]);
     assert.deepEqual(inventory({ procRoot: join(root, 'nothing-here'), lockRoot: root }), { adb_servers: [], emulators: [], xvfb: [] });
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// Story 2.5 (AD-17): a run's Reservation holds a place but is no waiter. Status prints and returns the waiters it always did,
+// numbered as before, and a read-only status never starts a Reservation's grace on a free lock (Story 4.3 adds the section).
+test('status leaves Reservations out of the waiters, keeps their numbering, and creates nothing for a free lock with a head Reservation', async () => {
+  const f = fixture();
+  try {
+    const runEnv = { ...f.env, GITHUB_REPOSITORY: 'delorenj/example', GITHUB_RUN_ID: '5', GITHUB_RUN_ATTEMPT: '1', GITHUB_JOB: 'gate' };
+    reserve('adb', { env: runEnv, log: () => {} });
+    const tree = dir => readdirSync(dir, { recursive: true }).sort();
+    const before = tree(join(f.root, 'locks'));
+    const free = JSON.parse((await f.run(['status', '--json'])).out.join('\n'));
+    assert.deepEqual(free.waiters, [], 'a Reservation is not a waiter');
+    assert.deepEqual(free.locks, [], 'nor a lock');
+    assert.deepEqual(tree(join(f.root, 'locks')), before, 'status started no grace and wrote nothing');
+    assert.match((await f.run(['status'])).out.join('\n'), /WAITERS[^\n]*\n  none/);
+    // a waiter behind it is still #1
+    const waiting = acquireLease('adb', { holder: 'agent-b', why: 'next in line', forMs: 600_000, id: 'next', waitMs: 10_000, env: f.env, log: () => {}, pollMs: 5 });
+    await settle(40);
+    const json = JSON.parse((await f.run(['status', '--json'])).out.join('\n'));
+    assert.deepEqual(json.waiters.map(waiter => [waiter.device, waiter.position, waiter.lease_id, waiter.holder]), [['s26', 1, 'next', 'agent-b']]);
+    assert.match((await f.run(['status'])).out.join('\n'), /s26 #1  next  holder=agent-b/);
+    releaseLease('adb', 'next', { env: f.env });
+    await assert.rejects(waiting, error => error.code === 'HUB_LEASE_CANCELLED' || error.code === 'HUB_LOCK_TIMEOUT');
+  } finally { f.cleanup(); }
 });
 
 test('status lists leases, waiters and the marked inventory, changes nothing and never calls adb', async () => {

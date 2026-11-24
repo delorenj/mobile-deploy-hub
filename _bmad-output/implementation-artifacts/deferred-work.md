@@ -30,3 +30,12 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-4-wait-deadlines-that-beat-githubs-timeout.md`
   summary: `deliver-android` and `deliver-ios` (timeout 45) wait on the internal `s3-<slug>` lock (`deliver.mjs:249`, 30 min) and have no `hold_allowance_min` entry, so their waits are not cut at a job deadline.
   evidence: The story names plan, android and ios only (AD-12), and an `s3-*` name is the bare path with no Queue (AD-4), so the deadline never applied there; a 30 min wait inside a 45 min job leaves 15 min, so it ends first. Add `deliver-*` to the queue block (and `HUB_JOB_TIMEOUT_MINUTES` to the workflow) only if a deliver wait ever lengthens.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-5-reservations-keep-a-runs-place.md`
+  summary: Nothing ends a Reservation yet: until Story 2.6 a run's Reservation lives to its 180 min ceiling, and `hub-device status` neither lists it nor shows its grace.
+  evidence: Story 2.5 only creates, reuses, prunes at expiry and honours Reservations (AD-7); the release rules, `announce`, the Mac's `reservation release` verb and the status Reservations section are Stories 2.6 and 4.3. Nothing is released before 2.8 (AD-20), so no hub runs with a Reservation that cannot end.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-5-reservations-keep-a-runs-place.md`
+  summary: A Lease taken inside a run (a `hub-device lease` from a job with the runner's `GITHUB_*` variables) gets no same-run passthrough: it waits behind the run's own Reservation like any Claimant. Only Job Holds (`withLock`) are served at the Reservation's place.
+  evidence: AD-7 and the Story 2.5 AC name Job Hold requests; no deploy job takes a Lease. Revisit if a job ever leases `adb` or `mac-ios` through `hub-device`.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-5-reservations-keep-a-runs-place.md`
+  summary: A job ticket and a Reservation with the same millisecond sort ticket first (a digit sorts before `r` in `<ms15>-reservation-<key>`), and a pinned hub orders only tickets, so a Claimant that asks in the very millisecond a Reservation is made can stand ahead of it.
+  evidence: AD-6 breaks ties on the full name string; the tie is a one-in-a-million coincidence for a human-paced queue and harmless (the ticket really did ask first). Not worth a rule.

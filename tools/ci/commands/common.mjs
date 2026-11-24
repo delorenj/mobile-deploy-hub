@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { freeGiB } from '../lib/apple.mjs';
 import { createGit } from '../lib/git.mjs';
 import { compareSemver } from '../lib/latest.mjs';
+import { reserve } from '../lib/lock.mjs';
 import { macLink, macProbeOver, runnerStatusOver, tailscaleStatus } from '../lib/metered.mjs';
 import { loadPolicy, testflightPolicyOf } from '../lib/policy.mjs';
 import { buildReceipt, writeReceipt } from '../lib/receipt.mjs';
@@ -33,6 +34,17 @@ export function policyBanner(log = console.log, file = undefined) {
 // which is what its hooks did before the block existed. Read from the policy at the pinned tag, never from an input.
 export function testflightHookEnv(policy, env) {
   return { HUB_TESTFLIGHT_GROUPS: testflightPolicyOf(policy.apps[env.GITHUB_REPOSITORY ?? '']).groups.join(',') };
+}
+
+// A run reserves a device when it starts (FR-9, AD-7): the gate takes `adb`, preflight-ios takes `mac-ios` on the Mac. A Reservation
+// only keeps the run's place in line, so a failure to make one is logged and never fails the job (`reserver` is the test seam).
+export function reserveFor(name, { reserver = reserve, env = process.env, log = console.log } = {}) {
+  try {
+    return reserver(name, { env, log });
+  } catch (error) {
+    log(`HUB_RESERVATION_FAILED ${name} ${firstLine(error?.message)}; the run goes on without a reserved place`);
+    return null;
+  }
 }
 
 // A lane writes its receipt on failure too: the stage it reached and a one-line reason, for announce.

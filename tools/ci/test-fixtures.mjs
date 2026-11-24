@@ -28,7 +28,11 @@ export const device = (name, model, status, extra = {}) => ({ name, model, statu
 // ~/.local/state. hermetic() points it at a per-process temp dir, so a test that spreads process.env (or a child that
 // inherits it) never writes host history. A test that builds its env from scratch still passes its own HUB_EVENT_DIR.
 const jobVariable = name => /^(GITHUB_|RUNNER_|ACTIONS_|HUB_)/.test(name) || name === 'CI' || name === 'GH_TOKEN';
+//
+// The lock directory is scratched the same way: a gate or preflight-ios under test reserves a device (Story 2.5), and a lane
+// that forgot its own HUB_LOCK_DIR must never write ~/.cache/mobile-deploy-hub/locks.
 let eventScratch = null;
+let lockScratch = null;
 export function hermetic() {
   for (const name of Object.keys(process.env)) if (jobVariable(name)) delete process.env[name];
   if (!eventScratch) {
@@ -36,6 +40,11 @@ export function hermetic() {
     process.on('exit', () => { try { rmSync(eventScratch, { recursive: true, force: true }); } catch { /* temp */ } });
   }
   process.env.HUB_EVENT_DIR = eventScratch;
+  if (!lockScratch) {
+    lockScratch = mkdtempSync(join(tmpdir(), 'hub-test-locks-'));
+    process.on('exit', () => { try { rmSync(lockScratch, { recursive: true, force: true }); } catch { /* temp */ } });
+  }
+  process.env.HUB_LOCK_DIR = lockScratch;
   globalThis.fetch = async input => { throw new Error(`a test reached the network (${typeof input === 'string' ? input : input?.url ?? String(input)}); inject fetchImpl instead`); };
 }
 

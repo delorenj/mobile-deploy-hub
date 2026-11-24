@@ -14,6 +14,8 @@ import { parseConfig } from './lib/config.mjs';
 import { loadPolicy, parsePolicy, policyFile, tagOf, tagOnlyOf } from './lib/policy.mjs';
 import * as hub from './hub.mjs';
 import { hermetic, sampleLatest } from './test-fixtures.mjs';
+import { listReservations } from './lib/lock.mjs';
+import { readEvents } from './lib/events.mjs';
 import { gate } from './hub.mjs';
 
 hermetic(); // offline and outside any workflow job, on every host (test-fixtures.mjs)
@@ -168,6 +170,39 @@ test('the gate passes a well-formed run and reads the state of things: metered M
     assert.equal(f.outputs().ios_lane, 'run');
     const receipt = JSON.parse(readFileSync(join(f.root, 'out/gate/hub-receipt-gate.json'), 'utf8'));
     assert.equal(receipt.policy, loadPolicy().sha256, 'every receipt records the full policy digest');
+  } finally { await f.cleanup(); }
+});
+
+// Story 2.5 (FR-9, AD-7): the gate reserves the S26 for a run that will install to it, and nothing on `adb` for an iOS-only run.
+test('the gate reserves adb for a run with an Android lane (one claim, reused by a rerun), and an iOS-only run reserves nothing on adb', async () => {
+  const f = await gateFixture();
+  try {
+    await gate(f.configure(), f.deps());
+    assert.deepEqual(listReservations('adb', { env: f.env }).map(entry => [entry.key, entry.repo, entry.run, entry.live]), [['delorenj--tower-of-lost-things--555', 'delorenj/tower-of-lost-things', '555', true]]);
+    assert.ok(f.logs.some(line => /^HUB_RESERVATION adb delorenj--tower-of-lost-things--555 until /.test(line)), f.logs.join('\n'));
+    assert.deepEqual(listReservations('mac-ios', { env: f.env }), [], 'the gate reserves the S26 only: the Mac\'s is preflight-ios\'s');
+    await gate(f.configure(), f.deps());
+    assert.ok(f.logs.some(line => /^HUB_RESERVATION_REUSED adb /.test(line)), 'a rerun reuses it');
+    assert.deepEqual([...readEvents({ env: f.env })].map(event => event.event), ['claim']);
+  } finally { await f.cleanup(); }
+  const iosOnly = await gateFixture();
+  try {
+    const result = await gate(iosOnly.configure(['--platform', 'ios']), iosOnly.deps());
+    assert.equal(result.ios_lane, 'run');
+    assert.equal(existsSync(join(iosOnly.root, 'locks/adb.reservations')), false, 'nothing was reserved on adb');
+    assert.deepEqual([...readEvents({ env: iosOnly.env })], []);
+  } finally { await iosOnly.cleanup(); }
+});
+
+test('a Reservation that cannot be made never fails the gate: it logs HUB_RESERVATION_FAILED and goes on', async () => {
+  const f = await gateFixture();
+  try {
+    const asked = [];
+    const result = await gate(f.configure(), f.deps({ reserver: (name, options) => { asked.push([name, options.env.GITHUB_RUN_ID]); throw new Error('the lock directory is read only\nsecond line'); } }));
+    assert.equal(result.ios_lane, 'run');
+    assert.deepEqual(asked, [['adb', '555']]);
+    assert.ok(f.logs.some(line => line === 'HUB_RESERVATION_FAILED adb the lock directory is read only; the run goes on without a reserved place'), f.logs.join('\n'));
+    assert.ok(f.logs.some(line => /^HUB_GATE ok /.test(line)));
   } finally { await f.cleanup(); }
 });
 

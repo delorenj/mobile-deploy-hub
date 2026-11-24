@@ -281,11 +281,15 @@ export function parsePolicy(source) {
 // The Queue's tuning (AD-11), one strict block that each Queue story grows by its own keys and no others. Story 2.4 adds the wait
 // deadline's two inputs: the margin that keeps a waiting job's own report ahead of GitHub's `timeout-minutes` kill, and the
 // minutes each job that waits for a device still needs once it has the device (ios takes `mac-ios` up to twice). Every value is
-// a positive whole number of minutes; the allowance names exactly the jobs that wait (plan, android, ios).
+// a positive whole number of minutes; the allowance names exactly the jobs that wait (plan, android, ios). Story 2.5 adds the
+// Reservation's one-time grace (a head Reservation holds the idle device that long) and its ceiling (how long a run's place lasts
+// at most); a Reservation record stamps both, so readers never apply their own.
 export const queueJobs = Object.freeze(['plan', 'android', 'ios']);
 function queueBlock(queue) {
-  exact('queue', queue, ['wait_margin_min', 'hold_allowance_min']);
+  exact('queue', queue, ['wait_margin_min', 'hold_allowance_min', 'grace_min', 'reservation_ceiling_min']);
   positive('queue.wait_margin_min', queue.wait_margin_min);
+  positive('queue.grace_min', queue.grace_min);
+  positive('queue.reservation_ceiling_min', queue.reservation_ceiling_min);
   exact('queue.hold_allowance_min', queue.hold_allowance_min, queueJobs);
   for (const job of queueJobs) positive(`queue.hold_allowance_min.${job}`, queue.hold_allowance_min[job]);
 }

@@ -520,7 +520,9 @@ async function status(parsed, context) {
   });
   const waiters = [];
   for (const name of new Set([...fleet.map(phone => phone.lock), GATE, ...locks.map(entry => entry.lock)])) {
-    queueView(name, { env, includeStale: true }).forEach(waiter => waiters.push({ lock: name, device: nameOf(fleet, name), position: waiter.place, lease_id: waiter.lease_id, holder: waiter.holder, why: waiter.why, since: waiter.enqueued_at, stale: waiter.stale }));
+    // A run's Reservation holds a place but is no waiter: status lists tickets only, numbered as before (Story 4.3 adds the
+    // Reservations section).
+    queueView(name, { env, includeStale: true }).filter(waiter => waiter.kind !== 'reservation').forEach((waiter, index) => waiters.push({ lock: name, device: nameOf(fleet, name), position: index + 1, lease_id: waiter.lease_id, holder: waiter.holder, why: waiter.why, since: waiter.enqueued_at, stale: waiter.stale }));
   }
   const found = (context.inventory ?? inventory)({ lockRoot: lockDir(env), hubAdbPort: Number(env.HUB_ADB_SERVER_PORT) || 5037 });
   const reach = await phonePresence(fleet, context, found);

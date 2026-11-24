@@ -157,7 +157,7 @@ test('a testflight block is parsed strictly: groups are plain unique names, the 
 
 test('the queue block is strict: the margin and one allowance per waiting job, nothing else, every value a whole number of minutes', () => {
   const base = JSON.parse(source);
-  assert.deepEqual(base.queue, { wait_margin_min: 2, hold_allowance_min: { plan: 5, android: 15, ios: 60 } });
+  assert.deepEqual(base.queue, { wait_margin_min: 2, hold_allowance_min: { plan: 5, android: 15, ios: 60 }, grace_min: 10, reservation_ceiling_min: 180 });
   assert.deepEqual(loadPolicy().policy.queue, base.queue);
   assert.deepEqual([...queueJobs], ['plan', 'android', 'ios']);
   const bad = {
@@ -178,6 +178,14 @@ test('the queue block is strict: the margin and one allowance per waiting job, n
     'a negative allowance': p => { p.queue.hold_allowance_min.android = -5; },
     'a fractional allowance': p => { p.queue.hold_allowance_min.plan = 4.5; },
     'an allowance as text': p => { p.queue.hold_allowance_min.plan = '5'; },
+    'no grace (Story 2.5)': p => { delete p.queue.grace_min; },
+    'grace zero': p => { p.queue.grace_min = 0; },
+    'grace fractional': p => { p.queue.grace_min = 2.5; },
+    'grace as text': p => { p.queue.grace_min = '10'; },
+    'no reservation ceiling (Story 2.5)': p => { delete p.queue.reservation_ceiling_min; },
+    'a reservation ceiling of zero': p => { p.queue.reservation_ceiling_min = 0; },
+    'a negative reservation ceiling': p => { p.queue.reservation_ceiling_min = -180; },
+    'a reservation ceiling as text': p => { p.queue.reservation_ceiling_min = '180'; },
   };
   for (const [name, change] of Object.entries(bad)) {
     const copy = structuredClone(base);
@@ -187,5 +195,7 @@ test('the queue block is strict: the margin and one allowance per waiting job, n
   const copy = structuredClone(base);
   copy.queue.wait_margin_min = 3;
   copy.queue.hold_allowance_min.ios = 90;
+  copy.queue.grace_min = 5;
+  copy.queue.reservation_ceiling_min = 240;
   assert.doesNotThrow(() => parsePolicy(JSON.stringify(copy)), 'a tuning change is a valid release, not a parse error');
 });

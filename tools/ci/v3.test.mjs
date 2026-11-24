@@ -19,6 +19,8 @@ import { bbEmitPath, correlationFor, deploymentEvent, emitArgs, sanitizeReason, 
 import { loadDevices, parseDevices } from './lib/devices.mjs';
 import { parseManifest } from './lib/manifest.mjs';
 import { android, announce, plan, play, preflightIos, release } from './hub.mjs';
+import { listReservations } from './lib/lock.mjs';
+import { readEvents } from './lib/events.mjs';
 import { checkPhone, lanesFrom, parseArguments, phone } from '../deploy.mjs';
 
 hermetic(); // offline and outside any workflow job, on every host (test-fixtures.mjs)
@@ -649,6 +651,26 @@ test('the Mac preflight has no checkout: it needs the bundle id from the gate', 
   const f = await gitFixture();
   try {
     await assert.rejects(preflightIos({ ...parseConfig(['preflight-ios', '--out', f.out], f.env), cwd: f.app }, { env: f.env, log: () => {} }), /needs the bundle id from the gate/);
+  } finally { await f.cleanup(); }
+});
+
+// Story 2.5 (FR-9, AD-7): preflight-ios runs only when the iPad lane is in scope, and reserves mac-ios on the Mac's own disk
+// first. xcodebuild is a stub that fails, so the run stops right after the Reservation on every host.
+test('preflight-ios reserves mac-ios before its checks, and a Reservation that cannot be made does not fail it', async () => {
+  const f = await gitFixture();
+  try {
+    const bin = join(f.root, 'bin');
+    await mkdir(bin);
+    await writeFile(join(bin, 'xcodebuild'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    const env = { ...f.env, PATH: bin, HOME: f.root, GITHUB_REPOSITORY: 'delorenj/example', GITHUB_RUN_ID: '77', HUB_LOCK_DIR: join(f.root, 'locks'), HUB_EVENT_DIR: join(f.root, 'events') };
+    const config = () => ({ ...parseConfig(['preflight-ios', '--out', f.out, '--bundle', 'io.example.app'], env), cwd: f.app });
+    await assert.rejects(preflightIos(config(), { env, home: f.root, log: () => {} }), /xcodebuild|disk|GiB|free/i);
+    assert.deepEqual(listReservations('mac-ios', { env }).map(entry => [entry.key, entry.live]), [['delorenj--example--77', true]]);
+    assert.deepEqual(listReservations('adb', { env }), [], 'only the Mac\'s lock');
+    assert.deepEqual([...readEvents({ env })].map(event => [event.event, event.lock]), [['claim', 'mac-ios']]);
+    const logs = [];
+    await assert.rejects(preflightIos(config(), { env, home: f.root, log: line => logs.push(line), reserver: () => { throw new Error('read only'); } }), /xcodebuild|disk|GiB|free/i);
+    assert.ok(logs.includes('HUB_RESERVATION_FAILED mac-ios read only; the run goes on without a reserved place'), logs.join('\n'));
   } finally { await f.cleanup(); }
 });
 

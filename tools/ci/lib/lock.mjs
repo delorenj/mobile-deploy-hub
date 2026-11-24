@@ -7,11 +7,14 @@
 // process that took it, until release or `expires_at`. It lives in the same directory under the same name (`adb` is the
 // S26), so withLock callers and leases exclude each other both ways. Waiters for a lease queue FIFO in `<name>.queue/`.
 //
+// A deploy run also reserves its devices (AD-7): `<name>.reservations/<owner>--<repo>--<run>/`, a sibling path no older version
+// reads, listed in the queue view at the run's start time so a build never loses its place while it compiles.
+//
 // Removal is exactly once (AD-9): a release or reclaim renames `<name>.lock` to a tomb, and only the process whose rename
 // succeeded deletes it and records the event in the Event Log (events.mjs). This module is the only caller of appendEvent.
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { join } from 'node:path';
 import { appendEvent, hostId as machineId } from './events.mjs';
@@ -405,34 +408,242 @@ export function listWaiters(name, { env = process.env, prune = false, now = Date
   return waiters;
 }
 
+// ---- Reservations (AD-7) ----
+//
+// A run reserves a device when it starts: the gate takes `adb` (when the S26 is in scope), `preflight-ios` takes `mac-ios` on the
+// Mac. A Reservation is a directory, never `<name>.lock/owner.json` (AD-2), so an older pinned version's bare `mkdir` of the lock
+// sees nothing and listLocks never lists it:
+//   <name>.reservations/<owner>--<repo>--<run>/reservation.json   {format, run_key, repo, run, reserved_at, expires_at, grace_ms}
+//   <name>.reservations/<owner>--<repo>--<run>/grace.json         {format, grace_started_at}, created once
+// Both are created once with `wx`, and their times are absolute: readers use the record and never their own policy (AD-11).
+// Liveness is `now < expires_at` and nothing else (no pid or hostname). A released or expired Reservation is renamed to
+// `.released-<key>-<ms>` and then deleted by the process whose rename won (AD-9); a late grace stamp then fails with ENOENT.
+export const RESERVATION_FORMAT = 1;
+export const RESERVABLE = Object.freeze(['adb', 'mac-ios']);
+const reservationsPath = (name, env) => join(lockDir(env), `${leaseName(name)}.reservations`);
+const RESERVATION_ABSENT_MS = 60_000;
+
+// `<owner>--<repo>--<run>` from the runner's GITHUB_REPOSITORY and GITHUB_RUN_ID, or null when this is not a run (a person at a
+// shell reserves nothing). Only characters GitHub allows in a name, so the key is one safe path segment and never starts with `.`.
+export function runKey(env = process.env) {
+  const parts = String(env.GITHUB_REPOSITORY ?? '').split('/');
+  const run = String(env.GITHUB_RUN_ID ?? '');
+  if (parts.length !== 2 || !/^[A-Za-z0-9][A-Za-z0-9-]*$/.test(parts[0]) || !/^[A-Za-z0-9._-]+$/.test(parts[1]) || !/^\d{1,20}$/.test(run)) return null;
+  return `${parts[0]}--${parts[1]}--${run}`;
+}
+
+const readJsonObject = path => {
+  try {
+    const value = JSON.parse(readFileSync(path, 'utf8'));
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  } catch { return null; }
+};
+
+// One Reservation directory as { key, record, reserved_ms, expires_ms, grace_started_ms }, or null when it holds no readable
+// reservation.json (a record being written, or junk). grace_started_ms is null until grace.json exists; a grace.json that does
+// not parse yet (being written) counts from its file time.
+function readReservation(dir, key) {
+  const record = readJsonObject(join(dir, 'reservation.json'));
+  const reserved = Date.parse(record?.reserved_at);
+  const expires = Date.parse(record?.expires_at);
+  if (!record || typeof record.repo !== 'string' || record.run === undefined || record.run === null || !Number.isFinite(reserved) || !Number.isFinite(expires) || !Number.isFinite(record.grace_ms) || record.grace_ms < 0) return null;
+  let graceAt = null;
+  try {
+    const mtime = statSync(join(dir, 'grace.json')).mtimeMs;
+    const stamped = Date.parse(readJsonObject(join(dir, 'grace.json'))?.grace_started_at);
+    graceAt = Number.isFinite(stamped) ? stamped : mtime;
+  } catch { /* no grace yet */ }
+  return { key, record, reserved_ms: reserved, expires_ms: expires, grace_started_ms: graceAt };
+}
+
+// Every readable Reservation of a name, in line order (reserved_at, then the key), expired ones included.
+function readReservations(name, env) {
+  const base = reservationsPath(name, env);
+  let keys = [];
+  try { keys = readdirSync(base).filter(entry => !entry.startsWith('.')).sort(); } catch { return []; }
+  return keys.map(key => readReservation(join(base, key), key)).filter(Boolean).sort((a, b) => a.reserved_ms - b.reserved_ms || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+}
+
+const askingKey = (repo, run) => `${repo}\u0000${run}`;
+
+// Where a run stands: its live Reservation on this name, or null. The place a Job Hold's ticket takes (AD-6).
+function ownReservation(name, env, now) {
+  const key = runKey(env);
+  if (key === null || !isQueued(name) || !RESERVABLE.includes(name)) return null;
+  const found = readReservation(join(reservationsPath(name, env), key), key);
+  return found && now() < found.expires_ms ? found : null;
+}
+
+// The AD-9 event fields every Reservation event carries: what was reserved and until when, so one event is a whole account.
+const reservationFields = (found, extra = {}) => ({
+  hold_kind: 'reservation', run_key: found.record.run_key ?? found.key, reserved_at: iso(found.reserved_ms), expires_at: iso(found.expires_ms), grace_ms: found.record.grace_ms,
+  grace_started_at: iso(found.grace_started_ms), ...extra,
+});
+const reservationSubject = (record, env = null) => ({ kind: 'job', repo: record.repo, run: String(record.run), attempt: env?.GITHUB_RUN_ATTEMPT ?? null, job: env?.GITHUB_JOB ?? null });
+
+let lastReleased = 0;
+
+// Retires a Reservation: renames its directory to `.released-<key>-<ms>` (inside the reservations directory, so the key can be
+// reserved again at once and nothing ever lists it), and only the process whose rename won reads on: it puts the directory back
+// when it moved a different Reservation than the one it judged (a rerun reserved again in between), deletes it, and appends
+// `as` (`expiry` here, a release in Story 2.6) when the name is Queued and an event is wanted. True for the winner; every
+// failure is a false, never a throw, because this runs inside readers. `afterRename` is a test seam, called with the new path.
+function retireReservation(name, found, { as = null, reason = null, env = process.env, now = Date.now, hostId, afterRename = () => {} } = {}) {
+  const base = reservationsPath(name, env);
+  const at = now();
+  lastReleased = Math.max(Number.isFinite(at) ? Math.trunc(at) : 0, lastReleased + 1);
+  const moved = join(base, `.released-${found.key}-${lastReleased}`);
+  try {
+    renameSync(join(base, found.key), moved);
+  } catch { return false; }
+  const taken = readReservation(moved, found.key);
+  if (found.record && taken?.record?.reserved_at !== found.record.reserved_at) {
+    try { renameSync(moved, join(base, found.key)); } catch { try { rmSync(moved, { recursive: true }); } catch { /* never blocks the key */ } }
+    return false;
+  }
+  afterRename(moved);
+  try { rmSync(moved, { recursive: true }); } catch { /* a released directory never blocks the key */ }
+  if (as && found.record) note(name, eventOf(as, name, reservationSubject(found.record), reservationFields(found, { held_ms: Math.max(0, at - found.reserved_ms), reason })), { env, at, hostId });
+  return true;
+}
+
+// Takes a Reservation of `name` for this run, once: `wx` creates reservation.json and only that create appends `claim`. A live
+// Reservation of the same run (a rerun) is reused and writes nothing. Returns { status: 'claimed' | 'reused' | 'skipped', key,
+// reservation } (skipped when this is not a run). The policy's queue block gives the grace and the ceiling; tests inject it.
+export function reserve(name, { env = process.env, now = Date.now, policy = null, hostId = machineId(), log = console.log, wait = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms) } = {}) {
+  if (!RESERVABLE.includes(name)) throw new Error(`bad reservation name "${name}" (${RESERVABLE.join(' or ')})`);
+  const key = runKey(env);
+  if (key === null) return { status: 'skipped', key: null, reservation: null };
+  const queue = (policy ?? loadPolicy().policy).queue;
+  const base = reservationsPath(name, env);
+  const dir = join(base, key);
+  for (let round = 0; round < 8; round += 1) {
+    mkdirSync(dir, { recursive: true });
+    const at = now();
+    const record = { format: RESERVATION_FORMAT, run_key: key, repo: env.GITHUB_REPOSITORY, run: String(env.GITHUB_RUN_ID), reserved_at: iso(at), expires_at: iso(at + queue.reservation_ceiling_min * 60_000), grace_ms: queue.grace_min * 60_000 };
+    try {
+      writeFileSync(join(dir, 'reservation.json'), JSON.stringify(record), { flag: 'wx' });
+    } catch (error) {
+      // ENOENT: the directory was renamed away between the mkdir and the write; go round and make it again.
+      if (error.code === 'ENOENT') continue;
+      if (error.code !== 'EEXIST') throw error;
+      const found = readReservation(dir, key);
+      if (found && now() < found.expires_ms) {
+        log(`HUB_RESERVATION_REUSED ${name} ${key} until ${iso(found.expires_ms)}`);
+        return { status: 'reused', key, reservation: found.record };
+      }
+      if (found) { retireReservation(name, found, { as: 'expiry', reason: 'ceiling', env, now, hostId }); continue; }
+      // No readable record: another process is writing it right now, or an earlier one died mid-write. Give it a moment, then
+      // set a record that never became readable aside.
+      let age = 0;
+      try { age = now() - statSync(join(dir, 'reservation.json')).mtimeMs; } catch { /* gone: round again */ }
+      if (age > RESERVATION_ABSENT_MS) retireReservation(name, { key, record: null }, { env, now, hostId }); else wait(25);
+      continue;
+    }
+    const found = readReservation(dir, key);
+    log(`HUB_RESERVATION ${name} ${key} until ${record.expires_at}`);
+    if (found) note(name, eventOf('claim', name, reservationSubject(record, env), reservationFields(found)), { env, at, hostId });
+    return { status: 'claimed', key, reservation: record };
+  }
+  throw new Error(`could not reserve ${name} for ${key}: its reservation record never became readable`);
+}
+
+// Every Reservation of a name as a plain record, in line order: the record's own keys plus key, live, grace_started_at and
+// grace_ends_at (null until its grace starts). Read only; expired ones are listed with live false.
+export function listReservations(name, { env = process.env, now = Date.now } = {}) {
+  const at = now();
+  return readReservations(name, env).map(found => ({
+    ...found.record, key: found.key, live: at < found.expires_ms,
+    grace_started_at: iso(found.grace_started_ms), grace_ends_at: found.grace_started_ms === null ? null : iso(found.grace_started_ms + found.record.grace_ms),
+  }));
+}
+
+// One Reservation as a queueView entry (AD-6). Its place in line is its `reserved_at`, written as a ticket's 15-digit millisecond
+// prefix so entries sort by one key: at equal milliseconds a ticket comes first, then the key breaks ties. `grace` says where its
+// one-time grace stands (pending: not started; running; over), computed from the record and never written here.
+function reservationEntry(found, at) {
+  const ends = found.grace_started_ms === null ? null : found.grace_started_ms + found.record.grace_ms;
+  return {
+    ...found.record, kind: 'reservation', file: `${String(found.reserved_ms).padStart(15, '0')}-reservation-${found.key}`, key: found.key,
+    run_key: found.record.run_key ?? found.key, holder: `${found.record.repo}#${found.record.run}`, why: 'reservation', lease_id: null,
+    enqueued_at: found.record.reserved_at, stale: at >= found.expires_ms, blocking: false,
+    grace: { state: ends === null ? 'pending' : at < ends ? 'running' : 'over', started_at: iso(found.grace_started_ms), ends_at: iso(ends) },
+  };
+}
+
+// The Reservation entries of a view. Past expires_at a Reservation is stale: an acquirer's prune retires it (the winner appends
+// `expiry`), and an observer sees it only with includeStale. A Reservation whose run has a live ticket is hidden (`asking`): that
+// ticket stands at its place. Only the first Reservation in line blocks, and only until its grace is over.
+function reservationEntries(name, { env, now, prune, hostId, asking, includeStale, afterRename }) {
+  const at = now();
+  const entries = [];
+  for (const found of readReservations(name, env)) {
+    if (at >= found.expires_ms) {
+      if (prune) retireReservation(name, found, { as: 'expiry', reason: 'ceiling', env, now, hostId, afterRename });
+      else if (includeStale) entries.push(reservationEntry(found, at));
+      continue;
+    }
+    if (asking.has(askingKey(found.record.repo, String(found.record.run)))) continue;
+    entries.push(reservationEntry(found, at));
+  }
+  const head = entries.find(entry => !entry.stale);
+  if (head && head.grace.state !== 'over') head.blocking = true;
+  return entries;
+}
+
+// A free lock with an unasking Reservation first in line starts that Reservation's one-time grace (AD-7): the first acquirer or
+// try that sees it creates grace.json with `wx` and appends `grace`; the others wait until grace_started_at + grace_ms. Only a view
+// with a blocking head Reservation whose grace has not started, and only while the lock does not exist, does anything (a try of
+// the head's own run, `own`, is that run asking, so it starts nothing). ENOENT (the
+// Reservation was released in between) and EEXIST (another observer won) write nothing. Never throws.
+function startGrace(name, view, { env, now, hostId, own = null }) {
+  const head = view[0];
+  if (head?.kind !== 'reservation' || head.stale || !head.blocking || head.grace.state !== 'pending' || head.key === own) return false;
+  try {
+    if (existsSync(lockPath(name, env))) return false;
+    const at = now();
+    writeFileSync(join(reservationsPath(name, env), head.key, 'grace.json'), JSON.stringify({ format: RESERVATION_FORMAT, grace_started_at: iso(at) }), { flag: 'wx' });
+    const found = { key: head.key, record: { run_key: head.run_key, repo: head.repo, run: head.run, grace_ms: head.grace_ms }, reserved_ms: Date.parse(head.reserved_at), expires_ms: Date.parse(head.expires_at), grace_started_ms: at };
+    note(name, eventOf('grace', name, reservationSubject(head), reservationFields(found)), { env, at, hostId });
+    return true;
+  } catch { return false; }
+}
+
 // ---- the one queue view (AD-6) ----
 //
 // Every caller that needs to know who is ahead, who blocks or what a position is reads it here and never parses tickets
-// (AD-1). Entries are the live tickets in order, each the ticket as written plus:
-//   file      the ticket's file name (its identity in the Queue)
-//   kind      lease, job, hub-job or remote (ticketKind: a missing kind is a lease)
+// (AD-1). Entries are the live tickets and the Reservations in order, each the ticket as written plus:
+//   file      the ticket's file name (its identity in the Queue); a Reservation's is its reserved_at in the same 15 digits
+//   kind      lease, job, hub-job or remote (ticketKind: a missing kind is a lease), or `reservation`
 //   place     1-based, in the order returned
-//   blocking  whether a Claimant behind it must wait for it: every live ticket blocks (Story 2.5 adds Reservation entries,
-//             `kind: 'reservation'` with `grace`, of which only the first in line blocks, and only until its grace ends)
-//   stale     true for a dead ticket, which `includeStale` keeps in the list so read-only status can still show it
-// Order is the sort key (a ticket's file name; a Reservation will bring its own) and then the full name. `prune` removes dead
-// tickets, as acquirers do; observers never pass it. `policy` is accepted for the Reservation grace of Story 2.5 and unused.
+//   blocking  whether a Claimant behind it must wait for it: every live ticket blocks; of the Reservations only the first in line
+//             does, and only until its grace is over (Reservation entries also carry `key`, `run_key` and `grace`)
+//   stale     true for a dead ticket or an expired Reservation, which `includeStale` keeps in the list so read-only status can
+//             still show it
+// A Reservation whose run has a live ticket is not listed: that ticket stands at its place (its file name carries the
+// Reservation's reserved_at). Order is the sort key (a ticket's file name; a Reservation's reserved_at) and then the full name.
+// `prune` removes dead tickets and retires expired Reservations, as acquirers do; observers never pass it, and a read computes
+// grace but creates nothing (`afterRename` is the test seam of the Reservation prune). `policy` is accepted and unused: a Reservation's record carries its own times (AD-7, AD-11).
 const sortKey = entry => entry.file;
 const inOrder = (a, b) => (sortKey(a) < sortKey(b) ? -1 : sortKey(a) > sortKey(b) ? 1 : a.file < b.file ? -1 : a.file > b.file ? 1 : 0);
 
-export function queueView(name, { env = process.env, now = Date.now, policy = null, includeStale = false, prune = false, host, hostId, processStart: startOf, isAlive } = {}) {
+export function queueView(name, { env = process.env, now = Date.now, policy = null, includeStale = false, prune = false, host, hostId, processStart: startOf, isAlive, afterRename } = {}) {
   void policy;
   const tickets = listWaiters(name, { env, prune, now, host, hostId, processStart: startOf, isAlive });
-  return tickets
+  const asking = new Set(tickets.filter(ticket => !ticket.stale && ticket.repo && ticket.run !== undefined && ticket.run !== null).map(ticket => askingKey(ticket.repo, String(ticket.run))));
+  const entries = tickets
     .filter(ticket => includeStale || !ticket.stale)
-    .map(ticket => ({ ...ticket, kind: ticketKind(ticket), blocking: !ticket.stale }))
+    .map(ticket => ({ ...ticket, kind: ticketKind(ticket), blocking: !ticket.stale }));
+  return [...entries, ...reservationEntries(name, { env, now, prune, hostId, asking, includeStale, afterRename })]
     .sort(inOrder)
     .map((entry, index) => ({ ...entry, place: index + 1 }));
 }
 
 // What blocks a Claimant: the blocking entries ahead of its own ticket, or every blocking entry for a try (which has no
 // ticket and so no place; it takes a free lock only when nothing waits).
-const blockersAhead = (view, file = null) => view.filter(entry => entry.blocking && (file === null || inOrder(entry, { file }) < 0));
+// A try of a run that holds a Reservation is not blocked by it: `own` is that Reservation's key (a ticket never needs it, its run's
+// Reservation is hidden while the ticket is live).
+const blockersAhead = (view, file = null, own = null) => view.filter(entry => entry.blocking && !(own !== null && entry.kind === 'reservation' && entry.key === own) && (file === null || inOrder(entry, { file }) < 0));
 
 // The AD-5 wording of every timeout on a Queued lock: `host lock <name> is held by <holder>`, then (when a Claimant waits ahead
 // of this one) how many and who, each with its place. Callers add what the wait gave up on.
@@ -533,14 +744,17 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
   const capped = limit !== null && limit.at < requested + timeoutMs ? limit : null;
   const deadline = capped ? Math.max(requested, capped.at) : requested + timeoutMs;
   const start = cachedStart(startOf, now);
+  // A request of a run that holds a live Reservation on this name is served at the Reservation's place (AD-6, AD-7): its ticket
+  // is named for the Reservation's reserved_at, so it sorts there in every version, and enqueued_at keeps the real time.
+  const reserved = ownReservation(name, env, now);
   let ticket = null;
   let ticketFile = null;
   let selfText = 'this job';
   if (!tryOnly) {
-    const body = buildTicket(kind, { env, requested, deadline, host, hostId, processStart: startOf });
+    const body = buildTicket(kind, { env, requested, deadline, host, hostId, processStart: startOf, reservation: reserved?.key ?? null });
     selfText = `${kind === 'hub-job' ? 'catch-up' : 'job'} ${body.lease_id}`;
-    ({ file: ticket, path: ticketFile } = writeTicket(name, body, { env, requested }));
-    note(name, eventOf('request', name, asked, { deadline_at: iso(deadline) }), { ...seams, at: requested });
+    ({ file: ticket, path: ticketFile } = writeTicket(name, body, { env, requested: reserved ? Math.min(requested, reserved.reserved_ms) : requested }));
+    note(name, eventOf('request', name, asked, { deadline_at: iso(deadline), ...(reserved ? { reservation: reserved.key } : {}) }), { ...seams, at: requested });
   }
   let left = false;
   const leave = (as, fields) => {
@@ -570,7 +784,7 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
       if (ticketFile) { try { statSync(ticketFile); } catch { throw cancelled('was released while it waited for'); } }
       const current = view();
       if (ticket && !current.some(entry => entry.file === ticket)) throw cancelled('lost its place in the queue for');
-      let blockers = blockersAhead(current, ticket);
+      let blockers = blockersAhead(current, ticket, tryOnly ? reserved?.key ?? null : null);
       if (blockers.length === 0) {
         const started = now();
         const record = { ...me, started_at: new Date(started).toISOString(), ...more };
@@ -584,7 +798,7 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
         }
         if (taken) {
           afterTake();
-          blockers = blockersAhead(view(), ticket);
+          blockers = blockersAhead(view(), ticket, tryOnly ? reserved?.key ?? null : null);
           if (blockers.length > 0) {
             retire(name, path, record, { env, now, log, hostId, beforeRetire });
             taken = false;
@@ -619,6 +833,7 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
         }
       }
       if (blockers.length > 0) {
+        startGrace(name, current, { env, now, hostId, own: tryOnly ? reserved?.key ?? null : null });
         const owner = readOwner(path);
         if (now() >= deadline) throw timedOut(`${heldText(name, owner, blockers, selfText)}; ${gaveUp}`, owner);
         if (!waiting) { log(`HUB_LOCK_WAIT ${name} queued behind ${blockers.length} (${describe(owner)})`); waiting = true; }
@@ -782,6 +997,7 @@ export async function acquireLease(name, {
         }
       }
       if (blockers.length > 0) {
+        startGrace(name, current, { env, now, hostId });
         const ahead = blockers.length;
         if (now() >= deadline) { const owner = readOwner(path); throw timedOut(`${heldText(name, owner, blockers, `lease ${lease_id}`)}; gave up after ${Math.round(waitMs / 1000)}s`, owner); }
         if (!waiting) { log(`HUB_LOCK_WAIT ${name} queued behind ${ahead} (${describe(readOwner(path))})`); waiting = true; }

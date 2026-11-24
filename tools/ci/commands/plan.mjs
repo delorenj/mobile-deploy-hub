@@ -22,7 +22,7 @@ import { loadDevices } from '../lib/devices.mjs';
 import { attempt, hook, hookOutput, run } from '../lib/exec.mjs';
 import { bumpTransaction, createGit } from '../lib/git.mjs';
 import { compareBuild, compareSemver, inflightKey, latestKey, parseLatest } from '../lib/latest.mjs';
-import { withLock } from '../lib/lock.mjs';
+import { reserve, withLock } from '../lib/lock.mjs';
 import { loadManifest } from '../lib/manifest.mjs';
 import { authoredNotes } from '../lib/release-notes.mjs';
 import { buildReceipt, setOutputs, writeReceipt } from '../lib/receipt.mjs';
@@ -30,12 +30,12 @@ import { jobWriter, readObject } from '../lib/s3.mjs';
 import { parseVersionInfo } from '../lib/version.mjs';
 import { checkCaller, refusal } from '../lib/caller.mjs';
 import { defaultGroups, groupsLabel, iosVersionOf, tagOnlyOf, tagPrefixOf, testflightPolicyOf } from '../lib/policy.mjs';
-import { checkDisk, checkSecrets, firstLine, guarded, isoNow, policyBanner, reachIpad, readMacLink, runOf, short, testflightHookEnv } from './common.mjs';
+import { checkDisk, checkSecrets, firstLine, guarded, isoNow, policyBanner, reachIpad, readMacLink, reserveFor, runOf, short, testflightHookEnv } from './common.mjs';
 import { callerReader, checkPins } from './gate.mjs';
 
 // ---------------------------------------------------------------------------------------------------- preflight-ios
 
-export async function preflightIos(config, { env = process.env, home = homedir(), log = console.log, sleep, now } = {}) {
+export async function preflightIos(config, { env = process.env, home = homedir(), log = console.log, sleep, now, reserver = reserve } = {}) {
   const { policy } = policyBanner(log);
   const dir = join(config.out, 'preflight');
   if (!config.bundle) throw new Error('preflight-ios needs the bundle id from the gate (HUB_BUNDLE); it has no checkout');
@@ -44,6 +44,9 @@ export async function preflightIos(config, { env = process.env, home = homedir()
   try {
     const devices = loadDevices(env);
     const notes = [];
+    // The iPad lane is in scope (the gate skipped this job otherwise): reserve the run's place on the Mac's `mac-ios` (FR-9, AD-7),
+    // on the Mac's own disk, before the checks that can take a while. Never fatal.
+    reserveFor('mac-ios', { reserver, env, log });
     const free = checkDisk(home, devices);
     notes.push(`${free.toFixed(1)} GiB free`);
     log(run('xcodebuild', ['-version'], { env }).trim());

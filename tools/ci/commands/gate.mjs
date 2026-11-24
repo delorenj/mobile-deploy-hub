@@ -23,7 +23,7 @@ import { macEstimate, tailscaleStatus } from '../lib/metered.mjs';
 import { appFor, bundleSplitOf, editionPinOf, groupsLabel, requiredTargets, testflightPolicyOf } from '../lib/policy.mjs';
 import { buildReceipt, setOutputs, writeReceipt } from '../lib/receipt.mjs';
 import { jobWriter, probe, readObject } from '../lib/s3.mjs';
-import { guarded, policyBanner, readCatchupMode, readMacLink, releaseRef } from './common.mjs';
+import { guarded, policyBanner, readCatchupMode, readMacLink, releaseRef, reserveFor } from './common.mjs';
 
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
@@ -149,7 +149,7 @@ async function quickS26({ env, home, devices, adbFactory }) {
 export async function gate(config, {
   env = process.env, home = homedir(), fetchImpl = fetch, log = console.log, s3Factory = null,
   tailscale = () => tailscaleStatus({ env }), macProbe = null, runnerStatus = null, adbFactory = createAdb,
-  policyFile = undefined,
+  policyFile = undefined, reserver = undefined,
 } = {}) {
   const loaded = policyBanner(log, policyFile);
   const { policy } = loaded;
@@ -236,6 +236,11 @@ export async function gate(config, {
       s3 = 'failed';
       throw refusal('s3', `the build directory write probe failed (${error.message.split('\n')[0]}); deliver would fail after the bump`);
     }
+
+    // The run's place on the S26 (FR-9, AD-7), taken now that nothing can refuse it any more: its build can take as long as it
+    // likes without losing its turn to whoever asks while it compiles. An iOS-only run reserves nothing on `adb`. A Reservation
+    // is an optimization: a failure to make one never fails the gate.
+    if (scope.android) reserveFor('adb', { reserver, env, log });
 
     const store = manifest.ios?.store ? { signer_sha1: manifest.ios.store.signer_sha1 ?? null, secrets: manifest.ios.store.secrets ?? [] } : null;
     const outputs = {
