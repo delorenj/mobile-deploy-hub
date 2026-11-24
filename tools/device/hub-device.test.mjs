@@ -197,13 +197,59 @@ test('--no-connect takes the lease without touching adb, even with the phone awa
   const f = fixture();
   try {
     f.away('s26');
-    const result = await f.run(['lease', 's26', '--for', '12h', '--why', 'gib: hold', '--no-connect', '--id', 'gib-hold']);
+    const result = await f.run(['lease', 's26', '--for', '1h', '--why', 'gib: hold', '--no-connect', '--id', 'gib-hold']);
     assert.equal(result.code, 0, result.err.join());
     assert.deepEqual(result.out, ["export HUB_LEASE_ID='gib-hold'", "export HUB_DEVICE='s26'", "export ANDROID_ADB_SERVER_PORT='5037'"]);
     assert.equal(f.calls(), '', 'adb was never called');
     assert.equal(f.owner().lease_id, 'gib-hold');
     assert.equal(f.owner().device, undefined);
     assert.equal((await f.run(['release', 'gib-hold'])).code, 0);
+  } finally { f.cleanup(); }
+});
+
+test('a lease on the s26 is capped by policy (MOBI-36): over it exits 2 naming the cap and the s24 or an emulator; the s24 and the cap itself are fine', async () => {
+  const f = fixture();
+  try {
+    f.away('s26');
+    const over = await f.run(['lease', 's26', '--for', '2h', '--why', 'long hold', '--no-connect']);
+    assert.equal(over.code, 2);
+    assert.deepEqual(over.out, [], 'a refusal prints nothing for eval');
+    assert.match(over.err.join('\n'), /^hub-device: --for 2h: a lease on adb runs at most 60 min in total \(the deploy-target cap, policy queue\.deploy_target_lease_max_min\); lease s24 or an emulator for longer$/m);
+    assert.ok(!existsSync(f.lock), 'nothing was taken');
+    assert.equal((await f.run(['lease', 's26', '--for', '61m', '--why', 'long hold', '--no-connect'])).code, 2, 'one minute over');
+    assert.equal((await f.run(['run', 's26', '--for', '3h', '--why', 'x', '--', 'true'])).code, 2, 'run takes the same cap');
+    const exact = await f.run(['lease', 's26', '--for', '60m', '--why', 'at the cap', '--no-connect', '--id', 'at-cap']);
+    assert.equal(exact.code, 0, exact.err.join());
+    await f.run(['release', 'at-cap']);
+    const s24 = await f.run(['lease', 's24', '--for', '12h', '--why', 'S24 overnight', '--no-connect', '--id', 'overnight']);
+    assert.equal(s24.code, 0, s24.err.join());
+    assert.equal(f.calls(), '', 'usage errors never reach adb');
+    await f.run(['release', 'overnight']);
+  } finally { f.cleanup(); }
+});
+
+test('phone with a --for over the cap skips the s26 and takes the s24; with no other phone it is a usage error', async () => {
+  const f = fixture();
+  try {
+    const taken = await f.run(['lease', 'phone', '--for', '2h', '--why', 'long phone', '--id', 'long-phone', '--json']);
+    assert.equal(taken.code, 0, taken.err.join('\n'));
+    assert.equal(JSON.parse(taken.out[0]).device, 's24');
+    // The s24 held: the s26 is not a candidate over the cap, so the request is busy rather than taking a Lease the cap refuses.
+    const second = await f.run(['lease', 'phone', '--for', '2h', '--why', 'second', '--wait', '0']);
+    assert.equal(second.code, 76, second.err.join('\n'));
+    assert.ok(!existsSync(f.lock), 'the s26 was never tried');
+    await f.run(['release', 'long-phone']);
+    // A host whose only phone is the deploy phone has nothing to offer past the cap.
+    const bare = { ...loadDevices() };
+    delete bare.android_extra;
+    const file = join(f.root, 'devices.json');
+    writeFileSync(file, JSON.stringify(bare));
+    f.env.HUB_DEVICES = file;
+    const refused = await f.run(['lease', 'phone', '--for', '2h', '--why', 'long phone']);
+    assert.equal(refused.code, 2);
+    assert.match(refused.err.join('\n'), /--for 2h: no phone can take it; a lease on adb runs at most 60 min/);
+    assert.equal((await f.run(['lease', 'phone', '--for', '30m', '--why', 'short phone', '--id', 'short'])).code, 0);
+    await f.run(['release', 'short']);
   } finally { f.cleanup(); }
 });
 

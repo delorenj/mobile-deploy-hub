@@ -97,7 +97,7 @@ function fixture(extra = {}) {
 }
 const fakeTimers = () => ({ setInterval: () => ({ unref() {} }), clearInterval: () => {} });
 const events = f => [...readEvents({ env: f.env })];
-const holder = (f, at = T0) => acquireLease('adb', { holder: 'agent-a', why: 'device proof', forMs: 6 * 3600_000, env: f.env, log: () => {}, id: 'held', now: () => at });
+const holder = (f, at = T0) => acquireLease('adb', { holder: 'agent-a', why: 'device proof', forMs: 60 * 60_000, env: f.env, log: () => {}, id: 'held', now: () => at });
 const tickets = f => readdirSync(join(f.root, 'locks/adb.queue')).filter(file => file.endsWith('.json')).map(file => JSON.parse(readFileSync(join(f.root, 'locks/adb.queue', file), 'utf8')));
 
 test('a plan waiting behind a Lease gives up at its deadline, 13 minutes into a 20-minute job, and says why', async () => {

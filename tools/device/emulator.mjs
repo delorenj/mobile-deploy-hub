@@ -228,7 +228,7 @@ function recordPids(env, record, entries) {
     record.pids.push(...fresh);
     writeRecord(env, record);
   }
-  return fresh.length === 0 || updateLease(record.slot, record.lease_id, { emulator: summary(record) }, { env });
+  return fresh.length === 0 || rewritten(record.slot, record.lease_id, { emulator: summary(record) }, { env });
 }
 
 // A record names only paths inside its own folders: its AVD home under <runtime>/<lease_id>, and a hub-emu-* temp folder.
@@ -384,6 +384,15 @@ const fatal = path => {
 };
 const cancelled = id => failure('HUB_LEASE_CANCELLED', `lease ${id} was released while its emulator was being made`);
 
+// A lease's record rewritten (AD-16): false when the lock is gone or has been taken by another holder since (updateLease throws
+// HUB_LEASE_LOST for the latter), which every caller here treats as a cancelled lease.
+function rewritten(slot, id, fields, { env }) {
+  try { return updateLease(slot, id, fields, { env }); } catch (error) {
+    if (error.code === 'HUB_LEASE_LOST') return false;
+    throw error;
+  }
+}
+
 // A short tool (avdmanager) with its output collected; killed on abort or timeout.
 function runTool(command, args, { env, input = '', signal, timeout = 180_000 }) {
   return new Promise((done, fail) => {
@@ -462,7 +471,7 @@ function claim({ env, id, slot, image, profileName }) {
     pids: [], created_at: new Date().toISOString(),
   };
   writeRecord(env, record);
-  if (!updateLease(slot, id, { emulator: summary(record) }, { env })) {
+  if (!rewritten(slot, id, { emulator: summary(record) }, { env })) {
     removeFiles(record);
     rmSync(recordPath(env, id), { force: true });
     throw cancelled(id);
@@ -602,8 +611,11 @@ export async function provision({
     const holderStart = Number.isSafeInteger(holderPid) ? liveStart(holderPid) : null;
     stillOurs();
     // The lease held the slot through the boot; its --for runs from now, when the emulator is ready.
-    const fields = { emulator: summary(record), holder_pid: holderPid, holder_process_start: holderStart, expires_at: new Date(now() + forMs).toISOString() };
-    if (!updateLease(slot, id, fields, { env })) throw cancelled(id);
+    // updateLease never moves an expiry later (AD-16): the slot was taken for boot + --for + 2 min, so `now + forMs` is earlier
+    // unless the boot overran its own allowance, and then the lease keeps the expiry it has.
+    const expires = Math.min(now() + forMs, Date.parse(readOwnerOf(slot, env)?.expires_at) || Infinity);
+    const fields = { emulator: summary(record), holder_pid: holderPid, holder_process_start: holderStart, expires_at: new Date(expires).toISOString() };
+    if (!rewritten(slot, id, fields, { env })) throw cancelled(id);
     log(`HUB_EMULATOR_READY ${record.serial} adb server ${record.adb_server_port} pids ${record.pids.map(entry => `${entry.role}:${entry.pid}`).join(',')}`);
     return { lease: readOwnerOf(slot, env), record };
   } catch (error) {

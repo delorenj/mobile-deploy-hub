@@ -302,6 +302,58 @@ function writeOwner(path, owner) {
   renameSync(tmp, join(path, 'owner.json'));
 }
 
+// The deploy targets (AD-16): the locks a deploy takes, whose Leases the policy caps in total length. `s24`, the emulator pool and
+// every other name keep only MAX_LEASE_MS.
+export const DEPLOY_TARGETS = Object.freeze(['adb', 'mac-ios']);
+
+// The cap on a Lease of `name` in ms: the policy's queue.deploy_target_lease_max_min for a deploy target, null for any other name.
+// `policy` is injected by tests; a policy object without the key (a hand-made one) reads the real policy file.
+export function deployTargetCapMs(name, { policy = null } = {}) {
+  if (!DEPLOY_TARGETS.includes(name)) return null;
+  let minutes = policy?.queue?.deploy_target_lease_max_min;
+  if (!(minutes > 0)) minutes = loadPolicy().policy.queue.deploy_target_lease_max_min;
+  return minutes * 60_000;
+}
+
+// The AD-16 wording of a cap refusal, shared by acquire, extend and `hub-device` so they never drift.
+export const capText = (name, capMs) => `a lease on ${name} runs at most ${Math.round(capMs / 60_000)} min in total (the deploy-target cap, policy queue.deploy_target_lease_max_min); lease s24 or an emulator for longer`;
+
+const lost = (name, id, why) => failure('HUB_LEASE_LOST', `lease ${id} no longer holds ${name}: ${why}`);
+
+// The lock directory's inode as a string (a number can lose digits in JSON), or null when there is no directory.
+const inodeOf = path => { try { return String(statSync(path).ino); } catch { return null; } };
+
+// AD-16: before an owner rewrite, is `path` still the lock this writer took? Returns the owner record when it is, null when no lock
+// or no owner record is there (released, or being taken), and throws HUB_LEASE_LOST when another Lease or a job holds the lock now or
+// the directory is not the one recorded at acquire. `ino` is what the writer recorded when it took the Lease (the record
+// `acquireLease` returned); a record that carries its own `lock_ino` is held to it as well. A Lease from before v1a has neither.
+function ownLease(name, path, id, ino) {
+  const dir = inodeOf(path);
+  if (dir === null) return null;
+  const owner = readOwner(path);
+  if (!owner) return null;
+  if (!isLease(owner) || owner.lease_id !== id) throw lost(name, id, `the lock is held by ${describe(owner)} now`);
+  if ((ino !== null && ino !== undefined && String(ino) !== dir) || (owner.lock_ino !== undefined && owner.lock_ino !== null && String(owner.lock_ino) !== dir)) throw lost(name, id, 'the lock directory was replaced since the lease was taken');
+  return owner;
+}
+
+// The one owner rewrite of a held Lease: write a temp file, check again that the lock is still this writer's, then rename it into
+// place. True when written; false when the lock is gone (nothing to write into); throws HUB_LEASE_LOST (and removes the temp file)
+// when another holder has it. A window of one rename remains between the last check and the rename (deferred-work.md).
+function rewriteOwner(name, path, id, ino, next) {
+  const tmp = join(path, `owner.json.${process.pid}.tmp`);
+  try { writeFileSync(tmp, JSON.stringify(next)); } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+  try {
+    if (!ownLease(name, path, id, ino)) { unlinkSync(tmp); return false; }
+    renameSync(tmp, join(path, 'owner.json'));
+    return true;
+  } catch (error) {
+    try { unlinkSync(tmp); } catch { /* gone with the directory */ }
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
 let ticketCounter = 0;
 
 // A pid can be reused, so a queue ticket names one process lifetime: pid plus its start time. On Linux that is
@@ -923,9 +975,13 @@ export async function acquireLease(name, {
   host = hostname(),
   processStart: startOf = processStart,
   pool = null,
+  policy = null,
 } = {}) {
   const path = lockPath(name, env);
   if (!(forMs > 0) || forMs > MAX_LEASE_MS) throw new Error(`a lease runs for more than 0 and at most ${MAX_LEASE_MS / 3600_000}h`);
+  // A Lease on a deploy target may not outlast the Queue's patience (AD-16): refused before it takes a place in line.
+  const cap = deployTargetCapMs(name, { policy });
+  if (cap !== null && forMs > cap) throw failure('HUB_LEASE_TOO_LONG', capText(name, cap));
   if (!holder || !why) throw new Error('a lease names its holder and why');
   const lease_id = id ? leaseId(id) : newLeaseId();
   mkdirSync(lockDir(env), { recursive: true });
@@ -983,6 +1039,8 @@ export async function acquireLease(name, {
         let taken = false;
         try {
           mkdirSync(path);
+          // The directory's inode names this take for every later rewrite (AD-16); an additive key no pinned hub reads.
+          record.lock_ino = inodeOf(path);
           writeOwner(path, record);
           taken = true;
         } catch (error) {
@@ -1092,17 +1150,59 @@ export function releaseLease(name, id, { env = process.env, now = Date.now, reas
   return { released: true, cancelled, reason: 'released', owner };
 }
 
-// Adds fields (the phone's adb id once connected) to the lease record this id holds. False when the lock is
-// gone (ENOENT), not this lease any more, or another holder rewrote it between the read and the write.
-export function updateLease(name, id, fields, { env = process.env } = {}) {
+// Changes the lease record this id holds: metadata (the phone's adb id once connected) or an earlier expiry. Never a later one
+// (AD-16: only extendLease moves expires_at later, and only while nobody waits): that throws HUB_LEASE_EXTEND_REFUSED and writes
+// nothing. False when the lock is gone, being taken, or another holder rewrote it between the read and the write. Throws
+// HUB_LEASE_LOST when another Lease or a job holds the lock now, or the directory is not the one this writer took (`ino`, the
+// `lock_ino` of the record acquireLease returned).
+export function updateLease(name, id, fields, { env = process.env, ino = null } = {}) {
   const path = lockPath(name, env);
-  let owner;
-  try { owner = readOwner(path); } catch { return false; }
-  if (!isLease(owner) || owner.lease_id !== id) return false;
-  const current = readOwner(path);
-  if (!isLease(current) || current.lease_id !== id) return false;
-  try { writeOwner(path, { ...current, ...fields }); } catch { return false; }
+  const current = ownLease(name, path, id, ino);
+  if (!current) return false;
+  if (fields && Object.hasOwn(fields, 'expires_at')) {
+    const next = Date.parse(fields.expires_at);
+    if (!(next <= expiresAt(current))) throw failure('HUB_LEASE_EXTEND_REFUSED', `lease ${id} on ${name}: updateLease never moves the expiry later; only extendLease does, and only while nobody waits`);
+  }
+  try {
+    if (!rewriteOwner(name, path, id, ino, { ...current, ...fields })) return false;
+  } catch (error) {
+    if (error.code === 'HUB_LEASE_LOST') throw error;
+    return false;
+  }
   return readOwner(path)?.lease_id === id;
+}
+
+// Extends the Lease `id` holds on `name` by `forMs` past its current expiry (AD-16), the only path that moves expires_at later.
+// Refused with HUB_LEASE_EXTEND_REFUSED, writing nothing:
+//   - at or after its expiry (a Lease that ran out is over, take a new one);
+//   - while any entry in the Queue that blocks is waiting (the message names each with its place; a Reservation past its grace does
+//     not block, queueView says so);
+//   - when the Lease would then run past the cap: the policy's deploy-target cap on adb and mac-ios, MAX_LEASE_MS elsewhere, both
+//     counted from started_at.
+// Throws HUB_LEASE_LOST when the lock is not this Lease's any more. On success it appends one `extend` event (the rewrite decided it)
+// and returns the new record.
+export function extendLease(name, id, { forMs, env = process.env, now = Date.now, policy = null, hostId = machineId(), host, processStart: startOf, ino = null } = {}) {
+  if (!(forMs > 0) || !Number.isFinite(forMs)) throw new Error('an extension is for more than 0 ms');
+  const path = lockPath(name, env);
+  const current = ownLease(name, path, id, ino);
+  if (!current) throw lost(name, id, 'nothing holds the lock');
+  const at = now();
+  const expiry = expiresAt(current);
+  if (!(expiry > at)) throw failure('HUB_LEASE_EXTEND_REFUSED', `lease ${id} on ${name} ${Number.isFinite(expiry) ? `ran out at ${current.expires_at}` : 'has no expiry'}; an expired lease cannot be extended, take a new one`);
+  const waiting = queueView(name, { env, now, hostId, host, processStart: startOf }).filter(entry => entry.blocking);
+  if (waiting.length > 0) {
+    throw failure('HUB_LEASE_EXTEND_REFUSED', `lease ${id} on ${name} cannot be extended while ${waiting.length} waiter${waiting.length === 1 ? '' : 's'} wait${waiting.length === 1 ? 's' : ''}: ${waiting.map(waiterText).join(', ')}`);
+  }
+  const started = Date.parse(current.started_at);
+  const next = expiry + forMs;
+  const total = next - (Number.isFinite(started) ? started : at);
+  const cap = deployTargetCapMs(name, { policy });
+  if (cap !== null && total > cap) throw failure('HUB_LEASE_EXTEND_REFUSED', `lease ${id} on ${name} would run ${Math.ceil(total / 60_000)} min in total; ${capText(name, cap)}`);
+  if (total > MAX_LEASE_MS) throw failure('HUB_LEASE_EXTEND_REFUSED', `lease ${id} on ${name} would run more than ${MAX_LEASE_MS / 3600_000}h in total, the longest a lease runs`);
+  const record = { ...current, expires_at: iso(next) };
+  if (!rewriteOwner(name, path, id, ino, record)) throw lost(name, id, 'the lock is gone');
+  note(name, eventOf('extend', name, record), { env, at: now(), hostId });
+  return record;
 }
 
 // Every lock in the directory, read only: leases and jobs' locks, each with whether it is stale now.

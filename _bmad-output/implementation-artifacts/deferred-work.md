@@ -56,3 +56,18 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-6-reservations-end-when-the-run-is-done.md`
   summary: The Mac release over ssh uses `~/.local/bin/hub-device`, the wrapper `install.sh` writes, so it works only once `hosts:install` (Story 2.8) has put a hub with the verb on the Mac; until then `announce` logs `HUB_RESERVATION_RELEASE_SKIPPED` and the Mac's own ios lane release (inside the `mac-ios` hold, local to the Mac) is what ends it.
   evidence: AD-7 ("a Mac release without the verb is logged and left to the ceiling"). The pinned `actions/hub@vX` runs `announce` on big-chungus with the new code, but the Mac's installed `hub-device` is whatever `hosts:install` last put there.
+
+## From Story 2.7 (MOBI-36)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-7-no-extension-while-others-wait-deploy-target-leases-capped.md`
+  summary: Nothing calls `extendLease` yet (the `hub-device extend` verb and Jarad's override are v1b/v1c), so no live Lease is extended on any host; and `hub-device lease s26|phone --for` over 60 min is now a usage error, so an adapter that holds the S26 for hours (the README's green-in-between loop-ship hold took `--for 12h`) must move to `s24`, an emulator, or re-lease within the cap.
+  evidence: AD-16 fixes the rule v1b's verb will call; the cap is the story's explicit AC and is policy, so a longer deploy-target hold is a hub release. Nothing is released before Story 2.8 (AD-20), so no adapter has hit the refusal yet; the adapter's own repo is outside this one.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-7-no-extension-while-others-wait-deploy-target-leases-capped.md`
+  summary: An owner rewrite is checked twice (before the temp file is written and right before its rename into place), but a window of one `rename` remains in which the lock can be reclaimed and re-taken between the last check and the rename, so a rewrite could land in the new holder's directory.
+  evidence: `rename` of a file into a directory cannot be made conditional on the directory's identity in `node:fs`. The window is microseconds, the rewrites are the phone-connect update and v1b's extension, and the new holder's next read-back (`updateLease`'s final `lease_id` check) reports it. A lock-level mutex would be a second protocol (AD-1).
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-7-no-extension-while-others-wait-deploy-target-leases-capped.md`
+  summary: Two extensions racing each other both read the same expiry and both write it plus their own `forMs`, so one extension is lost and two `extend` events exist. A Lease older than this story records no `lock_ino`, so for it the lease id alone guards a rewrite.
+  evidence: v1a has no caller of `extendLease`; v1b's verb is one person at a shell. Serialising extenders would need a lock beside the lock, which AD-1 forbids; the cap and the waiter check are re-evaluated by each call from its own read.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-7-no-extension-while-others-wait-deploy-target-leases-capped.md`
+  summary: A refused acquire on a deploy target is `HUB_LEASE_TOO_LONG`, a code the spine does not list (AD-5 names `HUB_LEASE_EXTEND_REFUSED` for extensions and says nothing of acquire).
+  evidence: The AC says the acquire is "refused" without a code; reusing `HUB_LEASE_EXTEND_REFUSED` would name an extension that never happened. Additive and branched on by `hub-device` only; fold into AD-5's list at the next spine edit.

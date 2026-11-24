@@ -40,7 +40,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { findPhone, idMatchesSerial } from '../ci/lib/adb.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
-import { MAX_LEASE_MS, RESERVABLE, acquireLease, isLease, listLocks, lockDir, poolRequest, queueView, readOwner, releaseLease, releaseReservation, updateLease } from '../ci/lib/lock.mjs';
+import { MAX_LEASE_MS, RESERVABLE, acquireLease, capText, deployTargetCapMs, isLease, listLocks, lockDir, poolRequest, queueView, readOwner, releaseLease, releaseReservation, updateLease } from '../ci/lib/lock.mjs';
 import { pause, sleep as realSleep } from '../ci/lib/pause.mjs';
 import { createAsyncAdb } from './async-adb.mjs';
 import { GATE, LEASE_ID, PROFILES, emulatorStatus, exportsOf as emulatorExports, hostPool, isEmulatorLease, isEmulatorLock, provision, readRecord, reap, releaseEmulator, teardownNow } from './emulator.mjs';
@@ -124,7 +124,7 @@ function warnOldHub(context) {
   if (supported === false) context.stderr(`hub-device: warning: the installed catch-up hub (${current}) predates leases and would reclaim this lease; this check cannot see the deploys' pinned hub release, so land the pin flip first (README, Devices).`);
 }
 
-function setup(parsed, { needForWhy, fleet, env }) {
+function setup(parsed, { needForWhy, fleet, env, policy = null }) {
   const { flags } = parsed;
   const device = parsed.words[1] ?? null;
   // The device word is checked first, as before, so a typo never reads as a missing flag.
@@ -144,12 +144,18 @@ function setup(parsed, { needForWhy, fleet, env }) {
   else if (needForWhy) throw usage('--for <duration> is required');
   else forMs = 3_600_000;
   if (forMs <= 0 || forMs > MAX_LEASE_MS) throw usage(`--for must be more than 0 and at most ${MAX_LEASE_MS / 3_600_000}h`);
+  // The deploy phone's lock is a deploy target, whose Leases are capped by policy (AD-16): a longer --for is a usage error that
+  // names the cap. `phone` (whichever is free) skips the deploy phone when --for is over the cap, and is refused when that leaves none.
+  const overCap = phone => phone.deploy && forMs > (deployTargetCapMs(phone.lock, { policy }) ?? Infinity);
+  if (entry && overCap(entry)) throw usage(`--for ${flags.for}: ${capText(entry.lock, deployTargetCapMs(entry.lock, { policy }))}`);
+  const usable = fleet.filter(phone => !overCap(phone));
+  if (device === PHONE && usable.length === 0) throw usage(`--for ${flags.for}: no phone can take it; ${capText('adb', deployTargetCapMs('adb', { policy }))}`);
   const why = flags.why ?? (needForWhy ? null : `run ${(parsed.command ?? []).join(' ').slice(0, 80)}`);
   if (!why) throw usage('--why <text> is required');
   const waitMs = flags.wait !== undefined ? parseDuration(flags.wait, '--wait') : 120_000;
   const pid = flags.pid === undefined ? null : Number(flags.pid);
   if (pid !== null && (!Number.isSafeInteger(pid) || pid < 1)) throw usage('--pid takes a live process id (a positive integer)');
-  return { device, entry, forMs, why, waitMs, holderPid: pid };
+  return { device, entry, forMs, why, waitMs, holderPid: pid, fleet: usable };
 }
 
 // Takes the lease on one phone, then (unless noConnect) connects it. A phone that does not come gives the lease back;
@@ -178,7 +184,9 @@ async function takeLease(phone, options, context) {
       releaseLease(phone.lock, lease.lease_id, { env });
       throw error;
     }
-    if (!updateLease(phone.lock, lease.lease_id, { device }, { env })) {
+    let updated = false;
+    try { updated = updateLease(phone.lock, lease.lease_id, { device }, { env, ino: lease.lock_ino }); } catch (error) { if (error.code !== 'HUB_LEASE_LOST') throw error; }
+    if (!updated) {
       // The lease was released or reclaimed while the phone was being found; take nothing.
       throw Object.assign(new Error(`lease ${lease.lease_id} was released while the phone was being found`), { code: 'HUB_LEASE_CANCELLED' });
     }
@@ -250,7 +258,7 @@ function exportsOf(lease, device, envSerial, phone) {
 function report(error, parsed, context) {
   const { stdout, stderr } = context;
   const device = parsed.words[1] ?? 's26';
-  if (error instanceof Usage || error.code === 'HUB_EMULATOR_USAGE') { stderr(`hub-device: ${error.message}`); return 2; }
+  if (error instanceof Usage || error.code === 'HUB_EMULATOR_USAGE' || error.code === 'HUB_LEASE_TOO_LONG') { stderr(`hub-device: ${error.message}`); return 2; }
   // A cancelled lease says so even when its last error was the phone not arriving: it never held anything to report.
   if (error.code === 'HUB_LEASE_CANCELLED') { stderr(`HUB_DEVICE_CANCELLED ${device} ${error.message}`); return 1; }
   if (away(error)) {
@@ -290,7 +298,7 @@ async function reapBeforeAcquire({ env, stderr, log, emulator }) {
 
 async function leaseEmulator(parsed, context) {
   const { stdout, env, signals, timing } = context;
-  const { forMs, why, waitMs, holderPid } = setup(parsed, { needForWhy: true, fleet: context.fleet, env: context.env });
+  const { forMs, why, waitMs, holderPid } = setup(parsed, { needForWhy: true, fleet: context.fleet, env: context.env, policy: context.policy });
   const { profile, pool } = emulatorOptions(parsed, env);
   const holder = parsed.flags.holder ?? env.HUB_DEVICE_HOLDER ?? `${env.USER ?? 'unknown'}@${hostname()}`;
   const id = parsed.flags.id ?? `e-${randomBytes(6).toString('hex')}`;
@@ -323,7 +331,7 @@ async function leaseEmulator(parsed, context) {
 async function lease(parsed, context) {
   if (parsed.words[1] === 'emulator') return leaseEmulator(parsed, context);
   const { stdout, env, signals } = context;
-  const { entry, forMs, why, waitMs, holderPid } = setup(parsed, { needForWhy: true, fleet: context.fleet, env: context.env });
+  const { entry, forMs, why, waitMs, holderPid, fleet } = setup(parsed, { needForWhy: true, fleet: context.fleet, env: context.env, policy: context.policy });
   const holder = parsed.flags.holder ?? env.HUB_DEVICE_HOLDER ?? `${env.USER ?? 'unknown'}@${hostname()}`;
   warnOldHub(context);
   const abort = new AbortController();
@@ -333,7 +341,7 @@ async function lease(parsed, context) {
   for (const name of names) signals.on(name, onSignal);
   try {
     const options = { holder, why, forMs, waitMs, id: parsed.flags.id ?? null, holderPid, noConnect: Boolean(parsed.flags['no-connect']), phoneWaitMs: waitMs, signal: abort.signal };
-    const { phone, lease: record, device } = entry ? await takeLease(entry, options, context) : await takeAnyPhone(context.fleet, options, context);
+    const { phone, lease: record, device } = entry ? await takeLease(entry, options, context) : await takeAnyPhone(fleet, options, context);
     if (received) {
       releaseLease(phone.lock, record.lease_id, { env });
       return 128 + constants.signals[received];
@@ -669,7 +677,7 @@ async function runCommand(parsed, context) {
   if (parsed.words[1] === 'emulator') return runEmulator(parsed, context);
   const { env, stderr, signals } = context;
   if (!parsed.command || parsed.command.length === 0) throw usage('run needs a command after --');
-  const { entry, forMs, why, waitMs, holderPid } = setup(parsed, { needForWhy: false, fleet: context.fleet, env: context.env });
+  const { entry, forMs, why, waitMs, holderPid, fleet } = setup(parsed, { needForWhy: false, fleet: context.fleet, env: context.env, policy: context.policy });
   const id = `run-${process.pid}-${randomBytes(4).toString('hex')}`;
   const holder = parsed.flags.holder ?? env.HUB_DEVICE_HOLDER ?? `${env.USER ?? 'unknown'}@${hostname()}`;
   warnOldHub(context);
@@ -690,7 +698,7 @@ async function runCommand(parsed, context) {
   signals.once('exit', giveBack);
   try {
     const options = { holder, why, forMs, waitMs, id, holderPid: holderPid ?? process.pid, noConnect: false, phoneWaitMs: waitMs, signal: abort.signal };
-    const taking = (entry ? takeLease(entry, options, context) : takeAnyPhone(context.fleet, options, context)).then(value => { held = value.phone.lock; return value; });
+    const taking = (entry ? takeLease(entry, options, context) : takeAnyPhone(fleet, options, context)).then(value => { held = value.phone.lock; return value; });
     // A signal while queued for the phone drops its place; await discovery settlement before exiting.
     const taken = await Promise.race([taking.then(value => ({ value }), error => ({ error })), woken.then(() => ({ signalled: true }))]);
     if (taken.signalled) {

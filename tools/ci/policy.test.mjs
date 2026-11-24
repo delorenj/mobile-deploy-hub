@@ -157,7 +157,7 @@ test('a testflight block is parsed strictly: groups are plain unique names, the 
 
 test('the queue block is strict: the margin and one allowance per waiting job, nothing else, every value a whole number of minutes', () => {
   const base = JSON.parse(source);
-  assert.deepEqual(base.queue, { wait_margin_min: 2, hold_allowance_min: { plan: 5, android: 15, ios: 60 }, grace_min: 10, reservation_ceiling_min: 180 });
+  assert.deepEqual(base.queue, { wait_margin_min: 2, hold_allowance_min: { plan: 5, android: 15, ios: 60 }, grace_min: 10, reservation_ceiling_min: 180, deploy_target_lease_max_min: 60 });
   assert.deepEqual(loadPolicy().policy.queue, base.queue);
   assert.deepEqual([...queueJobs], ['plan', 'android', 'ios']);
   const bad = {
@@ -186,6 +186,11 @@ test('the queue block is strict: the margin and one allowance per waiting job, n
     'a reservation ceiling of zero': p => { p.queue.reservation_ceiling_min = 0; },
     'a negative reservation ceiling': p => { p.queue.reservation_ceiling_min = -180; },
     'a reservation ceiling as text': p => { p.queue.reservation_ceiling_min = '180'; },
+    'no deploy-target Lease cap (Story 2.7)': p => { delete p.queue.deploy_target_lease_max_min; },
+    'a Lease cap of zero': p => { p.queue.deploy_target_lease_max_min = 0; },
+    'a negative Lease cap': p => { p.queue.deploy_target_lease_max_min = -60; },
+    'a fractional Lease cap': p => { p.queue.deploy_target_lease_max_min = 0.5; },
+    'a Lease cap as text': p => { p.queue.deploy_target_lease_max_min = '60'; },
   };
   for (const [name, change] of Object.entries(bad)) {
     const copy = structuredClone(base);
@@ -197,5 +202,6 @@ test('the queue block is strict: the margin and one allowance per waiting job, n
   copy.queue.hold_allowance_min.ios = 90;
   copy.queue.grace_min = 5;
   copy.queue.reservation_ceiling_min = 240;
+  copy.queue.deploy_target_lease_max_min = 30;
   assert.doesNotThrow(() => parsePolicy(JSON.stringify(copy)), 'a tuning change is a valid release, not a parse error');
 });
