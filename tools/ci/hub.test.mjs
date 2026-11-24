@@ -456,6 +456,16 @@ test('the hub ref comes from the action, or from where the runner put the tool',
   assert.equal(hubRef({}, `/home/delorenj/code/mobile-deploy-hub/tools/ci/lib/receipt.mjs`), null, 'a local checkout has no ref');
 });
 
+test('an installed release names its ref in its path, after HUB_REF and the runner layout (AD-10)', () => {
+  const release = '/home/x/.local/share/mobile-deploy-hub/releases';
+  assert.equal(hubRef({}, `${release}/v1.2.45/tools/ci/lib/receipt.mjs`), 'v1.2.45');
+  assert.equal(hubRef({}, `C:\\Users\\x\\.local\\share\\mobile-deploy-hub\\releases\\v1.2.45\\tools\\ci\\lib\\receipt.mjs`), 'v1.2.45');
+  assert.equal(hubRef({ HUB_REF: 'v9.9.9' }, `${release}/v1.2.45/tools/ci/lib/receipt.mjs`), 'v9.9.9', 'HUB_REF first');
+  assert.equal(hubRef({}, `/home/x/_work/_actions/delorenj/mobile-deploy-hub/v1.2.44/tools/ci/lib/receipt.mjs`), 'v1.2.44', 'the runner layout second');
+  assert.equal(hubRef({}, '/srv/releases/v1.2.45/tools/ci/lib/receipt.mjs'), null, 'only the hub install dir counts as a release dir');
+  assert.equal(hubRef({ HUB_VERSION: '3.4.5' }, '/home/x/code/mobile-deploy-hub/tools/ci/lib/receipt.mjs'), null, 'the app version is never the hub version');
+});
+
 test('the godot fallback exports with GODOT_BIN and fails on script errors', async () => {
   const f = await fixture();
   try {

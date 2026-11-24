@@ -17,9 +17,14 @@ export async function sha256File(path) {
 // The ref the runner fetched the hub at, so a Release or a TestFlight build traces back to the code that made it.
 // The composite action passes github.action_ref as HUB_REF; the runner's own layout names it too
 // (_actions/<owner>/<repo>/<ref>/tools/ci/lib/receipt.mjs). `main` is bring-up only, a tag is what a real run should show.
+// The catch-up and hub-device run from an installed release (~/.local/share/mobile-deploy-hub/releases/<ref>/tools/...),
+// which names its ref the same way (AD-10). This is the one hub-version resolver: the Event Log imports it, and nothing
+// reads the app's version for it. Order: HUB_REF, the _actions path, the release-dir name, null.
+const actionsLayout = /[\\/]_actions[\\/][^\\/]+[\\/][^\\/]+[\\/]([^\\/]+)[\\/]tools[\\/]ci[\\/]lib[\\/]receipt\.mjs$/;
+const releaseLayout = /[\\/]mobile-deploy-hub[\\/]releases[\\/]([^\\/]+)[\\/]tools[\\/]ci[\\/]lib[\\/]receipt\.mjs$/;
 export function hubRef(env = process.env, file = fileURLToPath(import.meta.url)) {
   if (env.HUB_REF) return env.HUB_REF;
-  return /[\\/]_actions[\\/][^\\/]+[\\/][^\\/]+[\\/]([^\\/]+)[\\/]tools[\\/]ci[\\/]lib[\\/]receipt\.mjs$/.exec(file)?.[1] ?? null;
+  return actionsLayout.exec(file)?.[1] ?? releaseLayout.exec(file)?.[1] ?? null;
 }
 
 // The digest of the policy this hub ran with, recorded in every receipt (design v1.1, A1).
