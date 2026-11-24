@@ -15,6 +15,9 @@
 // share of its stated `for_ms` that past agent Leases used; a blocking Reservation adds 0 to its grace left). An entry with fewer
 // matching holds than `eta_low_data_min_holds` widens to its stated duration and sets `low_data`; a duration nobody stated is
 // unknown, and the total upper bound is then the asker's own deadline (null without one).
+//
+// `formatEta(eta)` is the one ETA text (Story 4.2): the wait line's `eta=` value and 4.3's status both print it. `etaMoved(a, b)`
+// is the wait line's rule for when a recomputed range differs enough from the printed one to print again. Both are pure too.
 const DAY_MS = 86_400_000;
 const ENDS = new Set(['release', 'reclaim', 'force-release']);
 
@@ -147,4 +150,30 @@ export function eta(queue, events, policy, now) {
   lo = Math.round(lo);
   if (hi !== null) hi = Math.max(lo, Math.round(hi));
   return { lo_ms: lo, hi_ms: hi, low_data: low };
+}
+
+// One bound as text: under 60 s `<s>s`, under 60 min `<m>m`, otherwise `<h>h<mm>m`; whole units, rounded to the nearest.
+function duration(value) {
+  const seconds = Math.round(value / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.round(value / 60_000);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, '0')}m`;
+}
+
+// The ETA as the text after `eta=`: `<lo>-<hi>`, plus ` low-data` when the range is widened; `?` for an unknown upper bound
+// (`hi_ms` null) and `?` alone for no ETA at all (the computation failed). `{0, 900000, true}` is `0s-15m low-data`.
+export function formatEta(value) {
+  if (!value || typeof value !== 'object' || !Number.isFinite(value.lo_ms)) return '?';
+  const hi = Number.isFinite(value.hi_ms) ? duration(value.hi_ms) : '?';
+  return `${duration(Math.max(0, value.lo_ms))}-${hi}${value.low_data ? ' low-data' : ''}`;
+}
+
+// Whether `b` differs from `a` by more than a minute: either bound moved by over 60 s, the upper bound turned known or unknown,
+// or exactly one of the two has no ETA. The wait line compares with the last PRINTED range, so small drifts add up until due.
+export function etaMoved(a, b) {
+  if (!a || !b) return Boolean(a) !== Boolean(b);
+  if (Math.abs(a.lo_ms - b.lo_ms) > 60_000) return true;
+  if ((a.hi_ms === null) !== (b.hi_ms === null)) return true;
+  return a.hi_ms !== null && Math.abs(a.hi_ms - b.hi_ms) > 60_000;
 }

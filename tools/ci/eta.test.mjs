@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { eta, percentile } from './lib/eta.mjs';
+import { eta, etaMoved, formatEta, percentile } from './lib/eta.mjs';
 import { acquireLease, releaseLease, reserve, withLock } from './lib/lock.mjs';
 import { appendEvent, readEvents } from './lib/events.mjs';
 import { loadPolicy } from './lib/policy.mjs';
@@ -368,4 +368,40 @@ test('a run that holds a Reservation is told the wait from its Reservation\'s pl
     releaseLease('adb', 'first', { env: f.env });
     await served;
   } finally { f.cleanup(); }
+});
+
+test('formatEta prints each bound as s, m or h:mm and flags low data', () => {
+  const text = (lo_ms, hi_ms, low_data = false) => formatEta({ lo_ms, hi_ms, low_data });
+  assert.equal(text(0, 900_000, true), '0s-15m low-data');
+  assert.equal(text(125_000, 4_500_000), '2m-1h15m');
+  assert.equal(text(0, 0), '0s-0s');
+  assert.equal(text(1_499, 59_499), '1s-59s', 'under a minute: whole seconds');
+  assert.equal(text(59_500, 60_000), '1m-1m', '59.5 s rounds to the minute');
+  assert.equal(text(0, 59 * MIN), '0s-59m');
+  assert.equal(text(0, 59 * MIN + 29_000), '0s-59m');
+  assert.equal(text(0, 59 * MIN + 31_000), '0s-1h00m', 'rounds up into the hour');
+  assert.equal(text(0, 60 * MIN), '0s-1h00m');
+  assert.equal(text(0, 61 * MIN + 29_000), '0s-1h01m');
+  assert.equal(text(0, 25 * 60 * MIN + 5 * MIN), '0s-25h05m');
+  assert.equal(text(MIN, null), '1m-?', 'an unknown upper bound is ?');
+  assert.equal(text(MIN, null, true), '1m-? low-data');
+  assert.equal(formatEta(null), '?', 'no ETA at all');
+  assert.equal(formatEta(undefined), '?');
+});
+
+test('etaMoved: more than a minute on either bound, or a null changing sides', () => {
+  const a = { lo_ms: 0, hi_ms: 10 * MIN, low_data: true };
+  assert.equal(etaMoved(a, { ...a }), false);
+  assert.equal(etaMoved(a, { ...a, hi_ms: 10 * MIN - 60_000 }), false, 'exactly 60 s is not moved');
+  assert.equal(etaMoved(a, { ...a, hi_ms: 10 * MIN - 60_001 }), true);
+  assert.equal(etaMoved(a, { ...a, hi_ms: 10 * MIN + 60_001 }), true);
+  assert.equal(etaMoved(a, { ...a, lo_ms: 60_000 }), false);
+  assert.equal(etaMoved(a, { ...a, lo_ms: 60_001 }), true);
+  assert.equal(etaMoved(a, { ...a, low_data: false }), false, 'the flag alone does not print');
+  assert.equal(etaMoved(a, { ...a, hi_ms: null }), true, 'hi turned unknown');
+  assert.equal(etaMoved({ ...a, hi_ms: null }, a), true, 'hi turned known');
+  assert.equal(etaMoved({ ...a, hi_ms: null }, { ...a, hi_ms: null }), false);
+  assert.equal(etaMoved(a, null), true);
+  assert.equal(etaMoved(null, a), true);
+  assert.equal(etaMoved(null, null), false);
 });

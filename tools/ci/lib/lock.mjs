@@ -21,7 +21,7 @@ import { appendEvent, hostId as machineId, readEvents } from './events.mjs';
 import { pause, sleep as realSleep } from './pause.mjs';
 import { jobDeadline, jobTimeoutMs } from './deadline.mjs';
 import { loadPolicy } from './policy.mjs';
-import { eta } from './eta.mjs';
+import { eta, etaMoved, formatEta } from './eta.mjs';
 
 export const lockDir = (env = process.env, home = homedir()) => env.HUB_LOCK_DIR || join(home, '.cache/mobile-deploy-hub/locks');
 
@@ -224,12 +224,13 @@ export async function withLock(name, fn, {
   yieldToLease = false,
   timeoutReason = 'deadline',
   delivery = null,
+  afterEta = () => {},
 } = {}) {
   if (!/^[a-z0-9-]+$/.test(name)) throw new Error(`bad lock name "${name}"`);
   if (typeof timeoutReason !== 'string' || !/^[a-z][a-z0-9-]{0,39}$/.test(timeoutReason)) throw new Error(`bad timeout reason "${timeoutReason}"`);
   checkDelivery(delivery);
   if (kind !== 'job' && kind !== 'hub-job') throw new Error(`bad lock holder kind "${kind}" (job or hub-job)`);
-  if (isQueued(name)) return queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams, endsReservation, yieldToLease, timeoutReason, delivery });
+  if (isQueued(name)) return queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams, endsReservation, yieldToLease, timeoutReason, delivery, afterEta });
   const dir = lockDir(env);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${name}.lock`);
@@ -832,6 +833,46 @@ function enqueueEta(name, { file, deadline, env, now, policy = null, host, hostI
   }
 }
 
+// How long a waiter trusts the ETA it last computed: past this, the poll recomputes it (the holder's remaining time shrinks as time
+// passes), and a position change recomputes it at once (AD-18: the window read is bounded, never run on every 1-2 s poll).
+export const ETA_REFRESH_MS = 300_000;
+
+// The wait line of every Queued waiter (FR-16, Story 4.2): `HUB_LOCK_WAIT <name> held by <holder> position=<n> eta=<lo>-<hi>[ low-data]`.
+// One reporter serves a Lease (acquireLease) and a deploy job or the catch-up (queuedLock); each calls `report(owner, blockers)` on
+// every poll. `position` is the blocking entries ahead + 1. The first poll prints the ETA given at enqueue (`estimate`, no second
+// computation). After that the ETA is recomputed only when the position changed since the last computation or ETA_REFRESH_MS has
+// passed, and a line prints only when the position changed or the range moved over a minute from the last PRINTED one (etaMoved).
+// A failed recompute logs one HUB_ETA_FAILED per waiter and goes on with a null ETA (`eta=?`); the wait never fails because of it.
+// `afterEta` is a test seam called once per recompute.
+function waitReporter(name, { ticket, deadline, estimate, requested, env, now, policy, host, hostId, processStart: startOf, log, afterEta = () => {} }) {
+  let computed = estimate;
+  let computedAt = requested;
+  let computedPosition = null;
+  let printed = null;
+  // A null estimate means the enqueue already logged this waiter's HUB_ETA_FAILED: one line per waiter in all.
+  let failureLogged = estimate === null;
+  const once = line => {
+    if (failureLogged) return;
+    failureLogged = true;
+    log(line);
+  };
+  return function report(owner, blockers) {
+    const position = blockers.length + 1;
+    const at = now();
+    if (printed === null) {
+      computedPosition = position;
+    } else if (position !== computedPosition || at - computedAt >= ETA_REFRESH_MS) {
+      computed = enqueueEta(name, { file: ticket, deadline, env, now: () => at, policy, host, hostId, processStart: startOf, log: once });
+      computedAt = at;
+      computedPosition = position;
+      afterEta();
+    }
+    if (printed !== null && printed.position === position && !etaMoved(printed.eta, computed)) return;
+    printed = { position, eta: computed };
+    log(`HUB_LOCK_WAIT ${name} held by ${describe(owner)} position=${position} eta=${formatEta(computed)}`);
+  };
+}
+
 // A process start read at most once per pid in JOB_POLL_MS: a Mac pass spawns `ps` per ticket otherwise (AD "liveness cost").
 function cachedStart(startOf, now) {
   const seen = new Map();
@@ -895,7 +936,7 @@ export function poolRequest(pool, { id = newLeaseId(), holder, why, forMs = null
 // `timeoutMs` of 0 or less is a try: no ticket, no event unless it acquires. Events (AD-9) follow acquireLease's: `request` once
 // the ticket is in place, `acquire` once the ticket is claimed, and `timeout` or `cancel` once this waiter's own unlink of its
 // ticket succeeds. A wait that runs out throws HUB_LOCK_TIMEOUT, wording `host lock <name> is held ...` as before.
-async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams, endsReservation, yieldToLease, timeoutReason, delivery }) {
+async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams, endsReservation, yieldToLease, timeoutReason, delivery, afterEta }) {
   const tag = delivery ? { delivery } : {};
   const dir = lockDir(env);
   mkdirSync(dir, { recursive: true });
@@ -917,10 +958,11 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
   let ticket = null;
   let ticketFile = null;
   let selfText = 'this job';
+  let estimate = null;
   if (!tryOnly) {
     const placed = reserved ? Math.min(requested, reserved.reserved_ms) : requested;
     const named = ticketName(placed);
-    const estimate = enqueueEta(name, { file: named, deadline, env, now: () => requested, policy, host, hostId, processStart: startOf, log });
+    estimate = enqueueEta(name, { file: named, deadline, env, now: () => requested, policy, host, hostId, processStart: startOf, log });
     const body = buildTicket(kind, { env, requested, deadline, host, hostId, processStart: startOf, reservation: reserved?.key ?? null, delivery: delivery ?? null, eta: estimate });
     selfText = `${kind === 'hub-job' ? 'catch-up' : 'job'} ${body.lease_id}`;
     ({ file: ticket, path: ticketFile } = writeTicket(name, body, { env, requested: placed, file: named }));
@@ -954,7 +996,8 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
     ? `gave up after ${Math.round((deadline - requested) / 60_000)} min, ahead of this job's ${Math.round(capped.timeout_ms / 60_000)}-minute timeout. Another deploy is using the device; run again when it finishes.`
     : `gave up after ${Math.round(timeoutMs / 60_000)} min. Another deploy is using the device; run again when it finishes.`;
   if (capped) log(`HUB_LOCK_DEADLINE ${name} wait ends ${iso(deadline)} (job timeout ${Math.round(capped.timeout_ms / 60_000)} min, margin ${Math.round(capped.margin_ms / 60_000)} min, later holds ${Math.round(capped.allowance_ms / 60_000)} min)`);
-  let waiting = false;
+  // A try has no ticket and no ETA, so it has no wait line.
+  const report = tryOnly ? () => {} : waitReporter(name, { ticket, deadline, estimate, requested, env, now, policy, host, hostId, processStart: startOf, log, afterEta });
   let vanished = 0;
   let failed = true;
   let mine = null;
@@ -1009,7 +1052,7 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
           }
           yieldTo(owner);
           if (now() >= deadline) throw timedOut(`${heldText(name, owner)}; ${gaveUp}`, owner);
-          if (!waiting) { log(`HUB_LOCK_WAIT ${name} held by ${describe(owner)}`); waiting = true; }
+          report(owner, blockers);
         }
       }
       if (blockers.length > 0) {
@@ -1017,7 +1060,7 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
         const owner = readOwner(path);
         yieldTo(owner);
         if (now() >= deadline) throw timedOut(`${heldText(name, owner, blockers, selfText)}; ${gaveUp}`, owner, blockers);
-        if (!waiting) { log(`HUB_LOCK_WAIT ${name} queued behind ${blockers.length} (${describe(owner)})`); waiting = true; }
+        report(owner, blockers);
       }
       await sleep(pollMs);
     }
@@ -1072,6 +1115,7 @@ export async function acquireLease(name, {
   processStart: startOf = processStart,
   pool = null,
   policy = null,
+  afterEta = () => {},
 } = {}) {
   const path = lockPath(name, env);
   if (!(forMs > 0) || forMs > MAX_LEASE_MS) throw new Error(`a lease runs for more than 0 and at most ${MAX_LEASE_MS / 3600_000}h`);
@@ -1117,7 +1161,7 @@ export async function acquireLease(name, {
   };
   const view = () => queueView(name, { env, prune: true, now, host, hostId, processStart: startOf });
   const cancelled = text => failure('HUB_LEASE_CANCELLED', `lease ${lease_id} ${text} ${name}`);
-  let waiting = false;
+  const report = tryOnly ? () => {} : waitReporter(name, { ticket, deadline, estimate, requested, env, now, policy, host, hostId, processStart: startOf, log, afterEta });
   let vanished = 0;
   let failed = true;
   try {
@@ -1183,14 +1227,13 @@ export async function acquireLease(name, {
             continue;
           }
           if (now() >= deadline) throw timedOut(`${heldText(name, owner)}; gave up after ${Math.round(waitMs / 1000)}s`, owner);
-          if (!waiting) { log(`HUB_LOCK_WAIT ${name} held by ${describe(owner)}`); waiting = true; }
+          report(owner, blockers);
         }
       }
       if (blockers.length > 0) {
         startGrace(name, current, { env, now, hostId });
-        const ahead = blockers.length;
         if (now() >= deadline) { const owner = readOwner(path); throw timedOut(`${heldText(name, owner, blockers, `lease ${lease_id}`)}; gave up after ${Math.round(waitMs / 1000)}s`, owner); }
-        if (!waiting) { log(`HUB_LOCK_WAIT ${name} queued behind ${ahead} (${describe(readOwner(path))})`); waiting = true; }
+        report(readOwner(path), blockers);
       }
       await pause(pollMs, { signal, sleep });
     }

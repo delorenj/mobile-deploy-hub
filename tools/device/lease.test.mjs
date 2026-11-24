@@ -100,7 +100,11 @@ test('a lease and a withLock job exclude each other, both ways', async () => {
     const holding = withLock('adb', () => new Promise(done => { release = done; }), { env: f.env, log: f.log });
     await settle(20);
     await assert.rejects(lease(f, { waitMs: 30 }), error => error.code === 'HUB_LOCK_TIMEOUT' && /held by delorenj\/example run 9/.test(error.message));
-    assert.ok(f.logs.some(line => /^HUB_LOCK_WAIT adb held by delorenj\/example run 9/.test(line)));
+    // Intended text change (FR-13, FR-16, AD-17): the wait line gains `position=<n> eta=<lo>-<hi>[ low-data]` after the holder.
+    // No history and no stated hold length, so the range is 0 to the waiter's own 30 ms deadline, flagged low-data.
+    const waitLines = f.logs.filter(line => line.startsWith('HUB_LOCK_WAIT'));
+    assert.equal(waitLines.length, 1, 'one wait line while nothing changes');
+    assert.match(waitLines[0], /^HUB_LOCK_WAIT adb held by delorenj\/example run 9 \(pid \d+, since [^)]+\) position=1 eta=0s-\d+s low-data$/);
     // lease waits for the job, then gets it
     const waiting = lease(f, { id: 'queued', waitMs: 5000 });
     await settle(30);
