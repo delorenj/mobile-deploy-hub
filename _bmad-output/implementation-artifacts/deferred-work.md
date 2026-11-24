@@ -74,3 +74,12 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-7-no-extension-while-others-wait-deploy-target-leases-capped.md`
   summary: The emulator's ready-time rewrite can no longer move `expires_at` later (AD-16), so when AVD creation plus boot overran the slot Lease's 2-minute allowance, the Lease the maker prints lasts less than `--for` from ready.
   evidence: The slot is taken for boot + `--for` + 2 min and the rewrite sets `now + --for`, which is earlier unless prep + boot exceed boot timeout + 2 min; the clamp keeps the slot's own expiry. Widening the slot allowance is a tuning decision for the emulator story; the fake-emulator suite cannot reach the branch.
+
+## From Story 2.8 (MOBI-37)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-8-ship-the-freeze-set.md`
+  summary: `AGENTS.md` (and `CLAUDE.md`, its symlink) still say deploy jobs' `withLock` does not join the FIFO lease queue; after v1.2.46 is released and `hosts:install` has run on both hosts the line is false and must go (Known pitfalls, the starvation line). 2.8 leaves the instruction file unedited.
+  evidence: `docs/hub-releases.md` v1.2.46 now says the Queue serves every Claimant. The same note was filed under Story 2.3; nothing is released until the parent runs the release.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-8-ship-the-freeze-set.md`
+  summary: The emulator fixture's boots are real child processes and a hosted runner needs ~5 s per lease (probably the boot loop's 5 s adb re-registration; not proven), so `tools/device/emulator.test.mjs` takes minutes there; other tests in it still take a short real `--for` or wait on wall-clock expiry (the reaper and `run emulator reaps` tests use 1 s leases).
+  evidence: Only `status is read-only` (3 s lease) and `dies while booting` (wording race) failed on the runner; the others have one lease each, so a slow take cannot expire a neighbour. A suite-wide fake clock for the emulator tests would remove the class.
