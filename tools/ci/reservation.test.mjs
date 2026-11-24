@@ -36,6 +36,11 @@ const events = f => [...readEvents({ env: f.env })];
 const take = (f, env = f.env, name = 'adb', extra = {}) => reserve(name, { env, now: f.now, policy, log: f.log, ...extra });
 const keyOf = (repo, run) => `${repo.replace('/', '--')}--${run}`;
 const settle = ms => new Promise(done => setTimeout(done, ms));
+// Polls a condition on real timers for up to 10 s, so a loaded machine never turns a fixed pause into a flake.
+const until = async (check, what) => {
+  for (let tries = 0; tries < 1000; tries += 1) { if (check()) return; await settle(10); }
+  assert.fail(`never happened: ${what}`);
+};
 const fakeTimers = () => ({ setInterval: () => ({ unref() {} }), clearInterval() {} });
 const shape = view => view.map(entry => [entry.place, entry.kind, entry.key ?? entry.lease_id, entry.blocking]);
 // A ticket as a pinned or current hub would have written it (file name = ms15-counter-pid), for tests that place one by hand.
@@ -125,6 +130,35 @@ test('a record that never became readable is waited for, then set aside once it 
     const got = take(f, f.env, 'adb', { now: () => later, wait: () => {} });
     assert.equal(got.status, 'claimed');
     assert.deepEqual(events(f).map(event => event.event), ['claim']);
+  } finally { f.cleanup(); }
+});
+
+test('setting aside an unreadable record never deletes a Reservation another process made after it was judged: it goes back and is reused', () => {
+  const f = fixture();
+  try {
+    const dir = join(f.reservations, 'delorenj--example--5');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'reservation.json'), '{"format":');
+    const later = Date.now() + 120_000;
+    const made = { format: 1, run_key: 'delorenj--example--5', repo: 'delorenj/example', run: '5', reserved_at: new Date(later).toISOString(), expires_at: new Date(later + 180 * MIN).toISOString(), grace_ms: 10 * MIN };
+    let swapped = false;
+    // The instant between the age check and the rename (retireReservation reads the clock first): a rerun replaces the junk
+    // with a good Reservation.
+    const now = () => {
+      if (!swapped && new Error().stack.includes('retireReservation')) {
+        swapped = true;
+        rmSync(dir, { recursive: true });
+        mkdirSync(dir);
+        writeFileSync(join(dir, 'reservation.json'), JSON.stringify(made));
+      }
+      return later;
+    };
+    const got = take(f, f.env, 'adb', { now, wait: () => {} });
+    assert.ok(swapped);
+    assert.equal(got.status, 'reused', 'the Reservation made in between survived');
+    assert.deepEqual(got.reservation, made);
+    assert.deepEqual(readdirSync(f.reservations), ['delorenj--example--5']);
+    assert.deepEqual(events(f), [], 'no claim and no expiry: nothing was created or retired');
   } finally { f.cleanup(); }
 });
 
@@ -276,7 +310,7 @@ test('a Job Hold of the run takes its Reservation\'s place: ms15 is reserved_at,
     const between = putTicket(f, reservedAt + 5 * MIN, { lease_id: 'between', pid: process.pid });
     const served = [];
     const asking = withLock('adb', async () => { served.push('run 5'); }, { env: f.runEnv(5, 'android'), log: f.log, pollMs: 5, timeoutMs: 10_000, timers: fakeTimers() });
-    await settle(40);
+    await until(() => queueView('adb', { env: f.env }).some(entry => entry.kind === 'job'), 'the run\'s ticket');
     const view = queueView('adb', { env: f.env });
     assert.deepEqual(shape(view).map(row => row.slice(0, 2)), [[1, 'job'], [2, 'lease']], 'the run is ahead of the earlier-arriving ticket... and its Reservation is hidden');
     const [job] = view;
@@ -285,7 +319,7 @@ test('a Job Hold of the run takes its Reservation\'s place: ms15 is reserved_at,
     assert.equal(job.reservation, 'delorenj--example--5');
     assert.equal(view[1].file, basename(between));
     releaseLease('adb', 'holder', { env: f.plain });
-    await settle(60);
+    await until(() => served.length > 0, 'the run is served');
     assert.deepEqual(served, ['run 5']);
     rmSync(between);
     await asking;
@@ -304,15 +338,14 @@ test('a request of another run, or of a run without a Reservation, keeps its own
     take(f, f.runEnv(5), 'adb', { now: () => Date.now() });
     await settle(5);
     const waiting = withLock('adb', async () => {}, { env: f.runEnv(6, 'android'), log: f.log, pollMs: 5, timeoutMs: 10_000, timers: fakeTimers() });
-    await settle(40);
+    await until(() => queueView('adb', { env: f.env }).some(entry => entry.kind === 'job'), 'the waiting job\'s ticket');
     const view = queueView('adb', { env: f.env });
     assert.deepEqual(shape(view).map(row => [row[0], row[1]]), [[1, 'reservation'], [2, 'job']]);
     assert.equal(view[1].reservation, null);
     assert.ok(Math.abs(Number(view[1].file.slice(0, 15)) - Date.parse(view[1].enqueued_at)) < 1000, 'its ticket is named for its own request time');
     releaseLease('adb', 'holder', { env: f.plain });
     // the head Reservation (run 5, not asking) holds the free lock for its grace
-    await settle(60);
-    assert.ok(existsSync(join(f.reservations, 'delorenj--example--5/grace.json')), 'the waiter that saw a free lock started the grace');
+    await until(() => existsSync(join(f.reservations, 'delorenj--example--5/grace.json')), 'the waiter that saw a free lock starts the grace');
     rmSync(f.reservations, { recursive: true });
     await waiting;
   } finally { f.cleanup(); }
@@ -426,7 +459,7 @@ test('the same-run passthrough survives a rerun: attempt 2 asks at the original 
     const rerun = { ...f.runEnv(5, 'android'), GITHUB_RUN_ATTEMPT: '2' };
     take(f, rerun, 'adb', { now: () => Date.now() });
     const waiting = withLock('adb', async () => {}, { env: rerun, log: f.log, pollMs: 5, timeoutMs: 10_000, timers: fakeTimers() });
-    await settle(40);
+    await until(() => queueView('adb', { env: f.env }).some(entry => entry.kind === 'job'), 'the rerun\'s ticket');
     const [job] = queueView('adb', { env: f.env });
     assert.deepEqual([job.kind, job.attempt, job.file.slice(0, 15)], ['job', '2', String(reservedAt).padStart(15, '0')]);
     releaseLease('adb', 'holder', { env: f.plain });

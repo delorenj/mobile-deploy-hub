@@ -39,3 +39,8 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-5-reservations-keep-a-runs-place.md`
   summary: A job ticket and a Reservation with the same millisecond sort ticket first (a digit sorts before `r` in `<ms15>-reservation-<key>`), and a pinned hub orders only tickets, so a Claimant that asks in the very millisecond a Reservation is made can stand ahead of it.
   evidence: AD-6 breaks ties on the full name string; the tie is a one-in-a-million coincidence for a human-paced queue and harmless (the ticket really did ask first). Not worth a rule.
+
+## From the independent review of Story 2.5 (MOBI-34)
+
+- A grace stamp that fails for a reason other than ENOENT or EEXIST (a directory the caller cannot write) is swallowed, so the head Reservation would block until its ceiling. Every lock directory belongs to one user today; when that stops being true, make an unwritable Reservation count as grace over.
+- A grace stamp can land in a re-reserved directory of the same key if an expiry and an immediate rerun fall between the view and the stamp; the stamp only starts that Reservation's grace early.

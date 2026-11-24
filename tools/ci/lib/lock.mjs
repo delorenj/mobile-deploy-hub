@@ -497,7 +497,10 @@ function retireReservation(name, found, { as = null, reason = null, env = proces
     renameSync(join(base, found.key), moved);
   } catch { return false; }
   const taken = readReservation(moved, found.key);
-  if (found.record && taken?.record?.reserved_at !== found.record.reserved_at) {
+  // A judged record that was unreadable (`record: null`) was junk: anything readable in the moved directory is a Reservation
+  // another process made after that judgement, and goes back like any other that was not the one judged.
+  const moreThanJudged = found.record ? taken?.record?.reserved_at !== found.record.reserved_at : taken !== null;
+  if (moreThanJudged) {
     try { renameSync(moved, join(base, found.key)); } catch { try { rmSync(moved, { recursive: true }); } catch { /* never blocks the key */ } }
     return false;
   }

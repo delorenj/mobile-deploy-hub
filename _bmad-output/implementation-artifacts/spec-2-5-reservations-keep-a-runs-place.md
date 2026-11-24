@@ -101,3 +101,15 @@ Self-review, one pass; no patches needed. `heavy mise run check` green: 580 test
 **Commands:**
 - `node --test tools/ci/reservation.test.mjs tools/ci/policy.test.mjs tools/device/lease.test.mjs` -- expected: all pass
 - `heavy mise run check` -- expected: green
+
+## Review (independent)
+
+Adversarial pass against the epic's Story 2.5 ACs and AD-2, AD-6, AD-7, AD-9, AD-11, reading the commit `87f6984` and running the suite with `HOME` pointed at an empty temp dir (nothing was written there: the new tests and the gate and preflight-ios tests are hermetic).
+
+**Checked and sound:** every AC has a test that fails without the behaviour; eight processes reserving one run key give one `claim` and seven `reused`; six processes pruning one expired Reservation give one `expiry`; `wx` on `grace.json` gives one winner and one `grace`; a stamp into a renamed-away directory is ENOENT and silent; an old bare `mkdir` of `<name>.lock` and `listLocks()` never see a Reservation; tickets and owners gained no key; `hub-device status` output is unchanged (Reservations filtered, positions renumbered); the gate and `preflight-ios` log lines are the only new CLI output; `grace_min` and `reservation_ceiling_min` are read from policy only (the 60 s unreadable-record age and the 25 ms retry are protocol constants like `TICKET_ABSENT_MS`).
+
+**Fixed:**
+- `retireReservation` set an unreadable record aside without the put-back check it applies to a judged record, so `reserve` could delete a good Reservation a concurrent rerun created between its age check and its rename (the rerun then lost its place and a second `claim` followed). A readable Reservation found in the moved directory now goes back whatever was judged. Regression test: `setting aside an unreadable record never deletes a Reservation another process made after it was judged`.
+- Four tests waited a fixed 40 to 60 ms of real time for a ticket, a grace stamp or a served job; they now poll up to 10 s (`until`), so a loaded box cannot flake them.
+
+**Dismissed:** a Lease ticket made inside a deploy run's own environment would hide that run's Reservation (no deploy lane leases, and the AC hides on any live ticket of the run); a grace stamp that fails for a reason other than ENOENT or EEXIST is swallowed, so the head would block until its ceiling (same user owns every lock directory; recorded in `deferred-work.md`); a stamp racing an expiry plus an immediate re-reserve of the same key could start the new Reservation's grace early (needs a rerun within the same millisecond window as an expiry).
