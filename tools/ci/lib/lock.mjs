@@ -21,6 +21,7 @@ import { appendEvent, hostId as machineId, readEvents } from './events.mjs';
 import { pause, sleep as realSleep } from './pause.mjs';
 import { jobDeadline, jobTimeoutMs } from './deadline.mjs';
 import { loadPolicy } from './policy.mjs';
+import { eta } from './eta.mjs';
 
 export const lockDir = (env = process.env, home = homedir()) => env.HUB_LOCK_DIR || join(home, '.cache/mobile-deploy-hub/locks');
 
@@ -796,16 +797,35 @@ function heldText(name, owner, blockers = [], self = null) {
   return `host lock ${name} is held by ${describe(owner)}${list}`;
 }
 
+// A fresh ticket file name, `<ms15>-<counter6>-<pid8>.json`: minted before the body so the ETA can know the asker's place.
+const ticketName = requested => `${String(requested).padStart(15, '0')}-${String(ticketCounter++).padStart(6, '0')}-${String(process.pid).padStart(8, '0')}.json`;
+
 // Writes a ticket into <name>.queue/, write-then-rename so a reader never sees half of it, and returns its file name and path.
-function writeTicket(name, body, { env, requested }) {
+// `file` is a name from ticketName, when the caller minted it first.
+function writeTicket(name, body, { env, requested, file = ticketName(requested) }) {
   const queue = queuePath(name, env);
   mkdirSync(queue, { recursive: true });
-  const file = `${String(requested).padStart(15, '0')}-${String(ticketCounter++).padStart(6, '0')}-${String(process.pid).padStart(8, '0')}.json`;
   const path = join(queue, file);
   const pending = `${path}.tmp`;
   writeFileSync(pending, JSON.stringify(body), { flag: 'wx' });
   renameSync(pending, path);
   return { file, path };
+}
+
+// The ETA a waiter is told at enqueue (AD-18, FR-15), for the ticket and the `request` event, so its accuracy can be measured
+// later (SM-4). It reads the owner, an observer's view (no prune) and the policy window's events once, then asks eta(). `file`
+// is the ticket's minted name, so the asker's place is known before its ticket lands. Never throws and never delays the
+// enqueue beyond those reads: any error is a null ETA.
+function enqueueEta(name, { file, deadline, env, now, policy = null, host, hostId, processStart: startOf }) {
+  try {
+    const at = now();
+    const settings = policy ?? loadPolicy().policy;
+    const days = settings.queue.eta_window_days;
+    const owner = readOwner(lockPath(name, env));
+    const view = queueView(name, { env, now, host, hostId, processStart: startOf });
+    const events = [...readEvents({ env, since: at - days * 86_400_000, until: at + 1, log: () => {} })];
+    return eta({ owner, view, file, deadline_at: deadline }, events, settings, at);
+  } catch { return null; }
 }
 
 // A process start read at most once per pid in JOB_POLL_MS: a Mac pass spawns `ps` per ticket otherwise (AD "liveness cost").
@@ -894,10 +914,13 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
   let ticketFile = null;
   let selfText = 'this job';
   if (!tryOnly) {
-    const body = buildTicket(kind, { env, requested, deadline, host, hostId, processStart: startOf, reservation: reserved?.key ?? null, delivery: delivery ?? null });
+    const placed = reserved ? Math.min(requested, reserved.reserved_ms) : requested;
+    const named = ticketName(placed);
+    const estimate = enqueueEta(name, { file: named, deadline, env, now: () => requested, policy, host, hostId, processStart: startOf });
+    const body = buildTicket(kind, { env, requested, deadline, host, hostId, processStart: startOf, reservation: reserved?.key ?? null, delivery: delivery ?? null, eta: estimate });
     selfText = `${kind === 'hub-job' ? 'catch-up' : 'job'} ${body.lease_id}`;
-    ({ file: ticket, path: ticketFile } = writeTicket(name, body, { env, requested: reserved ? Math.min(requested, reserved.reserved_ms) : requested }));
-    note(name, eventOf('request', name, asked, { deadline_at: iso(deadline), ...(reserved ? { reservation: reserved.key } : {}), ...tag }), { ...seams, at: requested });
+    ({ file: ticket, path: ticketFile } = writeTicket(name, body, { env, requested: placed, file: named }));
+    note(name, eventOf('request', name, asked, { deadline_at: iso(deadline), ...(reserved ? { reservation: reserved.key } : {}), ...tag, eta: estimate }), { ...seams, at: requested });
   }
   let left = false;
   const leave = (as, fields) => {
@@ -1061,15 +1084,18 @@ export async function acquireLease(name, {
   // never sees a half-written ticket.
   let ticket = null;
   let ticketFile = null;
+  let estimate = null;
   if (!tryOnly) {
-    ({ file: ticket, path: ticketFile } = writeTicket(name, buildTicket('lease', { env, requested, deadline, lease_id, holder, why, host, hostId, processStart: startOf }), { env, requested }));
+    const named = ticketName(requested);
+    estimate = enqueueEta(name, { file: named, deadline, env, now: () => requested, policy, host, hostId, processStart: startOf });
+    ({ file: ticket, path: ticketFile } = writeTicket(name, buildTicket('lease', { env, requested, deadline, lease_id, holder, why, host, hostId, processStart: startOf, eta: estimate }), { env, requested, file: named }));
   }
   const attempt = env.GITHUB_RUN_ATTEMPT ?? null;
   const job = env.GITHUB_JOB ?? null;
   const asked = { kind: 'lease', lease_id, holder, repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null, attempt, job };
   const seams = { env, hostId };
   const waitedTo = at => ({ for_ms: forMs, deadline_at: iso(deadline), waited_ms: Math.max(0, at - requested) });
-  if (!tryOnly) note(name, eventOf('request', name, asked, { for_ms: forMs, deadline_at: iso(deadline) }), { ...seams, at: requested });
+  if (!tryOnly) note(name, eventOf('request', name, asked, { for_ms: forMs, deadline_at: iso(deadline), eta: estimate }), { ...seams, at: requested });
   // Leaves the queue by unlinking its own ticket. True when this waiter's unlink decided it (and recorded `as`); false
   // when the ticket was already gone, which means a release cancelled it and wrote that event.
   let left = false;

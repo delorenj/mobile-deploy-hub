@@ -285,16 +285,19 @@ export function parsePolicy(source) {
 // Reservation's one-time grace (a head Reservation holds the idle device that long) and its ceiling (how long a run's place lasts
 // at most); a Reservation record stamps both, so readers never apply their own. Story 2.7 adds the deploy-target Lease cap: the
 // most minutes a Lease on `adb` or `mac-ios` may run in total, at acquire and at every extension (AD-16). Story 3.3 adds the catch-up's
-// two waits: the short attempt in seconds, and the minutes a contention-pending build stays in line for its turn.
+// two waits: the short attempt in seconds, and the minutes a contention-pending build stays in line for its turn. Story 4.1 adds the ETA's two inputs (AD-18): the window of past
+// holds it reads, in days, and the number of matching holds below which a range is flagged low-data and widened.
 export const queueJobs = Object.freeze(['plan', 'android', 'ios']);
 function queueBlock(queue) {
-  exact('queue', queue, ['wait_margin_min', 'hold_allowance_min', 'grace_min', 'reservation_ceiling_min', 'deploy_target_lease_max_min', 'catchup_attempt_s', 'catchup_pending_wait_min']);
+  exact('queue', queue, ['wait_margin_min', 'hold_allowance_min', 'grace_min', 'reservation_ceiling_min', 'deploy_target_lease_max_min', 'catchup_attempt_s', 'catchup_pending_wait_min', 'eta_window_days', 'eta_low_data_min_holds']);
   positive('queue.wait_margin_min', queue.wait_margin_min);
   positive('queue.grace_min', queue.grace_min);
   positive('queue.reservation_ceiling_min', queue.reservation_ceiling_min);
   positive('queue.deploy_target_lease_max_min', queue.deploy_target_lease_max_min);
   positive('queue.catchup_attempt_s', queue.catchup_attempt_s);
   positive('queue.catchup_pending_wait_min', queue.catchup_pending_wait_min);
+  positive('queue.eta_window_days', queue.eta_window_days);
+  positive('queue.eta_low_data_min_holds', queue.eta_low_data_min_holds);
   exact('queue.hold_allowance_min', queue.hold_allowance_min, queueJobs);
   for (const job of queueJobs) positive(`queue.hold_allowance_min.${job}`, queue.hold_allowance_min[job]);
 }

@@ -483,7 +483,7 @@ test('a Lease is recorded as exactly request, acquire, release, each with the AD
     const got = events(f).filter(event => event.lease_id === record.lease_id);
     const id = record.lease_id;
     assert.deepEqual(got.map(body), [
-      { event: 'request', lock: 'adb', hold_kind: 'lease', claimant: leaseClaimant, lease_id: id, for_ms: 600_000, expires_at: null, deadline_at: at(T0 + 3000 + 60_000), waited_ms: null, held_ms: null, reason: null, last_alive_at: null },
+      { event: 'request', lock: 'adb', hold_kind: 'lease', claimant: leaseClaimant, lease_id: id, for_ms: 600_000, expires_at: null, deadline_at: at(T0 + 3000 + 60_000), waited_ms: null, held_ms: null, reason: null, last_alive_at: null, eta: { lo_ms: 0, hi_ms: 60_000, low_data: true } }, // Story 4.1 (intended change): the request records its enqueue ETA; the job ahead has no stated duration and no history, so the range ends at the deadline
       { event: 'acquire', lock: 'adb', hold_kind: 'lease', claimant: leaseClaimant, lease_id: id, for_ms: 600_000, expires_at: at(took + 600_000), deadline_at: at(T0 + 3000 + 60_000), waited_ms: took - (T0 + 3000), held_ms: null, reason: null, last_alive_at: null },
       { event: 'release', lock: 'adb', hold_kind: 'lease', claimant: leaseClaimant, lease_id: id, for_ms: 600_000, expires_at: at(took + 600_000), deadline_at: null, waited_ms: null, held_ms: 120_000, reason: 'by-id', last_alive_at: null },
     ]);
@@ -583,7 +583,7 @@ test('withLock on a Queued name records request, acquire and release as a deploy
     const job = { kind: 'deploy', holder: null, repo: 'delorenj/example', run: '9', attempt: '2', job: 'android' };
     const base = { lock: 'adb', hold_kind: 'job', claimant: job, lease_id: null, for_ms: null, expires_at: null, held_ms: null, waited_ms: null, reason: null, last_alive_at: null };
     assert.deepEqual(events(f).map(body), [
-      { ...base, event: 'request', deadline_at: at(T0 + 15 * 60_000) },
+      { ...base, event: 'request', deadline_at: at(T0 + 15 * 60_000), eta: { lo_ms: 0, hi_ms: 0, low_data: false } }, // Story 4.1 (intended change): a free lock has nothing ahead, so its enqueue ETA is 0-0
       { ...base, event: 'acquire', deadline_at: at(T0 + 15 * 60_000), waited_ms: 0 },
       { ...base, event: 'release', deadline_at: null, held_ms: 2 * ALIVE_MS + 1000, reason: 'done' },
     ]);
@@ -700,7 +700,8 @@ test('a Lease ticket carries exactly the AD-3 keys in order, keeps its file name
     assert.ok(ticket.process_start, 'the process lifetime is named');
     assert.equal(Date.parse(ticket.deadline_at) - Date.parse(ticket.enqueued_at), 10_000);
     assert.deepEqual([ticket.repo, ticket.run, ticket.attempt, ticket.job], ['delorenj/example', '9', '2', 'android']);
-    assert.deepEqual([ticket.expires_at, ticket.reservation, ticket.request, ticket.pool, ticket.eta, ticket.delivery], [null, null, null, null, null, null], 'the keys later stories fill are present and empty');
+    assert.deepEqual([ticket.expires_at, ticket.reservation, ticket.request, ticket.pool, ticket.delivery], [null, null, null, null, null], 'the keys later stories fill are present and empty');
+    assert.deepEqual(Object.keys(ticket.eta), ['lo_ms', 'hi_ms', 'low_data'], 'Story 4.1 (intended change): the ticket records its enqueue ETA');
     releaseLease('adb', 'waiter', { env: f.env });
     await assert.rejects(waiting, error => error.code === 'HUB_LEASE_CANCELLED');
   } finally { f.cleanup(); }
