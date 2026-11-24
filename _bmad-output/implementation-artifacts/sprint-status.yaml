@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 11-24-2026 08:06
-last_updated: 2026-11-24
+last_updated: 11-24-2026 09:00
 project: Mobile Deploy Hub
 project_key: MOBI
 tracking_system: file-system
@@ -54,7 +54,7 @@ development_status:
   2-8-ship-the-freeze-set: done
   epic-2-retrospective: optional  # skipped: Jarad, 2026-11-24
 
-  epic-3: backlog
+  epic-3: in-progress
   3-1-peek-at-the-s26-without-disturbing-a-lease: done
   3-2-a-blocked-android-delivery-goes-pending: done
   3-3-the-catch-up-delivers-contention-pending-builds-in-its-turn: done
@@ -62,7 +62,7 @@ development_status:
   3-5-ios-contention-is-red-and-says-who: backlog
   epic-3-retrospective: optional
 
-  epic-4: backlog
+  epic-4: done
   4-1-an-honest-eta-range-from-history: done
   4-2-position-and-eta-in-the-wait-line: done
   4-3-status-shows-every-waiter-reservations-and-etas: done
