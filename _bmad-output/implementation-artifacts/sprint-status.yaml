@@ -65,5 +65,5 @@ development_status:
   epic-4: backlog
   4-1-an-honest-eta-range-from-history: done
   4-2-position-and-eta-in-the-wait-line: done
-  4-3-status-shows-every-waiter-reservations-and-etas: backlog
+  4-3-status-shows-every-waiter-reservations-and-etas: awaiting-operator
   epic-4-retrospective: optional

@@ -4,6 +4,27 @@ One section per hub release, headed `## vX.Y.Z`. `mise run release -- X.Y.Z` (`t
 
 A section is plain text read in a terminal: everything after its heading up to the next `## ` heading. Use `###` for sub-headings and `-` lists; do not start a section line with `## `.
 
+## v1.2.47
+
+Epic 3 (deliveries survive contention) and Epic 4 (know where you stand and how long it will be), on top of v1.2.46. The Queue protocol and the Event Log format are unchanged; nothing here needs both hosts on the same hub version at the same instant, but install it on both (`mise run hosts:install`).
+
+### What changed
+
+- Peek under a Lease. The catch-up and the deploy's device checks read the S26 without disturbing a Lease holder.
+- `S26 busy` is pending. An Android delivery blocked by a Lease goes `pending` (not failed) and the catch-up delivers it in its turn.
+- The catch-up takes its turn in the FIFO with the Leases, so contention-pending builds are delivered when the line reaches it.
+- A newer installed build is refused with a name: `refused` is written to the Event Log, naming the Leases that held the device since the build went pending (`installed_by`).
+- Enqueue ETA. Every ticket and `request` event carries an `eta` (`{lo_ms, hi_ms, low_data}`): the 25th to 75th percentile of matching past holds in the last `eta_window_days` (30), added along the Queue; fewer than `eta_low_data_min_holds` (20) matching holds widens it to the stated durations and sets `low_data`. Two new keys in the `queue` block of `policy.json`.
+- Wait line. A waiter prints `HUB_LOCK_WAIT <name> held by <holder> position=<n> eta=<lo>-<hi>[ low-data]` in the job log (deploy jobs) or on stderr (`hub-device lease --wait`), only when its position changes or the range moves by more than a minute; at most one recompute every 5 minutes.
+- `hub-device status`. Every waiter is listed by kind (Lease, `JOB <repo> run <run> job <job>`, `CATCH-UP`) with its position and live ETA, and a RESERVATIONS section shows each run's place, grace state and expiry. `--json` adds `waiters[].kind/repo/run/job/eta` and `reservations[]`; no key is renamed or removed. Status stays read-only and answers from one windowed read of the Event Log.
+- `hub-device release job:<repo>#<run>.<attempt>/<job>` exits 2 with `HUB_DEVICE_JOB_ID ...` naming the run to cancel (`gh run cancel <run> --repo <repo>`). It never touched a job before; now it says why.
+
+### Wording change you will see
+
+The wait line is new text on the same `HUB_LOCK_WAIT <name> held by <holder>` prefix: it now ends with `position=<n> eta=<lo>-<hi>`. A caller that matched the whole line must match the prefix only (the old wait-line test was updated as an intended text change, AD-17).
+
+- `hub-device release job:<repo>#<run>.<attempt>/<job>` used to exit 0 with `HUB_DEVICE_NOT_HELD`; it now exits 2 with `HUB_DEVICE_JOB_ID`. A script that checked `release`'s exit code for a job id now sees 2.
+
 ## v1.2.46
 
 Freeze set of the v1a queue protocol (design AD-20): the Event Log from v1.2.45 (tagged, rolled back, never on `v1`), and all of Epic 2. v1.2.44 was the last release on `v1`; this one carries every change since it, in one pin so no pin ever holds half the format.
