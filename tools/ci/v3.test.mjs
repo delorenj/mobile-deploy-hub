@@ -20,6 +20,7 @@ import { loadDevices, parseDevices } from './lib/devices.mjs';
 import { parseManifest } from './lib/manifest.mjs';
 import { android, announce, plan, play, preflightIos, release } from './hub.mjs';
 import { listReservations, releaseReservation, reserve } from './lib/lock.mjs';
+import { reserveFor } from './commands/common.mjs';
 import { readEvents } from './lib/events.mjs';
 import { checkPhone, lanesFrom, parseArguments, phone } from '../deploy.mjs';
 
@@ -848,6 +849,38 @@ test('a real run end to end: bump pushed, APK installed in place and read back, 
     assert.deepEqual(host.calls('bb-emit.log').trim().split('\n').map(line => line.split(' ').pop()), ['--check', '--strict']);
     assert.equal(event.data.verified, true);
     assert.equal(event.data.artifact.commit, planned.build_sha);
+  } finally { await f.cleanup(); }
+});
+
+// Story 2.8 (AD-3, AD-7, NFR-2): the Event Log of one whole deploy run on a pinned hub, from the real gate reservation, plan and
+// android lane code and a fake phone: the run's claim, plan's hold, the android hold that ends the Reservation, and nothing from announce.
+test('a whole deploy run writes its events in order, each stamped with the pinned hub version: claim, plan hold, android hold with the Reservation release', async () => {
+  const f = await gitFixture();
+  try {
+    const host = await laneHost(f);
+    await host.installApk('io.example.app 0.2.1 4');
+    const jobEnv = job => ({ ...host.env, HUB_REF: 'v1.2.46', GITHUB_JOB: job });
+    const as = (job, command, extra = []) => host.configure(command, extra, jobEnv(job));
+    // gate: the call `gate` makes for a run with an Android lane (v11.test.mjs pins that the gate makes it)
+    reserveFor('adb', { env: jobEnv('gate'), log: () => {} });
+    const planned = await quiet(() => plan(as('plan', 'plan', ['--dry-run', 'false']), { env: jobEnv('plan'), home: f.root, fetchImpl: noLatest, s3Factory: async () => host.s3 }));
+    git(f.app, ['checkout', '-q', planned.build_sha], f.env);
+    const lane = await quiet(() => android(as('android', 'android', ['--dry-run', 'false', '--version', '0.2.2', '--android-code', '5', '--build-sha', planned.build_sha]), { env: jobEnv('android'), home: f.root }));
+    assert.equal(lane.delivery.verified, true);
+    const needs = JSON.stringify({ gate: { result: 'success' }, plan: { result: 'success', outputs: host.outputs() }, android: { result: 'success' }, deliver: { result: 'success' } });
+    await quiet(() => announce(as('announce', 'announce', ['--dry-run', 'false']), { env: { ...jobEnv('announce'), HUB_RECEIPTS: f.out, HUB_NEEDS: needs }, home: f.root, fetchImpl: noLatest }));
+    const events = [...readEvents({ env: host.env })];
+    assert.deepEqual(events.map(event => [event.event, event.hold_kind, event.claimant.job]), [
+      ['claim', 'reservation', 'gate'],
+      ['request', 'job', 'plan'], ['acquire', 'job', 'plan'], ['release', 'job', 'plan'],
+      ['request', 'job', 'android'], ['acquire', 'job', 'android'], ['release', 'reservation', 'android'], ['release', 'job', 'android'],
+    ], 'announce finds the Reservation already released by the lane and writes nothing; the Reservation is released before the lock is freed (AD-7)');
+    assert.deepEqual([...new Set(events.map(event => event.hub_version))], ['v1.2.46']);
+    assert.deepEqual([...new Set(events.map(event => event.lock))], ['adb']);
+    assert.deepEqual([...new Set(events.map(event => `${event.claimant.repo}#${event.claimant.run}.${event.claimant.attempt}`))], ['delorenj/example-app#777.1']);
+    for (const event of events.filter(event => event.hold_kind === 'job' && event.event === 'release')) assert.ok(event.held_ms >= 0, 'a release records how long the hold lasted');
+    for (const event of events.filter(event => event.event === 'acquire')) assert.ok(event.waited_ms >= 0, 'an acquire records how long the wait lasted');
+    assert.deepEqual(listReservations('adb', { env: host.env }), [], 'the run left no Reservation behind');
   } finally { await f.cleanup(); }
 });
 

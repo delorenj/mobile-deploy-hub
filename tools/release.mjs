@@ -7,8 +7,11 @@
 //      the iPad proof the old front-door ledger kept, now once per hub version and from any machine;
 //   5. red: v1 moves back to where it was (or goes away if it was new) and the release says so. Green: the run ids go
 //      into the annotation of vX.Y.Z.
+// The release notes: the `## vX.Y.Z` section of docs/hub-releases.md, when there is one, is put into every annotation of
+// vX.Y.Z (pending, green, red or unknown), between the header and the dry-run lines. A release with no section is annotated
+// as before.
 import { spawnSync } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { deploy, finishByHand, parseArguments, realGh, realGit, unknownStatus } from './deploy.mjs';
@@ -18,7 +21,25 @@ import { loadPolicy } from './ci/lib/policy.mjs';
 
 const hubRoot = fileURLToPath(new URL('..', import.meta.url));
 const workflowPath = resolve(hubRoot, '.github/workflows/mobile-deploy.yml');
+export const notesPath = resolve(hubRoot, 'docs/hub-releases.md');
 const coAuthor = 'Co-Authored-By: Claude Code <noreply@anthropic.com>';
+
+// The notes of one release: the lines after its `## vX.Y.Z` heading (the heading may go on, `## v1.2.46 (2026-11-24)`) up to
+// the next `## ` heading or the end, trimmed. null when the file has no such section or the section is empty.
+export function releaseNotes(text, tag) {
+  const lines = String(text ?? '').split('\n');
+  const start = lines.findIndex(line => line === `## ${tag}` || line.startsWith(`## ${tag} `));
+  if (start === -1) return null;
+  const end = lines.findIndex((line, index) => index > start && line.startsWith('## '));
+  const body = lines.slice(start + 1, end === -1 ? lines.length : end).join('\n').trim();
+  return body === '' ? null : body;
+}
+
+// The annotation of a release tag: the header, the release's notes when it has any, then what its dry runs said.
+export const tagMessage = (tag, status, notes = null) => `mobile-deploy-hub ${tag}\n\n${notes ? `${notes}\n\n` : ''}${status}`;
+
+// `git tag` strips `#` lines from a message by default; whitespace cleanup keeps a notes heading.
+export const tagArgs = (tag, commit, message, { force = false } = {}) => ['tag', ...(force ? ['-f'] : []), '-a', '--cleanup=whitespace', tag, ...(commit ? [commit] : []), '-m', message];
 
 function git(args, { allowFail = false } = {}) {
   const result = spawnSync('git', args, { cwd: hubRoot, encoding: 'utf8' });
@@ -73,7 +94,9 @@ export async function release(version, { log = console.log, dryRuns = true } = {
     git(['commit', '-q', '-m', `feat(hub): ${tag}: the workflow's inner actions/hub refs pin ${tag}`, '-m', coAuthor, '--', '.github/workflows/mobile-deploy.yml']);
   }
   const commit = git(['rev-parse', 'HEAD']).out;
-  git(['tag', '-a', tag, '-m', `mobile-deploy-hub ${tag}\n\nRelease dry runs pending.`]);
+  const notes = existsSync(notesPath) ? releaseNotes(readFileSync(notesPath, 'utf8'), tag) : null;
+  log(notes ? `RELEASE_NOTES ${tag}: ${notes.split('\n').length} lines from docs/hub-releases.md` : `RELEASE_NOTES ${tag}: none (no section in docs/hub-releases.md)`);
+  git(tagArgs(tag, null, tagMessage(tag, 'Release dry runs pending.', notes)));
   git(['push', '-q', '--atomic', 'origin', 'HEAD:refs/heads/main', `refs/tags/${tag}`]);
   log(`RELEASE_TAGGED ${tag} at ${commit.slice(0, 8)}`);
 
@@ -102,7 +125,7 @@ export async function release(version, { log = console.log, dryRuns = true } = {
   const lines = runs.map(item => `${item.repo}: ${item.status === 0 ? 'green' : item.status === unknownStatus ? 'UNKNOWN' : 'RED'} ${item.id ?? ''} ${item.url ?? item.error ?? ''}`.trim());
   if (unknown) {
     // No verdict is not red: v1 stays where it is, the release stays unproven, and a person finishes the watch.
-    git(['tag', '-f', '-a', tag, commit, '-m', `mobile-deploy-hub ${tag}\n\nRelease dry runs: UNKNOWN at ${unknown.repo} (GitHub gave no verdict); ${major} was moved and not rolled back.\n${lines.join('\n')}`]);
+    git(tagArgs(tag, commit, tagMessage(tag, `Release dry runs: UNKNOWN at ${unknown.repo} (GitHub gave no verdict); ${major} was moved and not rolled back.\n${lines.join('\n')}`, notes), { force: true }));
     git(['push', '-q', '-f', 'origin', `refs/tags/${tag}`]);
     throw new Error(`the release dry run of ${unknown.repo} has no verdict (${unknown.url ?? 'no run'}); ${major} stays on ${tag}, unproven, not rolled back. Finish by hand: ${finishByHand(unknown.id, ['--repo', unknown.repo])}`);
   }
@@ -116,11 +139,11 @@ export async function release(version, { log = console.log, dryRuns = true } = {
       git(['tag', '-d', major], { allowFail: true });
       log(`RELEASE_ROLLED_BACK ${major} removed (it was new): the dry run of ${red} is red`);
     }
-    git(['tag', '-f', '-a', tag, commit, '-m', `mobile-deploy-hub ${tag}\n\nRelease dry runs: RED at ${red}; ${major} not moved.\n${lines.join('\n')}`]);
+    git(tagArgs(tag, commit, tagMessage(tag, `Release dry runs: RED at ${red}; ${major} not moved.\n${lines.join('\n')}`, notes), { force: true }));
     git(['push', '-q', '-f', 'origin', `refs/tags/${tag}`]);
     throw new Error(`the release dry run of ${red} is red; ${major} is back where it was. Fix it and release the next patch`);
   }
-  git(['tag', '-f', '-a', tag, commit, '-m', `mobile-deploy-hub ${tag}\n\nRelease dry runs (strict, --dry-handoff true, at ${major}), all green:\n${lines.join('\n')}`]);
+  git(tagArgs(tag, commit, tagMessage(tag, `Release dry runs (strict, --dry-handoff true, at ${major}), all green:\n${lines.join('\n')}`, notes), { force: true }));
   git(['push', '-q', '-f', 'origin', `refs/tags/${tag}`]);
   log(`RELEASE_DONE ${tag}: ${major} points at it; ${lines.join('; ')}`);
   return { tag, commit, runs };

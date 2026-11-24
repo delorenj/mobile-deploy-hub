@@ -1,8 +1,9 @@
 name: Check
 
 # The hub's own checks on every push to main and every pull request: `mise run check` (actionlint over
-# .github/workflows/*.yml, this file included, then node --test 'tools/**/*.test.mjs'), with the node 24 and
-# actionlint 1.7.12 that the check task pins in mise.toml.
+# .github/workflows/*.yml, this file included, then node --test 'tools/**/*.test.mjs'), with the actionlint 1.7.12 that the
+# check task pins in mise.toml. It runs twice, as a matrix: Node 24 (the hub's runtime, the task's own pin) and Node 26
+# (`mise run --tool node@26 check` overrides the task's tool pin for that leg only; the pin in mise.toml stays 24).
 #
 # A GitHub-hosted runner, on purpose: this repository is public, so hosted minutes are free, and nothing here deploys.
 # mobile-deploy.yml is workflow_call only and writes its self-hosted labels itself, so no deploy job can land here.
@@ -23,8 +24,13 @@ concurrency:
 
 jobs:
   check:
+    name: check (node ${{ matrix.node }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['24', '26']
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -33,5 +39,5 @@ jobs:
       # `mise run check` then finds them installed. mise-action trusts this checkout's mise.toml (MISE_TRUSTED_CONFIG_PATHS).
       - uses: jdx/mise-action@v5.2.6
         with:
-          install_args: node@24 actionlint@1.7.12
-      - run: mise run check
+          install_args: node@${{ matrix.node }} actionlint@1.7.12
+      - run: mise run --tool node@${{ matrix.node }} check

@@ -2,8 +2,8 @@
 // injected; the Queue tests run against a temp HUB_LOCK_DIR/HUB_EVENT_DIR with an injected clock, and the workflow is parsed, not run.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { hostname, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { RUNNER_WORKER, jobDeadline, jobStart, jobTimeoutMs, systemProcess } from './lib/deadline.mjs';
@@ -118,6 +118,39 @@ test('a plan waiting behind a Lease gives up at its deadline, 13 minutes into a 
     const mine = events(f).filter(event => event.hold_kind === 'job');
     assert.deepEqual(mine.map(event => [event.event, event.deadline_at, event.waited_ms]), [['request', new Date(T0 + 13 * MIN).toISOString(), null], ['timeout', new Date(T0 + 13 * MIN).toISOString(), 13 * MIN]]);
     assert.deepEqual(readdirSync(join(f.root, 'locks/adb.queue')), [], 'its ticket is gone');
+  } finally { f.cleanup(); }
+});
+
+// Story 2.8 (AD-3, AD-5, FR-17): the Event Log of one timed-out wait on a pinned hub, whole: what the job asked, what ended it, who held
+// the device and who stood ahead, and that its ticket is gone and the others kept their places.
+test('a timed-out wait is request then timeout (deadline), HUB_LOCK_TIMEOUT, the holder and the waiters ahead named with their places, every event stamped with the hub version', async () => {
+  const f = fixture({ HUB_JOB_TIMEOUT_MINUTES: '45', GITHUB_JOB: 'android', HUB_REF: 'v1.2.46' });
+  try {
+    await holder(f);
+    const ahead = (name, body) => {
+      mkdirSync(join(f.root, 'locks/adb.queue'), { recursive: true });
+      writeFileSync(join(f.root, 'locks/adb.queue', name), JSON.stringify({ holder: 'agent-b', why: 'first in line', pid: process.pid, host: hostname(), enqueued_at: new Date(T0).toISOString(), ...body }));
+    };
+    ahead('000000000000001-000000-00000009.json', { lease_id: 'ahead-1' });
+    ahead('000000000000002-000000-00000009.json', { lease_id: 'ahead-2', holder: 'agent-c', why: 'second in line' });
+    let clock = T0;
+    await assert.rejects(
+      withLock('adb', async () => { throw new Error('must not run'); }, { env: f.env, log: line => f.logs.push(line), now: () => clock, sleep: async () => { clock += MIN; }, timeoutMs: 40 * MIN, timers: fakeTimers(), policy, deadlineSeams: { startedMs: T0 } }),
+      error => {
+        assert.equal(error.code, 'HUB_LOCK_TIMEOUT');
+        assert.match(error.message, /^host lock adb is held by lease held of agent-a \(device proof\) until .*; 2 waiters ahead of job job:delorenj\/example#9\.1\/android \(1\. agent-b \(first in line\), 2\. agent-c \(second in line\)\); gave up after 28 min, ahead of this job's 45-minute timeout\. Another deploy is using the device; run again when it finishes\.$/);
+        return true;
+      });
+    assert.equal(clock, T0 + 28 * MIN, 'it waited to job_start + 45 - 2 - 15');
+    const mine = events(f).filter(event => event.hold_kind === 'job');
+    assert.deepEqual(mine.map(event => event.event), ['request', 'timeout'], 'a wait that ran out never acquired and never released');
+    const [request, timeout] = mine;
+    assert.deepEqual(mine.map(event => event.hub_version), ['v1.2.46', 'v1.2.46']);
+    assert.deepEqual(mine.map(event => [event.lock, event.claimant.kind, event.claimant.repo, event.claimant.run, event.claimant.attempt, event.claimant.job]), Array(2).fill(['adb', 'deploy', 'delorenj/example', '9', '1', 'android']));
+    assert.deepEqual([request.waited_ms, request.reason, request.deadline_at], [null, null, new Date(T0 + 28 * MIN).toISOString()]);
+    assert.deepEqual([timeout.waited_ms, timeout.reason, timeout.deadline_at], [28 * MIN, 'deadline', new Date(T0 + 28 * MIN).toISOString()]);
+    assert.match(timeout.blocked_by, /^lease held of agent-a \(device proof\)/, 'the timeout names who held the device');
+    assert.deepEqual(tickets(f).map(ticket => ticket.lease_id), ['ahead-1', 'ahead-2'], 'its ticket is gone; the waiters ahead kept their places');
   } finally { f.cleanup(); }
 });
 

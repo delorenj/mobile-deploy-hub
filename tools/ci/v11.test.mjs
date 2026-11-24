@@ -598,7 +598,7 @@ test('the train dispatches Tower, then Green In Between, then Gruvato, and stops
 // ---------------------------------------------------------------------------------------------------- conformance and release
 
 import { checkApp, miseTasks, scriptsOf } from '../conformance.mjs';
-import { flipInnerRefs } from '../release.mjs';
+import { flipInnerRefs, notesPath, releaseNotes, tagArgs, tagMessage } from '../release.mjs';
 
 test('conformance: the template caller and a clean app pass; uploads, bumps, tags and announcements outside the hub fail', () => {
   const app = { slug: 'gruvato', lanes: ['android', 'ios'] };
@@ -631,6 +631,53 @@ test('release flips every inner actions/hub ref to the exact tag in one edit', (
   const flipped = flipInnerRefs(text, 'v1.2.3');
   assert.deepEqual([...new Set([...flipped.matchAll(/uses: delorenj\/mobile-deploy-hub\/actions\/hub@(\S+)/g)].map(match => match[1]))], ['v1.2.3']);
   assert.equal(flipped.split('\n').length, text.split('\n').length);
+});
+
+// Story 2.8: docs/hub-releases.md carries each hub release's notes into its tag annotation (one mechanism for every release).
+test('release notes: the section of the tag, bounded by the next heading, trimmed; no section or an empty one is null', () => {
+  const text = '# Hub release notes\n\nintro\n\n## v1.2.47 (next)\n\nnewer\n\n## v1.2.46\n\nfirst line\n\n### Sub heading\n- item\n\n## v1.2.4\n\nolder\n';
+  assert.equal(releaseNotes(text, 'v1.2.46'), 'first line\n\n### Sub heading\n- item');
+  assert.equal(releaseNotes(text, 'v1.2.4'), 'older', 'v1.2.4 is not a prefix match of v1.2.46, and the last section ends at the end of the file');
+  assert.equal(releaseNotes(text, 'v1.2.47'), 'newer', 'a heading may carry more words after the tag');
+  assert.equal(releaseNotes(text, 'v1.2.9'), null);
+  assert.equal(releaseNotes('## v1.2.5\n\n## v1.2.6\nx\n', 'v1.2.5'), null, 'an empty section is no section');
+  assert.equal(releaseNotes(undefined, 'v1.2.5'), null);
+});
+
+test('release notes: the annotation is the header, the notes, then the dry-run lines; without notes it is exactly what it was', () => {
+  assert.equal(tagMessage('v1.2.46', 'Release dry runs pending.', 'a\nb'), 'mobile-deploy-hub v1.2.46\n\na\nb\n\nRelease dry runs pending.');
+  assert.equal(tagMessage('v1.2.46', 'Release dry runs pending.', null), 'mobile-deploy-hub v1.2.46\n\nRelease dry runs pending.');
+  assert.equal(tagMessage('v1.2.46', 'Release dry runs pending.'), 'mobile-deploy-hub v1.2.46\n\nRelease dry runs pending.');
+  assert.deepEqual(tagArgs('v1.2.46', null, 'm'), ['tag', '-a', '--cleanup=whitespace', 'v1.2.46', '-m', 'm']);
+  assert.deepEqual(tagArgs('v1.2.46', 'abc', 'm', { force: true }), ['tag', '-f', '-a', '--cleanup=whitespace', 'v1.2.46', 'abc', '-m', 'm']);
+});
+
+test('release notes: git keeps a notes heading in the annotation (--cleanup=whitespace), and re-annotating keeps the notes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'hub-notes-'));
+  try {
+    const run = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: root, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' } });
+    run('init', '-q', '-b', 'main');
+    await writeFile(join(root, 'f'), 'x');
+    run('add', 'f');
+    run('commit', '-q', '-m', 'one');
+    const notes = releaseNotes('## v1.2.46\n\nintro\n\n### Read this first\n- fairness\n', 'v1.2.46');
+    run(...tagArgs('v1.2.46', null, tagMessage('v1.2.46', 'Release dry runs pending.', notes)));
+    const annotation = () => run('tag', '-l', '--format=%(contents)', 'v1.2.46').trimEnd();
+    assert.equal(annotation(), 'mobile-deploy-hub v1.2.46\n\nintro\n\n### Read this first\n- fairness\n\nRelease dry runs pending.');
+    const commit = run('rev-parse', 'HEAD').trim();
+    run(...tagArgs('v1.2.46', commit, tagMessage('v1.2.46', 'Release dry runs, all green:\nrepo: green 1', notes), { force: true }));
+    assert.match(annotation(), /^mobile-deploy-hub v1\.2\.46\n\nintro\n\n### Read this first\n- fairness\n\nRelease dry runs, all green:\nrepo: green 1$/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('the v1.2.46 release notes say what a reader of the tag must know', () => {
+  const notes = releaseNotes(readFileSync(notesPath, 'utf8'), 'v1.2.46');
+  assert.ok(notes, 'docs/hub-releases.md has a v1.2.46 section');
+  assert.match(notes, /fairness holds only among runs on this pin and later/i);
+  assert.match(notes, /older pins age out within 30 days/i);
+  for (const word of [/Event Log/, /Queue/, /Reservations?/, /Deadlines?/, /Lease cap/, /concurrency group/i, /HUB_LOCK_TIMEOUT/, /wording/i, /hosts:install/]) assert.match(notes, word);
+  assert.ok(notes.split('\n').every(line => !line.startsWith('## ')), 'no line of the section may look like a heading of the next release');
+  assert.equal(releaseNotes(readFileSync(notesPath, 'utf8'), 'v9.9.9'), null);
 });
 
 // v1.x never removes or retypes a caller input: callers pinned @v1 must keep working when v1 moves (D1).

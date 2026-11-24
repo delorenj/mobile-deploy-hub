@@ -75,8 +75,10 @@ run = "'{{config_root}}/.mise/scripts/versioning.sh' sync"
 [tasks.check]
 description = "Lint the reusable workflow with actionlint, then run the tool tests"
 tools = { actionlint = "1.7.12", node = "24" }
-# The glob is node's own (quoted), so tools/catchup/*.test.mjs runs here too.
-run = ["actionlint .github/workflows/*.yml", "node --test 'tools/**/*.test.mjs'"]
+# Node 24 is the hub's runtime and this task's pin; `mise run --tool node@26 check` runs the same task on Node 26 (check.yml's
+# second leg), and the first line says which Node a log was made with. The glob is node's own (quoted), so
+# tools/catchup/*.test.mjs runs here too.
+run = ["node --version", "actionlint .github/workflows/*.yml", "node --test 'tools/**/*.test.mjs'"]
 
 # ---- mobile-deploy-hub v1.1 (docs/design-hub-v1.1.md) ----
 # The usage specs own --dry-run and friends, so `mise run deploy:train --dry-run false` reaches the front door
