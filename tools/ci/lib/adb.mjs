@@ -72,6 +72,35 @@ export function adbEnv(given = process.env) {
   return env;
 }
 
+// The Peek (AD-13): what a deploy run may read of the S26 while a Lease holds `adb`. Only `adb -L tcp:127.0.0.1:<port> ...`
+// reads, and `-L` refuses to launch a server, so this never starts, restarts or reconnects anything the leaseholder uses: the
+// only argv forms are `devices` and `-s <id> shell dumpsys package`. RUNNER_TRACKING_ID is blank, as for the server itself. The
+// port and id come from the Lease's recorded `device` (hub-device takeLease), else the default server. With no id recorded
+// (a Lease taken --no-connect) one `devices` listing finds it by string match on the serial. Never throws: any failure is
+// `unknown`, with the reason. `installed` is null when the package is not on the phone.
+export function peekInstalled({ pkg, serial, lease = null, env = process.env, home = homedir(), runner = runBounded } = {}) {
+  const recorded = lease?.device ?? null;
+  const port = Number.isInteger(recorded?.adb_port) && recorded.adb_port > 0 && recorded.adb_port < 65536 ? recorded.adb_port : Number(env.ANDROID_ADB_SERVER_PORT) || 5037;
+  const result = { state: 'unknown', installed: null, adb_id: null, adb_port: port, reason: null };
+  try {
+    const adb = adbPath(env, home);
+    const call = (args, timeout, label) => runner(adb, ['-L', `tcp:127.0.0.1:${port}`, ...args], { env: { ...adbEnv(env), RUNNER_TRACKING_ID: '' }, timeout, label });
+    let id = typeof recorded?.adb_id === 'string' && /^[\w.:-]+$/.test(recorded.adb_id) ? recorded.adb_id : null;
+    if (!id) {
+      if (!serial) { result.reason = 'no serial to look the phone up by'; return result; }
+      const listed = parseDeviceList(call(['devices'], 15_000, 'adb peek devices'));
+      id = listed.find(device => device.state === 'device' && idMatchesSerial(device.id, serial))?.id ?? null;
+      if (!id) { result.reason = 'the phone is not on the adb server'; return result; }
+    }
+    result.adb_id = id;
+    result.installed = parsePackage(call(['-s', id, 'shell', 'dumpsys', 'package', pkg], 60_000, 'adb peek dumpsys'), pkg);
+    result.state = 'read';
+  } catch (error) {
+    result.reason = String(error?.message ?? error).split('\n')[0].slice(0, 200);
+  }
+  return result;
+}
+
 export function createAdb({ env: given = process.env, home = homedir(), runner = runBounded } = {}) {
   const env = adbEnv(given);
   const adb = adbPath(env, home);

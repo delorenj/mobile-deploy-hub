@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { peekInstalled } from '../lib/adb.mjs';
 import { freeGiB } from '../lib/apple.mjs';
 import { createGit } from '../lib/git.mjs';
 import { compareSemver } from '../lib/latest.mjs';
@@ -45,6 +46,14 @@ export function reserveFor(name, { reserver = reserve, env = process.env, log = 
     log(`HUB_RESERVATION_FAILED ${name} ${firstLine(error?.message)}; the run goes on without a reserved place`);
     return null;
   }
+}
+
+// The Peek at the S26 under a live Lease (Story 3.1, AD-13): one read-only query through peekInstalled, never a lock, and one
+// log line that names the Lease, the id, the port and the outcome. Returns the peek result.
+export function peekS26({ lease, manifest, devices, env = process.env, home = homedir(), log = console.log, adbRunner }) {
+  const peek = peekInstalled({ pkg: manifest.android.package, serial: devices.android.serial, lease, env, home, ...(adbRunner ? { runner: adbRunner } : {}) });
+  log(`HUB_S26_PEEK lease=${lease.lease_id ?? '-'} adb=${peek.adb_id ?? '-'} port=${peek.adb_port} ${peek.state === 'read' ? (peek.installed ? `read ${peek.installed.versionName} (${peek.installed.versionCode})` : 'read (not installed)') : `unknown (${peek.reason})`}`);
+  return peek;
 }
 
 // The run is done with a device (Story 2.6, AD-7): its Reservation of `name` on this host is released, never fatal. A lane that
