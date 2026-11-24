@@ -7,3 +7,7 @@
 
 # Canonical agent config lives in .agents; generated skill projections stay local.
 /.agents/skills
+.bmad-loop/runs/
+.bmad-loop/cache/
+.bmad-loop/policy.toml
+_bmad/render/
