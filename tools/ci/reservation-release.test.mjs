@@ -243,7 +243,7 @@ test('a Mac whose hub-device has no reservation verb yet is logged and left to t
   try {
     const old = () => { throw new Error('ssh hub-mac failed (exit 2)\nhub-device: usage: hub-device lease s24|s26|phone --for <dur> ...'); };
     assert.deepEqual(releaseFinished({ env: f.env, needs: needsOf(null, 'success'), devices, runner: old, log: f.log }), [['mac-ios', 'skipped']]);
-    assert.ok(f.logs.includes(`HUB_RESERVATION_RELEASE_SKIPPED mac-ios ${KEY}: the Mac's hub-device has no reservation release verb yet; the 3 h ceiling ends it`), f.logs.join('\n'));
+    assert.ok(f.logs.includes(`HUB_RESERVATION_RELEASE_SKIPPED mac-ios ${KEY}: the Mac's hub-device has no reservation release verb yet; the Reservation's ceiling ends it`), f.logs.join('\n'));
     const down = () => { throw new Error('ssh hub-mac failed (exit 255)\nssh: connect to host hub-mac port 22: Connection timed out'); };
     assert.deepEqual(releaseFinished({ env: f.env, needs: needsOf(null, 'success'), devices, runner: down, log: f.log }), [['mac-ios', 'failed']]);
     assert.ok(f.logs.some(line => line.startsWith(`HUB_RESERVATION_RELEASE_FAILED mac-ios ${KEY}: ssh hub-mac failed (exit 255)`)), f.logs.join('\n'));
@@ -297,6 +297,18 @@ test('hub-device reservation release --json adds a shape and renames nothing; a 
       const result = await verb(f, args);
       assert.equal(result.code, 2, args.join(' '));
       assert.match(result.err.join('\n'), pattern);
+      assert.deepEqual(result.out, []);
+    }
+  } finally { f.cleanup(); }
+});
+
+test('--run and --name are the reservation verb\'s flags alone: every other command still refuses them as unknown flags (exit 2, AD-17)', async () => {
+  const f = fixture();
+  try {
+    for (const [args, flag] of [[['status', '--run', KEY], 'run'], [['status', '--name=adb'], 'name'], [['release', '--any', '--name', 'adb'], 'name'], [['lease', 's26', '--for', '1m', '--why', 'x', '--run', KEY], 'run'], [['run', 's26', '--name', 'x', '--', 'true'], 'name']]) {
+      const result = await verb(f, args);
+      assert.equal(result.code, 2, args.join(' '));
+      assert.match(result.err.join('\n'), new RegExp(`unknown flag --${flag}`));
       assert.deepEqual(result.out, []);
     }
   } finally { f.cleanup(); }

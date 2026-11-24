@@ -98,6 +98,22 @@ In-session review of the diff against AD-7 and AD-17.
 
 Self-review, one pass; no patches needed beyond the announce test seam. `heavy mise run check` green: 600 tests, 0 fail.
 
+## Review (independent)
+
+Adversarial pass over `e6b69cb` against the epics-v1a Story 2.6 ACs, AD-7, AD-9 and AD-17.
+
+Checked and held: the rename-before-free order (`runHeld`'s `finally`, release event before the job's); one `release` event under six racing processes; ENOENT on a late grace stamp (the test releases from inside `startGrace`); the put-back of a Reservation made after the one judged; an unreadable record never taken; android success and S26-away release inside the hold, every failure keeps it; ios keeps it across a device error and across the first take of a store build; plan releases only when `scope.android` is false; `announce` runs first, never `rm`, ssh argv is a fixed shape over a validated key and host, an old Mac verb is `SKIPPED` and a dead Mac `FAILED`; no new on-disk path (the layout is Story 2.5's, so v1.2.43 bare-`mkdir` callers and ticket readers never see `.released-*`); tests are hermetic (temp lock and event dirs, injected releaser and ssh runner, `completion.test.mjs` injects both); no `release` consumer exists in the tools that a `hold_kind: reservation` release could confuse.
+
+| Finding | Verdict | Evidence |
+|---|---|---|
+| `--run` and `--name` were added to the global flag set, so `hub-device status --run X` or `lease s26 --name Y` stopped being exit 2 "unknown flag" and were silently accepted | confirmed, fixed | AD-17 keeps exit codes; `main` now refuses both outside `reservation`; test `--run and --name are the reservation verb's flags alone` |
+| The pending-S26 android release had no test (only the success path did) | confirmed gap, fixed | new v3 test: plan keeps the Reservation, the pending lane releases it, events `claim`, `release` |
+| `announce`'s log line and the README hard-coded "the 3 h ceiling" outside `policy.json` | confirmed nit, fixed | wording now names the ceiling without its value |
+| README claimed a failed lane is always served at the original place | confirmed overstatement, fixed | the README now names the post-hold failure case already in `deferred-work.md` |
+| A step that fails after a lane's last hold (Play, Release, IPA send, TestFlight) finds the Reservation released, so a failed-job rerun queues normally | dismissed as a deviation, kept in `deferred-work.md` | releasing outside the hold would leave a free lock with the finished run's Reservation first in line, starting a grace that blocks the next Claimant, which is the harm AD-7's rename-before-free exists to prevent; the two AC lines only meet inside the hold |
+| `~/.local/bin/hub-device` is not literally absolute | dismissed | the wrapper `install.sh` writes lives there, the remote shell expands `~`, and `completion.mjs` addresses the Mac's catch-up the same way |
+| Two retires of one key in the same millisecond choose one `.released-<key>-<ms>` name | dismissed | needs a release, a rerun's re-reserve and a second retire inside one ms; the loser's rename fails and it returns false, nothing is lost |
+
 ## Verification
 
 **Commands:**

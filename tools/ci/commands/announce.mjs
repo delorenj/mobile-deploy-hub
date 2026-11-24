@@ -92,8 +92,8 @@ export function releaseFinished({ env, needs, devices, releaser = releaseReserva
       const verbMissing = /usage:|exit 2\b|exit 127\b|not found/i.test(text);
       status = verbMissing ? 'skipped' : 'failed';
       log(verbMissing
-        ? `HUB_RESERVATION_RELEASE_SKIPPED mac-ios ${key}: the Mac's hub-device has no reservation release verb yet; the 3 h ceiling ends it`
-        : `HUB_RESERVATION_RELEASE_FAILED mac-ios ${key}: ${firstLine(text)}; the 3 h ceiling ends it`);
+        ? `HUB_RESERVATION_RELEASE_SKIPPED mac-ios ${key}: the Mac's hub-device has no reservation release verb yet; the Reservation's ceiling ends it`
+        : `HUB_RESERVATION_RELEASE_FAILED mac-ios ${key}: ${firstLine(text)}; the Reservation's ceiling ends it`);
     }
     done.push(['mac-ios', status]);
   }

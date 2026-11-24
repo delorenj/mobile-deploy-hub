@@ -739,6 +739,8 @@ export async function main(argv, {
   const context = { env, stdout, stderr, signals, adbFactory, inventory: inventoryImpl, timing, emulator, log: line => stderr(line), killGraceMs: Number(env.HUB_DEVICE_KILL_GRACE_MS) || 10_000 };
   try {
     parsed = parseArgs(argv);
+    // `--run` and `--name` belong to `reservation release` alone: every other command still refuses them as unknown flags (AD-17: exit 2 stays exit 2).
+    if (parsed.words[0] !== 'reservation') for (const flag of ['run', 'name']) if (parsed.flags[flag] !== undefined) throw usage(`unknown flag --${flag}`);
     // The phones this checkout's devices.json names; a broken one is a tool failure, named like any other.
     context.fleet = fleetOf(loadDevices(env));
     switch (parsed.words[0]) {

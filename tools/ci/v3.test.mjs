@@ -936,6 +936,23 @@ test('an away S26 is pending, not a stop: the plan still bumps, and the lane pub
   } finally { await f.cleanup(); }
 });
 
+test('an away S26 is pending, and a pending android lane releases the run\'s Reservation of the S26 (Story 2.6)', async () => {
+  const f = await gitFixture();
+  try {
+    const host = await laneHost(f);
+    await script(join(f.root, 'bin/adb'), `echo "$*" >> "${host.state}/calls.log"\n[ "$1" = devices ] && printf 'List of devices attached\\n'\nexit 0`);
+    reserve('adb', { env: host.env, log: () => {} });
+    const planned = await plan(host.configure('plan'), { env: host.env, home: f.root, fetchImpl: noLatest, log: () => {} });
+    assert.equal(planned.s26, 'away');
+    assert.equal(listReservations('adb', { env: host.env }).length, 1, 'plan keeps it: the Android lane still runs');
+    const out = host.outputs();
+    const lane = await quiet(() => android(host.configure('android', ['--version', out.version, '--android-code', out.android_code, '--build-sha', out.build_sha, '--bump-patch', out.bump_patch]), { env: host.env, home: f.root }));
+    assert.equal(lane.delivery.status, 'pending');
+    assert.deepEqual(listReservations('adb', { env: host.env }), [], 'pending is a lane that ended well: released inside the hold');
+    assert.deepEqual([...readEvents({ env: host.env })].filter(event => event.hold_kind === 'reservation').map(event => event.event), ['claim', 'release']);
+  } finally { await f.cleanup(); }
+});
+
 test('the plan holds the event to its contract before it spends a version', async () => {
   const f = await gitFixture();
   try {
