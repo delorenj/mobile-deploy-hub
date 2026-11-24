@@ -98,3 +98,24 @@ In-session review of the diff against AD-16, AD-11, AD-17 and the Story 2.7 ACs.
 **Commands:**
 - `node --test tools/device/lease.test.mjs tools/device/hub-device.test.mjs tools/ci/policy.test.mjs tools/device/emulator.test.mjs` -- expected: all pass
 - `heavy mise run check` -- expected: green
+
+## Review (independent)
+
+Checked against Story 2.7's nine ACs, AD-6, AD-11 and AD-16, and hunted for races, older-hub compatibility, liveness, hermeticity, CLI drift, event exactly-once and hard-coded policy.
+
+**Confirmed and fixed**
+
+- `emulator.mjs` rewrote its slot Lease (`recordPids`, `claim`, the ready-time rewrite) with the lease id alone: it never passed the lock directory inode its maker recorded at acquire, so AD-16's "lease id and inode recorded at acquire" held for `hub-device` only. A slot reclaimed and re-taken under the same lease id (a `--id` reused, or a pre-v1a record without `lock_ino`) was written into silently. `provision` now keeps the inode `acquireLease` returned, stores it as an additive `lock_ino` key on the emulator record (read by `recordPids`, so the reaper's teardown checks it too) and passes it to `updateLease`. Regression test in `emulator.test.mjs` (fails without the fix: the maker reported HUB_EMULATOR_READY into the replaced lock).
+- Test gap: the `HUB_LEASE_LOST` to cancelled conversion in `hub-device` `takeLease` (the lock re-taken by another lease while the phone is being found) had no test; added to `hub-device.test.mjs`, asserting exit 1, the CANCELLED line and the other holder's record untouched.
+
+**Checked and dismissed**
+
+- Races: `extendLease` and `updateLease` write nothing when the lock is gone, re-taken by a Lease or a job, or mid-take; a rewrite racing `retire` either fails the `sameOwner` judgement (restored) or hits ENOENT on the renamed directory. The remaining one-rename window and two racing extenders are the builder's accepted deferrals (not 2.7 ACs, AD-1 forbids a second lock).
+- Older hubs: `lock_ino` is an additive key on Lease owners only, a v1.2.43 `updateLease` keeps it through `{...current, ...fields}`, tickets without `kind`/`host_id` are untouched by this diff (`queueView` is read-only in `extendLease`, no prune), the temp file name is the one `writeOwner` already used.
+- Liveness: `extendLease` never prunes; stale tickets and an expired Reservation do not block; a Reservation head whose grace has not started (the lock is held) does block, as AD-6 says.
+- Events: one `extend` event, written only after the rename succeeded; refusals and LOST write none.
+- Policy: the 60 lives only in `policy.json`; `DEPLOY_TARGETS` is the lock identity, not tuning.
+- CLI: `lease phone` over the cap skipping the S26 and `run s26 --for 3h` exiting 2 are consequences of the AC, documented; `status`/`--json` print no `lock_ino`.
+- Tests: new ones are hermetic (temp lock/event dirs, injected clock and policy).
+
+**Left (deferred-work.md)**: the emulator ready-time `expires_at` is clamped to the slot Lease's expiry, so a boot that overruns its 2-minute allowance leaves a Lease shorter than `--for`; the branch is not reachable in the fake-emulator suite.

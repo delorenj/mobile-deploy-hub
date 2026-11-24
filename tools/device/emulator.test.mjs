@@ -6,7 +6,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -605,6 +605,28 @@ test('a lease released while its emulator boots ends the maker as CANCELLED, not
     assert.doesNotMatch(result.err, /exited while booting/);
     for (const entry of record.pids) assert.ok(gone(entry.pid), `${entry.role} ${entry.pid} is gone`);
     assert.ok(!existsSync(join(f.root, 'locks/emulator-1.lock')));
+    f.clean();
+  } finally { f.cleanup(); }
+});
+
+test('a slot lock replaced by another take of the same lease id while the emulator boots ends the maker as CANCELLED (AD-16, MOBI-36)', async () => {
+  const f = fixture();
+  try {
+    const id = uid('retaken');
+    const { exit } = spawnCli(f, ['lease', 'emulator', '--for', '10m', '--why', 'retaken', '--id', id], { FAKE_BOOT_MS: '2500' });
+    assert.ok(await waitFor(() => readdirSync(f.state).some(name => /^helper-\d+\.pid$/.test(name))), 'the emulator is booting');
+    const slot = join(f.root, 'locks/emulator-1.lock');
+    const { lock_ino, ...old } = f.owner('emulator-1');
+    assert.match(lock_ino, /^\d+$/, 'the take recorded its directory inode');
+    // The slot is reclaimed and taken again under the same id (a record from before v1a carries no inode): another directory.
+    renameSync(slot, `${slot}.tomb-1-1`);
+    mkdirSync(slot);
+    const theirs = JSON.stringify({ ...old, expires_at: new Date(Date.now() + 3600_000).toISOString() });
+    writeFileSync(join(slot, 'owner.json'), theirs);
+    const result = await exit;
+    assert.equal(result.code, 1, result.err);
+    assert.match(result.err, new RegExp(`^HUB_DEVICE_CANCELLED emulator lease ${id} was released while its emulator was being made$`, 'm'));
+    assert.doesNotMatch(result.err, /HUB_EMULATOR_READY/);
     f.clean();
   } finally { f.cleanup(); }
 });

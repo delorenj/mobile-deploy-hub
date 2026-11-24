@@ -228,7 +228,7 @@ function recordPids(env, record, entries) {
     record.pids.push(...fresh);
     writeRecord(env, record);
   }
-  return fresh.length === 0 || rewritten(record.slot, record.lease_id, { emulator: summary(record) }, { env });
+  return fresh.length === 0 || rewritten(record.slot, record.lease_id, { emulator: summary(record) }, { env, ino: record.lock_ino });
 }
 
 // A record names only paths inside its own folders: its AVD home under <runtime>/<lease_id>, and a hub-emu-* temp folder.
@@ -386,8 +386,9 @@ const cancelled = id => failure('HUB_LEASE_CANCELLED', `lease ${id} was released
 
 // A lease's record rewritten (AD-16): false when the lock is gone or has been taken by another holder since (updateLease throws
 // HUB_LEASE_LOST for the latter), which every caller here treats as a cancelled lease.
-function rewritten(slot, id, fields, { env }) {
-  try { return updateLease(slot, id, fields, { env }); } catch (error) {
+// `ino` is the lock directory inode the maker recorded when it took the slot (AD-16): a same-id lease in a replaced directory is lost too.
+function rewritten(slot, id, fields, { env, ino = null }) {
+  try { return updateLease(slot, id, fields, { env, ino }); } catch (error) {
     if (error.code === 'HUB_LEASE_LOST') return false;
     throw error;
   }
@@ -450,7 +451,7 @@ function configure(path, values) {
 }
 
 // Ports, folders and the record, made while the gate is held so two leases never pick the same ports.
-function claim({ env, id, slot, image, profileName }) {
+function claim({ env, id, slot, image, profileName, ino = null }) {
   if (readRecord(env, id)) throw failure('HUB_EMULATOR_USAGE', `lease id ${id} already names an emulator`);
   const found = inventory({ lockRoot: lockDir(env) });
   const records = listRecords(env);
@@ -469,9 +470,11 @@ function claim({ env, id, slot, image, profileName }) {
     console_port: ports.console, adb_port: ports.adb, adb_server_port: ports.adbServer, dir, tmp,
     avd: { name, home: join(dir, 'avd'), ini: join(dir, 'avd', `${name}.ini`), dir: join(dir, 'avd', `${name}.avd`) },
     pids: [], created_at: new Date().toISOString(),
+    // The slot lock's directory inode at the take (additive: records from before carry none and are held to the lease id alone).
+    ...(ino === null || ino === undefined ? {} : { lock_ino: String(ino) }),
   };
   writeRecord(env, record);
-  if (!rewritten(slot, id, { emulator: summary(record) }, { env })) {
+  if (!rewritten(slot, id, { emulator: summary(record) }, { env, ino })) {
     removeFiles(record);
     rmSync(recordPath(env, id), { force: true });
     throw cancelled(id);
@@ -504,6 +507,7 @@ export async function provision({
     throw out;
   }
   let slot = null;
+  let slotIno = null;
   let record = null;
   try {
     try {
@@ -516,7 +520,7 @@ export async function provision({
         for (let k = 1; k <= pool && !slot; k += 1) {
           if (unreaped.has(slotName(k))) continue;
           try {
-            await acquireLease(slotName(k), { id, holder, why, forMs: Math.min(MAX_LEASE_MS, bootTimeoutMs + forMs + 120_000), waitMs: 0, holderPid: process.pid, env, log, pollMs, sleep, now, signal, pool: request.tag });
+            ({ lock_ino: slotIno } = await acquireLease(slotName(k), { id, holder, why, forMs: Math.min(MAX_LEASE_MS, bootTimeoutMs + forMs + 120_000), waitMs: 0, holderPid: process.pid, env, log, pollMs, sleep, now, signal, pool: request.tag }));
             slot = slotName(k);
           } catch (error) {
             if (error.code !== 'HUB_LOCK_TIMEOUT') throw error;
@@ -528,7 +532,7 @@ export async function provision({
         if (!waiting) { log(`HUB_EMULATOR_WAIT the pool is full (${held}); ${id} is next`); waiting = true; }
         await pause(pollMs, { signal, sleep });
       }
-      record = claim({ env, id, slot, image, profileName });
+      record = claim({ env, id, slot, image, profileName, ino: slotIno });
     } catch (error) {
       // A request that never took a slot ends as a Pool timeout or cancel; one that did has its acquire already.
       if (!slot) request.settle(error, { signal });
@@ -615,7 +619,7 @@ export async function provision({
     // unless the boot overran its own allowance, and then the lease keeps the expiry it has.
     const expires = Math.min(now() + forMs, Date.parse(readOwnerOf(slot, env)?.expires_at) || Infinity);
     const fields = { emulator: summary(record), holder_pid: holderPid, holder_process_start: holderStart, expires_at: new Date(expires).toISOString() };
-    if (!rewritten(slot, id, fields, { env })) throw cancelled(id);
+    if (!rewritten(slot, id, fields, { env, ino: record.lock_ino })) throw cancelled(id);
     log(`HUB_EMULATOR_READY ${record.serial} adb server ${record.adb_server_port} pids ${record.pids.map(entry => `${entry.role}:${entry.pid}`).join(',')}`);
     return { lease: readOwnerOf(slot, env), record };
   } catch (error) {

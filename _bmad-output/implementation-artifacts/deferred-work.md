@@ -71,3 +71,6 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-7-no-extension-while-others-wait-deploy-target-leases-capped.md`
   summary: A refused acquire on a deploy target is `HUB_LEASE_TOO_LONG`, a code the spine does not list (AD-5 names `HUB_LEASE_EXTEND_REFUSED` for extensions and says nothing of acquire).
   evidence: The AC says the acquire is "refused" without a code; reusing `HUB_LEASE_EXTEND_REFUSED` would name an extension that never happened. Additive and branched on by `hub-device` only; fold into AD-5's list at the next spine edit.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-7-no-extension-while-others-wait-deploy-target-leases-capped.md`
+  summary: The emulator's ready-time rewrite can no longer move `expires_at` later (AD-16), so when AVD creation plus boot overran the slot Lease's 2-minute allowance, the Lease the maker prints lasts less than `--for` from ready.
+  evidence: The slot is taken for boot + `--for` + 2 min and the rewrite sets `now + --for`, which is earlier unless prep + boot exceed boot timeout + 2 min; the clamp keeps the slot's own expiry. Widening the slot allowance is a tuning decision for the emulator story; the fake-emulator suite cannot reach the branch.

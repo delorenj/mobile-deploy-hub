@@ -11,7 +11,7 @@ import { createAdb, findPhone } from '../ci/lib/adb.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
 import { acquireLease, releaseLease, reserve, withLock } from '../ci/lib/lock.mjs';
 import { readEvents } from '../ci/lib/events.mjs';
-import { runAdb } from './async-adb.mjs';
+import { createAsyncAdb, runAdb } from './async-adb.mjs';
 import { inventory } from './inventory.mjs';
 import { leaseSupport, main, parseArgs, parseDuration } from './hub-device.mjs';
 
@@ -825,6 +825,29 @@ test('a lease released while the phone was being found exits 1 holding nothing',
     assert.ok(err.some(line => /^HUB_DEVICE_CANCELLED s26 lease late-id was released while the phone was being found/.test(line)), err.join('\n'));
     assert.ok(!existsSync(f.lock), 'nothing is held');
     assert.deepEqual(queued(f), [], 'no ticket left');
+  } finally { f.cleanup(); }
+});
+
+test('a lease whose lock was taken by another lease while the phone was being found exits 1 and leaves the new holder alone (HUB_LEASE_LOST, MOBI-36)', async () => {
+  const f = fixture();
+  try {
+    let theirs = null;
+    const adbFactory = ({ env, signal }) => {
+      // The race: reclaimed and re-taken by another lease (an owner record of someone else) before the phone answers.
+      releaseLease('adb', 'late-id', { env: f.env });
+      mkdirSync(f.lock);
+      theirs = JSON.stringify({ pid: process.pid, host: hostname(), kind: 'lease', lease_id: 'theirs', holder: 'agent-b', why: 'their proof', started_at: new Date().toISOString(), expires_at: new Date(Date.now() + 600_000).toISOString(), format: 1 });
+      writeFileSync(join(f.lock, 'owner.json'), theirs);
+      return createAsyncAdb({ env, signal });
+    };
+    const err = [];
+    const code = await main(['lease', 's26', '--for', '5m', '--why', 'raced', '--id', 'late-id', '--wait', '0'], {
+      env: f.env, stdout: () => {}, stderr: line => err.push(line), adbFactory,
+    });
+    assert.equal(code, 1, err.join('\n'));
+    assert.ok(err.some(line => /^HUB_DEVICE_CANCELLED s26 lease late-id was released while the phone was being found/.test(line)), err.join('\n'));
+    assert.equal(readFileSync(join(f.lock, 'owner.json'), 'utf8'), theirs, 'the other holder\'s record is untouched');
+    assert.deepEqual(readdirSync(f.lock), ['owner.json'], 'and nothing of ours is left in their lock');
   } finally { f.cleanup(); }
 });
 
