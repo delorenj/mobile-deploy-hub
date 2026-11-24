@@ -40,7 +40,7 @@ import { loadDevices } from '../ci/lib/devices.mjs';
 import { createDevicectl, createIpad } from '../ci/lib/devicectl.mjs';
 import { runBounded } from '../ci/lib/exec.mjs';
 import { apkKey, compareRelease, compareSemver, inflightKey, ipaKey, isBusyPending, latestKey, platforms, serializeLatest, updateDevice, validateLatest } from '../ci/lib/latest.mjs';
-import { checkDelivery, withLock } from '../ci/lib/lock.mjs';
+import { checkDelivery, deliveryPendingEvent, leaseHoldersSince, noteRefused, withLock } from '../ci/lib/lock.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { sha256File } from '../ci/lib/receipt.mjs';
 import { createS3, publishPages, writerCredentials } from '../ci/lib/s3.mjs';
@@ -291,6 +291,37 @@ export function factsOf(result) {
   };
 }
 
+// How far before a build's `device.since` the deploy's `delivery-pending` timeout is looked for (FR-30): the deploy waits its budget
+// before it marks the device pending, so the event is minutes earlier; six hours is far more than any wait.
+export const pendingLookbackMs = 6 * 3600_000;
+// The Queued lock each platform's device sits behind.
+const lockOf = { android: 'adb', ios: 'mac-ios' };
+
+// Who put the newer build on the device (AD-15, FR-30): the Lease holders on the device's lock since the build went pending, read
+// from this host's Event Log. The window starts at the deploy's `delivery-pending` timeout for this build when the log has one,
+// else at latest.json's `device.since`. Never throws: an unreadable log reads as no holders. Names stay in the Event Log and the
+// host's own log line; never in latest.json, the pages or a bus event.
+export function whoInstalled(ctx, result) {
+  const lock = lockOf[result.platform] ?? null;
+  let delivery = null;
+  try { delivery = checkDelivery({ repo: result.repo, run: String(result.block.run.id), version: result.block.version }); } catch { delivery = null; }
+  const sinceDevice = Date.parse(result.block?.device?.since);
+  const nowMs = ctx.now().getTime();
+  const fallback = Number.isFinite(sinceDevice) ? sinceDevice : nowMs;
+  let since = fallback;
+  let from = 'latest.json';
+  let holders = [];
+  try {
+    const pending = delivery ? deliveryPendingEvent(lock, delivery, { env: ctx.env, since: fallback - pendingLookbackMs, log: () => {} }) : null;
+    const pendingAt = Date.parse(pending?.ts);
+    if (Number.isFinite(pendingAt)) { since = pendingAt; from = 'pending-event'; }
+    holders = leaseHoldersSince(lock, since, { env: ctx.env, log: () => {} });
+  } catch { holders = []; }
+  return { lock, delivery, since, from, holders };
+}
+
+const installedByText = who => `installed by ${who.holders.length > 0 ? who.holders.map(hold => `${hold.holder ?? 'someone'} (lease ${hold.lease_id})`).join(', ') : 'unknown'} (Leases on ${who.lock} since ${new Date(who.since).toISOString()})`;
+
 // Logs one result; in live mode also records it. Returns false when something went wrong that the logs must show.
 async function settle(ctx, result) {
   const where = `${result.slug} ${result.platform} ${describe(result.version, result.build)}`;
@@ -300,18 +331,30 @@ async function settle(ctx, result) {
   // A repair that failed changes nothing in latest.json (the build is installed there); it is logged, counted by the
   // flap guard and tried again on a later pass.
   if (result.kind === 'repair-failed') { ctx.log(`HUB_CATCHUP_REPAIR_FAILED ${where}: attempt failed at ${result.stage}: ${result.reason}`); return false; }
+  // A refusal names who put the newer build there (FR-30); the names go to the log line and the Event Log only.
+  const who = result.kind === 'ahead' ? whoInstalled(ctx, result) : null;
+  const named = who ? `; ${installedByText(who)}` : '';
   if (ctx.mode !== 'live') {
     const would = { installed: 'record installed (HUB_CATCHUP_INSTALLED)', confirmed: 'record installed by a person (HUB_CATCHUP_CONFIRMED)', ahead: `record skipped (${result.marker})`, failure: 'count a failed attempt', 'would-install': 'install', 'would-repair': 'repair the displaced build (reinstall in place)' }[result.kind];
-    ctx.log(`HUB_CATCHUP_WATCH ${where}: would ${would}: ${result.message ?? result.reason}`);
+    ctx.log(`HUB_CATCHUP_WATCH ${where}: would ${would}: ${result.message ?? result.reason}${named}`);
     return true;
   }
   if (result.kind === 'failure') ctx.log(`HUB_CATCHUP_PENDING ${where}: attempt failed at ${result.stage}: ${result.reason}`);
-  else ctx.log(`${result.marker ?? markerOf[result.kind]} ${where}: ${result.message}`);
+  else ctx.log(`${result.marker ?? markerOf[result.kind]} ${where}: ${result.message}${named}`);
+  let recorded;
   try {
-    await ctx.record(factsOf(result));
+    recorded = await ctx.record(factsOf(result));
   } catch (error) {
     ctx.log(`HUB_CATCHUP_ERROR ${where}: could not record it (${oneLine(error)}); the next pass finds it again`);
     return false;
+  }
+  // Written unless record reports `changed: false` (latest.json already said it). A moved pointer still counts: the device does run a
+  // newer build. The Mac's ssh record reports nothing and counts as taken; a repeat there is unreachable, since a skipped build never
+  // comes back as `ahead`.
+  if (who && recorded?.changed !== false) {
+    try {
+      noteRefused(who.lock, { delivery: who.delivery, installed: result.was, installedBy: who.holders, since: who.since, from: who.from }, { env: ctx.env });
+    } catch { /* the Event Log is never fatal (AD-9) */ }
   }
   return result.kind !== 'failure';
 }
@@ -381,7 +424,7 @@ async function androidApp(ctx, item, id) {
   }
   const plan = androidPlan(installed, block);
   try {
-    if (plan.action === 'ahead') return outcome(item, 'android', 'ahead', { marker: 'HUB_CATCHUP_AHEAD', reason: `the S26 runs ${plan.was}, ahead of this build`, message: `the S26 runs ${plan.was}; not touched` });
+    if (plan.action === 'ahead') return outcome(item, 'android', 'ahead', { marker: 'HUB_CATCHUP_AHEAD', was: plan.was, reason: `the S26 runs ${plan.was}, ahead of this build`, message: `the S26 runs ${plan.was}; not touched` });
     if (plan.action === 'conflict') throw stageError('install', `the S26 has versionCode ${block.code} as ${installed.versionName}, not ${block.version}; something else installed that code`);
     let reinstall = false;
     if (plan.action === 'compare-bytes') {
@@ -556,7 +599,7 @@ async function iosApp(ctx, item) {
       const repairs = ctx.journal.repairsToday(app.slug, 'ios');
       if (repairs >= iosRepairsPerDay) return outcome(item, 'ios', 'idle', { message: `the iPad was displaced by ${plan.was} again; already repaired ${repairs} times today (the limit), only logging` });
     }
-    if (plan.action === 'ahead') return outcome(item, 'ios', 'ahead', { marker: 'HUB_IPAD_NEWER', reason: `the iPad runs ${plan.was}, newer than this build`, message: `the iPad runs ${plan.was}; not touched` });
+    if (plan.action === 'ahead') return outcome(item, 'ios', 'ahead', { marker: 'HUB_IPAD_NEWER', was: plan.was, reason: `the iPad runs ${plan.was}, newer than this build`, message: `the iPad runs ${plan.was}; not touched` });
     if (plan.action === 'conflict') throw stageError('install', `the iPad runs ${plan.was}, which cannot be compared with ${describe(block.version, block.build)}`);
     if (plan.action === 'confirm') {
       const mine = ctx.journal.mine(app.slug, 'ios', block);

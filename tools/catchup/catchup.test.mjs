@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { isAnonymous } from '../ci/lib/access.mjs';
 import { bbEmitPath, uuidv5 } from '../ci/lib/announce.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
-import { withLock } from '../ci/lib/lock.mjs';
+import { acquireLease, releaseLease, withLock } from '../ci/lib/lock.mjs';
 import { readEvents } from '../ci/lib/events.mjs';
 import { compareBuild, validateLatest } from '../ci/lib/latest.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
@@ -1424,4 +1424,139 @@ test('the catch-up takes its device lock as a hub job: its hold is recorded as h
     assert.deepEqual(got.map(event => [event.event, event.lock, event.claimant.kind]), [['request', 'adb', 'hub-job'], ['acquire', 'adb', 'hub-job'], ['release', 'adb', 'hub-job']]);
     assert.ok(existsSync(join(host.root, 'state/mobile-deploy-hub/events')), 'the events land under the test state dir');
   } finally { host.cleanup(); }
+});
+
+// Story 3.4 (FR-30, AD-15): a newer installed build is refused with a name. The catch-up reads the Lease holders on the device's lock
+// since the build went pending from the Event Log and writes one `refused` event; latest.json keeps only the coarse reason.
+const refusedOf = env => [...readEvents({ env })].filter(event => event.event === 'refused');
+const lease = (env, name, id, holder) => acquireLease(name, { holder, why: 'device proof', forMs: 20 * 60_000, id, env, log: () => {} });
+const sleep = ms => new Promise(done => setTimeout(done, ms));
+// The deploy of `repo#runId` timing out behind whoever holds `adb` (Story 3.2): its `delivery-pending` event.
+const deployPends = host => withLock('adb', async () => {}, { env: { ...deployEnv(host), GITHUB_REPOSITORY: repo, GITHUB_RUN_ID: runId }, log: () => {}, timeoutMs: 200, pollMs: 20, timeoutReason: 'delivery-pending' })
+  .then(() => assert.fail('the deploy should have timed out'), error => assert.equal(error.code, 'HUB_LOCK_TIMEOUT'));
+const wholeBucket = s3 => [...s3.objects.values()].map(object => object.body).join('\n');
+
+test('a Lease that put a newer build on the S26 after the deploy went pending is named in one refused event; latest.json stays coarse', async () => {
+  const host = linuxHost();
+  try {
+    publish(host.s3, { latest: latestDoc({ android: androidBlock({ device: busyDevice }) }), apk: apkText() });
+    host.phone.install(apkText({ version: '0.2.1', code: 3 }));
+    await lease(host.env, 'adb', 'early', 'agent-z');
+    releaseLease('adb', 'early', { env: host.env });
+    await sleep(5);
+    await lease(host.env, 'adb', 'mine', 'agent-a');
+    await deployPends(host);
+    host.phone.install(apkText({ version: '0.2.9', code: 9 }));
+    releaseLease('adb', 'mine', { env: host.env });
+
+    const out = await androidPass(host.ctx);
+    assert.equal(out.errors, 0);
+    assert.doesNotMatch(host.phone.calls(), /\binstall -r\b/);
+    const pending = [...readEvents({ env: host.env })].find(event => event.event === 'timeout' && event.reason === 'delivery-pending');
+    const refused = refusedOf(host.env);
+    assert.equal(refused.length, 1);
+    const [event] = refused;
+    assert.deepEqual([event.lock, event.claimant.kind, event.reason, event.installed, event.pending_from, event.pending_since], ['adb', 'hub-job', 'newer-installed', '0.2.9 (9)', 'pending-event', pending.ts]);
+    assert.deepEqual(event.delivery, deliveryOf);
+    assert.deepEqual(event.installed_by.map(hold => [hold.holder, hold.lease_id]), [['agent-a', 'mine']], 'the Lease that ended before the pending event is not named');
+    assert.match(event.installed_by[0].acquired_at, /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal('installed_by_more' in event, false);
+    const device = latestOf(host.s3).android.device;
+    assert.deepEqual([device.status, device.reason], ['skipped', 'the S26 runs 0.2.9 (9), ahead of this build']);
+    assert.doesNotMatch(wholeBucket(host.s3) + JSON.stringify(host.events), /agent-a|agent-z|"mine"/, 'no holder name leaves the Event Log and the host log');
+    assert.equal(host.lines(/^HUB_CATCHUP_AHEAD .*; installed by agent-a \(lease mine\) \(Leases on adb since /).length, 1);
+
+    // A later pass neither installs nor refuses again.
+    host.phone.clearCalls();
+    await androidPass(host.ctx);
+    assert.equal(refusedOf(host.env).length, 1);
+    assert.doesNotMatch(host.phone.calls(), /\binstall -r\b/);
+    assert.equal(host.phone.installed(), apkText({ version: '0.2.9', code: 9 }));
+    assert.deepEqual([latestOf(host.s3).android.version, latestOf(host.s3).android.code, latestOf(host.s3).android.device.status], ['0.2.2', 4, 'skipped']);
+  } finally { host.cleanup(); }
+});
+
+test('a refusal with no Lease on the lock since the build went pending says installed_by unknown, counted from latest.json', async () => {
+  const host = linuxHost();
+  try {
+    publish(host.s3, { latest: latestDoc(), apk: apkText() });
+    host.phone.install(apkText({ version: '0.2.9', code: 9 }));
+    await androidPass(host.ctx);
+    const [event, ...rest] = refusedOf(host.env);
+    assert.equal(rest.length, 0);
+    assert.deepEqual([event.installed_by, event.pending_from, event.pending_since, event.installed], ['unknown', 'latest.json', '2026-10-09T20:00:00.000Z', '0.2.9 (9)']);
+    assert.match(host.lines(/^HUB_CATCHUP_AHEAD /)[0], /; installed by unknown \(Leases on adb since 2026-10-09T20:00:00\.000Z\)/);
+    assert.equal(latestOf(host.s3).android.device.status, 'skipped');
+  } finally { host.cleanup(); }
+});
+
+test('a refusal in watch mode names the holder in the log and writes no event and no latest.json', async () => {
+  const host = linuxHost({ mode: 'watch' });
+  try {
+    publish(host.s3, { latest: latestDoc({ android: androidBlock({ device: busyDevice }) }), apk: apkText() });
+    host.phone.install(apkText({ version: '0.2.1', code: 3 }));
+    await lease(host.env, 'adb', 'mine', 'agent-a');
+    await deployPends(host);
+    host.phone.install(apkText({ version: '0.2.9', code: 9 }));
+    releaseLease('adb', 'mine', { env: host.env });
+    const writes = host.s3.writer.writes.length;
+    await androidPass(host.ctx);
+    assert.equal(host.lines(/^HUB_CATCHUP_WATCH tower-of-lost-things android 0\.2\.2 \(4\): would record skipped \(HUB_CATCHUP_AHEAD\): .*; installed by agent-a \(lease mine\) \(Leases on adb since /).length, 1);
+    assert.equal(refusedOf(host.env).length, 0);
+    assert.equal(host.s3.writer.writes.length, writes);
+    assert.equal(latestOf(host.s3).android.device.status, 'pending');
+  } finally { host.cleanup(); }
+});
+
+test('a record that fails writes no refused event; the next pass finds the build again and writes it once', async () => {
+  const host = linuxHost();
+  try {
+    publish(host.s3, { latest: latestDoc(), apk: apkText() });
+    host.phone.install(apkText({ version: '0.2.9', code: 9 }));
+    const real = host.ctx.record;
+    host.ctx.record = async () => { throw new Error('the bucket is down'); };
+    const out = await androidPass(host.ctx);
+    assert.equal(out.errors, 1);
+    assert.equal(host.lines(/^HUB_CATCHUP_ERROR .*could not record it/).length, 1);
+    assert.equal(refusedOf(host.env).length, 0);
+    assert.equal(latestOf(host.s3).android.device.status, 'pending');
+    host.ctx.record = real;
+    await androidPass(host.ctx);
+    assert.equal(refusedOf(host.env).length, 1);
+    assert.equal(latestOf(host.s3).android.device.status, 'skipped');
+  } finally { host.cleanup(); }
+});
+
+test('a record that finds latest.json already settled (changed: false) writes no refused event', async () => {
+  const host = linuxHost();
+  try {
+    publish(host.s3, { latest: latestDoc(), apk: apkText() });
+    host.phone.install(apkText({ version: '0.2.9', code: 9 }));
+    host.ctx.record = async () => ({ moved: false, changed: false });
+    assert.equal((await androidPass(host.ctx)).errors, 0);
+    assert.equal(refusedOf(host.env).length, 0);
+  } finally { host.cleanup(); }
+});
+
+test('iPad: a newer build on the iPad is refused with the Lease holder from the Mac\'s own Event Log', async () => {
+  const mac = macHost();
+  try {
+    publish(mac.linux.s3, { latest: latestDoc({ android: null, ios: iosBlock() }), ipa: ipaText() });
+    mac.ipadState.installed = { version: '0.3.0', build: '1' };
+    mac.outbox(ipaText());
+    await lease(mac.env, 'mac-ios', 'pad', 'agent-b');
+    releaseLease('mac-ios', 'pad', { env: mac.env });
+    await iosPass(mac.ctx);
+    const refused = refusedOf(mac.env);
+    assert.equal(refused.length, 1);
+    assert.deepEqual([refused[0].lock, refused[0].reason, refused[0].installed, refused[0].pending_from], ['mac-ios', 'newer-installed', '0.3.0 (1)', 'latest.json']);
+    assert.deepEqual(refused[0].installed_by.map(hold => [hold.holder, hold.lease_id]), [['agent-b', 'pad']]);
+    assert.deepEqual(refused[0].delivery, deliveryOf);
+    assert.equal(refusedOf(mac.linux.env).length, 0, 'the Mac\'s refusal is in the Mac\'s log only');
+    assert.equal(latestOf(mac.linux.s3).ios.device.status, 'skipped');
+    assert.doesNotMatch(wholeBucket(mac.linux.s3), /agent-b/);
+    assert.equal(mac.lines(/^HUB_IPAD_NEWER .*; installed by agent-b \(lease pad\)/).length, 1);
+    await iosPass(mac.ctx);
+    assert.equal(refusedOf(mac.env).length, 1, 'a later pass does not refuse it again');
+  } finally { mac.cleanup(); }
 });

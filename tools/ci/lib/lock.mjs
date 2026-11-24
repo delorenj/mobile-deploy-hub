@@ -17,7 +17,7 @@ import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { join } from 'node:path';
-import { appendEvent, hostId as machineId } from './events.mjs';
+import { appendEvent, hostId as machineId, readEvents } from './events.mjs';
 import { pause, sleep as realSleep } from './pause.mjs';
 import { jobDeadline, jobTimeoutMs } from './deadline.mjs';
 import { loadPolicy } from './policy.mjs';
@@ -128,9 +128,10 @@ function heldMs(owner, at) {
   return Number.isFinite(started) ? Math.max(0, end - started) : null;
 }
 
-// Appends one event for a Queued name, at `at`; every other name writes nothing (AD-4). Never throws (appendEvent).
+// Appends one event for a Queued name, at `at`; every other name writes nothing (AD-4). Never throws (appendEvent). True when the
+// line was written, false when it was not (a name that is not Queued, or a failed write); the transitions ignore it.
 function note(name, body, { env, at, hostId }) {
-  if (isQueued(name)) appendEvent(body, { env, now: () => at, hostId });
+  return isQueued(name) ? appendEvent(body, { env, now: () => at, hostId }) : false;
 }
 
 let lastTomb = 0;
@@ -1271,6 +1272,80 @@ export function extendLease(name, id, { forMs, env = process.env, now = Date.now
   if (!rewriteOwner(name, path, id, ino, record)) throw lost(name, id, 'the lock is gone');
   note(name, eventOf('extend', name, record), { env, at: now(), hostId });
   return record;
+}
+
+// ---- who held a lock (AD-9 `refused`, Story 3.4, FR-30) ----
+
+// The most Lease holders a `refused` event names; the rest are counted in `installed_by_more`, so the line stays under 4 KiB.
+export const REFUSED_NAMES_MAX = 10;
+const NAME_MAX = 64;
+const clip = value => (typeof value === 'string' ? value.slice(0, NAME_MAX) : null);
+const msOf = value => (typeof value === 'number' ? value : Date.parse(value));
+const LEASE_EVENTS = Object.freeze(['acquire', 'extend', 'release', 'reclaim', 'force-release']);
+const LEASE_ENDS = Object.freeze(['release', 'reclaim', 'force-release']);
+
+// Every Lease that held `name` at any moment from `since` (ms or ISO) until now, read from the Event Log, in log order, as plain
+// data for an event or a log line (never public): [{holder, lease_id, acquired_at}]. A hold opens at its `acquire` (or at the first
+// event seen for a Lease whose acquire is not in the window) and closes at its release, reclaim or force-release; it ends no later
+// than its latest `expires_at`, as heldMs does, so an expired Lease nobody reclaimed is not a holder past its expiry. The log is read
+// MAX_LEASE_MS before `since`, so a Lease that began earlier and still held at `since` is found. Throws on an unreadable `since`;
+// a read error inside the log is the log's own (readEvents skips what it cannot parse).
+export function leaseHoldersSince(name, since, { env = process.env, log = console.error } = {}) {
+  const from = msOf(since);
+  if (!Number.isFinite(from)) throw new TypeError('since must be a date');
+  const holds = [];
+  const open = new Map();
+  for (const event of readEvents({ env, since: from - MAX_LEASE_MS, log })) {
+    if (event.lock !== name || event.hold_kind !== 'lease' || !event.lease_id || !LEASE_EVENTS.includes(event.event)) continue;
+    const id = event.lease_id;
+    const at = Date.parse(event.ts);
+    let hold = open.get(id);
+    if (event.event === 'acquire' || !hold) {
+      // A hold whose acquire is older than the read has no known start: acquired_at is null, never the later event's time.
+      hold = { holder: event.claimant?.holder ?? null, lease_id: id, acquired_at: event.event === 'acquire' ? event.ts : null, expires: Infinity, ended: Infinity };
+      open.set(id, hold);
+      holds.push(hold);
+    }
+    const expiry = Date.parse(event.expires_at);
+    if (Number.isFinite(expiry)) hold.expires = event.event === 'acquire' ? expiry : Math.max(Number.isFinite(hold.expires) ? hold.expires : -Infinity, expiry);
+    if (LEASE_ENDS.includes(event.event)) {
+      hold.ended = at;
+      open.delete(id);
+    }
+  }
+  return holds.filter(hold => Math.min(hold.ended, hold.expires) >= from).map(({ holder, lease_id, acquired_at }) => ({ holder, lease_id, acquired_at }));
+}
+
+// The `timeout` event with `reason: delivery-pending` that the deploy of `repo#run` wrote on `name` (Story 3.2): the last one, or
+// null. `since` bounds the read (ms or ISO).
+export function deliveryPendingEvent(name, { repo, run }, { env = process.env, since, log = console.error } = {}) {
+  let found = null;
+  for (const event of readEvents({ env, ...(since === undefined ? {} : { since }), log })) {
+    if (event.event === 'timeout' && event.lock === name && event.reason === 'delivery-pending'
+      && event.claimant?.repo === repo && String(event.claimant?.run) === String(run)) found = event;
+  }
+  return found;
+}
+
+// Appends the one `refused` event (AD-9): the catch-up found a newer build installed than the pending one and left it alone.
+// `installedBy` is leaseHoldersSince's list (the first REFUSED_NAMES_MAX are named, the rest counted; none is the string
+// 'unknown'); `since` and `from` say where the window began (`pending-event` or `latest.json`). The claimant is the caller as a
+// `hub-job`. True when the line was written; false for a name that is not Queued or a failed write (the Event Log is never fatal).
+export function noteRefused(name, { delivery = null, installed, installedBy = [], since, from }, { env = process.env, now = Date.now, hostId = machineId(), host = hostname() } = {}) {
+  checkDelivery(delivery);
+  const holders = Array.isArray(installedBy) ? installedBy : [];
+  const named = holders.slice(0, REFUSED_NAMES_MAX).map(hold => ({ holder: clip(hold.holder), lease_id: clip(hold.lease_id), acquired_at: hold.acquired_at ?? null }));
+  const { me, more } = jobIdentity({ env, host, hostId, kind: 'hub-job' });
+  const at = now();
+  return note(name, eventOf('refused', name, { ...me, ...more, started_at: iso(at) }, {
+    reason: 'newer-installed',
+    ...(delivery ? { delivery } : {}),
+    installed: clip(installed),
+    installed_by: named.length > 0 ? named : 'unknown',
+    ...(holders.length > REFUSED_NAMES_MAX ? { installed_by_more: holders.length - REFUSED_NAMES_MAX } : {}),
+    pending_since: iso(msOf(since)),
+    pending_from: from ?? null,
+  }), { env, at, hostId });
 }
 
 // Every lock in the directory, read only: leases and jobs' locks, each with whether it is stale now.
