@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { hostname, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { RESERVABLE, acquireLease, listLocks, liveLease, listReservations, queueView, readOwner, releaseLease, reserve, runKey, withLock } from './lib/lock.mjs';
+import { RESERVABLE, acquireLease, holdsOf, listLocks, liveLease, listReservations, queueView, readOwner, releaseLease, reserve, runKey, withLock } from './lib/lock.mjs';
 import { readEvents } from './lib/events.mjs';
 import { loadPolicy } from './lib/policy.mjs';
 import { hermetic } from './test-fixtures.mjs';
@@ -536,5 +536,34 @@ test('without yieldToLease the same wait keeps waiting for a Lease, and an expir
     await withLock('adb', async () => { ran = true; }, { env: f.runEnv(6, 'plan'), log: f.log, pollMs: 5, timeoutMs: 10_000, timers: fakeTimers(), yieldToLease: true, now: () => Date.now() + 2 * MIN });
     assert.equal(ran, true, 'the Lease had expired: reclaimed, not yielded to');
     assert.ok(events(f).some(event => event.event === 'reclaim' && event.reason === 'expired'));
+  } finally { f.cleanup(); }
+});
+
+// Story 3.2 (FR-30, AD-14): any Queued wait can say what its timeout means and learns who blocked it.
+test('timeoutReason names a wait\'s timeout event, and the HUB_LOCK_TIMEOUT error carries the blocking Holds (holder, then each blocker ahead)', async () => {
+  const f = fixture();
+  try {
+    await acquireLease('adb', { holder: 'agent-a', why: 'device proof', forMs: 30 * MIN, id: 'holder', env: f.plain, log: f.log });
+    putTicket(f, Date.now() - 5000, { lease_id: 'ahead-1', holder: 'agent-b', why: 'waiting' });
+    const waits = reason => withLock('adb', async () => assert.fail('must not take the lock'), { env: f.runEnv(5, 'android'), log: f.log, pollMs: 5, timeoutMs: 150, timers: fakeTimers(), ...(reason ? { timeoutReason: reason } : {}) })
+      .then(() => null, error => error);
+    const error = await waits('delivery-pending');
+    assert.equal(error.code, 'HUB_LOCK_TIMEOUT');
+    assert.match(error.message, /^host lock adb is held by lease holder of agent-a/);
+    assert.equal(error.owner.lease_id, 'holder');
+    assert.equal(error.holds.length, 2);
+    assert.deepEqual(error.holds[0], { role: 'holder', kind: 'lease', holder: 'agent-a', lease_id: 'holder', why: 'device proof', since: error.owner.started_at, until: error.owner.expires_at });
+    assert.deepEqual([error.holds[1].role, error.holds[1].place, error.holds[1].kind, error.holds[1].holder, error.holds[1].lease_id], ['ahead', 1, 'lease', 'agent-b', 'ahead-1']);
+    const timeout = events(f).find(event => event.event === 'timeout');
+    assert.equal(timeout.reason, 'delivery-pending');
+    assert.match(timeout.blocked_by, /lease holder of agent-a/);
+    assert.deepEqual(queueView('adb', { env: f.plain }).map(entry => entry.lease_id), ['ahead-1'], 'the wait left no ticket behind');
+    // Without the option nothing changes: reason `deadline`.
+    await waits(null);
+    assert.deepEqual(events(f).filter(event => event.event === 'timeout').map(event => event.reason), ['delivery-pending', 'deadline']);
+    assert.match(String((await waits('Not Valid')).message), /bad timeout reason/);
+    // A Job Hold is a holder too, named `<repo>#<run>`; the bare (unqueued) path carries it as well.
+    assert.deepEqual(holdsOf({ kind: 'job', repo: 'delorenj/other', run: '1', started_at: 'then' })[0], { role: 'holder', kind: 'job', holder: 'delorenj/other#1', lease_id: null, why: null, since: 'then', until: null });
+    assert.deepEqual(holdsOf(null), []);
   } finally { f.cleanup(); }
 });

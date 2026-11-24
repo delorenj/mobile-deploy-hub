@@ -3,7 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  apkKey, compareBuild, compareRelease, compareSemver, installUrl, ipaKey, mayReplace, parseLatest, publicUrl,
+  apkKey, busyReason, compareBuild, compareRelease, compareSemver, installUrl, ipaKey, isBusyPending, mayReplace, parseLatest, publicUrl,
   publishedFloor, serializeLatest, updateDevice, validateLatest, versionKey,
 } from './lib/latest.mjs';
 
@@ -95,4 +95,20 @@ test('keys stay inside the app folder', () => {
   assert.equal(apkKey('gruvato', '0.2.5', 2005), 'gruvato/0.2.5/gruvato-0.2.5-2005.apk');
   assert.equal(ipaKey('gruvato', '0.2.5', '0.2.5'), 'gruvato/0.2.5/gruvato-0.2.5-0.2.5.ipa');
   for (const [slug, version, file] of [['../x', '0.1.0', 'a'], ['gruvato', '0.1', 'a'], ['gruvato', '0.1.0', '../a'], ['gruvato', '0.1.0', '.hidden']]) assert.throws(() => versionKey(slug, version, file), undefined, `${slug} ${version} ${file}`);
+});
+
+test('the busy wording is one public phrase, and only a pending device with exactly that reason (and the catch-up suffix) is busy-pending', () => {
+  assert.equal(busyReason('S26'), 'S26 busy');
+  const device = (status, reason) => ({ name: 'S26', status, reason });
+  assert.equal(isBusyPending(device('pending', 'S26 busy')), true);
+  assert.equal(isBusyPending(device('pending', 'S26 busy; catch-up off on big-chungus (catchup.mjs mode live)')), true);
+  assert.equal(isBusyPending(device('pending', "not on big-chungus's adb")), false, 'away is not busy');
+  assert.equal(isBusyPending(device('pending', 'S26 busier')), false);
+  assert.equal(isBusyPending(device('skipped', 'S26 busy')), false);
+  assert.equal(isBusyPending(device('pending', null)), false);
+  assert.equal(isBusyPending(null), false);
+  // The frozen contract takes the busy state as an ordinary pending reason: no new key, no new status.
+  const doc = sampleLatest();
+  Object.assign(doc.android.device, { status: 'pending', reason: busyReason(doc.android.device.name), by: null });
+  assert.equal(parseLatest(serializeLatest(doc)).android.device.reason, 'S26 busy');
 });

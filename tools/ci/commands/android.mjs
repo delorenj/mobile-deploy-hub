@@ -22,8 +22,8 @@ import { hookEnvironment } from '../lib/config.mjs';
 import { loadDevices } from '../lib/devices.mjs';
 import { hook, run } from '../lib/exec.mjs';
 import { exportGodot } from '../lib/godot.mjs';
-import { apkName } from '../lib/latest.mjs';
-import { withLock } from '../lib/lock.mjs';
+import { apkName, busyReason } from '../lib/latest.mjs';
+import { holdsOf, releaseReservation, withLock } from '../lib/lock.mjs';
 import { editionApkName, editionLane, isPublicEdition } from '../lib/editions.mjs';
 import { editionsOf, loadManifest } from '../lib/manifest.mjs';
 import { editionPinOf, loadPolicy, tagOf } from '../lib/policy.mjs';
@@ -38,7 +38,7 @@ import { applyBump, checkAppReceipt, exists, guarded, policyBanner, readReceipts
 // Away is the code findPhone attaches, never its wording: the message names the reason (absent, unauthorized, offline).
 const notOnAdb = error => error?.code === 'HUB_PHONE_AWAY';
 
-async function androidLane(config, manifest, { env, home, track, policy, log, quickdropLink }) {
+async function androidLane(config, manifest, { env, home, track, policy, log, quickdropLink, lockOptions }) {
   const spec = manifest.android ?? (() => { throw new Error('the manifest has no android section'); })();
   const devices = loadDevices(env);
   requirePlan(config);
@@ -109,51 +109,68 @@ async function androidLane(config, manifest, { env, home, track, policy, log, qu
   track.receipt.delivery = delivery;
   const notes = [];
   track.stage = 'preflight';
-  await withLock('adb', async () => {
-    const adb = createAdb({ env, home });
-    let id;
-    try {
-      id = await findPhone(adb, { serial: devices.android.serial, model: devices.android.model, waitMs: Number(env.HUB_ADB_LANE_WAIT_MS) || 30_000 });
-    } catch (error) {
-      if (!notOnAdb(error)) throw error;
-      delivery.reason = "not on big-chungus's adb";
-      notes.push('the S26 is away: pending; the build is published for Install APK, Quickdrop and the catch-up');
-      log(`HUB_S26_PENDING ${config.version} (${planned}) is published for a later install`);
-      return;
-    }
-    const before = adb.installed(id, spec.package);
-    const was = before ? `${before.versionName} (${before.versionCode})` : 'nothing';
-    if (before && before.versionCode > planned) throw new Error(`the S26 has versionCode ${before.versionCode}, above the planned ${planned}; Android would refuse the update (the hub never downgrades)`);
-    if (before && before.versionCode === planned) {
-      // Only "Re-run failed jobs" of this deploy gets here (or a person who installed it from the link): the same
-      // bytes are verified, other bytes reinstall in place.
-      if (before.versionName !== config.version) throw new Error(`the S26 has versionCode ${planned} as ${before.versionName}, not ${config.version}; something else installed that code`);
-      const onDevice = adb.sha256(id, adb.baseApk(id, spec.package));
-      if (onDevice === sha256) {
-        Object.assign(delivery, { verified: true, status: 'installed', reason: null });
-        notes.push(`the S26 already runs ${was} with this APK (base.apk sha256 matches); not installed again`);
-        log(`HUB_S26_CURRENT ${was} sha256 verified`);
+  // `entered` tells a timeout of the wait for the S26 from an error raised while the lane holds it: only the wait going pending is
+  // a busy device (FR-30); anything the held step throws still fails the lane.
+  let entered = false;
+  try {
+    await withLock('adb', async () => {
+      entered = true;
+      const adb = createAdb({ env, home });
+      let id;
+      try {
+        id = await findPhone(adb, { serial: devices.android.serial, model: devices.android.model, waitMs: Number(env.HUB_ADB_LANE_WAIT_MS) || 30_000 });
+      } catch (error) {
+        if (!notOnAdb(error)) throw error;
+        delivery.reason = "not on big-chungus's adb";
+        notes.push('the S26 is away: pending; the build is published for Install APK, Quickdrop and the catch-up');
+        log(`HUB_S26_PENDING ${config.version} (${planned}) is published for a later install`);
         return;
       }
-      notes.push(`the S26 runs ${was} with other bytes; this APK replaces it in place`);
-    }
-    if (config.dryRun) {
-      delivery.reason = `dry run: would install over ${was}`;
-      notes.push(`dry run: would install ${config.version} (${planned}) over ${was} on the S26`);
-      log(`HUB_S26_DRY_RUN would install ${config.version} (${planned}) over ${was}`);
-      return;
-    }
-    track.stage = 'install';
-    adb.install(id, apk);
-    track.stage = 'verify';
-    const after = adb.installed(id, spec.package);
-    if (!after || after.versionCode !== planned || after.versionName !== config.version) throw new Error(`readback: the S26 reports ${after ? `${after.versionName} (${after.versionCode})` : 'no package'} after the install, expected ${config.version} (${planned})`);
-    const onDevice = adb.sha256(id, adb.baseApk(id, spec.package));
-    if (onDevice !== sha256) throw new Error(`readback: base.apk on the S26 has sha256 ${onDevice}, the built APK has ${sha256}`);
-    Object.assign(delivery, { verified: true, status: 'installed', reason: null });
-    notes.push(`installed on the S26 over ${was}; readback ${config.version} (${planned}), base.apk sha256 matches`);
-    log(`HUB_S26_INSTALLED ${config.version} (${planned}) over ${was}, sha256 verified`);
-  }, { env, timeoutMs: 20 * 60_000, endsReservation: true });
+      const before = adb.installed(id, spec.package);
+      const was = before ? `${before.versionName} (${before.versionCode})` : 'nothing';
+      if (before && before.versionCode > planned) throw new Error(`the S26 has versionCode ${before.versionCode}, above the planned ${planned}; Android would refuse the update (the hub never downgrades)`);
+      if (before && before.versionCode === planned) {
+        // Only "Re-run failed jobs" of this deploy gets here (or a person who installed it from the link): the same
+        // bytes are verified, other bytes reinstall in place.
+        if (before.versionName !== config.version) throw new Error(`the S26 has versionCode ${planned} as ${before.versionName}, not ${config.version}; something else installed that code`);
+        const onDevice = adb.sha256(id, adb.baseApk(id, spec.package));
+        if (onDevice === sha256) {
+          Object.assign(delivery, { verified: true, status: 'installed', reason: null });
+          notes.push(`the S26 already runs ${was} with this APK (base.apk sha256 matches); not installed again`);
+          log(`HUB_S26_CURRENT ${was} sha256 verified`);
+          return;
+        }
+        notes.push(`the S26 runs ${was} with other bytes; this APK replaces it in place`);
+      }
+      if (config.dryRun) {
+        delivery.reason = `dry run: would install over ${was}`;
+        notes.push(`dry run: would install ${config.version} (${planned}) over ${was} on the S26`);
+        log(`HUB_S26_DRY_RUN would install ${config.version} (${planned}) over ${was}`);
+        return;
+      }
+      track.stage = 'install';
+      adb.install(id, apk);
+      track.stage = 'verify';
+      const after = adb.installed(id, spec.package);
+      if (!after || after.versionCode !== planned || after.versionName !== config.version) throw new Error(`readback: the S26 reports ${after ? `${after.versionName} (${after.versionCode})` : 'no package'} after the install, expected ${config.version} (${planned})`);
+      const onDevice = adb.sha256(id, adb.baseApk(id, spec.package));
+      if (onDevice !== sha256) throw new Error(`readback: base.apk on the S26 has sha256 ${onDevice}, the built APK has ${sha256}`);
+      Object.assign(delivery, { verified: true, status: 'installed', reason: null });
+      notes.push(`installed on the S26 over ${was}; readback ${config.version} (${planned}), base.apk sha256 matches`);
+      log(`HUB_S26_INSTALLED ${config.version} (${planned}) over ${was}, sha256 verified`);
+    }, { env, timeoutMs: 20 * 60_000, endsReservation: true, timeoutReason: 'delivery-pending', ...lockOptions });
+  } catch (error) {
+    if (entered || error?.code !== 'HUB_LOCK_TIMEOUT') throw error;
+    // The wait for the S26 ran out (FR-30, AD-14): the build is good, so the delivery goes pending for the catch-up and the run
+    // stays green. The lock wrote the one `timeout` event (reason delivery-pending). Who blocked it goes to this receipt, the
+    // summary and the log, never to the public delivery reason, notes or latest.json.
+    delivery.reason = busyReason(devices.android.name);
+    track.receipt.contention = { lock: 'adb', reason: 'delivery-pending', blocked_by: error.holds ?? holdsOf(error.owner) };
+    notes.push(`the ${devices.android.name} stayed busy past the wait: pending; the build is published for Install APK, Quickdrop and the catch-up`);
+    log(`HUB_S26_BUSY ${config.version} (${planned}) is published and the catch-up installs it: ${String(error.message).replace(/\s*Another deploy is using the device; run again when it finishes\.\s*$/, '')}`);
+    const ended = releaseReservation('adb', { env, reason: 'delivery-pending' });
+    if (ended.status === 'released') log(`HUB_RESERVATION_RELEASED adb ${ended.key}`);
+  }
 
   // Quickdrop: real runs only (a dry run writes nothing a phone could pick up), after the S26's own checks, and only
   // while the S26 syncs from the LAN.
@@ -178,7 +195,7 @@ async function androidLane(config, manifest, { env, home, track, policy, log, qu
       edition: { name: built.edition, package: built.package, device: false, public: built.public }, staged: built.staged,
     }), env);
   }
-  await writeReceipt(out, buildReceipt({ lane: 'android', config, env, version: config.version, androidCode: config.androidCode, artifacts, signer, notes, delivery, staged, quickdrop, ...(track.receipt.play ? { play: track.receipt.play } : {}), ...(editions.length > 0 ? { editions: editions.map(({ edition, package: pkg, staged: copy, public: open }) => ({ edition, package: pkg, staged: copy, public: open })) } : {}) }), env);
+  await writeReceipt(out, buildReceipt({ lane: 'android', config, env, version: config.version, androidCode: config.androidCode, artifacts, signer, notes, delivery, staged, quickdrop, ...(track.receipt.contention ? { contention: track.receipt.contention } : {}), ...(track.receipt.play ? { play: track.receipt.play } : {}), ...(editions.length > 0 ? { editions: editions.map(({ edition, package: pkg, staged: copy, public: open }) => ({ edition, package: pkg, staged: copy, public: open })) } : {}) }), env);
   return { out, artifact: apk, sha256, signer, delivery, staged, quickdrop, editions };
 }
 
@@ -217,10 +234,10 @@ async function buildEdition(config, manifest, { name, spec }, { env, home, hooks
   return { edition: name, package: spec.package, apk, sha256, signer, bytes, staged: { name: apkFile, bytes, sha256 }, public: Boolean(spec.public) };
 }
 
-export async function android(config, { env = process.env, home = homedir(), log = console.log, quickdropLink = null, policyFile } = {}) {
+export async function android(config, { env = process.env, home = homedir(), log = console.log, quickdropLink = null, policyFile, lockOptions = {} } = {}) {
   const { policy } = policyBanner(log, policyFile);
   const manifest = await loadManifest(config.cwd, config.manifest);
-  return guarded('android', join(config.out, 'android'), config, env, track => androidLane(config, manifest, { env, home, track, policy, log, quickdropLink }));
+  return guarded('android', join(config.out, 'android'), config, env, track => androidLane(config, manifest, { env, home, track, policy, log, quickdropLink, lockOptions }));
 }
 
 // The Play upload and the Release run as later steps of the android job. Each writes its own receipt (lane android-play,

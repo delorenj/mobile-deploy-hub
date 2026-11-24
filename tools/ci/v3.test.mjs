@@ -1427,3 +1427,129 @@ test('the upload step re-reads the bundle and refuses a swapped one before it co
     assert.equal(readJson(join(f.out, 'android/hub-receipt-android-play.json')).outcome, 'failure');
   } finally { await f.cleanup(); }
 });
+
+// ---------------------------------------------------------------------------------------------------- Story 3.2: a blocked Android delivery goes pending
+
+import { deviceOf, mergeLatest as mergePending, publicReceipts } from './commands/deliver.mjs';
+import { parseLatest as parsePending, serializeLatest as serializePending } from './lib/latest.mjs';
+import { summaryMarkdown } from './lib/receipt.mjs';
+import { readOwner } from './lib/lock.mjs';
+
+const waited = { lockOptions: { timeoutMs: 150, pollMs: 20 } };
+const androidEvents = host => [...readEvents({ env: host.env })].filter(event => event.claimant.repo === 'delorenj/example-app' && event.claimant.job === 'android');
+
+test('a real run whose S26 stays busy goes green: pending "S26 busy", the blockers in the receipt and the Event Log, the Reservation released, the Release still published', async () => {
+  const f = await gitFixture();
+  try {
+    const host = await laneHost(f);
+    await host.installApk('io.example.app 0.2.1 4');
+    const jobEnv = job => ({ ...host.env, HUB_REF: 'v1.2.46', GITHUB_JOB: job });
+    const as = (job, command, extra = []) => host.configure(command, extra, jobEnv(job));
+    reserveFor('adb', { env: jobEnv('gate'), log: () => {} });
+    const planned = await quiet(() => plan(as('plan', 'plan', ['--dry-run', 'false']), { env: jobEnv('plan'), home: f.root, fetchImpl: noLatest, s3Factory: async () => host.s3 }));
+    git(f.app, ['checkout', '-q', planned.build_sha], f.env);
+    await holdS26(host, otherJob());
+    const before = host.adbCalls();
+    const logs = [];
+    const lane = await android(as('android', 'android', ['--dry-run', 'false', '--version', '0.2.2', '--android-code', '5', '--build-sha', planned.build_sha]), { env: jobEnv('android'), home: f.root, log: line => logs.push(line), ...waited });
+    assert.deepEqual({ status: lane.delivery.status, verified: lane.delivery.verified, reason: lane.delivery.reason }, { status: 'pending', verified: false, reason: 'S26 busy' });
+    assert.equal(host.adbCalls(), before, 'no adb call: the S26 was never touched');
+    assert.equal(readFileSync(join(host.state, 'installed.apk'), 'utf8').trim(), 'io.example.app 0.2.1 4', 'the S26 still runs what it ran');
+    const receipt = readJson(join(f.out, 'android/hub-receipt-android.json'));
+    assert.equal(receipt.outcome, 'success');
+    assert.equal(receipt.delivery.reason, 'S26 busy');
+    assert.equal(receipt.contention.lock, 'adb');
+    assert.equal(receipt.contention.reason, 'delivery-pending');
+    assert.equal(receipt.contention.blocked_by.length, 1);
+    assert.deepEqual([receipt.contention.blocked_by[0].role, receipt.contention.blocked_by[0].kind, receipt.contention.blocked_by[0].holder], ['holder', 'job', 'delorenj/other#1']);
+    assert.doesNotMatch(JSON.stringify([receipt.notes, receipt.delivery]), /delorenj\/other|agent-a/, 'no holder in the notes or the delivery');
+    const mine = androidEvents(host);
+    assert.deepEqual(mine.map(event => [event.event, event.hold_kind, event.reason]), [['request', 'job', null], ['timeout', 'job', 'delivery-pending'], ['release', 'reservation', 'delivery-pending']]);
+    assert.match(mine[1].blocked_by, /delorenj\/other run 1/);
+    assert.deepEqual([...readEvents({ env: host.env })].filter(event => event.hold_kind === 'reservation').map(event => event.event), ['claim', 'release']);
+    assert.deepEqual(listReservations('adb', { env: host.env }), [], 'no Reservation left');
+    assert.ok(logs.some(line => /^HUB_S26_BUSY 0\.2\.2 \(5\)/.test(line)), logs.join('\n'));
+    assert.ok(logs.some(line => /^HUB_RESERVATION_RELEASED adb /.test(line)));
+    assert.match(summaryMarkdown(receipt), /- contention on adb \(delivery-pending\): holder job delorenj\/other#1/);
+    // The run goes on: the Release step publishes a pending build, and deliver's latest.json block says only "S26 busy".
+    await quiet(() => release(as('release', 'release', ['--dry-run', 'false', '--version', '0.2.2', '--android-code', '5', '--build-sha', planned.build_sha]), { env: { ...jobEnv('release'), GH_TOKEN: 'token' }, fetchImpl: noLatest }));
+    assert.match(host.calls('gh.log'), /gh release create v0\.2\.2 /, 'the Release of a contention-pending build is published');
+    const stamp = '2026-11-24T10:00:00Z';
+    const device = deviceOf(loadDevices(host.env).android, receipt, { stamp });
+    assert.deepEqual([device.status, device.reason, device.by], ['pending', 'S26 busy', null]);
+    const current = sampleLatest();
+    const next = { ...current.android, version: '0.2.3', code: 5, key: current.android.key.replace('0.2.2/tower-of-lost-things-0.2.2-4', '0.2.3/tower-of-lost-things-0.2.3-5'), device };
+    next.url = next.url.replace('0.2.2/tower-of-lost-things-0.2.2-4', '0.2.3/tower-of-lost-things-0.2.3-5');
+    const top = { slug: current.slug, name: current.name, version: '0.2.3', commit: current.commit, hub_ref: 'v1.2.46', run: current.run, correlation: current.correlation, mac_bytes: current.mac_bytes };
+    const merged = mergePending({ current, candidates: { android: next, ios: null }, top, stamp, log: () => {} });
+    const parsed = parsePending(serializePending(merged.latest));
+    assert.deepEqual([parsed.android.device.status, parsed.android.device.reason], ['pending', 'S26 busy']);
+    assert.deepEqual(Object.keys(parsed.android.device).sort(), Object.keys(current.android.device).sort(), 'no key was added to latest.json');
+    assert.deepEqual(Object.keys(publicReceipts({ android: receipt }).android).includes('contention'), false, 'the bucket copy of the receipt has no contention');
+    const needs = JSON.stringify({ gate: { result: 'success' }, plan: { result: 'success', outputs: host.outputs() }, android: { result: 'success' }, deliver: { result: 'success' } });
+    const event = await quiet(() => announce(as('announce', 'announce', ['--dry-run', 'false']), { env: { ...jobEnv('announce'), HUB_RECEIPTS: f.out, HUB_NEEDS: needs }, home: f.root, fetchImpl: noLatest }));
+    assert.doesNotMatch(JSON.stringify(event.data), /contention|delorenj\/other|agent-a/);
+    const delivery = JSON.stringify(event.data.deliveries ?? event.data.delivery ?? event.data);
+    assert.match(delivery, /pending/);
+    assert.match(delivery, /S26 busy/);
+  } finally { await f.cleanup(); }
+});
+
+test('a Lease on the S26 with another ticket ahead: blocked_by lists the Lease holder, then the one ahead (dry run: the same pending delivery, nothing installed)', async () => {
+  const f = await gitFixture();
+  try {
+    const host = await laneHost(f);
+    await host.installApk('io.example.app 0.2.1 4');
+    const planned = await plan(host.configure('plan'), { env: host.env, home: f.root, fetchImpl: noLatest, log: () => {} });
+    const out = host.outputs();
+    assert.equal(planned.s26, 'present');
+    const { GITHUB_REPOSITORY: _repo, GITHUB_RUN_ID: _run, ...leaseEnv } = host.env; // an agent at a shell, not the run
+    await acquireLease('adb', { holder: 'agent-a', why: 'device proof', forMs: 30 * 60_000, id: 'held', env: leaseEnv, log: () => {} });
+    reserve('adb', { env: host.env, log: () => {} });
+    const queue = join(host.env.HUB_LOCK_DIR, 'adb.queue');
+    await mkdir(queue, { recursive: true });
+    await writeFile(join(queue, '000000000000001-000001-00000009.json'), JSON.stringify({ format: 1, kind: 'lease', lease_id: 'ahead-1', holder: 'agent-b', why: 'waiting', pid: process.pid, host: hostname(), enqueued_at: new Date(1).toISOString() }));
+    const before = host.adbCalls();
+    const lane = await quiet(() => android(host.configure('android', ['--version', out.version, '--android-code', out.android_code, '--build-sha', out.build_sha, '--bump-patch', out.bump_patch]), { env: host.env, home: f.root, ...waited }));
+    assert.deepEqual([lane.delivery.status, lane.delivery.reason], ['pending', 'S26 busy']);
+    assert.equal(host.adbCalls(), before);
+    const receipt = readJson(join(f.out, 'android/hub-receipt-android.json'));
+    assert.equal(receipt.outcome, 'success');
+    const [holder, ahead] = receipt.contention.blocked_by;
+    assert.deepEqual([holder.role, holder.kind, holder.holder, holder.lease_id], ['holder', 'lease', 'agent-a', 'held']);
+    assert.equal(receipt.contention.blocked_by.length, 2);
+    assert.deepEqual([ahead.role, ahead.kind, ahead.holder], ['ahead', 'lease', 'agent-b']);
+    assert.ok(ahead.place >= 1);
+    assert.deepEqual([...readEvents({ env: host.env })].filter(event => event.event === 'timeout').map(event => [event.event, event.reason, event.claimant.holder]), [['timeout', 'delivery-pending', null]]);
+    assert.equal(readOwner(join(host.env.HUB_LOCK_DIR, 'adb.lock'))?.lease_id, 'held', 'the Lease is untouched');
+  } finally { await f.cleanup(); }
+});
+
+test('an error inside the hold still fails the lane (a newer versionCode on the S26) and keeps the Reservation; a ticket released mid-wait is still HUB_LEASE_CANCELLED', async () => {
+  const f = await gitFixture();
+  try {
+    const host = await laneHost(f);
+    await host.installApk('io.example.app 0.2.1 4');
+    reserve('adb', { env: host.env, log: () => {} });
+    const planned = await plan(host.configure('plan'), { env: host.env, home: f.root, fetchImpl: noLatest, log: () => {} });
+    assert.equal(planned.s26, 'present');
+    const out = host.outputs();
+    await host.installApk('io.example.app 0.9.0 99');
+    const args = ['--version', out.version, '--android-code', out.android_code, '--build-sha', out.build_sha, '--bump-patch', out.bump_patch];
+    await assert.rejects(quiet(() => android(host.configure('android', args), { env: host.env, home: f.root, ...waited })), /above the planned/);
+    assert.equal(listReservations('adb', { env: host.env }).length, 1, 'a failed hold keeps the Reservation for the rerun');
+    const failed = readJson(join(f.out, 'android/hub-receipt-android.json'));
+    assert.equal(failed.outcome, 'failure');
+    assert.equal('contention' in failed, false);
+    git(f.app, ['reset', '--hard', '-q'], f.env); // the failed lane's bump patch
+    // Released mid-wait: the ticket is gone, the wait is cancelled, and that is not a busy S26.
+    releaseReservation('adb', { env: host.env });
+    const { GITHUB_REPOSITORY: _repo, GITHUB_RUN_ID: _run, ...leaseEnv } = host.env;
+    await acquireLease('adb', { holder: 'agent-a', why: 'proof', forMs: 30 * 60_000, id: 'held', env: leaseEnv, log: () => {} });
+    const waiting = android(host.configure('android', args), { env: host.env, home: f.root, lockOptions: { timeoutMs: 60_000, pollMs: 20 } }).then(() => null, error => error);
+    await Promise.race([queuedPlan(host), waiting.then(error => { throw error ?? new Error('the lane finished instead of waiting'); })]);
+    for (const file of readdirSync(join(host.env.HUB_LOCK_DIR, 'adb.queue'))) await rm(join(host.env.HUB_LOCK_DIR, 'adb.queue', file), { force: true });
+    const error = await quiet(() => waiting);
+    assert.equal(error?.code, 'HUB_LEASE_CANCELLED', String(error));
+  } finally { await f.cleanup(); }
+});

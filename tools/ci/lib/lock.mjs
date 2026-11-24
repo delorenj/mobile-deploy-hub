@@ -205,10 +205,12 @@ export async function withLock(name, fn, {
   deadlineSeams = {},
   endsReservation = false,
   yieldToLease = false,
+  timeoutReason = 'deadline',
 } = {}) {
   if (!/^[a-z0-9-]+$/.test(name)) throw new Error(`bad lock name "${name}"`);
+  if (typeof timeoutReason !== 'string' || !/^[a-z][a-z0-9-]{0,39}$/.test(timeoutReason)) throw new Error(`bad timeout reason "${timeoutReason}"`);
   if (kind !== 'job' && kind !== 'hub-job') throw new Error(`bad lock holder kind "${kind}" (job or hub-job)`);
-  if (isQueued(name)) return queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams, endsReservation, yieldToLease });
+  if (isQueued(name)) return queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams, endsReservation, yieldToLease, timeoutReason });
   const dir = lockDir(env);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${name}.lock`);
@@ -237,7 +239,7 @@ export async function withLock(name, fn, {
       continue;
     }
     if (yieldToLease && isLease(owner)) throw yielded(name, owner);
-    if (now() >= deadline) throw failure('HUB_LOCK_TIMEOUT', `${heldText(name, owner)}; gave up after ${Math.round(timeoutMs / 60_000)} min. Another deploy is using the device; run again when it finishes.`);
+    if (now() >= deadline) throw Object.assign(failure('HUB_LOCK_TIMEOUT', `${heldText(name, owner)}; gave up after ${Math.round(timeoutMs / 60_000)} min. Another deploy is using the device; run again when it finishes.`), { owner, holds: holdsOf(owner) });
     if (!waiting) { log(`HUB_LOCK_WAIT ${name} held by ${describe(owner)}`); waiting = true; }
     await sleep(pollMs);
   }
@@ -309,6 +311,28 @@ const leaseId = id => { if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(id)) throw new Err
 const lockPath = (name, env) => join(lockDir(env), `${leaseName(name)}.lock`);
 const queuePath = (name, env) => join(lockDir(env), `${leaseName(name)}.queue`);
 const failure = (code, message) => Object.assign(new Error(message), { code });
+
+// The Holds that kept a wait from the lock, as plain data for a receipt or an event (never public): the holder first, then each
+// blocker ahead of the waiter in the Queue with its place. A holder is a Lease's `holder` or a job's `<repo>#<run>`. Never throws.
+export function holdsOf(owner, blockers = []) {
+  try {
+    const holds = [];
+    if (owner) {
+      const lease = isLease(owner);
+      holds.push({
+        role: 'holder', kind: lease ? 'lease' : owner.kind ?? 'job', holder: lease ? owner.holder ?? null : `${owner.repo ?? 'local'}#${owner.run ?? '-'}`,
+        lease_id: owner.lease_id ?? null, why: owner.why ?? null, since: owner.started_at ?? null, until: owner.expires_at ?? null,
+      });
+    }
+    for (const entry of blockers ?? []) {
+      holds.push({
+        role: 'ahead', place: entry.place ?? null, kind: entry.kind ?? null, holder: entry.holder ?? null, lease_id: entry.lease_id ?? null, why: entry.why ?? null,
+        since: entry.enqueued_at ?? entry.reserved_at ?? null, until: entry.expires_at ?? entry.deadline_at ?? null,
+      });
+    }
+    return holds;
+  } catch { return []; }
+}
 
 // Write-then-rename: a reader never sees half a record.
 function writeOwner(path, owner) {
@@ -829,7 +853,7 @@ export function poolRequest(pool, { id = newLeaseId(), holder, why, forMs = null
 // `timeoutMs` of 0 or less is a try: no ticket, no event unless it acquires. Events (AD-9) follow acquireLease's: `request` once
 // the ticket is in place, `acquire` once the ticket is claimed, and `timeout` or `cancel` once this waiter's own unlink of its
 // ticket succeeds. A wait that runs out throws HUB_LOCK_TIMEOUT, wording `host lock <name> is held ...` as before.
-async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams, endsReservation, yieldToLease }) {
+async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams, endsReservation, yieldToLease, timeoutReason }) {
   const dir = lockDir(env);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${name}.lock`);
@@ -865,10 +889,13 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
     return true;
   };
   const cancelled = text => failure('HUB_LEASE_CANCELLED', `${selfText} ${text} ${name}`);
-  const timedOut = (message, owner) => {
-    if (tryOnly) return failure('HUB_LOCK_TIMEOUT', message);
-    if (!leave('timeout', { reason: 'deadline', blocked_by: describe(owner) })) return cancelled('was released while it waited for');
-    return failure('HUB_LOCK_TIMEOUT', message);
+  // The error carries the blocking Holds (`owner`, `holds`) so a caller can name them in its own receipt; the event says what the
+  // caller's timeout means (`timeoutReason`, `deadline` unless the caller named one) and who held the lock.
+  const timedOut = (message, owner, blockers = []) => {
+    const error = () => Object.assign(failure('HUB_LOCK_TIMEOUT', message), { owner, holds: holdsOf(owner, blockers) });
+    if (tryOnly) return error();
+    if (!leave('timeout', { reason: timeoutReason, blocked_by: describe(owner) })) return cancelled('was released while it waited for');
+    return error();
   };
   // With `yieldToLease`, a live Lease on the lock ends the wait: the ticket leaves with a cancel event and the caller reads around it.
   const yieldTo = owner => {
@@ -943,7 +970,7 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
         startGrace(name, current, { env, now, hostId, own: tryOnly ? reserved?.key ?? null : null });
         const owner = readOwner(path);
         yieldTo(owner);
-        if (now() >= deadline) throw timedOut(`${heldText(name, owner, blockers, selfText)}; ${gaveUp}`, owner);
+        if (now() >= deadline) throw timedOut(`${heldText(name, owner, blockers, selfText)}; ${gaveUp}`, owner, blockers);
         if (!waiting) { log(`HUB_LOCK_WAIT ${name} queued behind ${blockers.length} (${describe(owner)})`); waiting = true; }
       }
       await sleep(pollMs);
