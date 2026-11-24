@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { eta, percentile } from './lib/eta.mjs';
 import { acquireLease, releaseLease, withLock } from './lib/lock.mjs';
-import { readEvents } from './lib/events.mjs';
+import { appendEvent, readEvents } from './lib/events.mjs';
 import { loadPolicy } from './lib/policy.mjs';
 
 const NOW = Date.parse('2026-11-24T12:00:00Z');
@@ -63,12 +63,15 @@ test('a holder past its median is conditioned on how long it has held, and falls
   const rest = many(10, i => (10 + i) * MIN).map(x => x - (10 * MIN + 30_000));
   assert.deepEqual(past, { lo_ms: Math.round(percentile(rest, 0.25)), hi_ms: Math.round(percentile(rest, 0.75)), low_data: false });
   assert.equal(run({ owner: jobOwner(10 * MIN + 30_000) }, held).low_data, true, 'only 10 hold past 10.5 min, below the threshold of 20');
-  // Past every sample: nothing survives, the range falls back to the allowance (15 min less 25 min held is 0, never negative).
-  assert.deepEqual(run({ owner: jobOwner(25 * MIN) }, held), { lo_ms: 0, hi_ms: 0, low_data: true });
-  // Only a few survive: low data, widened to the stated remaining time.
+  // Past every sample and past its whole 15 min allowance: its stated remaining time is unknown (never 0-0 while it still
+  // holds), so the total hi is the asker's deadline, or null without one.
+  assert.deepEqual(run({ owner: jobOwner(25 * MIN) }, held), { lo_ms: 0, hi_ms: null, low_data: true });
+  assert.deepEqual(run({ owner: jobOwner(25 * MIN), deadline_at: iso(NOW + 7 * MIN) }, held), { lo_ms: 0, hi_ms: 7 * MIN, low_data: true });
+  // Only a few survive (and the allowance is spent): low data, lo from the survivors, hi unknown.
   const sparse = run({ owner: jobOwner(19 * MIN) }, held);
-  assert.equal(sparse.low_data, true);
-  assert.ok(sparse.hi_ms >= sparse.lo_ms);
+  assert.deepEqual(sparse, { lo_ms: MIN, hi_ms: null, low_data: true });
+  // Inside its allowance a sparse holder widens to the stated remaining time.
+  assert.deepEqual(run({ owner: jobOwner(3 * MIN) }, [jobHold(2 * MIN)]), { lo_ms: 0, hi_ms: 12 * MIN, low_data: true });
 });
 
 test('window: holds older than the window and holds from the future are ignored', () => {
@@ -156,6 +159,19 @@ test('unknown stated duration: the total hi is the asker\'s deadline, or null wi
   assert.deepEqual(run({ owner: null, view, deadline_at: iso(NOW + MIN) }, some), { lo_ms: 40 * MIN, hi_ms: 40 * MIN, low_data: true });
 });
 
+test('a blocking entry of an unknown kind (remote) is low data with an unknown duration: the asker\'s deadline, or null', () => {
+  const view = [{ file: 'a', kind: 'remote', blocking: true }];
+  assert.deepEqual(run({ owner: null, view, deadline_at: iso(NOW + 4 * MIN) }), { lo_ms: 0, hi_ms: 4 * MIN, low_data: true });
+  assert.deepEqual(run({ owner: null, view }), { lo_ms: 0, hi_ms: null, low_data: true });
+});
+
+test('a reused lease id takes its latest request for_ms', () => {
+  const old = { event: 'request', ts: iso(NOW - 2 * DAY), lease_id: 'w1', for_ms: 5 * MIN };
+  const latest = { event: 'request', ts: iso(NOW - MIN), lease_id: 'w1', for_ms: 40 * MIN };
+  assert.deepEqual(run({ owner: null, view: [lease('a', 'w1')] }, [old, latest]), { lo_ms: 0, hi_ms: 40 * MIN, low_data: true });
+  assert.deepEqual(run({ owner: null, view: [lease('a', 'w1')] }, [old]), { lo_ms: 0, hi_ms: 5 * MIN, low_data: true });
+});
+
 test('sparse history lowers lo to the sparse p25 and raises hi to the sparse p75 when it is larger than the stated duration', () => {
   const some = [jobHold(30 * MIN), jobHold(40 * MIN)];
   const got = run({ owner: null, view: [job('a')] }, some);
@@ -229,13 +245,67 @@ test('a waiting Queued withLock writes the same ETA into its ticket and its requ
 test('an ETA that cannot be computed never stops an enqueue: the ticket and the request record eta null', async () => {
   const f = fixture();
   try {
+    const logged = [];
     const broken = { queue: { deploy_target_lease_max_min: 60, eta_window_days: 0 } };
     await acquireLease('adb', { holder: 'first', why: 'holds', forMs: 600_000, env: f.env, log: () => {}, hostId: HOST_ID, policy: broken });
-    const waiting = acquireLease('adb', { holder: 'second', why: 'waits', forMs: 600_000, waitMs: 30_000, id: 'w-broken', env: f.env, log: () => {}, pollMs: 5, hostId: HOST_ID, policy: broken });
+    const waiting = acquireLease('adb', { holder: 'second', why: 'waits', forMs: 600_000, waitMs: 30_000, id: 'w-broken', env: f.env, log: line => logged.push(line), pollMs: 5, hostId: HOST_ID, policy: broken });
     await settle(60);
     assert.equal(tickets(f)[0].eta, null);
     assert.equal(requests(f).find(event => event.lease_id === 'w-broken').eta, null);
+    assert.deepEqual(logged.filter(line => line.startsWith('HUB_ETA_FAILED')), ['HUB_ETA_FAILED adb eta: queue.eta_window_days must be a positive whole number'], 'one line, naming the lock and the reason');
     releaseLease('adb', 'w-broken', { env: f.env });
     await assert.rejects(waiting, error => error.code === 'HUB_LEASE_CANCELLED');
+  } finally { f.cleanup(); }
+});
+
+const keepHolding = f => withLock('adb', () => new Promise(done => { f.done = done; }), { env: f.env, log: () => {}, hostId: HOST_ID, timers: { setInterval: () => ({ unref() {} }), clearInterval() {} } });
+
+test('the enqueue reads real history once: in-window holds set the range and older ones do not count', async () => {
+  const f = fixture();
+  try {
+    const at = Date.now();
+    const seed = (held, ago) => appendEvent({ event: 'release', lock: 'adb', hold_kind: 'job', claimant: { kind: 'deploy', holder: null, repo: 'delorenj/example', run: '1', attempt: '1', job: 'android' }, held_ms: held, for_ms: null, last_alive_at: null }, { env: f.env, now: () => at - ago, hostId: HOST_ID, log: () => {} });
+    for (let i = 1; i <= 20; i += 1) assert.ok(seed(i * MIN, DAY));
+    for (let i = 0; i < 6; i += 1) assert.ok(seed(300 * MIN, 31 * DAY), 'outside the 30-day window');
+    const holder = keepHolding(f);
+    await settle(30);
+    const waiting = acquireLease('adb', { holder: 'second', why: 'waits', forMs: 600_000, waitMs: 30_000, id: 'w-real', env: f.env, log: () => {}, pollMs: 5, hostId: HOST_ID });
+    await settle(60);
+    const [ticket] = tickets(f);
+    const sent = requests(f).find(event => event.lease_id === 'w-real');
+    assert.deepEqual(sent.eta, ticket.eta);
+    assert.equal(ticket.eta.low_data, false);
+    // p25 and p75 of 1..20 min (5.75 and 15.25 min) less the few ms the holder has held; the 300 min holds did not count.
+    assert.ok(ticket.eta.lo_ms <= 5.75 * MIN && ticket.eta.lo_ms > 5.75 * MIN - 5000, String(ticket.eta.lo_ms));
+    assert.ok(ticket.eta.hi_ms <= 15.25 * MIN && ticket.eta.hi_ms > 15.25 * MIN - 5000, String(ticket.eta.hi_ms));
+    releaseLease('adb', 'w-real', { env: f.env });
+    await assert.rejects(waiting, error => error.code === 'HUB_LEASE_CANCELLED');
+    f.done();
+    await holder;
+  } finally { f.cleanup(); }
+});
+
+test('the asker\'s place counts end to end: a later waiter includes the one ahead of it, and the earlier one never includes the later', async () => {
+  const f = fixture();
+  try {
+    await acquireLease('adb', { holder: 'first', why: 'holds', forMs: 600_000, id: 'first', env: f.env, log: () => {}, hostId: HOST_ID });
+    const b = acquireLease('adb', { holder: 'b', why: 'waits', forMs: 600_000, waitMs: 30_000, id: 'b', env: f.env, log: () => {}, pollMs: 5, hostId: HOST_ID });
+    await settle(60);
+    const c = acquireLease('adb', { holder: 'c', why: 'waits', forMs: 300_000, waitMs: 30_000, id: 'c', env: f.env, log: () => {}, pollMs: 5, hostId: HOST_ID });
+    await settle(60);
+    const byId = Object.fromEntries(tickets(f).map(ticket => [ticket.lease_id, ticket]));
+    const asked = Object.fromEntries(requests(f).map(event => [event.lease_id, event]));
+    assert.deepEqual(byId.b.eta, asked.b.eta);
+    assert.deepEqual(byId.c.eta, asked.c.eta);
+    const forB = asked.b.for_ms;
+    assert.equal(forB, 600_000, 'B\'s contribution is its own request event\'s for_ms');
+    // B is behind the holder only (about 10 min); C adds B's whole 10 min on top, and C's own time never enters B's range.
+    assert.ok(byId.b.eta.hi_ms <= 600_000 && byId.b.eta.hi_ms > 595_000, String(byId.b.eta.hi_ms));
+    const added = byId.c.eta.hi_ms - byId.b.eta.hi_ms;
+    assert.ok(added > forB - 5000 && added <= forB, String(added));
+    releaseLease('adb', 'c', { env: f.env });
+    releaseLease('adb', 'b', { env: f.env });
+    await assert.rejects(c, error => error.code === 'HUB_LEASE_CANCELLED');
+    await assert.rejects(b, error => error.code === 'HUB_LEASE_CANCELLED');
   } finally { f.cleanup(); }
 });

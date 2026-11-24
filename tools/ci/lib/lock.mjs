@@ -816,7 +816,7 @@ function writeTicket(name, body, { env, requested, file = ticketName(requested) 
 // later (SM-4). It reads the owner, an observer's view (no prune) and the policy window's events once, then asks eta(). `file`
 // is the ticket's minted name, so the asker's place is known before its ticket lands. Never throws and never delays the
 // enqueue beyond those reads: any error is a null ETA.
-function enqueueEta(name, { file, deadline, env, now, policy = null, host, hostId, processStart: startOf }) {
+function enqueueEta(name, { file, deadline, env, now, policy = null, host, hostId, processStart: startOf, log = console.log }) {
   try {
     const at = now();
     const settings = policy ?? loadPolicy().policy;
@@ -825,7 +825,11 @@ function enqueueEta(name, { file, deadline, env, now, policy = null, host, hostI
     const view = queueView(name, { env, now, host, hostId, processStart: startOf });
     const events = [...readEvents({ env, since: at - days * 86_400_000, until: at + 1, log: () => {} })];
     return eta({ owner, view, file, deadline_at: deadline }, events, settings, at);
-  } catch { return null; }
+  } catch (error) {
+    // One line, so a broken ETA path is not a silent null on every ticket; a throwing logger never escapes.
+    try { log(`HUB_ETA_FAILED ${name} ${String(error?.message ?? error).split('\n')[0]}`); } catch { /* the enqueue goes on */ }
+    return null;
+  }
 }
 
 // A process start read at most once per pid in JOB_POLL_MS: a Mac pass spawns `ps` per ticket otherwise (AD "liveness cost").
@@ -916,7 +920,7 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
   if (!tryOnly) {
     const placed = reserved ? Math.min(requested, reserved.reserved_ms) : requested;
     const named = ticketName(placed);
-    const estimate = enqueueEta(name, { file: named, deadline, env, now: () => requested, policy, host, hostId, processStart: startOf });
+    const estimate = enqueueEta(name, { file: named, deadline, env, now: () => requested, policy, host, hostId, processStart: startOf, log });
     const body = buildTicket(kind, { env, requested, deadline, host, hostId, processStart: startOf, reservation: reserved?.key ?? null, delivery: delivery ?? null, eta: estimate });
     selfText = `${kind === 'hub-job' ? 'catch-up' : 'job'} ${body.lease_id}`;
     ({ file: ticket, path: ticketFile } = writeTicket(name, body, { env, requested: placed, file: named }));
@@ -1087,7 +1091,7 @@ export async function acquireLease(name, {
   let estimate = null;
   if (!tryOnly) {
     const named = ticketName(requested);
-    estimate = enqueueEta(name, { file: named, deadline, env, now: () => requested, policy, host, hostId, processStart: startOf });
+    estimate = enqueueEta(name, { file: named, deadline, env, now: () => requested, policy, host, hostId, processStart: startOf, log });
     ({ file: ticket, path: ticketFile } = writeTicket(name, buildTicket('lease', { env, requested, deadline, lease_id, holder, why, host, hostId, processStart: startOf, eta: estimate }), { env, requested, file: named }));
   }
   const attempt = env.GITHUB_RUN_ATTEMPT ?? null;

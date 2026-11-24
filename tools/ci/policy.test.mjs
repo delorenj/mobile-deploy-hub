@@ -155,7 +155,7 @@ test('a testflight block is parsed strictly: groups are plain unique names, the 
 
 // ---------------------------------------------------------------------------------------------------- MOBI-33 (AD-11)
 
-test('the queue block is strict: the margin and one allowance per waiting job, nothing else, every value a whole number of minutes', () => {
+test('the queue block is strict: the margin and one allowance per waiting job, nothing else, every value a positive whole number', () => {
   const base = JSON.parse(source);
   assert.deepEqual(base.queue, { wait_margin_min: 2, hold_allowance_min: { plan: 5, android: 15, ios: 60 }, grace_min: 10, reservation_ceiling_min: 180, deploy_target_lease_max_min: 60, catchup_attempt_s: 5, catchup_pending_wait_min: 30, eta_window_days: 30, eta_low_data_min_holds: 20 });
   assert.deepEqual(loadPolicy().policy.queue, base.queue);

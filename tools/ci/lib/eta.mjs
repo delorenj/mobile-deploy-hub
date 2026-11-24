@@ -101,14 +101,16 @@ export function eta(queue, events, policy, now) {
     } else {
       const alive = sameJob(owner.repo, owner.job).filter(hold => elapsed === 0 || hold.held > elapsed).map(hold => hold.held - elapsed);
       const total = typeof owner.job === 'string' ? allowance(owner.job) : null;
-      parts.push(bounds(alive, total === null ? null : Math.max(0, total - elapsed), min));
+      // A holder past its whole allowance has no stated remaining time: unknown, not 0 while it still holds the lock.
+      parts.push(bounds(alive, total === null || total - elapsed <= 0 ? null : total - elapsed, min));
     }
   }
 
   // The blocking entries ahead of the asker (all of them for the back of the line).
+  // The latest request per lease id (events arrive in ascending order): a reused id takes its newest for_ms.
   const requests = new Map();
   for (const event of events ?? []) {
-    if (event?.event === 'request' && typeof event.lease_id === 'string' && Number.isFinite(event.for_ms) && event.for_ms > 0 && !requests.has(event.lease_id)) requests.set(event.lease_id, event.for_ms);
+    if (event?.event === 'request' && typeof event.lease_id === 'string' && Number.isFinite(event.for_ms) && event.for_ms > 0) requests.set(event.lease_id, event.for_ms);
   }
   let own = null;
   for (const entry of view) {
