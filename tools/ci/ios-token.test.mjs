@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { hookEnvironment, parseConfig } from './lib/config.mjs';
 import { ios, testflightStep, uploadHookEnvironment } from './commands/ios.mjs';
+import { listReservations, reserve } from './lib/lock.mjs';
 
 const root = fileURLToPath(new URL('../..', import.meta.url));
 const workflow = readFileSync(join(root, '.github/workflows/mobile-deploy.yml'), 'utf8');
@@ -146,6 +147,19 @@ for (const [name, prior] of histories) test(`real ios dry-run retry accepts read
   assert.equal(f.requests().length, 2);
   assert.ok(f.requests().every(read => read.authenticated && !read.saved_login));
   assert.equal(logs.join('\n').includes(marker), false);
+});
+
+// Story 2.6 (AD-7): the run's Reservation of the Mac ends with the ios lane's last mac-ios hold, and only when the lane ended well.
+test('the ios lane releases the run\'s Reservation of mac-ios inside its hold when it ends well, and a lane that fails keeps it for the rerun', async t => {
+  const f = dryFixture(t);
+  reserve('mac-ios', { env: f.env, log: () => {} });
+  assert.deepEqual(listReservations('mac-ios', { env: f.env }).map(entry => entry.key), ['owner--app--123']);
+  await f.run();
+  assert.deepEqual(listReservations('mac-ios', { env: f.env }), [], 'success: released');
+  const failing = dryFixture(t, 'denied');
+  reserve('mac-ios', { env: failing.env, log: () => {} });
+  await assert.rejects(failing.run, /ephemeral job token|denied or unavailable|incomplete|not JSON/);
+  assert.equal(listReservations('mac-ios', { env: failing.env }).length, 1, 'failure: kept');
 });
 
 for (const mode of ['absent', 'denied', 'incomplete', 'invalid-json']) test(`real ios dry-run fails read proof before native work: ${mode}`, async t => {

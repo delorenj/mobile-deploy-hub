@@ -15,9 +15,10 @@ import { latestKey, parseLatest } from '../lib/latest.mjs';
 import { loadManifest } from '../lib/manifest.mjs';
 import { notesKey, notesText, validateNotes } from '../lib/release-notes.mjs';
 import { linkable } from '../lib/links.mjs';
+import { releaseReservation, runKey } from '../lib/lock.mjs';
 import { jobContext, jobCredentials, readObject } from '../lib/s3.mjs';
 import { parseVersionInfo } from '../lib/version.mjs';
-import { firstLine, parseNeeds, policyBanner, readReceipts, runOf, semver } from './common.mjs';
+import { firstLine, parseNeeds, policyBanner, readReceipts, releaseFor, runOf, semver } from './common.mjs';
 
 export const completionFile = out => join(out, 'completion', 'completion.json');
 
@@ -64,11 +65,47 @@ export function findLostMac({ env, needs, policy, runner = runBounded }) {
   return null;
 }
 
-export async function announce(config, { env = process.env, home = homedir(), fetchImpl = fetch, log = console.log, lostMac = undefined, credentials = undefined, credentialsFor = null, now = () => new Date() } = {}) {
+// The Mac's installed hub-device wrapper (tools/catchup/units/install.sh writes it with an absolute node and release path, so
+// the ssh session's bare PATH does not matter); `~` is the Mac user's home, expanded by the remote shell.
+export const MAC_HUB_DEVICE = '~/.local/bin/hub-device';
+
+// A lane that ended well has no later job that takes its device, so its Reservation is released here as the backstop of the
+// lane's own release (Story 2.6, AD-7): android and ios `success` (a pending S26 or iPad is a successful job). A failed,
+// cancelled or skipped lane releases nothing: grace and the ceiling end it, and a rerun keeps its place. `adb` is released on
+// this host through lock.mjs. `mac-ios` is on the Mac's disk, so it goes over `ssh hub-mac` running the installed hub-device
+// at its absolute path, never `rm`; a Mac without the verb, or one that does not answer, is logged and left to the ceiling.
+export function releaseFinished({ env, needs, devices, releaser = releaseReservation, runner = runBounded, log = console.log }) {
+  const key = runKey(env);
+  if (key === null) return [];
+  const done = [];
+  if (needs?.android?.result === 'success') done.push(['adb', releaseFor('adb', { releaser, env, log })?.status ?? 'failed']);
+  if (needs?.ios?.result === 'success') {
+    const host = devices?.mac?.host;
+    let status;
+    try {
+      const out = runner('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', host, `${MAC_HUB_DEVICE} reservation release --run ${key} --name mac-ios`], { env, timeout: 40_000, label: `ssh ${host}` });
+      status = /HUB_DEVICE_RESERVATION_RELEASED/.test(out) ? 'released' : 'none';
+      if (status === 'released') log(`HUB_RESERVATION_RELEASED mac-ios ${key} (on the Mac)`);
+    } catch (error) {
+      const text = String(error?.message ?? error);
+      // An older hub-device on the Mac answers a verb it does not know with its usage (exit 2), a missing wrapper with 127.
+      const verbMissing = /usage:|exit 2\b|exit 127\b|not found/i.test(text);
+      status = verbMissing ? 'skipped' : 'failed';
+      log(verbMissing
+        ? `HUB_RESERVATION_RELEASE_SKIPPED mac-ios ${key}: the Mac's hub-device has no reservation release verb yet; the 3 h ceiling ends it`
+        : `HUB_RESERVATION_RELEASE_FAILED mac-ios ${key}: ${firstLine(text)}; the 3 h ceiling ends it`);
+    }
+    done.push(['mac-ios', status]);
+  }
+  return done;
+}
+
+export async function announce(config, { env = process.env, home = homedir(), fetchImpl = fetch, log = console.log, lostMac = undefined, credentials = undefined, credentialsFor = null, now = () => new Date(), releaser = releaseReservation, runner = runBounded } = {}) {
   const { policy } = policyBanner(log);
   const devices = loadDevices(env);
   const needs = parseNeeds(env.HUB_NEEDS);
   const receipts = readReceipts(env.HUB_RECEIPTS || join(config.out, 'receipts'));
+  try { releaseFinished({ env, needs, devices, releaser, runner, log }); } catch (error) { log(`HUB_RESERVATION_RELEASE_FAILED ${firstLine(error?.message)}; the ceiling ends it`); }
   const preflight = preflightReceipt(needs);
   if (preflight && !receipts['preflight-ios']) receipts['preflight-ios'] = preflight;
 

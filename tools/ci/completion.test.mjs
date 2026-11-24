@@ -197,7 +197,7 @@ async function announceFixture({ receipts, needs, latest, dryRun = false, testfl
   const env = { PATH: process.env.PATH, GITHUB_REPOSITORY: repo, GITHUB_RUN_ID: '41500000000', GITHUB_RUN_ATTEMPT: '1', GITHUB_SHA: 'c'.repeat(40), HUB_BB_EMIT: join(bin, 'bb-emit'), HUB_NEEDS: JSON.stringify(needs), HUB_RECEIPTS: join(out, 'receipts') };
   const config = { ...parseConfig(['announce', '--manifest', 'tools/ci/mobile-deploy.json', '--out', out, '--dry-run', String(dryRun), '--testflight', String(testflight)], env), cwd: app };
   const fetchImpl = async () => (latest ? { status: 200, ok: true, text: async () => JSON.stringify(latest) } : { status: 404, ok: false, text: async () => '' });
-  const run = async (more = {}, deps = {}) => announce(config, { env: { ...env, ...more }, home: root, fetchImpl, log: () => {}, lostMac: null, ...deps });
+  const run = async (more = {}, deps = {}) => announce(config, { env: { ...env, ...more }, home: root, fetchImpl, log: () => {}, lostMac: null, releaser: () => ({ status: 'none' }), runner: () => '', ...deps });
   const completion = async () => JSON.parse(await readFile(join(out, 'completion/completion.json'), 'utf8'));
   return { run, completion, cleanup: () => rm(root, { recursive: true, force: true }) };
 }

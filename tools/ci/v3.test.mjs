@@ -19,7 +19,7 @@ import { bbEmitPath, correlationFor, deploymentEvent, emitArgs, sanitizeReason, 
 import { loadDevices, parseDevices } from './lib/devices.mjs';
 import { parseManifest } from './lib/manifest.mjs';
 import { android, announce, plan, play, preflightIos, release } from './hub.mjs';
-import { listReservations } from './lib/lock.mjs';
+import { listReservations, releaseReservation, reserve } from './lib/lock.mjs';
 import { readEvents } from './lib/events.mjs';
 import { checkPhone, lanesFrom, parseArguments, phone } from '../deploy.mjs';
 
@@ -861,8 +861,14 @@ test('Re-run failed jobs finishes a deploy: same build verified without reinstal
     // Attempt 1 installed 0.2.2 (5) and then failed later in the job (a Release clash, a runner restart).
     await host.installApk('io.example.app 0.2.2 5 ');
     await rm(join(host.state, 'calls.log'), { force: true });
+    // The run's Reservation of the S26 (the gate took it): a lane that ends well releases it inside its hold, before `adb` is freed
+    // (Story 2.6, AD-7), so the next Claimant is not held up by a run that no longer needs the phone.
+    reserve('adb', { env: host.env, log: () => {} });
+    assert.equal(listReservations('adb', { env: host.env }).length, 1);
     const same = await quiet(() => android(real, { env: host.env, home: f.root }));
     assert.equal(same.delivery.verified, true);
+    assert.deepEqual(listReservations('adb', { env: host.env }), [], 'a lane that ended in success released its Reservation');
+    assert.deepEqual([...readEvents({ env: host.env })].filter(event => event.hold_kind === 'reservation').map(event => event.event), ['claim', 'release']);
     assert.doesNotMatch(host.adbCalls(), /\binstall\b/, 'the same bytes are not installed again');
     // The rebuilt APK differs (Godot exports are not byte-reproducible): same versionCode, in place, data kept.
     await rm(join(host.state, 'calls.log'), { force: true });
@@ -875,7 +881,27 @@ test('Re-run failed jobs finishes a deploy: same build verified without reinstal
     assert.match(host.calls('gh.log'), /gh release upload v0\.2\.2 .* --clobber/);
     // A phone ahead of the plan is never downgraded.
     await host.installApk('io.example.app 0.2.9 9');
+    reserve('adb', { env: host.env, log: () => {} });
     await assert.rejects(quiet(() => android(real, { env: host.env, home: f.root })), /versionCode 9, above the planned 5/);
+    assert.equal(listReservations('adb', { env: host.env }).length, 1, 'a failed lane never releases: grace and the ceiling end it, and a rerun keeps its place');
+  } finally { await f.cleanup(); }
+});
+
+test('a plan whose run skips the Android lane releases the run\'s Reservation of the S26; a plan that keeps it releases nothing (Story 2.6)', async () => {
+  const f = await gitFixture({ manifest: v3Manifest({ ios: { bundle: 'io.example.app', device: 'true', device_artifact: 'App.xcarchive' } }) });
+  try {
+    const host = await laneHost(f);
+    await host.installApk('io.example.app 0.2.1 4');
+    reserve('adb', { env: host.env, log: () => {} });
+    const asked = [];
+    const releaser = (name, options) => { asked.push(name); return releaseReservation(name, options); };
+    const logs = [];
+    await quiet(() => plan(host.configure('plan', ['--ios-lane', 'skip-metered']), { env: host.env, home: f.root, fetchImpl: noLatest, releaser, log: line => logs.push(line) }));
+    assert.deepEqual([asked, listReservations('adb', { env: host.env }).length], [[], 1], 'the Android lane runs: the Reservation stays for its job');
+    await quiet(() => plan(host.configure('plan', ['--platform', 'ios', '--ios-lane', 'skip-metered']), { env: host.env, home: f.root, fetchImpl: noLatest, releaser, log: line => logs.push(line) }));
+    assert.deepEqual(asked, ['adb']);
+    assert.deepEqual(listReservations('adb', { env: host.env }), []);
+    assert.ok(logs.includes('HUB_RESERVATION_RELEASED adb delorenj--example-app--777'), logs.join('\n'));
   } finally { await f.cleanup(); }
 });
 

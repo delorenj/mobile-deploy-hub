@@ -25,6 +25,9 @@
 //   hub-device run emulator [--profile default|playstore] [--for 1h] [--why TEXT] [--wait 2m] [--env-serial NAME]... -- <cmd...>
 //   (--pool N asks for a smaller pool than the host's; it can never raise it)
 //   hub-device release emulator <lease_id>   (a bare id or $HUB_LEASE_ID that names an emulator lease works too)
+//   hub-device reservation release --run <owner--repo--run> [--name adb|mac-ios] [--json]   (a deploy run's Reservation on this host; the
+//                    hub's announce job runs it over ssh on the Mac. Exits 0 whether or not one was held: HUB_DEVICE_RESERVATION_RELEASED or
+//                    HUB_DEVICE_RESERVATION_NONE)
 //
 // Exit codes: 0 done; 1 the lease was cancelled or the tool failed; 75 the phone is away (stdout is exactly
 // `HUB_DEVICE_AWAY <device>`); 76 the lock (or a pool slot) was not free within --wait (`HUB_DEVICE_BUSY <device> ...` on stderr); 2 usage;
@@ -37,7 +40,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { findPhone, idMatchesSerial } from '../ci/lib/adb.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
-import { MAX_LEASE_MS, acquireLease, isLease, listLocks, lockDir, poolRequest, queueView, readOwner, releaseLease, updateLease } from '../ci/lib/lock.mjs';
+import { MAX_LEASE_MS, RESERVABLE, acquireLease, isLease, listLocks, lockDir, poolRequest, queueView, readOwner, releaseLease, releaseReservation, updateLease } from '../ci/lib/lock.mjs';
 import { pause, sleep as realSleep } from '../ci/lib/pause.mjs';
 import { createAsyncAdb } from './async-adb.mjs';
 import { GATE, LEASE_ID, PROFILES, emulatorStatus, exportsOf as emulatorExports, hostPool, isEmulatorLease, isEmulatorLock, provision, readRecord, reap, releaseEmulator, teardownNow } from './emulator.mjs';
@@ -79,7 +82,7 @@ export function parseDuration(text, flag = 'duration') {
   return parts.reduce((total, [, count, unit]) => total + Number(count) * { d: 86_400_000, h: 3_600_000, m: 60_000, s: 1000 }[unit], 0);
 }
 
-const VALUE_FLAGS = new Set(['for', 'why', 'wait', 'id', 'pid', 'holder', 'env-serial', 'profile', 'pool']);
+const VALUE_FLAGS = new Set(['for', 'why', 'wait', 'id', 'pid', 'holder', 'env-serial', 'profile', 'pool', 'run', 'name']);
 const SWITCHES = new Set(['no-connect', 'json', 'verbose', 'any']);
 
 // Words, flags (`--flag value` or `--flag=value`), and everything after `--` as the command.
@@ -105,7 +108,7 @@ export function parseArgs(argv) {
 const shellQuote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 const away = error => error?.code === 'HUB_PHONE_AWAY';
 
-const USAGE = 'usage: hub-device lease s24|s26|phone --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | lease emulator [--profile NAME] --for <dur> --why <text> [--wait <dur>] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] | release [emulator] [<lease_id>|--any] | status [--json] | run s24|s26|phone|emulator [--profile NAME] [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...>';
+const USAGE = 'usage: hub-device lease s24|s26|phone --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | lease emulator [--profile NAME] --for <dur> --why <text> [--wait <dur>] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] | release [emulator] [<lease_id>|--any] | status [--json] | reservation release --run <key> [--name adb|mac-ios] [--json] | run s24|s26|phone|emulator [--profile NAME] [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...>';
 
 // Leases are honoured only by a hub whose lock.mjs knows them. The catch-up runs from the installed release, and an
 // older one sees a lease's short-lived pid as a dead job and reclaims the lock at once, so lease and run say so.
@@ -368,6 +371,29 @@ async function releaseEmulatorCommand(id, context) {
       stderr(`hub-device: emulator ${id}: pids ${result.result.survivors.join(',')} would not stop; ${result.slot} stays out of the pool until they do`);
       return 1;
   }
+}
+
+// `reservation release --run <key> [--name adb|mac-ios]`: a deploy run's Reservation (AD-7, Story 2.6), released through lock.mjs on
+// this host. Without --name every reservable name here is tried (a host holds only its own: adb on Linux, mac-ios on the Mac). Exits 0
+// when nothing is reserved, so the hub's announce job (which runs it over ssh on the Mac) never has to tell the two apart.
+const RUN_KEY = /^[A-Za-z0-9][A-Za-z0-9-]*--[A-Za-z0-9._-]+--\d{1,20}$/;
+function reservationCommand(parsed, context) {
+  const { env, stdout } = context;
+  if (parsed.words[1] !== 'release' || parsed.words.length > 2) throw usage('reservation takes: release --run <key> [--name adb|mac-ios] [--json]');
+  const key = parsed.flags.run;
+  if (!key) throw usage('reservation release needs --run <key> (owner--repo--run, what the deploy run reserved)');
+  if (!RUN_KEY.test(key)) throw usage(`reservation release: "${key}" is not a run key (owner--repo--run)`);
+  const name = parsed.flags.name;
+  if (name !== undefined && !RESERVABLE.includes(name)) throw usage(`reservation release: --name is one of ${RESERVABLE.join(', ')}`);
+  const released = [];
+  for (const lock of name ? [name] : RESERVABLE) {
+    const result = releaseReservation(lock, { env, key, now: context.timing.now, reason: 'released' });
+    if (result.status === 'released') released.push({ name: lock, key });
+  }
+  if (parsed.flags.json) stdout(JSON.stringify({ run: key, released }));
+  else if (released.length === 0) stdout(`HUB_DEVICE_RESERVATION_NONE ${key}`);
+  else for (const entry of released) stdout(`HUB_DEVICE_RESERVATION_RELEASED ${entry.name} ${entry.key}`);
+  return 0;
 }
 
 async function release(parsed, context) {
@@ -719,6 +745,7 @@ export async function main(argv, {
       case 'lease': return await lease(parsed, context);
       case 'release': return await release(parsed, context);
       case 'status': return await status(parsed, context);
+      case 'reservation': return reservationCommand(parsed, context);
       case 'run': return await runCommand(parsed, context);
       default: throw usage(USAGE);
     }

@@ -273,6 +273,9 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
     // it still goes back for over-the-air and deliver publishes it with the iPad failed. Anything earlier stops here.
     let deviceError = null;
     let deviceStage = null;
+    // The run's Reservation of the Mac ends with its last `mac-ios` hold (Story 2.6): this one, unless a TestFlight build takes the
+    // Mac a second time below. A device that failed keeps it, so a rerun of this job is served at the run's place.
+    const needsStoreTake = Boolean(config.testflight && spec.store?.build);
     await withLock('mac-ios', async () => {
       track.stage = 'preflight';
       checkDisk(home, devices);
@@ -341,7 +344,7 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
         Object.assign(delivery, { verified: false, status: 'failed', reason: firstLine(error.message).replace(/^::error::/, '').slice(0, 300) });
         log(`HUB_IPAD_FAILED at ${deviceStage}: ${delivery.reason}; the checked IPA is still published for Install on iPad`);
       }
-    }, { env, timeoutMs: 40 * 60_000 });
+    }, { env, timeoutMs: 40 * 60_000, endsReservation: () => !deviceError && !needsStoreTake });
 
     // The IPA goes back to big-chungus when the iPad will need it over the air (a real run that did not install it),
     // or when the link costs nothing, read again here on the Mac: the gate's reading can be an hour old by now. A dry
@@ -387,7 +390,7 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
       // (bundle, version, build, distribution signer, App Store profile) before anything can be uploaded.
       if (spec.store.build) {
         track.stage = 'build';
-        storeIpa = await withLock('mac-ios', () => buildStoreIpa({ spec, config, out, team: devices.apple.team, hooks, env, runner, log }), { env, timeoutMs: 40 * 60_000 });
+        storeIpa = await withLock('mac-ios', () => buildStoreIpa({ spec, config, out, team: devices.apple.team, hooks, env, runner, log }), { env, timeoutMs: 40 * 60_000, endsReservation: true });
         track.receipt.store_ipa = receiptStoreIpa(storeIpa);
       }
       // Publishing, not the device: a failed upload or assign is reported at stage deliver and the iPad keeps its status.

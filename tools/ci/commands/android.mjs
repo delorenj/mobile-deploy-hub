@@ -153,7 +153,7 @@ async function androidLane(config, manifest, { env, home, track, policy, log, qu
     Object.assign(delivery, { verified: true, status: 'installed', reason: null });
     notes.push(`installed on the S26 over ${was}; readback ${config.version} (${planned}), base.apk sha256 matches`);
     log(`HUB_S26_INSTALLED ${config.version} (${planned}) over ${was}, sha256 verified`);
-  }, { env, timeoutMs: 20 * 60_000 });
+  }, { env, timeoutMs: 20 * 60_000, endsReservation: true });
 
   // Quickdrop: real runs only (a dry run writes nothing a phone could pick up), after the S26's own checks, and only
   // while the S26 syncs from the LAN.

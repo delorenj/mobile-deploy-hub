@@ -193,10 +193,11 @@ export async function withLock(name, fn, {
   processStart: startOf = processStart,
   policy = null,
   deadlineSeams = {},
+  endsReservation = false,
 } = {}) {
   if (!/^[a-z0-9-]+$/.test(name)) throw new Error(`bad lock name "${name}"`);
   if (kind !== 'job' && kind !== 'hub-job') throw new Error(`bad lock holder kind "${kind}" (job or hub-job)`);
-  if (isQueued(name)) return queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams });
+  if (isQueued(name)) return queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams, endsReservation });
   const dir = lockDir(env);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${name}.lock`);
@@ -240,7 +241,7 @@ function jobIdentity({ env, host, hostId, kind }) {
 }
 
 // Runs fn under a lock this process just took (`mine` is its owner record), then gives it back with a `release` event.
-async function runHeld(name, path, mine, fn, { env, now, log, hostId, timers }) {
+async function runHeld(name, path, mine, fn, { env, now, log, hostId, timers, endsReservation = false }) {
   log(`HUB_LOCK ${name}`);
   // The liveness touch (AD-19): the only in-process interval, unref'd so it never keeps a process alive. It touches only
   // while owner.json is still this take, so a lock that changed hands is never touched by its old holder.
@@ -268,6 +269,18 @@ async function runHeld(name, path, mine, fn, { env, now, log, hostId, timers }) 
     throw error;
   } finally {
     if (timer) timers.clearInterval(timer);
+    // The run is done with the device (AD-7): its Reservation is renamed away before the lock is freed, so nobody ever sees a
+    // free lock with a finished run's Reservation still first in line (and a late grace stamp into it is ENOENT). Only after a
+    // hold that ended well; a failed hold keeps the Reservation for the rerun. `endsReservation` may be a function that decides
+    // once the hold is over.
+    if (!failed && endsReservation && isQueued(name)) {
+      try {
+        if (typeof endsReservation !== 'function' || endsReservation()) {
+          const ended = releaseReservation(name, { env, now, hostId });
+          if (ended.status === 'released') log(`HUB_RESERVATION_RELEASED ${name} ${ended.key}`);
+        }
+      } catch { /* the ceiling ends it */ }
+    }
     const owner = readOwner(path);
     if (owner?.pid === mine.pid && !isLease(owner)) retire(name, path, owner, { as: 'release', reason: failed ? 'error' : 'done', env, now, log, hostId });
   }
@@ -506,8 +519,25 @@ function retireReservation(name, found, { as = null, reason = null, env = proces
   }
   afterRename(moved);
   try { rmSync(moved, { recursive: true }); } catch { /* a released directory never blocks the key */ }
-  if (as && found.record) note(name, eventOf(as, name, reservationSubject(found.record), reservationFields(found, { held_ms: Math.max(0, at - found.reserved_ms), reason })), { env, at, hostId });
+  // A release by the run itself names its attempt and job; an expiry (some other run's acquirer) never does.
+  const own = as === 'release' && runKey(env) === found.key ? env : null;
+  if (as && found.record) note(name, eventOf(as, name, reservationSubject(found.record, own), reservationFields(found, { held_ms: Math.max(0, at - found.reserved_ms), reason })), { env, at, hostId });
   return true;
+}
+
+// Releases a run's Reservation of `name` (AD-7): the directory is renamed to `.released-<key>-<ms>` (retireReservation) and the
+// process whose rename won appends one `release` event, so a late grace stamp is ENOENT and a rerun can reserve again at once.
+// `key` is the run to release (default: this process's own run). Returns { status: 'released' | 'none', key }: none when nothing
+// is reserved, the record is unreadable (an owner mid-write is never taken away), or another process released it first. Never
+// throws: a release is an optimization and the ceiling ends a Reservation this misses.
+export function releaseReservation(name, { env = process.env, now = Date.now, hostId = machineId(), key = null, reason = 'done' } = {}) {
+  const run = key ?? runKey(env);
+  if (!RESERVABLE.includes(name) || typeof run !== 'string' || run === '' || run.startsWith('.') || run.includes('/')) return { status: 'none', key: run };
+  try {
+    const found = readReservation(join(reservationsPath(name, env), run), run);
+    if (!found) return { status: 'none', key: run };
+    return { status: retireReservation(name, found, { as: 'release', reason, env, now, hostId }) ? 'released' : 'none', key: run };
+  } catch { return { status: 'none', key: run }; }
 }
 
 // Takes a Reservation of `name` for this run, once: `wx` creates reservation.json and only that create appends `claim`. A live
@@ -732,7 +762,7 @@ export function poolRequest(pool, { id = newLeaseId(), holder, why, forMs = null
 // `timeoutMs` of 0 or less is a try: no ticket, no event unless it acquires. Events (AD-9) follow acquireLease's: `request` once
 // the ticket is in place, `acquire` once the ticket is claimed, and `timeout` or `cancel` once this waiter's own unlink of its
 // ticket succeeds. A wait that runs out throws HUB_LOCK_TIMEOUT, wording `host lock <name> is held ...` as before.
-async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams }) {
+async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams, endsReservation }) {
   const dir = lockDir(env);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${name}.lock`);
@@ -852,7 +882,7 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
       rmSync(ticketFile, { force: true });
     }
   }
-  return runHeld(name, path, mine, fn, { env, now, log, hostId, timers });
+  return runHeld(name, path, mine, fn, { env, now, log, hostId, timers, endsReservation });
 }
 
 // Takes the lock as a lease and returns the record. Waiters are served first in, first out, through queueView: a waiter

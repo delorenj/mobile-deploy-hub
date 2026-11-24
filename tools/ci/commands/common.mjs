@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { freeGiB } from '../lib/apple.mjs';
 import { createGit } from '../lib/git.mjs';
 import { compareSemver } from '../lib/latest.mjs';
-import { reserve } from '../lib/lock.mjs';
+import { releaseReservation, reserve } from '../lib/lock.mjs';
 import { macLink, macProbeOver, runnerStatusOver, tailscaleStatus } from '../lib/metered.mjs';
 import { loadPolicy, testflightPolicyOf } from '../lib/policy.mjs';
 import { buildReceipt, writeReceipt } from '../lib/receipt.mjs';
@@ -43,6 +43,19 @@ export function reserveFor(name, { reserver = reserve, env = process.env, log = 
     return reserver(name, { env, log });
   } catch (error) {
     log(`HUB_RESERVATION_FAILED ${name} ${firstLine(error?.message)}; the run goes on without a reserved place`);
+    return null;
+  }
+}
+
+// The run is done with a device (Story 2.6, AD-7): its Reservation of `name` on this host is released, never fatal. A lane that
+// ends well releases through withLock's `endsReservation`; plan (a run that skips the Android lane) calls this directly.
+export function releaseFor(name, { releaser = releaseReservation, env = process.env, log = console.log, reason = 'done' } = {}) {
+  try {
+    const result = releaser(name, { env, reason });
+    if (result?.status === 'released') log(`HUB_RESERVATION_RELEASED ${name} ${result.key}`);
+    return result ?? null;
+  } catch (error) {
+    log(`HUB_RESERVATION_RELEASE_FAILED ${name} ${firstLine(error?.message)}; the ceiling ends it`);
     return null;
   }
 }

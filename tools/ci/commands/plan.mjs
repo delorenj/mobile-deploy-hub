@@ -22,7 +22,7 @@ import { loadDevices } from '../lib/devices.mjs';
 import { attempt, hook, hookOutput, run } from '../lib/exec.mjs';
 import { bumpTransaction, createGit } from '../lib/git.mjs';
 import { compareBuild, compareSemver, inflightKey, latestKey, parseLatest } from '../lib/latest.mjs';
-import { reserve, withLock } from '../lib/lock.mjs';
+import { releaseReservation, reserve, withLock } from '../lib/lock.mjs';
 import { loadManifest } from '../lib/manifest.mjs';
 import { authoredNotes } from '../lib/release-notes.mjs';
 import { buildReceipt, setOutputs, writeReceipt } from '../lib/receipt.mjs';
@@ -30,7 +30,7 @@ import { jobWriter, readObject } from '../lib/s3.mjs';
 import { parseVersionInfo } from '../lib/version.mjs';
 import { checkCaller, refusal } from '../lib/caller.mjs';
 import { defaultGroups, groupsLabel, iosVersionOf, tagOnlyOf, tagPrefixOf, testflightPolicyOf } from '../lib/policy.mjs';
-import { checkDisk, checkSecrets, firstLine, guarded, isoNow, policyBanner, reachIpad, readMacLink, reserveFor, runOf, short, testflightHookEnv } from './common.mjs';
+import { checkDisk, checkSecrets, firstLine, guarded, isoNow, policyBanner, reachIpad, readMacLink, releaseFor, reserveFor, runOf, short, testflightHookEnv } from './common.mjs';
 import { callerReader, checkPins } from './gate.mjs';
 
 // ---------------------------------------------------------------------------------------------------- preflight-ios
@@ -168,7 +168,7 @@ async function eventPreflight({ config, manifest, devices, version, androidCode,
 // Away is the code findPhone attaches, never its wording: the message names the reason (absent, unauthorized, offline).
 const notOnAdb = error => error?.code === 'HUB_PHONE_AWAY';
 
-export async function plan(config, { env = process.env, home = homedir(), fetchImpl = fetch, s3Factory = null, log = console.log, macLinkNow = null } = {}) {
+export async function plan(config, { env = process.env, home = homedir(), fetchImpl = fetch, s3Factory = null, log = console.log, macLinkNow = null, releaser = releaseReservation } = {}) {
   const { policy } = policyBanner(log);
   const manifest = await loadManifest(config.cwd, config.manifest);
   // The manifest as dispatched (github.sha): the bump must land on a main whose manifest the gate checked.
@@ -191,6 +191,9 @@ export async function plan(config, { env = process.env, home = homedir(), fetchI
     // The iPad lane runs only when the gate said so (the Mac online and within its data budget).
     const iosLane = config.iosLane || 'run';
     const scope = { android: declared.android, ios: declared.ios && iosLane === 'run' };
+    // A run that skips the Android lane has no later job that takes the S26: whatever place it holds on `adb` ends here (Story 2.6,
+    // AD-7). A no-op when the gate reserved nothing.
+    if (!scope.android) releaseFor('adb', { releaser, env, log, reason: 'skipped' });
     if (config.platform === 'android' && !manifest.android) throw new Error('platform android but the manifest has no android section');
     if (config.platform === 'ios' && !manifest.ios) throw new Error('platform ios but the manifest has no ios section');
     if (config.testflight && !manifest.ios?.store) throw new Error(`TestFlight is for an app with ios.store; ${manifest.project.slug} has no App Store Connect app in its manifest`);

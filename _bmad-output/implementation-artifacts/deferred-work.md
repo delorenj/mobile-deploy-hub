@@ -44,3 +44,15 @@
 
 - A grace stamp that fails for a reason other than ENOENT or EEXIST (a directory the caller cannot write) is swallowed, so the head Reservation would block until its ceiling. Every lock directory belongs to one user today; when that stops being true, make an unwritable Reservation count as grace over.
 - A grace stamp can land in a re-reserved directory of the same key if an expiry and an immediate rerun fall between the view and the stamp; the stamp only starts that Reservation's grace early.
+
+## From Story 2.6 (MOBI-35)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-6-reservations-end-when-the-run-is-done.md`
+  summary: A lane releases its Reservation inside its last hold, when that hold ends well, so a step that fails after the hold (the android job's Play or Release step, the ios lane's IPA send or TestFlight upload) leaves the run's Reservation already gone: `gh run rerun --failed` then asks like any Claimant, at the back of the queue.
+  evidence: AD-7 wants release on lane success and the rename before the lock is freed; those two only meet inside the hold, and the ios lane's steps after its last take run for minutes while a Reservation would block the next Claimant for its grace. The android lane's own steps after the hold are seconds; Play and Release are separate steps. Revisit if reruns of a post-hold failure turn out to matter; the fix is a lane-end release (outside the hold) for that case.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-6-reservations-end-when-the-run-is-done.md`
+  summary: The Android contention-pending release has no call site: nothing produces a "contention-pending" outcome yet (a `HUB_LOCK_TIMEOUT` of the android hold is still a red job), and an iOS Reservation of a run whose plan turns the iPad lane into `skip-lost` is left to the ceiling (the Mac is offline anyway).
+  evidence: FR-30 pending-not-red is Epic 3 (the spine's `HUB_LOCK_TIMEOUT --> PEND` edge); when it adds that outcome it calls `releaseFor('adb', ...)` there. `announce` already releases a successful android job, which a pending S26 is.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-6-reservations-end-when-the-run-is-done.md`
+  summary: The Mac release over ssh uses `~/.local/bin/hub-device`, the wrapper `install.sh` writes, so it works only once `hosts:install` (Story 2.8) has put a hub with the verb on the Mac; until then `announce` logs `HUB_RESERVATION_RELEASE_SKIPPED` and the Mac's own ios lane release (inside the `mac-ios` hold, local to the Mac) is what ends it.
+  evidence: AD-7 ("a Mac release without the verb is logged and left to the ceiling"). The pinned `actions/hub@vX` runs `announce` on big-chungus with the new code, but the Mac's installed `hub-device` is whatever `hosts:install` last put there.
