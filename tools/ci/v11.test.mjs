@@ -598,7 +598,7 @@ test('the train dispatches Tower, then Green In Between, then Gruvato, and stops
 // ---------------------------------------------------------------------------------------------------- conformance and release
 
 import { checkApp, miseTasks, scriptsOf } from '../conformance.mjs';
-import { flipInnerRefs, notesPath, releaseNotes, tagArgs, tagMessage } from '../release.mjs';
+import { flipInnerRefs, notesMaxBytes, notesPath, releaseNotes, tagArgs, tagMessage } from '../release.mjs';
 
 test('conformance: the template caller and a clean app pass; uploads, bumps, tags and announcements outside the hub fail', () => {
   const app = { slug: 'gruvato', lanes: ['android', 'ios'] };
@@ -667,6 +667,42 @@ test('release notes: git keeps a notes heading in the annotation (--cleanup=whit
     const commit = run('rev-parse', 'HEAD').trim();
     run(...tagArgs('v1.2.46', commit, tagMessage('v1.2.46', 'Release dry runs, all green:\nrepo: green 1', notes), { force: true }));
     assert.match(annotation(), /^mobile-deploy-hub v1\.2\.46\n\nintro\n\n### Read this first\n- fairness\n\nRelease dry runs, all green:\nrepo: green 1$/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+// MOBI-37 review: the Node 26 leg of check.yml must run on Node 26. The workflow hands each leg its major as NODE_MATRIX_MAJOR;
+// this test fails the leg whose `mise run --tool node@<n>` override did not take (it would otherwise pass on the task's own Node 24).
+test('check.yml runs the suite on Node 24 and Node 26, and each leg proves the Node it ran on', () => {
+  const text = readFileSync(join(repoRoot, '.github/workflows/check.yml'), 'utf8');
+  assert.match(text, /^\s+node: \['24', '26'\]$/m);
+  assert.match(text, /^\s+- run: mise run --tool node@\$\{\{ matrix\.node \}\} check\n\s+env:\n\s+NODE_MATRIX_MAJOR: \$\{\{ matrix\.node \}\}$/m);
+  assert.match(text, /install_args: node@\$\{\{ matrix\.node \}\} actionlint@1\.7\.12/);
+  const expected = process.env.NODE_MATRIX_MAJOR;
+  if (expected !== undefined) assert.equal(process.versions.node.split('.')[0], expected, `this leg is named Node ${expected} and ran on Node ${process.versions.node}`);
+});
+
+// MOBI-37 review: a notes file must never be able to break or silently drop out of a release.
+test('release notes: a CRLF file reads like an LF one, a NUL is dropped, odd text survives, and a huge section is cut to fit one git argument', async () => {
+  assert.equal(releaseNotes('# Notes\r\n\r\n## v1.2.46\r\n\r\nfirst\r\n\r\n### Sub\r\n- item\r\n\r\n## v1.2.4\r\nolder\r\n', 'v1.2.46'), 'first\n\n### Sub\n- item', 'a CRLF heading is still the heading');
+  assert.equal(releaseNotes('## v1.2.46\na\0b\n', 'v1.2.46'), 'ab', 'a NUL cannot go in a process argument');
+  const odd = '`$(rm -rf x)` "quoted" \'single\' \\ back \u00e9\u4e2d\ud83d\ude80 -m --cleanup=strip';
+  assert.equal(releaseNotes(`## v1.2.46\n${odd}\n`, 'v1.2.46'), odd);
+  const huge = releaseNotes(`## v1.2.46\n${'\u4e2d'.repeat(200_000)}\n\n## v1.2.47\nnext\n`, 'v1.2.46');
+  assert.ok(Buffer.byteLength(huge) < notesMaxBytes + 200, 'cut near the cap, notes line included');
+  assert.match(huge, /\(the notes were cut here: the whole v1\.2\.46 section is in docs\/hub-releases\.md\)$/);
+  assert.doesNotMatch(huge, /\uFFFD/, 'no half character at the cut');
+  const root = await mkdtemp(join(tmpdir(), 'hub-notes-big-'));
+  try {
+    const run = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: root, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' } });
+    run('init', '-q', '-b', 'main');
+    await writeFile(join(root, 'f'), 'x');
+    run('add', 'f');
+    run('commit', '-q', '-m', 'one');
+    const status = Array.from({ length: 6 }, (_, index) => `delorenj/app-${index}: green 4534191${index} https://github.com/delorenj/app-${index}/actions/runs/4534191${index}`).join('\n');
+    run(...tagArgs('v1.2.46', null, tagMessage('v1.2.46', `Release dry runs (strict, --dry-handoff true, at v1), all green:\n${status}`, huge)));
+    assert.match(run('tag', '-l', '--format=%(contents)', 'v1.2.46'), /all green:\ndelorenj\/app-0: green/, 'a git tag with the largest notes the release allows still goes through');
+    run(...tagArgs('v1.2.47', null, tagMessage('v1.2.47', 'pending', releaseNotes(`## v1.2.47\n${odd}\n`, 'v1.2.47'))));
+    assert.ok(run('tag', '-l', '--format=%(contents)', 'v1.2.47').includes(odd), 'odd characters reach the annotation unchanged');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

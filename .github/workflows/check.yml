@@ -40,4 +40,8 @@ jobs:
       - uses: jdx/mise-action@v5.2.6
         with:
           install_args: node@${{ matrix.node }} actionlint@1.7.12
+      # NODE_MATRIX_MAJOR (not a HUB_ name: the suite's hermetic() clears those) is read by the suite (tools/ci/v11.test.mjs): a leg whose `--tool` override did not take, and so ran
+      # another Node than its name says, fails instead of passing quietly.
       - run: mise run --tool node@${{ matrix.node }} check
+        env:
+          NODE_MATRIX_MAJOR: ${{ matrix.node }}

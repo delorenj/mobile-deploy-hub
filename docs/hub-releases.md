@@ -14,7 +14,7 @@ Fairness holds only among runs on this pin and later. A run still on an older pi
 
 ### What changed
 
-- Event Log. Every hold of a lock, ticket and Reservation writes one JSON line (`format`, `ts`, `host`, `host_id`, `hub_version`, `event`, `lock`, `hold_kind`, `claimant`, waits and holds in ms) to `HUB_EVENT_DIR/<YYYY-MM>.jsonl` on the host that owns the lock. Events are `request`, `acquire`, `release`, `timeout`, `cancel`, `claim`, `grace`, `expiry`, `extend`, each written once by whoever won the unlink or rename that decided it. `hub_version` is the hub ref the run pinned.
+- Event Log. Every hold of a lock, ticket and Reservation writes one JSON line (`format`, `ts`, `host`, `host_id`, `hub_version`, `event`, `lock`, `hold_kind`, `claimant`, waits and holds in ms) to `HUB_EVENT_DIR/<YYYY-MM>.jsonl` on the host that owns the lock. Events are `request`, `acquire`, `release`, `reclaim` (a dead holder's lock taken back), `timeout`, `cancel`, `claim`, `grace`, `expiry`, `extend`, each written once by whoever won the unlink or rename that decided it. `hub_version` is the hub ref the run pinned.
 - Queue. Deploy jobs (`plan`, `android`, `ios`), the iPad catch-up and every Lease take a ticket and are served first come, first served on `adb`, `s24`, `mac-ios` and the emulator slots. One `queueView` answers who holds, who waits and in which place; a ticket carries a machine identity and a liveness order, so a dead waiter never blocks the line.
 - Reservations. The gate reserves `adb` for a run with an Android lane, and `preflight-ios` reserves `mac-ios` on the Mac, when the run starts, so a build does not lose its place while it compiles. Only the first Reservation in line blocks, and only for `grace_min` (10); the ceiling is `reservation_ceiling_min` (180). A lane releases its Reservation inside its last hold, before the lock is freed; `announce` backstops it, over ssh on the Mac. By hand: `hub-device reservation release --run <owner--repo--run> [--name adb|mac-ios]`. A failed lane keeps its Reservation, so `gh run rerun --failed` is served at the original place.
 - Deadlines. A deploy job that waits in the Queue stops at `job_start + timeout - wait_margin_min - hold_allowance_min` and reports its own reason before GitHub kills it (a killed job ends `cancelled`: no `finally`, no `deliver-*`).
@@ -23,10 +23,10 @@ Fairness holds only among runs on this pin and later. A run still on an older pi
 
 ### Wording change you will see
 
-A deploy job's queued timeout now names the holder and the places ahead of it, and every `withLock` timeout carries the code `HUB_LOCK_TIMEOUT`.
+A queued timeout now names the holder and, when anyone waits ahead, each waiter with its place, for a deploy job and the catch-up as well as a Lease; and every `withLock` and Lease timeout carries the code `HUB_LOCK_TIMEOUT`.
 
-- Before (v1.2.44): `host lock adb has 2 waiter(s) ahead of lease <id> (held by ...)`.
-- Now: `host lock adb is held by <holder>; 2 waiter(s) ahead of <self> (1. <holder> (why), 2. ...); gave up after N min`; with a job deadline it ends `ahead of this job's M-minute timeout`.
+- Before (v1.2.44), a Lease: `host lock adb has 2 waiters ahead of lease <id> (held by ...); gave up after Ns`. A deploy job: `host lock adb is held by ...; gave up after N min. Another deploy is using the device; run again when it finishes.`
+- Now, all three: `host lock adb is held by <holder>; 2 waiters ahead of <self> (1. <holder> (why), 2. ...); gave up after ...`; a deploy job's with its own deadline ends `gave up after M min, ahead of this job's N-minute timeout. ...`. With nobody ahead the wording is the old `host lock adb is held by ...; gave up after ...`.
 
 Anything that matches the old sentence by regex must match the code (`HUB_LOCK_TIMEOUT`) instead. The catch-up's own idle checks were moved with it and still match.
 

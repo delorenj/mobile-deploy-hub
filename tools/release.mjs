@@ -25,14 +25,19 @@ export const notesPath = resolve(hubRoot, 'docs/hub-releases.md');
 const coAuthor = 'Co-Authored-By: Claude Code <noreply@anthropic.com>';
 
 // The notes of one release: the lines after its `## vX.Y.Z` heading (the heading may go on, `## v1.2.46 (2026-11-24)`) up to
-// the next `## ` heading or the end, trimmed. null when the file has no such section or the section is empty.
+// the next `## ` heading or the end, trimmed. null when the file has no such section or the section is empty. Notes can never
+// break a release: CRLF files read like LF ones (a `\r` would hide the heading), a NUL (which cannot go in an argument) is
+// dropped, and a section past notesMaxBytes (one argument is capped near 128 KiB) is cut with a line saying so.
+export const notesMaxBytes = 60_000;
 export function releaseNotes(text, tag) {
-  const lines = String(text ?? '').split('\n');
+  const lines = String(text ?? '').replaceAll('\0', '').split(/\r\n|\r|\n/);
   const start = lines.findIndex(line => line === `## ${tag}` || line.startsWith(`## ${tag} `));
   if (start === -1) return null;
   const end = lines.findIndex((line, index) => index > start && line.startsWith('## '));
   const body = lines.slice(start + 1, end === -1 ? lines.length : end).join('\n').trim();
-  return body === '' ? null : body;
+  if (body === '') return null;
+  if (Buffer.byteLength(body) <= notesMaxBytes) return body;
+  return `${Buffer.from(body).subarray(0, notesMaxBytes).toString('utf8').replace(/\uFFFD+$/, '').trimEnd()}\n\n(the notes were cut here: the whole ${tag} section is in docs/hub-releases.md)`;
 }
 
 // The annotation of a release tag: the header, the release's notes when it has any, then what its dry runs said.
@@ -94,7 +99,8 @@ export async function release(version, { log = console.log, dryRuns = true } = {
     git(['commit', '-q', '-m', `feat(hub): ${tag}: the workflow's inner actions/hub refs pin ${tag}`, '-m', coAuthor, '--', '.github/workflows/mobile-deploy.yml']);
   }
   const commit = git(['rev-parse', 'HEAD']).out;
-  const notes = existsSync(notesPath) ? releaseNotes(readFileSync(notesPath, 'utf8'), tag) : null;
+  let notes = null;
+  try { notes = existsSync(notesPath) ? releaseNotes(readFileSync(notesPath, 'utf8'), tag) : null; } catch (error) { log(`RELEASE_NOTES ${tag}: docs/hub-releases.md unreadable (${error.code ?? error.message}); tagging without notes`); }
   log(notes ? `RELEASE_NOTES ${tag}: ${notes.split('\n').length} lines from docs/hub-releases.md` : `RELEASE_NOTES ${tag}: none (no section in docs/hub-releases.md)`);
   git(tagArgs(tag, null, tagMessage(tag, 'Release dry runs pending.', notes)));
   git(['push', '-q', '--atomic', 'origin', 'HEAD:refs/heads/main', `refs/tags/${tag}`]);

@@ -103,3 +103,20 @@ In-session review of the diff against Story 2.8's ACs, AD-3, AD-7, AD-20 and AD-
 ## Review
 
 `heavy mise run check` green on Node 24 (623 tests) and `heavy mise run --tool node@26 check` green on Node 26.13.0 (623 tests). `check.yml` run 45341918045 at 68d98e4: `check (node 24)` and `check (node 26)` both green in 3 minutes (the first green since d504f2b).
+
+## Review (independent)
+
+2026-11-24, adversarial pass over 6a0c0ae, 68d98e4, d3c0499 and the whole freeze set (3ce85f4^..HEAD). Verdict: FIXED (three small defects, no Epic 2 defect).
+
+**Verified as claimed**
+- `check.yml`: actionlint clean; CI run 45341918045 shows `check (node 24)` on v24.22.3 and `check (node 26)` on v26.13.1 (the `--tool` override took; mise also installs the task's Node 24 on the 26 leg, which is harmless), 623 tests, 621 pass, 2 skipped (no `bb-emit` on a hosted runner), 0 fail on both. Local `heavy mise run check` on Node 24: 623 of 623, 0 skipped.
+- Event-sequence tests run the real `reserveFor`, `plan`, `android`, `announce` and `withLock` code (no hand-written event lists). Mutation proof, each killing the named test: dropping the job `request`, dropping the job `acquire`, turning the `timeout` into a `cancel`, skipping the Reservation release in `runHeld`, and moving it after the lane's own `release`. Both tests also pass 5 of 5 repeats and pinned to one CPU (`taskset -c 0`).
+- Old-pin coexistence (v1.2.43 and v1.2.44 share `lock.mjs`): a throwaway harness (outside the repo) ran the tagged `lock.mjs` against state written by the current code, in real processes. All 21 checks passed: an old job waits behind a live new holder and never reclaims it, reclaims a SIGKILLed new holder, lists and releases a new Lease; new waiting tickets survive old pruning and an old Lease queues behind them; an old Lease waiter is served before a later new job; the new code reclaims a dead old job and an old Lease whose `holder_pid` died; a Reservation (advisory to old pins) and a leftover tomb never block an old `mkdir`, and `listLocks` ignores both. Nothing strands the Queue for an older pin.
+- The v1.2.46 notes state the pin-fairness and 30-day sentences, and the policy numbers (grace 10, ceiling 180, Lease cap 60, margin 2, allowances) match `policy.json`.
+
+**Defects fixed**
+1. `releaseNotes` read a CRLF `docs/hub-releases.md` as having no section (the heading line ends in `\r`), so a release would have tagged silently without notes. Lines now split on CRLF.
+2. Notes could still break the tag call: a NUL cannot be a process argument, and a section over ~128 KiB hits the one-argument limit (E2BIG) after the release has made its local commit and run `check`. NULs are dropped, a section is cut at `notesMaxBytes` (60,000) with a line pointing at the file, and an unreadable notes file is logged and the release goes on without notes. Regression test: CRLF, NUL, odd characters (backticks, quotes, `-m`, non-BMP), a huge section through real `git tag`.
+3. The Node 26 leg could pass on Node 24 if the override ever stopped taking (the task pins 24). `check.yml` now passes `NODE_MATRIX_MAJOR` per leg and a test fails a leg whose Node major differs (not a `HUB_` name: `hermetic()` clears those).
+
+**Notes corrected** (`docs/hub-releases.md`): the event list lacked `reclaim`; the "Before" wording was a Lease's (`2 waiters`, not `waiter(s)`) and a deploy job's old timeout had no waiter list, so both are now quoted as they were.
