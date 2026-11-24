@@ -167,7 +167,7 @@ async function androidLane(config, manifest, { env, home, track, policy, log, qu
     delivery.reason = busyReason(devices.android.name);
     track.receipt.contention = { lock: 'adb', reason: 'delivery-pending', blocked_by: error.holds ?? holdsOf(error.owner) };
     notes.push(`the ${devices.android.name} stayed busy past the wait: pending; the build is published for Install APK, Quickdrop and the catch-up`);
-    log(`HUB_S26_BUSY ${config.version} (${planned}) is published for a later install: ${error.message}`);
+    log(`HUB_S26_BUSY ${config.version} (${planned}) is published and the catch-up installs it: ${String(error.message).replace(/\s*Another deploy is using the device; run again when it finishes\.\s*$/, '')}`);
     const ended = releaseReservation('adb', { env, reason: 'delivery-pending' });
     if (ended.status === 'released') log(`HUB_RESERVATION_RELEASED adb ${ended.key}`);
   }

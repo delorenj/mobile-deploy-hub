@@ -1538,7 +1538,9 @@ test('an error inside the hold still fails the lane (a newer versionCode on the 
     const args = ['--version', out.version, '--android-code', out.android_code, '--build-sha', out.build_sha, '--bump-patch', out.bump_patch];
     await assert.rejects(quiet(() => android(host.configure('android', args), { env: host.env, home: f.root, ...waited })), /above the planned/);
     assert.equal(listReservations('adb', { env: host.env }).length, 1, 'a failed hold keeps the Reservation for the rerun');
-    assert.ok(!existsSync(join(f.out, 'android/hub-receipt-android.json')) || readJson(join(f.out, 'android/hub-receipt-android.json')).outcome === 'failure');
+    const failed = readJson(join(f.out, 'android/hub-receipt-android.json'));
+    assert.equal(failed.outcome, 'failure');
+    assert.equal('contention' in failed, false);
     git(f.app, ['reset', '--hard', '-q'], f.env); // the failed lane's bump patch
     // Released mid-wait: the ticket is gone, the wait is cancelled, and that is not a busy S26.
     releaseReservation('adb', { env: host.env });
