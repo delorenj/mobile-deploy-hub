@@ -299,7 +299,7 @@ export async function reap({ env = process.env, log = () => {}, graceMs, sleep, 
       for (const { record, why } of victims()) {
         const result = await teardown(record, { env, log, graceMs, sleep, now });
         if (result.ok) {
-          releaseLease(record.slot, record.lease_id, { env });
+          releaseLease(record.slot, record.lease_id, { env, reason: `reaped-${why.replace(/ /g, '-')}` });
           log(`HUB_EMULATOR_REAPED ${record.lease_id} ${record.slot} (${why}): stopped pids ${describePids(result.signalled)}, deleted AVD ${record.avd?.name}, freed ports ${record.console_port},${record.adb_port},${record.adb_server_port}`);
         } else {
           log(`HUB_EMULATOR_REAP_FAILED ${record.lease_id} ${record.slot} (${why}): pids ${describePids(result.survivors)} would not stop; ${record.slot} stays out of the pool`);

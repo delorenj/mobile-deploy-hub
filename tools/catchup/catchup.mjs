@@ -851,7 +851,8 @@ function base({ env, home, log, now, settings, devices, lockWaitMs }) {
     lockWaitMs,
     mode: readMode({ env, home }),
     journal: createJournal({ env, home, now }),
-    lock: (name, fn, options = {}) => withLock(name, fn, { env, log, ...options }),
+    // The catch-up is a hub job, never a deploy: its holds and short attempts are recorded as `hub-job` (FR-7).
+    lock: (name, fn, options = {}) => withLock(name, fn, { env, log, kind: 'hub-job', ...options }),
     sha256: path => sha256File(path),
   };
 }

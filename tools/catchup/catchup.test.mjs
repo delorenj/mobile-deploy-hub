@@ -16,6 +16,7 @@ import { isAnonymous } from '../ci/lib/access.mjs';
 import { bbEmitPath, uuidv5 } from '../ci/lib/announce.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
 import { withLock } from '../ci/lib/lock.mjs';
+import { readEvents } from '../ci/lib/events.mjs';
 import { compareBuild, validateLatest } from '../ci/lib/latest.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import {
@@ -1224,4 +1225,14 @@ test('MOBI-17 catch-up: the event\'s page link is plain for an anonymous page, p
   // and an event that has no link to give carries none, never a URL that answers 403
   const bare = catchupEvent({ name: 'Tower', slug, platform: 'android', block: latestDoc().android, device: { status: 'installed', by: 'catch-up' }, run: runOf(runId), commit, hubRef: null, correlation: null, devices, publicBase: 'https://s3.delo.sh/builds', pageUrl: false, now: now() });
   assert.equal(bare.data.links, undefined);
+});
+
+test('the catch-up takes its device lock as a hub job: its hold is recorded as hub-job, never as a deploy (MOBI-27)', async () => {
+  const host = linuxHost();
+  try {
+    await host.ctx.lock('adb', async () => {});
+    const got = [...readEvents({ env: host.env })];
+    assert.deepEqual(got.map(event => [event.event, event.lock, event.claimant.kind]), [['request', 'adb', 'hub-job'], ['acquire', 'adb', 'hub-job'], ['release', 'adb', 'hub-job']]);
+    assert.ok(existsSync(join(host.root, 'state/mobile-deploy-hub/events')), 'the events land under the test state dir');
+  } finally { host.cleanup(); }
 });

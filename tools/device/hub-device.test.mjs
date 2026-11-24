@@ -371,7 +371,8 @@ test('release --any frees whichever phone lease is held; a deploy job on one pho
     const result = await f.run(['release', '--any']);
     assert.deepEqual([result.code, result.out], [0, ['HUB_DEVICE_RELEASED s26 on-s26']], 'the s26 lease was freed');
     assert.ok(existsSync(f.s24lock), 'the deploy job on the s24 was left alone');
-    assert.equal(f.owner('s24').kind, undefined, 'the job lock is not a lease record');
+    // Intended change (Story 1.4, AD-2): a job's owner.json now names its kind; it is still not a lease record.
+    assert.equal(f.owner('s24').kind, 'job', 'the job lock is not a lease record');
     done();
     await job;
     assert.ok(!existsSync(f.s24lock));

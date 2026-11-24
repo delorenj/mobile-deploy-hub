@@ -11,10 +11,10 @@
 // succeeded deletes it and records the event in the Event Log (events.mjs). This module is the only caller of appendEvent.
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { join } from 'node:path';
-import { appendEvent } from './events.mjs';
+import { appendEvent, hostId as machineId } from './events.mjs';
 import { pause, sleep as realSleep } from './pause.mjs';
 
 export const lockDir = (env = process.env, home = homedir()) => env.HUB_LOCK_DIR || join(home, '.cache/mobile-deploy-hub/locks');
@@ -23,6 +23,10 @@ export const lockDir = (env = process.env, home = homedir()) => env.HUB_LOCK_DIR
 // `emulator-<n>`. Every other name (s3-*, s3-index, emulator-reaper) writes no events.
 export const QUEUED = Object.freeze(['adb', 's24', 'mac-ios', 'emulator']);
 export const isQueued = name => QUEUED.includes(name) || /^emulator-\d+$/.test(name);
+
+// A holder of a Queued lock touches <name>.lock/alive this often at most (AD-19), so a reclaim can say when it was last seen.
+export const ALIVE_MS = 60_000;
+const OWNER_FORMAT = 1;
 
 const alive = pid => {
   try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
@@ -67,19 +71,40 @@ const stale = (path, owner, options) => staleness(path, owner, options) !== null
 
 const sameOwner = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
-// The release/reclaim event body; Story 1.4 adds the rest of the AD-9 shape. held_ms runs from started_at to now, and a
-// lease's ends no later than its expires_at.
-function holdEvent(event, name, owner, reason, at) {
-  const lease = isLease(owner);
+const iso = ms => (Number.isFinite(ms) ? new Date(ms).toISOString() : null);
+
+// The AD-9 event body for a hold or a request. `subject` is an owner record, or the would-be owner of a request (a Lease:
+// kind 'lease', lease_id, holder; a job: its owner without started_at). A Lease is taken by an agent (v1a has no person
+// surface), a withLock job by a deploy run unless it says `hub-job` (the catch-up). An owner from before v1a (no kind) is a
+// deploy job. for_ms and expires_at describe a Lease; `fields` fills or overrides the rest.
+function eventOf(event, name, subject, fields = {}) {
+  const lease = isLease(subject);
+  const forMs = expiresAt(subject) - Date.parse(subject?.started_at);
+  return {
+    event, lock: name, hold_kind: subject ? (lease ? 'lease' : 'job') : null,
+    claimant: {
+      kind: subject ? (lease ? 'agent' : subject.kind === 'hub-job' ? 'hub-job' : 'deploy') : null,
+      holder: subject?.holder ?? null, repo: subject?.repo ?? null, run: subject?.run ?? null, attempt: subject?.attempt ?? null, job: subject?.job ?? null,
+    },
+    lease_id: lease ? subject.lease_id ?? null : null,
+    for_ms: lease && Number.isFinite(forMs) ? forMs : null,
+    expires_at: lease ? subject.expires_at ?? null : null,
+    deadline_at: null, waited_ms: null, held_ms: null, reason: null, last_alive_at: null,
+    ...fields,
+  };
+}
+
+// held_ms runs from started_at (the take, never the wait) to `at`; a Lease's ends no later than its expires_at, so a
+// reclaim of a dead Lease ends at the earlier of its expiry and the death the reclaimer observed (AD-19).
+function heldMs(owner, at) {
   const started = Date.parse(owner?.started_at);
   const end = Number.isFinite(expiresAt(owner)) ? Math.min(at, expiresAt(owner)) : at;
-  return {
-    event, lock: name, hold_kind: owner ? (lease ? 'lease' : 'job') : null,
-    claimant: { holder: owner?.holder ?? null, repo: owner?.repo ?? null, run: owner?.run ?? null },
-    lease_id: lease ? owner.lease_id ?? null : null,
-    held_ms: Number.isFinite(started) ? Math.max(0, end - started) : null,
-    reason,
-  };
+  return Number.isFinite(started) ? Math.max(0, end - started) : null;
+}
+
+// Appends one event for a Queued name, at `at`; every other name writes nothing (AD-4). Never throws (appendEvent).
+function note(name, body, { env, at, hostId }) {
+  if (isQueued(name)) appendEvent(body, { env, now: () => at, hostId });
 }
 
 let lastTomb = 0;
@@ -90,7 +115,7 @@ let lastTomb = 0;
 // the owner that was judged means the lock changed hands after the judgement; it is put back. Only the winner deletes
 // its tomb and, when `as` names an event and the name is Queued, appends it. True for the winner. beforeRetire is a test
 // seam, called with 'rename' before the rename and 'restore' before a put-back.
-function retire(name, path, judged, { as = null, reason = null, env = process.env, now = Date.now, log = console.error, beforeRetire = () => {} } = {}) {
+function retire(name, path, judged, { as = null, reason = null, env = process.env, now = Date.now, log = console.error, hostId, beforeRetire = () => {} } = {}) {
   if (!sameOwner(readOwner(path), judged)) return false;
   beforeRetire('rename');
   const at = now();
@@ -115,8 +140,16 @@ function retire(name, path, judged, { as = null, reason = null, env = process.en
     }
     return false;
   }
+  // A job's last sign of life is the mtime of its alive touch, read from the tomb before it goes. It is approximate: a
+  // synchronous child can block the touch (AD-19). A job from before v1a has none.
+  let alive = null;
+  const job = as === 'reclaim' && judged && !isLease(judged);
+  if (job) { try { alive = statSync(join(tomb, 'alive')).mtimeMs; } catch { /* never touched */ } }
   try { rmSync(tomb, { recursive: true }); } catch { /* a tomb never blocks the name */ }
-  if (as && isQueued(name)) appendEvent(holdEvent(as, name, judged, reason, at), { env, now: () => at });
+  if (as) {
+    const lastAlive = job && alive !== null ? { last_alive_at: iso(alive), approx: true } : {};
+    note(name, eventOf(as, name, judged, { held_ms: heldMs(judged, at), reason, ...lastAlive }), { env, at, hostId });
+  }
   return true;
 }
 
@@ -128,20 +161,33 @@ export async function withLock(name, fn, {
   log = console.log,
   sleep = ms => new Promise(done => setTimeout(done, ms)),
   now = Date.now,
+  kind = 'job',
+  hostId = machineId(),
+  timers = { setInterval, clearInterval },
   beforeRetire,
 } = {}) {
   if (!/^[a-z0-9-]+$/.test(name)) throw new Error(`bad lock name "${name}"`);
+  if (kind !== 'job' && kind !== 'hub-job') throw new Error(`bad lock holder kind "${kind}" (job or hub-job)`);
   const dir = lockDir(env);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${name}.lock`);
+  // owner.json keeps every key older versions read (pid, host, repo, run, started_at) and adds the AD-2 keys after them.
   const me = { pid: process.pid, host: hostname(), repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null };
-  const deadline = now() + timeoutMs;
+  const more = { format: OWNER_FORMAT, kind, attempt: env.GITHUB_RUN_ATTEMPT ?? null, job: env.GITHUB_JOB ?? null, host_id: hostId };
+  const seams = { env, hostId };
+  const requested = now();
+  const deadline = requested + timeoutMs;
+  note(name, eventOf('request', name, { ...me, ...more }, { deadline_at: iso(deadline) }), { ...seams, at: requested });
   let waiting = false;
+  let mine;
   for (;;) {
     try {
       mkdirSync(path);
       // started_at is when the lock was taken, not when the wait began, so a release's held_ms is the hold alone.
-      writeFileSync(join(path, 'owner.json'), JSON.stringify({ ...me, started_at: new Date(now()).toISOString() }));
+      const taken = now();
+      mine = { ...me, started_at: new Date(taken).toISOString(), ...more };
+      writeFileSync(join(path, 'owner.json'), JSON.stringify(mine));
+      note(name, eventOf('acquire', name, mine, { deadline_at: iso(deadline), waited_ms: Math.max(0, taken - requested) }), { ...seams, at: taken });
       break;
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
@@ -149,19 +195,46 @@ export async function withLock(name, fn, {
     const owner = readOwner(path);
     const verdict = staleness(path, owner, { now, staleMs });
     if (verdict) {
-      if (retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
+      if (retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, hostId, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
       continue;
     }
-    if (now() >= deadline) throw new Error(`host lock ${name} is held by ${describe(owner)}; gave up after ${Math.round(timeoutMs / 60_000)} min. Another deploy is using the device; run again when it finishes.`);
+    const at = now();
+    if (at >= deadline) {
+      note(name, eventOf('timeout', name, { ...me, ...more }, { deadline_at: iso(deadline), waited_ms: Math.max(0, at - requested), reason: 'deadline', blocked_by: describe(owner) }), { ...seams, at });
+      throw new Error(`host lock ${name} is held by ${describe(owner)}; gave up after ${Math.round(timeoutMs / 60_000)} min. Another deploy is using the device; run again when it finishes.`);
+    }
     if (!waiting) { log(`HUB_LOCK_WAIT ${name} held by ${describe(owner)}`); waiting = true; }
     await sleep(pollMs);
   }
   log(`HUB_LOCK ${name}`);
+  // The liveness touch (AD-19): the only in-process interval, unref'd so it never keeps a process alive. It touches only
+  // while owner.json is still this take, so a lock that changed hands is never touched by its old holder.
+  let timer = null;
+  if (isQueued(name)) {
+    const alive = join(path, 'alive');
+    const touch = () => {
+      try {
+        const owner = readOwner(path);
+        if (owner?.pid !== mine.pid || owner.started_at !== mine.started_at) return;
+        const at = new Date(now());
+        writeFileSync(alive, '');
+        utimesSync(alive, at, at);
+      } catch { /* liveness is advisory: a failed touch never fails the hold */ }
+    };
+    touch();
+    timer = timers.setInterval(touch, ALIVE_MS);
+    timer?.unref?.();
+  }
+  let failed = false;
   try {
     return await fn();
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
+    if (timer) timers.clearInterval(timer);
     const owner = readOwner(path);
-    if (owner?.pid === me.pid && !isLease(owner)) retire(name, path, owner, { as: 'release', reason: 'done', env, now, log });
+    if (owner?.pid === me.pid && !isLease(owner)) retire(name, path, owner, { as: 'release', reason: failed ? 'error' : 'done', env, now, log, hostId });
   }
 }
 
@@ -236,6 +309,11 @@ export function listWaiters(name, { env = process.env, prune = false } = {}) {
 // holderPid, when given, ties the lease to a process: the lease is reclaimed when that process is gone. The queue
 // ticket is claimed (unlinked) only after the record is written: a release that removed the ticket first wins, and the
 // record is taken back. beforeClaim is a test seam that runs between the two.
+//
+// Events (AD-9), each written only by the step that decided it: `request` once the ticket is in place, `acquire` once
+// the ticket is claimed, `timeout` and `cancel` (an abort or an error while queued) once this waiter's own unlink of its
+// ticket succeeds. A releaseLease that removes the ticket first records the cancel itself. A call with waitMs 0 is a
+// try: it records its acquire and nothing when it fails, so pool probes never flood the log.
 export async function acquireLease(name, {
   holder,
   why,
@@ -252,6 +330,7 @@ export async function acquireLease(name, {
   signal,
   beforeClaim = () => {},
   beforeRetire,
+  hostId = machineId(),
 } = {}) {
   const path = lockPath(name, env);
   if (!(forMs > 0) || forMs > MAX_LEASE_MS) throw new Error(`a lease runs for more than 0 and at most ${MAX_LEASE_MS / 3600_000}h`);
@@ -260,14 +339,37 @@ export async function acquireLease(name, {
   mkdirSync(lockDir(env), { recursive: true });
   const queue = queuePath(name, env);
   mkdirSync(queue, { recursive: true });
-  const ticket = `${String(now()).padStart(15, '0')}-${String(ticketCounter++).padStart(6, '0')}-${String(process.pid).padStart(8, '0')}.json`;
+  const requested = now();
+  const ticket = `${String(requested).padStart(15, '0')}-${String(ticketCounter++).padStart(6, '0')}-${String(process.pid).padStart(8, '0')}.json`;
   const ticketFile = join(queue, ticket);
   // Write-then-rename, like owner.json: a reader never sees a half-written ticket.
   const pending = `${ticketFile}.tmp`;
-  writeFileSync(pending, JSON.stringify({ lease_id, holder, why, pid: process.pid, host: hostname(), process_start: processStart(process.pid), enqueued_at: new Date(now()).toISOString() }), { flag: 'wx' });
+  writeFileSync(pending, JSON.stringify({ lease_id, holder, why, pid: process.pid, host: hostname(), process_start: processStart(process.pid), enqueued_at: new Date(requested).toISOString() }), { flag: 'wx' });
   renameSync(pending, ticketFile);
-  const deadline = now() + waitMs;
+  const deadline = requested + waitMs;
+  const attempt = env.GITHUB_RUN_ATTEMPT ?? null;
+  const job = env.GITHUB_JOB ?? null;
+  const asked = { kind: 'lease', lease_id, holder, repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null, attempt, job };
+  const tryOnly = !(waitMs > 0);
+  const seams = { env, hostId };
+  const waitedTo = at => ({ for_ms: forMs, deadline_at: iso(deadline), waited_ms: Math.max(0, at - requested) });
+  if (!tryOnly) note(name, eventOf('request', name, asked, { for_ms: forMs, deadline_at: iso(deadline) }), { ...seams, at: requested });
+  // Leaves the queue by unlinking its own ticket. True when this waiter's unlink decided it (and recorded `as`); false
+  // when the ticket was already gone, which means a release cancelled it and wrote that event.
+  let left = false;
+  const leave = (as, fields) => {
+    try { unlinkSync(ticketFile); } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+    left = true;
+    const at = now();
+    if (!tryOnly) note(name, eventOf(as, name, asked, { ...waitedTo(at), ...fields }), { ...seams, at });
+    return true;
+  };
+  const timedOut = (message, owner) => {
+    if (!leave('timeout', { reason: 'deadline', blocked_by: describe(owner) })) return failure('HUB_LEASE_CANCELLED', `lease ${lease_id} was released while it waited for ${name}`);
+    return failure('HUB_LOCK_TIMEOUT', message);
+  };
   let waiting = false;
+  let failed = true;
   try {
     for (;;) {
       signal?.throwIfAborted();
@@ -280,6 +382,7 @@ export async function acquireLease(name, {
           pid: process.pid, host: hostname(), repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null, started_at: new Date(started).toISOString(),
           kind: 'lease', lease_id, holder, why, expires_at: new Date(started + forMs).toISOString(),
           holder_pid: holderPid, holder_process_start: Number.isSafeInteger(holderPid) ? processStart(holderPid) : null,
+          format: OWNER_FORMAT, attempt, job, host_id: hostId,
         };
         let taken = false;
         try {
@@ -298,33 +401,41 @@ export async function acquireLease(name, {
             retire(name, path, record, { env, now, log });
             throw failure('HUB_LEASE_CANCELLED', `lease ${lease_id} was released while it was being taken for ${name}`);
           }
+          left = true;
+          note(name, eventOf('acquire', name, record, { deadline_at: iso(deadline), waited_ms: Math.max(0, started - requested) }), { ...seams, at: started });
           log(`HUB_LEASE ${name} ${lease_id} until ${record.expires_at}`);
+          failed = false;
           return record;
         }
         const owner = readOwner(path);
         const verdict = staleness(path, owner, { now, staleMs });
         if (verdict) {
-          if (retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
+          if (retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, hostId, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
           continue;
         }
-        if (now() >= deadline) throw failure('HUB_LOCK_TIMEOUT', `host lock ${name} is held by ${describe(owner)}; gave up after ${Math.round(waitMs / 1000)}s`);
+        if (now() >= deadline) throw timedOut(`host lock ${name} is held by ${describe(owner)}; gave up after ${Math.round(waitMs / 1000)}s`, owner);
         if (!waiting) { log(`HUB_LOCK_WAIT ${name} held by ${describe(owner)}`); waiting = true; }
       } else {
         if (position === -1) throw failure('HUB_LEASE_CANCELLED', `lease ${lease_id} lost its place in the queue for ${name}`);
-        if (now() >= deadline) throw failure('HUB_LOCK_TIMEOUT', `host lock ${name} has ${position} waiter${position === 1 ? '' : 's'} ahead of lease ${lease_id} (held by ${describe(readOwner(path))}); gave up after ${Math.round(waitMs / 1000)}s`);
+        if (now() >= deadline) { const owner = readOwner(path); throw timedOut(`host lock ${name} has ${position} waiter${position === 1 ? '' : 's'} ahead of lease ${lease_id} (held by ${describe(owner)}); gave up after ${Math.round(waitMs / 1000)}s`, owner); }
         if (!waiting) { log(`HUB_LOCK_WAIT ${name} queued behind ${position} (${describe(readOwner(path))})`); waiting = true; }
       }
       await pause(pollMs, { signal, sleep });
     }
   } finally {
+    // Anything else that ends the wait (an abort, an error) leaves the queue as a cancel.
+    if (failed && !left) {
+      try { leave('cancel', { reason: signal?.aborted ? 'aborted' : 'error' }); } catch { /* the rmSync below still clears it */ }
+    }
     rmSync(ticketFile, { force: true });
   }
 }
 
 // Releases a lease by id (the lease of a waiter that has not been served yet is cancelled). Never touches a job's lock,
 // another holder's lease or a lock that has moved on. Returns {released, cancelled, reason}. A release writes one
-// `release` event (reason `by-id`, or `any` when no id was given).
-export function releaseLease(name, id, { env = process.env, now = Date.now } = {}) {
+// `release` event (`reason`, else `by-id`, or `any` when no id was given); each waiter it cancels, one `cancel` event
+// (reason `released`), written because this unlink of the ticket decided it.
+export function releaseLease(name, id, { env = process.env, now = Date.now, reason = null, hostId } = {}) {
   const path = lockPath(name, env);
   let cancelled = 0;
   if (id) {
@@ -333,7 +444,13 @@ export function releaseLease(name, id, { env = process.env, now = Date.now } = {
     try { files = readdirSync(dir); } catch { /* no queue */ }
     for (const file of files) {
       try {
-        if (JSON.parse(readFileSync(join(dir, file), 'utf8')).lease_id === id) { unlinkSync(join(dir, file)); cancelled += 1; }
+        const ticket = JSON.parse(readFileSync(join(dir, file), 'utf8'));
+        if (ticket.lease_id !== id) continue;
+        unlinkSync(join(dir, file));
+        cancelled += 1;
+        const at = now();
+        const enqueued = Date.parse(ticket.enqueued_at);
+        note(name, eventOf('cancel', name, { kind: 'lease', lease_id: id, holder: ticket.holder ?? null }, { waited_ms: Number.isFinite(enqueued) ? Math.max(0, at - enqueued) : null, reason: 'released' }), { env, at, hostId });
       } catch { /* gone, or being written */ }
     }
   }
@@ -345,7 +462,10 @@ export function releaseLease(name, id, { env = process.env, now = Date.now } = {
   }
   if (!isLease(owner)) return { released: false, cancelled, reason: 'not-a-lease' };
   if (id && owner.lease_id !== id) return { released: false, cancelled, reason: 'other-lease', owner };
-  if (!retire(name, path, owner, { as: 'release', reason: id ? 'by-id' : 'any', env, now })) return { released: false, cancelled, reason: 'changed' };
+  // A record whose ticket this call just cancelled was being taken: its taker never acquired it and gives it back, so
+  // the cancel above is its whole history and the retire records nothing.
+  const as = cancelled > 0 && id ? null : 'release';
+  if (!retire(name, path, owner, { as, reason: reason ?? (id ? 'by-id' : 'any'), env, now, hostId })) return { released: false, cancelled, reason: 'changed' };
   return { released: true, cancelled, reason: 'released', owner };
 }
 

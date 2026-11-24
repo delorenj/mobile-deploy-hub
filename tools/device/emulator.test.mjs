@@ -652,6 +652,7 @@ test('status is read-only: a dead lease is neither reaped nor logged by looking;
       assert.match(text, new RegExp(`^HUB_EMULATOR_REAPED ${id} ${slot} \\(${why}\\)`, 'm'));
     }
     assert.ok(logged(f).some(event => event.event === 'release' && event.lock === 'emulator-1'), 'the reaped slot\'s release was logged on the acquire path');
+    assert.deepEqual(logged(f).filter(event => event.event === 'release' && event.reason?.startsWith('reaped')).map(event => [event.lock, event.reason]), [['emulator-1', 'reaped-expired'], ['emulator-2', 'reaped-holder-gone']], 'a reap says why it released (the orphan had no lock left to release)');
     assert.deepEqual(f.records().sort(), [`${f.exportsOf(leased.out).HUB_LEASE_ID}.json`]);
     assert.equal((await f.run(['release', 'emulator', f.exportsOf(leased.out).HUB_LEASE_ID])).code, 0);
   } finally { f.cleanup(); }
@@ -766,6 +767,29 @@ test('--for runs from READY: a boot longer than the lease never expires it mid-b
     const next = await f.run(['lease', 'emulator', '--for', '1m', '--why', 'after the slow boot', '--id', uid('next')]);
     assert.match(next.err.join('\n'), new RegExp(`^HUB_EMULATOR_REAPED ${id} emulator-1 \\(expired\\)`, 'm'));
     assert.equal((await f.run(['release', 'emulator', f.exportsOf(next.out).HUB_LEASE_ID])).code, 0);
+    f.clean();
+  } finally { f.cleanup(); }
+});
+
+test('an emulator Lease is recorded as exactly: request and acquire on the gate, acquire on its slot, the gate let go, the slot released', async () => {
+  const f = fixture();
+  try {
+    f.env.HUB_EMULATOR_POOL = '1';
+    const id = uid('seq');
+    const leased = await f.run(['lease', 'emulator', '--for', '30m', '--why', 'sequence', '--id', id]);
+    assert.equal(leased.code, 0, leased.err.join('\n'));
+    assert.equal((await f.run(['release', 'emulator', id])).code, 0);
+    const got = logged(f);
+    assert.deepEqual(got.map(event => [event.event, event.lock, event.lease_id, event.reason]), [
+      ['request', 'emulator', id, null],
+      ['acquire', 'emulator', id, null],
+      ['acquire', 'emulator-1', id, null],
+      ['release', 'emulator', id, 'by-id'],
+      ['release', 'emulator-1', id, 'by-id'],
+    ]);
+    assert.ok(got.every(event => event.hold_kind === 'lease' && event.claimant.kind === 'agent' && event.claimant.holder === `tester@${hostname()}`));
+    assert.equal(got[0].deadline_at !== null && got[0].for_ms > 0, true, 'the gate request says how long it may wait and hold');
+    assert.ok(got[4].held_ms >= 0 && got[2].waited_ms === 0, 'the slot is a try: taken at once, without a request of its own');
     f.clean();
   } finally { f.cleanup(); }
 });
