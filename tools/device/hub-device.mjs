@@ -17,8 +17,9 @@
 //
 //   hub-device lease s24|s26|phone --for 30m --why "device proof" [--wait 2m] [--no-connect] [--id ID] [--pid N] [--holder WHO]
 //                    [--env-serial NAME]... [--json] [--verbose]
-//   hub-device release [<lease_id>|--any]    (no id: $HUB_LEASE_ID; --any: whichever lease holds a phone)
-//   hub-device status [--json]
+//   hub-device release [<lease_id>|--any]    (no id: $HUB_LEASE_ID; --any: whichever lease holds a phone; a `job:` id is a deploy job's place in
+//                    line, not a lease: exit 2, HUB_DEVICE_JOB_ID names the run to cancel)
+//   hub-device status [--json]   (read only: locks, every waiter with its position and live ETA, the Reservations, the inventory)
 //   hub-device run s24|s26|phone [--for 1h] [--why TEXT] [--wait 2m] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...>
 //   hub-device lease emulator [--profile default|playstore] --for 30m --why TEXT [--wait 2m] [--id ID] [--pid N] [--holder WHO]
 //                    [--env-serial NAME]... [--json]
@@ -40,8 +41,10 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { findPhone, idMatchesSerial } from '../ci/lib/adb.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
-import { MAX_LEASE_MS, RESERVABLE, acquireLease, capText, deployTargetCapMs, isLease, listLocks, lockDir, poolRequest, queueView, readOwner, releaseLease, releaseReservation, updateLease } from '../ci/lib/lock.mjs';
+import { formatEta } from '../ci/lib/eta.mjs';
+import { MAX_LEASE_MS, RESERVABLE, acquireLease, capText, deployTargetCapMs, etaHistory, isLease, listLocks, lockDir, poolRequest, queueView, readOwner, releaseLease, releaseReservation, updateLease, waiterEtas } from '../ci/lib/lock.mjs';
 import { pause, sleep as realSleep } from '../ci/lib/pause.mjs';
+import { loadPolicy } from '../ci/lib/policy.mjs';
 import { createAsyncAdb } from './async-adb.mjs';
 import { GATE, LEASE_ID, PROFILES, emulatorStatus, exportsOf as emulatorExports, hostPool, isEmulatorLease, isEmulatorLock, provision, readRecord, reap, releaseEmulator, teardownNow } from './emulator.mjs';
 import { inventory } from './inventory.mjs';
@@ -407,6 +410,17 @@ function reservationCommand(parsed, context) {
 async function release(parsed, context) {
   const { env, stdout, stderr } = context;
   const fleet = context.fleet;
+  // A deploy job's ticket id is its place in line, not a lease: nothing here can release it, so say which run to cancel.
+  const given = parsed.flags.any ? null : parsed.words[1] === 'emulator' ? parsed.words[2] ?? env.HUB_LEASE_ID : parsed.words[1] ?? env.HUB_LEASE_ID;
+  if (typeof given === 'string' && given.startsWith('job:')) {
+    const [, repo, run] = /^job:([^#]+)#([^.]+)\.[^/]+\/.+$/.exec(given) ?? [];
+    const hint = repo && repo !== 'local' ? ` (gh run cancel ${run} --repo ${repo})` : '';
+    // A local run's id carries the process: the catch-up and a hand-run deploy have no GitHub run to cancel.
+    const pid = repo === 'local' ? /^local-(\d+)$/.exec(run)?.[1] : undefined;
+    const what = pid ? `it is the local process ${pid}, stop that process instead` : `cancel ${repo ? `run ${run} of ${repo}` : 'its run'} instead${hint}`;
+    stderr(`HUB_DEVICE_JOB_ID ${given} is a deploy job's place in line, not a lease; ${what}`);
+    return 2;
+  }
   // `release emulator [<id>]` (no id: $HUB_LEASE_ID), or an id (given or $HUB_LEASE_ID) that names an emulator lease;
   // everything else is a phone's. An empty or malformed emulator id is refused: lock.mjs reads an empty id as any lease.
   if (parsed.words[1] === 'emulator') {
@@ -553,10 +567,40 @@ async function status(parsed, context) {
     };
   });
   const waiters = [];
-  for (const name of new Set([...fleet.map(phone => phone.lock), GATE, ...locks.map(entry => entry.lock)])) {
-    // A run's Reservation holds a place but is no waiter: status lists tickets only, numbered as before (Story 4.3 adds the
-    // Reservations section).
-    queueView(name, { env, includeStale: true }).filter(waiter => waiter.kind !== 'reservation').forEach((waiter, index) => waiters.push({ lock: name, device: nameOf(fleet, name), position: index + 1, lease_id: waiter.lease_id, holder: waiter.holder, why: waiter.why, since: waiter.enqueued_at, stale: waiter.stale }));
+  const reservations = [];
+  // The ETAs come from one windowed read of the Event Log and one policy, shared by every waiter and read only when a live waiter
+  // exists; a failure of either leaves those waiters with `eta: null` (`eta=?`) and never fails status.
+  let history = null;
+  let settings = null;
+  const loadEtaInputs = () => {
+    if (history !== null) return;
+    history = false;
+    try {
+      settings = context.policy ?? loadPolicy().policy;
+      history = etaHistory({ env, now: nowMs, policy: settings });
+    } catch { history = false; }
+  };
+  for (const name of new Set([...fleet.map(phone => phone.lock), GATE, ...RESERVABLE, ...locks.map(entry => entry.lock)])) {
+    const view = queueView(name, { env, includeStale: true, now: timing.now });
+    const device = nameOf(fleet, name);
+    // A run's Reservation holds a place but is no waiter: it has its own section, and the tickets are numbered without it.
+    const tickets = view.filter(entry => entry.kind !== 'reservation');
+    let etas = new Map();
+    if (tickets.some(ticket => !ticket.stale)) {
+      loadEtaInputs();
+      if (history) etas = waiterEtas({ owner: readOwnerOf(name, env), view, events: history, policy: settings, now: nowMs });
+    }
+    tickets.forEach((waiter, index) => waiters.push({
+      lock: name, device, position: index + 1, lease_id: waiter.lease_id, holder: waiter.holder, why: waiter.why, since: waiter.enqueued_at, stale: waiter.stale,
+      kind: waiter.kind, repo: waiter.repo ?? null, run: waiter.run ?? null, job: waiter.job ?? null, eta: waiter.stale ? null : etas.get(waiter.file) ?? null,
+    }));
+    for (const entry of view) {
+      if (entry.kind !== 'reservation') continue;
+      reservations.push({
+        lock: name, device, run_key: entry.run_key, repo: entry.repo ?? null, run: entry.run ?? null, place: entry.place, blocking: entry.blocking,
+        grace: entry.grace, reserved_at: entry.reserved_at, expires_at: entry.expires_at, stale: entry.stale,
+      });
+    }
   }
   const found = (context.inventory ?? inventory)({ lockRoot: lockDir(env), hubAdbPort: Number(env.HUB_ADB_SERVER_PORT) || 5037 });
   const reach = await phonePresence(fleet, context, found);
@@ -576,7 +620,7 @@ async function status(parsed, context) {
   for (const list of [found.adb_servers, found.emulators, found.xvfb]) {
     for (const item of list) if (owners.has(item.pid)) Object.assign(item, { managed: true, lease_id: owners.get(item.pid) });
   }
-  const result = { phones, locks, waiters, inventory: found, emulators };
+  const result = { phones, locks, waiters, reservations, inventory: found, emulators };
   if (parsed.flags.json) { stdout(JSON.stringify(result, null, 2)); return 0; }
   stdout('PHONES (read only; adb is queried, never connected)');
   for (const phone of phones) {
@@ -602,7 +646,25 @@ async function status(parsed, context) {
   }
   stdout('WAITERS');
   if (waiters.length === 0) stdout('  none');
-  for (const waiter of waiters) stdout(`  ${waiter.device ?? waiter.lock} #${waiter.position}  ${waiter.lease_id}  holder=${waiter.holder}  why="${waiter.why}"  waiting since ${waiter.since}${waiter.stale ? '  [stale]' : ''}`);
+  for (const waiter of waiters) {
+    const dash = value => value ?? '-';
+    const place = `${waiter.device ?? waiter.lock} #${waiter.position}`;
+    const what = waiter.kind === 'job' || waiter.kind === 'hub-job'
+      ? `${waiter.kind === 'hub-job' ? 'CATCH-UP' : 'JOB'} ${dash(waiter.repo)} run ${dash(waiter.run)} job ${dash(waiter.job)}`
+      : `${dash(waiter.lease_id)}  holder=${dash(waiter.holder)}  why="${dash(waiter.why)}"`;
+    const estimate = waiter.stale ? '' : `  eta=${formatEta(waiter.eta)}`;
+    stdout(`  ${place}  ${what}  waiting since ${dash(waiter.since)}${estimate}${waiter.stale ? '  [stale]' : ''}`);
+  }
+  if (reservations.length > 0) {
+    stdout('RESERVATIONS');
+    for (const entry of reservations) {
+      const label = entry.device ? `${entry.device} (${entry.lock})` : entry.lock;
+      const grace = entry.grace?.state === 'running' ? `running until ${entry.grace.ends_at}` : entry.grace?.state ?? '-';
+      const left = Date.parse(entry.expires_at) - nowMs;
+      const expiry = left > 0 ? `expires in ${age(left)}` : `expired ${age(-left)} ago`;
+      stdout(`  ${label}  ${entry.run_key ?? '-'}  place ${entry.place}  grace ${grace}  ${expiry} (${entry.expires_at ?? '-'})${entry.blocking ? '  [blocking]' : ''}${entry.stale ? '  [expired]' : ''}`);
+    }
+  }
   stdout('INVENTORY (read only)');
   const tag = item => (item.managed ? `managed${item.lease_id ? ` (lease ${item.lease_id})` : ''}` : 'foreign');
   for (const server of found.adb_servers) stdout(`  adb server  port ${server.port}  pid ${server.pid}  ${tag(server)}${server.cwd ? `  cwd ${server.cwd}` : ''}`);
@@ -736,6 +798,7 @@ export async function main(argv, {
   inventory: inventoryImpl,
   sleep = realSleep,
   now = Date.now,
+  policy = null,
 } = {}) {
   let parsed = { flags: {}, words: [], envSerial: [], command: null };
   const timing = { sleep, now, leasePollMs: Number(env.HUB_DEVICE_POLL_MS) || 1000, phonePollMs: Number(env.HUB_DEVICE_POLL_MS) || 3000 };
@@ -744,7 +807,7 @@ export async function main(argv, {
     bootTimeoutMs: Number(env.HUB_EMULATOR_BOOT_TIMEOUT_MS) || 360_000,
     bootPollMs: Number(env.HUB_EMULATOR_POLL_MS) || 2000,
   };
-  const context = { env, stdout, stderr, signals, adbFactory, inventory: inventoryImpl, timing, emulator, log: line => stderr(line), killGraceMs: Number(env.HUB_DEVICE_KILL_GRACE_MS) || 10_000 };
+  const context = { env, stdout, stderr, signals, policy, adbFactory, inventory: inventoryImpl, timing, emulator, log: line => stderr(line), killGraceMs: Number(env.HUB_DEVICE_KILL_GRACE_MS) || 10_000 };
   try {
     parsed = parseArgs(argv);
     // `--run` and `--name` belong to `reservation release` alone: every other command still refuses them as unknown flags (AD-17: exit 2 stays exit 2).

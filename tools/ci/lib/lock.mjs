@@ -813,6 +813,29 @@ function writeTicket(name, body, { env, requested, file = ticketName(requested) 
   return { file, path };
 }
 
+// The events the ETA reads: the policy window only (`queue.eta_window_days`), read once and never the whole log (AD-18). Throws on a
+// bad policy; callers that must not fail catch it.
+export function etaHistory({ env = process.env, now, policy }) {
+  const days = policy.queue.eta_window_days;
+  return [...readEvents({ env, since: now - days * 86_400_000, until: now + 1, log: () => {} })];
+}
+
+// The live ETA of every waiter of a Queued lock, for the read-only surfaces (`hub-device status` now, the Hub API later). `view` is a
+// queueView (stale entries may be in it), `events` one etaHistory read shared by every waiter. A Map from each live ticket's `file` to
+// its eta() (the ticket's own place and deadline), or null when that computation throws. Stale tickets and Reservations get no entry:
+// a stale waiter has no ETA and a Reservation is not a waiter. No I/O.
+export function waiterEtas({ owner = null, view = [], events = [], policy, now }) {
+  const live = view.filter(entry => !entry.stale);
+  const etas = new Map();
+  for (const entry of live) {
+    if (entry.kind === 'reservation') continue;
+    let value = null;
+    try { value = eta({ owner, view: live, file: entry.file, deadline_at: entry.deadline_at }, events, policy, now); } catch { /* an ETA never fails a read */ }
+    etas.set(entry.file, value);
+  }
+  return etas;
+}
+
 // The ETA a waiter is told at enqueue (AD-18, FR-15), for the ticket and the `request` event, so its accuracy can be measured
 // later (SM-4). It reads the owner, an observer's view (no prune) and the policy window's events once, then asks eta(). `file`
 // is the ticket's minted name, so the asker's place is known before its ticket lands. Never throws and never delays the
@@ -821,10 +844,9 @@ function enqueueEta(name, { file, deadline, env, now, policy = null, host, hostI
   try {
     const at = now();
     const settings = policy ?? loadPolicy().policy;
-    const days = settings.queue.eta_window_days;
     const owner = readOwner(lockPath(name, env));
     const view = queueView(name, { env, now, host, hostId, processStart: startOf });
-    const events = [...readEvents({ env, since: at - days * 86_400_000, until: at + 1, log: () => {} })];
+    const events = etaHistory({ env, now: at, policy: settings });
     return eta({ owner, view, file, deadline_at: deadline }, events, settings, at);
   } catch (error) {
     // One line, so a broken ETA path is not a silent null on every ticket; a throwing logger never escapes.

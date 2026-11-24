@@ -1043,6 +1043,197 @@ test('status lists leases, waiters and the marked inventory, changes nothing and
   } finally { f.cleanup(); }
 });
 
+// Story 4.3: status shows every waiter by kind with its live ETA, and the Reservations in a section of their own.
+test('status shows a deploy job and a Lease waiting behind a Lease: kind, repo, run, job, position and a live ETA', async () => {
+  const f = fixture();
+  try {
+    await acquireLease('adb', { holder: 'agent-a', why: 'device proof', forMs: 3600_000, id: 'held', env: f.env, log: () => {} });
+    const jobEnv = { ...f.env, GITHUB_REPOSITORY: 'o/a', GITHUB_RUN_ID: '9', GITHUB_RUN_ATTEMPT: '1', GITHUB_JOB: 'android' };
+    const job = withLock('adb', async () => {}, { env: jobEnv, log: () => {}, pollMs: 5 });
+    await settle(40);
+    const waiting = acquireLease('adb', { holder: 'agent-b', why: 'next in line', forMs: 600_000, id: 'next', waitMs: 10_000, env: f.env, log: () => {}, pollMs: 5 });
+    await settle(40);
+    // the catch-up as the hub calls it: a hub-job ticket
+    const catchUp = withLock('adb', async () => {}, { env: { ...jobEnv, GITHUB_RUN_ID: '10' }, kind: 'hub-job', log: () => {}, pollMs: 5 });
+    await settle(40);
+    const before = readdirSync(join(f.root, 'locks'), { recursive: true }).sort();
+    const doc = JSON.parse((await f.run(['status', '--json'])).out.join('\n'));
+    assert.deepEqual(doc.reservations, []);
+    const [first, second, third] = doc.waiters;
+    assert.deepEqual([third.position, third.kind, third.repo, third.run, third.job], [3, 'hub-job', 'o/a', '10', 'android']);
+    assert.equal(typeof third.eta.lo_ms, 'number');
+    assert.deepEqual([first.device, first.position, first.kind, first.repo, first.run, first.job, first.stale], ['s26', 1, 'job', 'o/a', '9', 'android', false]);
+    assert.deepEqual([second.position, second.kind, second.lease_id, second.holder, second.why], [2, 'lease', 'next', 'agent-b', 'next in line']);
+    for (const waiter of doc.waiters) {
+      assert.equal(typeof waiter.eta.lo_ms, 'number');
+      assert.equal(typeof waiter.eta.low_data, 'boolean');
+    }
+    assert.ok(second.eta.hi_ms >= first.eta.hi_ms, 'the later waiter counts the one ahead');
+    const text = (await f.run(['status'])).out.join('\n');
+    assert.doesNotMatch(text, /undefined|null/);
+    assert.match(text, /^  s26 #1  JOB o\/a run 9 job android  waiting since \S+  eta=\S+/m);
+    assert.match(text, /^  s26 #2  next  holder=agent-b  why="next in line"  waiting since \S+  eta=\S+/m);
+    assert.match(text, /^  s26 #\d  CATCH-UP \S+ run \S+ job \S+  waiting since \S+  eta=/m);
+    assert.deepEqual(readdirSync(join(f.root, 'locks'), { recursive: true }).sort(), before, 'status wrote nothing');
+    releaseLease('adb', 'next', { env: f.env });
+    await assert.rejects(waiting, error => error.code === 'HUB_LEASE_CANCELLED');
+    releaseLease('adb', 'held', { env: f.env });
+    await job;
+    await catchUp;
+  } finally { f.cleanup(); }
+});
+
+test('status prints a RESERVATIONS section for a live Reservation (run key, place, grace, expiry) and writes nothing; without one the output is unchanged', async () => {
+  const f = fixture();
+  try {
+    const runEnv = { ...f.env, GITHUB_REPOSITORY: 'delorenj/example', GITHUB_RUN_ID: '5', GITHUB_RUN_ATTEMPT: '1', GITHUB_JOB: 'gate' };
+    assert.doesNotMatch((await f.run(['status'])).out.join('\n'), /RESERVATIONS/);
+    reserve('adb', { env: runEnv, log: () => {} });
+    // mac-ios is walked too, with no lock of its own
+    reserve('mac-ios', { env: runEnv, log: () => {} });
+    assert.ok(!existsSync(join(f.root, 'locks/mac-ios.lock')));
+    const tree = () => readdirSync(join(f.root, 'locks'), { recursive: true }).sort();
+    const before = tree();
+    const doc = JSON.parse((await f.run(['status', '--json'])).out.join('\n'));
+    assert.deepEqual(doc.reservations.map(entry => entry.lock).sort(), ['adb', 'mac-ios']);
+    const entry = doc.reservations.find(item => item.lock === 'adb');
+    assert.deepEqual([entry.lock, entry.device, entry.run_key, entry.repo, entry.run, entry.place, entry.blocking, entry.stale], ['adb', 's26', 'delorenj--example--5', 'delorenj/example', '5', 1, true, false]);
+    assert.deepEqual([entry.grace.state, entry.grace.started_at, entry.grace.ends_at], ['pending', null, null]);
+    assert.ok(Date.parse(entry.expires_at) > Date.parse(entry.reserved_at));
+    const mac = doc.reservations.find(item => item.lock === 'mac-ios');
+    assert.deepEqual([mac.device, mac.run_key, mac.place, mac.stale], [null, 'delorenj--example--5', 1, false]);
+    const lines = (await f.run(['status'])).out;
+    const at = lines.indexOf('RESERVATIONS');
+    assert.ok(at > lines.indexOf('WAITERS') && lines[at + 3].startsWith('INVENTORY'), lines.join('\n'));
+    assert.match(lines.find(line => line.startsWith('  s26 (adb)  delorenj')), /^  s26 \(adb\)  delorenj--example--5  place 1  grace pending  expires in \S+ \(\S+Z\)  \[blocking\]$/);
+    assert.match(lines.find(line => line.startsWith('  mac-ios  delorenj')), /^  mac-ios  delorenj--example--5  place 1  grace pending  expires in \S+ \(\S+Z\)  \[blocking\]$/);
+    assert.deepEqual(tree(), before, 'status started no grace and wrote nothing');
+
+    // a grace that started a minute ago and has nine minutes to run
+    const startedAt = new Date(Date.now() - 60_000).toISOString();
+    writeFileSync(join(f.root, 'locks/adb.reservations/delorenj--example--5/grace.json'), JSON.stringify({ format: 1, grace_started_at: startedAt }));
+    const running = JSON.parse((await f.run(['status', '--json'])).out.join('\n')).reservations.find(item => item.lock === 'adb');
+    assert.equal(running.grace.state, 'running');
+    assert.equal(running.grace.started_at, startedAt);
+    assert.match((await f.run(['status'])).out.join('\n'), new RegExp(`  place 1  grace running until ${running.grace.ends_at.replace(/\./g, '\\.')}  expires in `));
+
+    // past its ceiling the Reservation is stale: still shown, marked expired, blocking nothing
+    const later = () => Date.now() + 4 * 3600_000;
+    const expired = JSON.parse((await f.run(['status', '--json'], { now: later })).out.join('\n')).reservations.find(item => item.lock === 'adb');
+    assert.deepEqual([expired.stale, expired.blocking], [true, false]);
+    assert.match((await f.run(['status'], { now: later })).out.join('\n'), /^  s26 \(adb\)  delorenj--example--5  place 1  grace \S+.*  expired \S+ ago \(\S+Z\)  \[expired\]$/m);
+  } finally { f.cleanup(); }
+});
+
+test('release refuses a job id: exit 2, HUB_DEVICE_JOB_ID names the run to cancel, and the waiting job ticket stays', async () => {
+  const f = fixture();
+  try {
+    await acquireLease('adb', { holder: 'agent-a', why: 'hold', forMs: 3600_000, id: 'held', env: f.env, log: () => {} });
+    const jobEnv = { ...f.env, GITHUB_REPOSITORY: 'o/a', GITHUB_RUN_ID: '9', GITHUB_RUN_ATTEMPT: '1', GITHUB_JOB: 'android' };
+    const job = withLock('adb', async () => {}, { env: jobEnv, log: () => {}, pollMs: 5 });
+    await settle(40);
+    const tickets = queued(f);
+    assert.equal(tickets.length, 1);
+    const refused = await f.run(['release', 'job:o/a#9.1/android']);
+    assert.equal(refused.code, 2);
+    assert.deepEqual(refused.out, []);
+    assert.deepEqual(refused.err, ['HUB_DEVICE_JOB_ID job:o/a#9.1/android is a deploy job\'s place in line, not a lease; cancel run 9 of o/a instead (gh run cancel 9 --repo o/a)']);
+    const viaEnv = await f.run(['release'], { env: { ...f.env, HUB_LEASE_ID: 'job:o/a#9.1/android' } });
+    assert.equal(viaEnv.code, 2);
+    assert.match(viaEnv.err[0], /^HUB_DEVICE_JOB_ID /);
+    const local = await f.run(['release', 'job:local#local-5.1/job']);
+    assert.equal(local.code, 2);
+    assert.deepEqual(local.err, ['HUB_DEVICE_JOB_ID job:local#local-5.1/job is a deploy job\'s place in line, not a lease; it is the local process 5, stop that process instead']);
+    const odd = await f.run(['release', 'job:weird']);
+    assert.equal(odd.code, 2);
+    assert.match(odd.err[0], /^HUB_DEVICE_JOB_ID job:weird .*cancel its run instead$/);
+    assert.deepEqual(queued(f), tickets, 'nothing was released');
+    assert.equal(f.owner().lease_id, 'held');
+    releaseLease('adb', 'held', { env: f.env });
+    await job;
+  } finally { f.cleanup(); }
+});
+
+test('status with a month of events (~15k lines) and waiters answers under 200 ms and writes nothing (NFR)', async () => {
+  const f = fixture();
+  try {
+    const events = join(f.root, 'events');
+    mkdirSync(events, { recursive: true });
+    const nowMs = Date.now();
+    const months = new Map();
+    for (let i = 0; i < 15_000; i += 1) {
+      const ts = new Date(nowMs - 60_000 - Math.floor(i * (30 * 86_400_000 - 120_000) / 15_000)).toISOString();
+      const lease = i % 3 === 0;
+      const line = JSON.stringify({
+        format: 1, ts, event: 'release', lock: 'adb', hold_kind: lease ? 'lease' : 'job', held_ms: 60_000 + (i % 40) * 30_000, for_ms: lease ? 3_600_000 : null, last_alive_at: null,
+        claimant: { kind: lease ? 'agent' : 'deploy', holder: 'x', repo: lease ? null : 'o/a', run: String(i), attempt: '1', job: lease ? null : 'android' },
+      });
+      const month = ts.slice(0, 7);
+      months.set(month, `${months.get(month) ?? ''}${line}\n`);
+    }
+    for (const [month, text] of months) writeFileSync(join(events, `${month}.jsonl`), text);
+    const bytes = () => readdirSync(events).sort().map(name => `${name}:${statSync(join(events, name)).size}`).join();
+    await acquireLease('adb', { holder: 'agent-a', why: 'hold', forMs: 3600_000, id: 'held', env: f.env, log: () => {} });
+    const jobEnv = { ...f.env, GITHUB_REPOSITORY: 'o/a', GITHUB_RUN_ID: '9', GITHUB_RUN_ATTEMPT: '1', GITHUB_JOB: 'android' };
+    const job = withLock('adb', async () => {}, { env: jobEnv, log: () => {}, pollMs: 5 });
+    const waiting = acquireLease('s24', { holder: 'agent-c', why: 'x', forMs: 600_000, id: 'held24', env: f.env, log: () => {} });
+    await waiting;
+    const second = acquireLease('s24', { holder: 'agent-d', why: 'y', forMs: 600_000, id: 'next24', waitMs: 10_000, env: f.env, log: () => {}, pollMs: 5 });
+    await settle(60);
+    const sizes = bytes();   // what the setup itself logged; status adds nothing to it
+    const times = [];
+    let doc;
+    for (let i = 0; i < 3; i += 1) {
+      const started = performance.now();
+      const result = await f.run(['status', '--json']);
+      times.push(performance.now() - started);
+      doc = JSON.parse(result.out.join('\n'));
+    }
+    assert.equal(doc.waiters.length, 2);
+    assert.ok(doc.waiters.every(waiter => waiter.eta !== null), 'both got a live ETA from the month of history');
+    assert.equal(doc.waiters.find(waiter => waiter.kind === 'job').eta.low_data, false, 'the windowed history was read: 5000 matching holds');
+    assert.ok(Math.min(...times) < 200, `best of 3 was ${Math.min(...times).toFixed(0)} ms`);
+    assert.equal(bytes(), sizes, 'the Event Log is untouched');
+    releaseLease('s24', 'next24', { env: f.env });
+    await assert.rejects(second, error => error.code === 'HUB_LEASE_CANCELLED');
+    releaseLease('s24', 'held24', { env: f.env });
+    releaseLease('adb', 'held', { env: f.env });
+    await job;
+  } finally { f.cleanup(); }
+});
+
+test('status never fails because of an ETA: a broken policy prints eta=? and null, and a stale waiter has no ETA at all', async () => {
+  const f = fixture();
+  try {
+    await acquireLease('adb', { holder: 'agent-a', why: 'hold', forMs: 3600_000, id: 'held', env: f.env, log: () => {} });
+    const waiting = acquireLease('adb', { holder: 'agent-b', why: 'next in line', forMs: 600_000, id: 'next', waitMs: 10_000, env: f.env, log: () => {}, pollMs: 5 });
+    await settle(40);
+    const queue = join(f.root, 'locks/adb.queue');
+    // a dead waiter: a ticket whose process is gone
+    const [liveName] = readdirSync(queue);
+    const live = JSON.parse(readFileSync(join(queue, liveName), 'utf8'));
+    writeFileSync(join(queue, '000000000000001-000001-00000001.json'), JSON.stringify({ ...live, lease_id: 'dead', holder: 'ghost', pid: 2_000_000_000, host: hostname(), host_id: null, process_start: null, eta: null }));
+    const broken = await f.run(['status', '--json'], { policy: { queue: {} } });
+    assert.equal(broken.code, 0, broken.err.join());
+    const doc = JSON.parse(broken.out.join('\n'));
+    const byId = Object.fromEntries(doc.waiters.map(waiter => [waiter.lease_id, waiter]));
+    assert.equal(byId.next.eta, null);
+    assert.equal(byId.next.stale, false);
+    assert.equal(byId.dead.stale, true);
+    assert.equal(byId.dead.eta, null);
+    const text = (await f.run(['status'], { policy: { queue: {} } })).out.join('\n');
+    assert.match(text, /^  s26 #\d  next  holder=agent-b.*  eta=\?$/m);
+    assert.match(text, /^  s26 #\d  dead  holder=ghost.*  \[stale\]$/m);
+    assert.doesNotMatch(text.split('\n').find(line => line.includes(' dead ')), /eta=/);
+    // with the real policy the live one has a range and the dead one still none
+    const real = (await f.run(['status'])).out.join('\n');
+    assert.match(real, /holder=agent-b.*  eta=\d+s-\S+/);
+    assert.doesNotMatch(real.split('\n').find(line => line.includes(' dead ')), /eta=/);
+    releaseLease('adb', 'next', { env: f.env });
+    await assert.rejects(waiting, error => error.code === 'HUB_LEASE_CANCELLED');
+  } finally { f.cleanup(); }
+});
+
 test('status with nothing held says so (and, with no adb server running, does not ask adb at all)', async () => {
   const f = fixture();
   try {

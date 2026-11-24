@@ -6,7 +6,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { eta, etaMoved, formatEta, percentile } from './lib/eta.mjs';
-import { acquireLease, releaseLease, reserve, withLock } from './lib/lock.mjs';
+import { acquireLease, releaseLease, reserve, waiterEtas, withLock } from './lib/lock.mjs';
 import { appendEvent, readEvents } from './lib/events.mjs';
 import { loadPolicy } from './lib/policy.mjs';
 import { hermetic } from './test-fixtures.mjs';
@@ -404,4 +404,26 @@ test('etaMoved: more than a minute on either bound, or a null changing sides', (
   assert.equal(etaMoved(a, null), true);
   assert.equal(etaMoved(null, a), true);
   assert.equal(etaMoved(null, null), false);
+});
+
+test('waiterEtas: stale tickets and Reservations get no ETA, each live ticket is asked at its own place and deadline, a throwing policy is null', () => {
+  const held = many(20, i => jobHold(i * MIN));
+  const view = [
+    job('001-a', { deadline_at: null }),
+    job('002-stale', { stale: true, blocking: false }),
+    { file: '003-reservation', kind: 'reservation', blocking: true, stale: false, grace: { state: 'pending' }, grace_ms: 10 * MIN },
+    job('004-b', { deadline_at: iso(NOW + 5 * MIN) }),
+    lease('005-c', 'later', { deadline_at: null }),
+  ];
+  const owner = jobOwner(0);
+  const etas = waiterEtas({ owner, view, events: held, policy, now: NOW });
+  assert.deepEqual([...etas.keys()], ['001-a', '004-b', '005-c'], 'no entry for the stale ticket or the Reservation');
+  for (const [file, deadline] of [['001-a', null], ['004-b', iso(NOW + 5 * MIN)], ['005-c', null]]) {
+    const live = view.filter(entry => !entry.stale);
+    assert.deepEqual(etas.get(file), eta({ owner, view: live, file, deadline_at: deadline }, held, policy, NOW), `${file} is eta() at its own place`);
+  }
+  assert.ok(etas.get('004-b').lo_ms > etas.get('001-a').lo_ms, 'a later waiter counts the ones ahead of it');
+  const broken = waiterEtas({ owner, view, events: held, policy: { queue: {} }, now: NOW });
+  assert.deepEqual([...broken.entries()], [['001-a', null], ['004-b', null], ['005-c', null]]);
+  assert.equal(waiterEtas({ policy, now: NOW }).size, 0);
 });
