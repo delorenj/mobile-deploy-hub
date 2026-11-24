@@ -12,7 +12,7 @@ import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hostId } from '../ci/lib/events.mjs';
-import { releaseLease, withLock } from '../ci/lib/lock.mjs';
+import { releaseLease, updateLease, withLock } from '../ci/lib/lock.mjs';
 import { choosePorts, doomed, isEmulatorLease, liveStart, portsInUse, releaseEmulator, resolveImage, stopProcesses } from './emulator.mjs';
 import { inventory } from './inventory.mjs';
 import { main } from './hub-device.mjs';
@@ -468,7 +468,9 @@ test('an emulator that dies while booting is reported and everything it started 
     writeFileSync(join(f.state, 'crash'), '');
     const result = await f.run(['run', 'emulator', '--', NODE, '-e', '']);
     assert.equal(result.code, 1);
-    assert.match(result.err.join('\n'), /^hub-device: the emulator exited while booting: FATAL \| fake emulator crashed$/m);
+    // Either wording is the same report: the boot loop sees the FATAL line in the log and the exit in the same poll, and which it
+    // reads first depends on whether the dying process has been reaped yet (a slow runner reads the log first, 2026-11-24).
+    assert.match(result.err.join('\n'), /^hub-device: the emulator (?:exited|failed) while booting: FATAL \| fake emulator crashed$/m);
     const server = readdirSync(f.state).filter(name => /^adb-server-\d+\.json$/.test(name)).map(name => JSON.parse(f.read(name)).pid);
     assert.equal(server.length, 1);
     assert.ok(gone(server[0]), 'its adb server was stopped');
@@ -653,14 +655,16 @@ test('status is read-only: a dead lease is neither reaped nor logged by looking;
     f.env.HUB_EMULATOR_POOL = '3';
     const holder = sleeper();
     const [SHORT, TIED, GONE] = [uid('short'), uid('tied'), uid('gone')];
-    // 3s, not 1s: under a loaded host the two leases below can take over a second, and an acquire reaps an expired lease
-    assert.equal((await f.run(['lease', 'emulator', '--for', '3s', '--why', 'short', '--id', SHORT])).code, 0);
+    // Not a short --for: each lease below can take seconds on a slow host (a GitHub runner boots the fake emulator in ~5 s), and an
+    // acquire reaps an expired lease, so a 3 s lease was reaped by the next take and the test's premise went with it. The lease is
+    // taken for 30m and expired by hand below (updateLease may move an expiry earlier), so no wall clock decides the test.
+    assert.equal((await f.run(['lease', 'emulator', '--for', '30m', '--why', 'short', '--id', SHORT])).code, 0);
     assert.equal((await f.run(['lease', 'emulator', '--for', '30m', '--why', 'tied', '--id', TIED, '--pid', String(holder.pid)])).code, 0);
     assert.equal((await f.run(['lease', 'emulator', '--for', '30m', '--why', 'orphan', '--id', GONE])).code, 0);
     holder.kill('SIGKILL');
     await waitFor(() => gone(holder.pid));
     releaseLease('emulator-3', GONE, { env: f.env });   // its record stays: an orphan
-    await settle(Math.max(0, Date.parse(f.owner('emulator-1').expires_at) - Date.now()) + 100);
+    assert.equal(updateLease('emulator-1', SHORT, { expires_at: new Date(Date.now() - 1000).toISOString() }, { env: f.env }), true, 'the first lease now reads as expired');
     const eventsBefore = logged(f).length;
     const before = snapshot(join(f.root, 'locks'), join(f.root, 'events'));
     assert.ok(Object.keys(before).some(path => path.endsWith(`${SHORT}.json`)), 'the dead leases have records');
