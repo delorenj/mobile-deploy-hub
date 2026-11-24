@@ -155,9 +155,9 @@ test('a testflight block is parsed strictly: groups are plain unique names, the 
 
 // ---------------------------------------------------------------------------------------------------- MOBI-33 (AD-11)
 
-test('the queue block is strict: the margin and one allowance per waiting job, nothing else, every value a whole number of minutes', () => {
+test('the queue block is strict: the margin and one allowance per waiting job, nothing else, every value a positive whole number', () => {
   const base = JSON.parse(source);
-  assert.deepEqual(base.queue, { wait_margin_min: 2, hold_allowance_min: { plan: 5, android: 15, ios: 60 }, grace_min: 10, reservation_ceiling_min: 180, deploy_target_lease_max_min: 60, catchup_attempt_s: 5, catchup_pending_wait_min: 30 });
+  assert.deepEqual(base.queue, { wait_margin_min: 2, hold_allowance_min: { plan: 5, android: 15, ios: 60 }, grace_min: 10, reservation_ceiling_min: 180, deploy_target_lease_max_min: 60, catchup_attempt_s: 5, catchup_pending_wait_min: 30, eta_window_days: 30, eta_low_data_min_holds: 20 });
   assert.deepEqual(loadPolicy().policy.queue, base.queue);
   assert.deepEqual([...queueJobs], ['plan', 'android', 'ios']);
   const bad = {
@@ -199,6 +199,16 @@ test('the queue block is strict: the margin and one allowance per waiting job, n
     'a catch-up pending wait of zero': p => { p.queue.catchup_pending_wait_min = 0; },
     'a fractional catch-up pending wait': p => { p.queue.catchup_pending_wait_min = 0.5; },
     'a catch-up pending wait as text': p => { p.queue.catchup_pending_wait_min = '30'; },
+    'no ETA window (Story 4.1)': p => { delete p.queue.eta_window_days; },
+    'an ETA window of zero': p => { p.queue.eta_window_days = 0; },
+    'a negative ETA window': p => { p.queue.eta_window_days = -30; },
+    'a fractional ETA window': p => { p.queue.eta_window_days = 0.5; },
+    'an ETA window as text': p => { p.queue.eta_window_days = '30'; },
+    'no ETA low-data threshold (Story 4.1)': p => { delete p.queue.eta_low_data_min_holds; },
+    'an ETA low-data threshold of zero': p => { p.queue.eta_low_data_min_holds = 0; },
+    'a negative ETA low-data threshold': p => { p.queue.eta_low_data_min_holds = -20; },
+    'a fractional ETA low-data threshold': p => { p.queue.eta_low_data_min_holds = 2.5; },
+    'an ETA low-data threshold as text': p => { p.queue.eta_low_data_min_holds = '20'; },
   };
   for (const [name, change] of Object.entries(bad)) {
     const copy = structuredClone(base);
@@ -213,5 +223,7 @@ test('the queue block is strict: the margin and one allowance per waiting job, n
   copy.queue.deploy_target_lease_max_min = 30;
   copy.queue.catchup_attempt_s = 8;
   copy.queue.catchup_pending_wait_min = 20;
+  copy.queue.eta_window_days = 14;
+  copy.queue.eta_low_data_min_holds = 10;
   assert.doesNotThrow(() => parsePolicy(JSON.stringify(copy)), 'a tuning change is a valid release, not a parse error');
 });
