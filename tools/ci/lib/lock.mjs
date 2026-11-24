@@ -142,7 +142,7 @@ const VANISHED_RETRIES = 3;
 // the owner that was judged means the lock changed hands after the judgement; it is put back. Only the winner deletes
 // its tomb and, when `as` names an event and the name is Queued, appends it. True for the winner. beforeRetire is a test
 // seam, called with 'rename' before the rename and 'restore' before a put-back.
-function retire(name, path, judged, { as = null, reason = null, env = process.env, now = Date.now, log = console.error, hostId, beforeRetire = () => {} } = {}) {
+function retire(name, path, judged, { as = null, reason = null, fields = {}, env = process.env, now = Date.now, log = console.error, hostId, beforeRetire = () => {} } = {}) {
   if (!sameOwner(readOwner(path), judged)) return false;
   beforeRetire('rename');
   const at = now();
@@ -175,7 +175,7 @@ function retire(name, path, judged, { as = null, reason = null, env = process.en
   try { rmSync(tomb, { recursive: true }); } catch { /* a tomb never blocks the name */ }
   if (as) {
     const lastAlive = job && alive !== null ? { last_alive_at: iso(alive), approx: true } : {};
-    note(name, eventOf(as, name, judged, { held_ms: heldMs(judged, at), reason, ...lastAlive }), { env, at, hostId });
+    note(name, eventOf(as, name, judged, { held_ms: heldMs(judged, at), reason, ...lastAlive, ...fields }), { env, at, hostId });
   }
   return true;
 }
@@ -185,6 +185,21 @@ function retire(name, path, judged, { as = null, reason = null, env = process.en
 // ticket and no event. Either way a wait that runs out throws code HUB_LOCK_TIMEOUT with a message that starts
 // `host lock <name> is held` (AD-5), so a catch-up from before this change still reads it.
 export const JOB_POLL_MS = 2000;
+
+// The delivery a Queued hold is for (AD-15, Story 3.3): null, or exactly {repo, run, version}. It goes onto the caller's ticket and
+// onto every event that waiter or holder writes, and only when the caller gave one.
+export function checkDelivery(delivery) {
+  if (delivery === null || delivery === undefined) return null;
+  const plain = delivery !== null && typeof delivery === 'object' && !Array.isArray(delivery) && Object.getPrototypeOf(delivery) === Object.prototype;
+  const keys = plain ? Object.keys(delivery).sort().join(',') : '';
+  if (!plain || keys !== 'repo,run,version'
+    || typeof delivery.repo !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(delivery.repo)
+    || typeof delivery.run !== 'string' || !/^\d{1,20}$/.test(delivery.run)
+    || typeof delivery.version !== 'string' || !/^[0-9A-Za-z.+-]{1,40}$/.test(delivery.version)) {
+    throw new Error(`bad delivery ${JSON.stringify(delivery)} (null, or {repo: "owner/name", run: digits, version})`);
+  }
+  return delivery;
+}
 
 export async function withLock(name, fn, {
   env = process.env,
@@ -206,11 +221,13 @@ export async function withLock(name, fn, {
   endsReservation = false,
   yieldToLease = false,
   timeoutReason = 'deadline',
+  delivery = null,
 } = {}) {
   if (!/^[a-z0-9-]+$/.test(name)) throw new Error(`bad lock name "${name}"`);
   if (typeof timeoutReason !== 'string' || !/^[a-z][a-z0-9-]{0,39}$/.test(timeoutReason)) throw new Error(`bad timeout reason "${timeoutReason}"`);
+  checkDelivery(delivery);
   if (kind !== 'job' && kind !== 'hub-job') throw new Error(`bad lock holder kind "${kind}" (job or hub-job)`);
-  if (isQueued(name)) return queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams, endsReservation, yieldToLease, timeoutReason });
+  if (isQueued(name)) return queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams, endsReservation, yieldToLease, timeoutReason, delivery });
   const dir = lockDir(env);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${name}.lock`);
@@ -258,7 +275,7 @@ function jobIdentity({ env, host, hostId, kind }) {
 }
 
 // Runs fn under a lock this process just took (`mine` is its owner record), then gives it back with a `release` event.
-async function runHeld(name, path, mine, fn, { env, now, log, hostId, timers, endsReservation = false }) {
+async function runHeld(name, path, mine, fn, { env, now, log, hostId, timers, endsReservation = false, fields = {} }) {
   log(`HUB_LOCK ${name}`);
   // The liveness touch (AD-19): the only in-process interval, unref'd so it never keeps a process alive. It touches only
   // while owner.json is still this take, so a lock that changed hands is never touched by its old holder.
@@ -299,7 +316,7 @@ async function runHeld(name, path, mine, fn, { env, now, log, hostId, timers, en
       } catch { /* the ceiling ends it */ }
     }
     const owner = readOwner(path);
-    if (owner?.pid === mine.pid && !isLease(owner)) retire(name, path, owner, { as: 'release', reason: failed ? 'error' : 'done', env, now, log, hostId });
+    if (owner?.pid === mine.pid && !isLease(owner)) retire(name, path, owner, { as: 'release', reason: failed ? 'error' : 'done', fields, env, now, log, hostId });
   }
 }
 
@@ -853,7 +870,8 @@ export function poolRequest(pool, { id = newLeaseId(), holder, why, forMs = null
 // `timeoutMs` of 0 or less is a try: no ticket, no event unless it acquires. Events (AD-9) follow acquireLease's: `request` once
 // the ticket is in place, `acquire` once the ticket is claimed, and `timeout` or `cancel` once this waiter's own unlink of its
 // ticket succeeds. A wait that runs out throws HUB_LOCK_TIMEOUT, wording `host lock <name> is held ...` as before.
-async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams, endsReservation, yieldToLease, timeoutReason }) {
+async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams, endsReservation, yieldToLease, timeoutReason, delivery }) {
+  const tag = delivery ? { delivery } : {};
   const dir = lockDir(env);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${name}.lock`);
@@ -875,17 +893,17 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
   let ticketFile = null;
   let selfText = 'this job';
   if (!tryOnly) {
-    const body = buildTicket(kind, { env, requested, deadline, host, hostId, processStart: startOf, reservation: reserved?.key ?? null });
+    const body = buildTicket(kind, { env, requested, deadline, host, hostId, processStart: startOf, reservation: reserved?.key ?? null, delivery: delivery ?? null });
     selfText = `${kind === 'hub-job' ? 'catch-up' : 'job'} ${body.lease_id}`;
     ({ file: ticket, path: ticketFile } = writeTicket(name, body, { env, requested: reserved ? Math.min(requested, reserved.reserved_ms) : requested }));
-    note(name, eventOf('request', name, asked, { deadline_at: iso(deadline), ...(reserved ? { reservation: reserved.key } : {}) }), { ...seams, at: requested });
+    note(name, eventOf('request', name, asked, { deadline_at: iso(deadline), ...(reserved ? { reservation: reserved.key } : {}), ...tag }), { ...seams, at: requested });
   }
   let left = false;
   const leave = (as, fields) => {
     try { unlinkSync(ticketFile); } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
     left = true;
     const at = now();
-    note(name, eventOf(as, name, asked, { deadline_at: iso(deadline), waited_ms: Math.max(0, at - requested), ...fields }), { ...seams, at });
+    note(name, eventOf(as, name, asked, { deadline_at: iso(deadline), waited_ms: Math.max(0, at - requested), ...tag, ...fields }), { ...seams, at });
     return true;
   };
   const cancelled = text => failure('HUB_LEASE_CANCELLED', `${selfText} ${text} ${name}`);
@@ -948,7 +966,7 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
             }
           }
           left = true;
-          note(name, eventOf('acquire', name, record, { deadline_at: iso(deadline), waited_ms: Math.max(0, started - requested) }), { ...seams, at: started });
+          note(name, eventOf('acquire', name, record, { deadline_at: iso(deadline), waited_ms: Math.max(0, started - requested), ...tag }), { ...seams, at: started });
           mine = record;
           failed = false;
           break;
@@ -984,7 +1002,7 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
       rmSync(ticketFile, { force: true });
     }
   }
-  return runHeld(name, path, mine, fn, { env, now, log, hostId, timers, endsReservation });
+  return runHeld(name, path, mine, fn, { env, now, log, hostId, timers, endsReservation, fields: tag });
 }
 
 // Takes the lock as a lease and returns the record. Waiters are served first in, first out, through queueView: a waiter

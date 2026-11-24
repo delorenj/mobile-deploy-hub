@@ -567,3 +567,36 @@ test('timeoutReason names a wait\'s timeout event, and the HUB_LOCK_TIMEOUT erro
     assert.deepEqual(holdsOf(null), []);
   } finally { f.cleanup(); }
 });
+
+// Story 3.3 (AD-15): any Queued waiter can say which delivery its hold is for. It goes onto the ticket and onto every event that
+// waiter or holder writes, and only when given.
+test('a delivery goes onto the ticket and the request, acquire, timeout and release events; without one no event carries the key', async () => {
+  const f = fixture();
+  try {
+    const delivery = { repo: 'delorenj/example', run: '5', version: '1.2.3' };
+    // A free lock: request, acquire, release, all tagged.
+    await withLock('adb', async () => {}, { env: f.runEnv(5, 'android'), log: f.log, pollMs: 5, timeoutMs: 1000, timers: fakeTimers(), delivery });
+    assert.deepEqual(events(f).map(event => [event.event, event.delivery]), [['request', delivery], ['acquire', delivery], ['release', delivery]]);
+    // A held lock: the ticket file carries it while waiting, and the timeout event carries it.
+    await acquireLease('adb', { holder: 'agent-a', why: 'proof', forMs: 30 * MIN, id: 'holder', env: f.plain, log: f.log });
+    const waiting = withLock('adb', async () => assert.fail('must not take the lock'), { env: f.runEnv(5, 'android'), log: f.log, pollMs: 5, timeoutMs: 400, timers: fakeTimers(), delivery, timeoutReason: 'catchup-idle' })
+      .then(() => null, error => error);
+    await until(() => queueView('adb', { env: f.plain }).length === 1, 'the waiter has a ticket');
+    const dir = join(f.root, 'locks/adb.queue');
+    assert.deepEqual(readdirSync(dir).map(file => JSON.parse(readFileSync(join(dir, file), 'utf8')).delivery), [delivery]);
+    assert.equal((await waiting).code, 'HUB_LOCK_TIMEOUT');
+    const timeout = events(f).filter(event => event.event === 'timeout').at(-1);
+    assert.deepEqual([timeout.reason, timeout.delivery], ['catchup-idle', delivery]);
+    // Without a delivery: no key at all on any event, and a null on the ticket.
+    releaseLease('adb', 'holder', { env: f.plain });
+    const before = events(f).length;
+    await withLock('adb', async () => {}, { env: f.runEnv(6, 'android'), log: f.log, pollMs: 5, timeoutMs: 1000, timers: fakeTimers() });
+    const plain = events(f).slice(before);
+    assert.deepEqual(plain.map(event => event.event), ['request', 'acquire', 'release']);
+    assert.ok(plain.every(event => !('delivery' in event)), 'no delivery key without one');
+    // A bad delivery is refused up front, for every shape that is not exactly {repo, run, version}.
+    for (const bad of [{}, { repo: 'x', run: '5', version: '1.0.0' }, { ...delivery, run: 5 }, { ...delivery, version: 'bad version' }, { ...delivery, extra: 1 }, 'x', []]) {
+      await assert.rejects(withLock('adb', async () => {}, { env: f.env, log: f.log, delivery: bad }), /bad delivery/);
+    }
+  } finally { f.cleanup(); }
+});
