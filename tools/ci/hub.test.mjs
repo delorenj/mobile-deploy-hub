@@ -494,8 +494,9 @@ test('the reusable workflow is hardened: no hosted runners, no shell interpolati
   const jobs = [...workflow.matchAll(/^ {2}([\w-]+):\n/gm)].map(match => match[1]).filter(name => !['workflow_call'].includes(name));
   assert.deepEqual(jobs.slice(-9), ['gate', 'preflight-ios', 'plan', 'android', 'ios-export', 'ios', 'deliver-android', 'deliver-ios', 'announce']);
   const groups = [...workflow.matchAll(/^\s+group: (mobile-deploy-[\w-]+)-\$\{\{ github\.repository \}\}$/gm)].map(match => match[1]);
-  assert.deepEqual(groups, ['mobile-deploy-plan', 'mobile-deploy-android', 'mobile-deploy-ios-export', 'mobile-deploy-ios', 'mobile-deploy-deliver-android', 'mobile-deploy-deliver-ios']);
-  assert.equal([...workflow.matchAll(/cancel-in-progress: false/g)].length, 6);
+  // AD-21: android and ios lost their groups; the device Queue orders them, and a group would drop a pending run it would have served.
+  assert.deepEqual(groups, ['mobile-deploy-plan', 'mobile-deploy-ios-export', 'mobile-deploy-deliver-android', 'mobile-deploy-deliver-ios']);
+  assert.equal([...workflow.matchAll(/cancel-in-progress: false/g)].length, 4);
   // runs-on is the policy's self-hosted labels, never a caller input: a caller cannot put a job on a hosted runner.
   assert.doesNotMatch(workflow, /runs-on: \$\{\{/, 'runs-on takes no expression');
   const labels = [...workflow.matchAll(/runs-on: \[([^\]]+)\]/g)].map(match => match[1]);

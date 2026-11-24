@@ -159,7 +159,7 @@ export const editionPinOf = (app, name) => app?.android?.editions?.[name] ?? nul
 export function parsePolicy(source) {
   let policy;
   try { policy = JSON.parse(source); } catch (error) { fail(`not valid JSON (${error.message})`); }
-  exact('policy', policy, ['schema', 'bump', 'event', 'manifest_schema', 'apps', 'callers', 'runners', 'devices', 'delivery', 'mac', 'catch_up'], ['completion', 'shared_bundle_allowlist']);
+  exact('policy', policy, ['schema', 'bump', 'event', 'manifest_schema', 'apps', 'callers', 'runners', 'devices', 'delivery', 'mac', 'catch_up', 'queue'], ['completion', 'shared_bundle_allowlist']);
   if (policy.schema !== 1) fail('schema must be 1');
 
   exact('bump', policy.bump, ['levels', 'default']);
@@ -259,6 +259,8 @@ export function parsePolicy(source) {
   positive('catch_up.ios_every_s', policy.catch_up.ios_every_s);
   positive('catch_up.max_failures', policy.catch_up.max_failures);
 
+  queueBlock(policy.queue);
+
   // What "shipped" means, for every app at once (TOWE-76): the required targets, what the gate does when a required
   // lane cannot run, and how many same-version reruns `ship` may do on its own. No per-app switch exists on purpose:
   // an app is a TestFlight app because its manifest declares ios.store, never because the policy names it.
@@ -274,6 +276,18 @@ export function parsePolicy(source) {
   if (!laneUnavailable.includes(policy.completion.lane_unavailable)) fail(`completion.lane_unavailable must be one of ${laneUnavailable.join(', ')}`);
   if (!Number.isSafeInteger(policy.completion.reruns) || policy.completion.reruns < 0 || policy.completion.reruns > maxReruns) fail(`completion.reruns must be a whole number from 0 to ${maxReruns}`);
   return policy;
+}
+
+// The Queue's tuning (AD-11), one strict block that each Queue story grows by its own keys and no others. Story 2.4 adds the wait
+// deadline's two inputs: the margin that keeps a waiting job's own report ahead of GitHub's `timeout-minutes` kill, and the
+// minutes each job that waits for a device still needs once it has the device (ios takes `mac-ios` up to twice). Every value is
+// a positive whole number of minutes; the allowance names exactly the jobs that wait (plan, android, ios).
+export const queueJobs = Object.freeze(['plan', 'android', 'ios']);
+function queueBlock(queue) {
+  exact('queue', queue, ['wait_margin_min', 'hold_allowance_min']);
+  positive('queue.wait_margin_min', queue.wait_margin_min);
+  exact('queue.hold_allowance_min', queue.hold_allowance_min, queueJobs);
+  for (const job of queueJobs) positive(`queue.hold_allowance_min.${job}`, queue.hold_allowance_min[job]);
 }
 
 export const completionDevices = Object.freeze(['lanes', 'never']);

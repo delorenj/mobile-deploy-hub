@@ -16,6 +16,8 @@ import { homedir, hostname } from 'node:os';
 import { join } from 'node:path';
 import { appendEvent, hostId as machineId } from './events.mjs';
 import { pause, sleep as realSleep } from './pause.mjs';
+import { jobDeadline, jobTimeoutMs } from './deadline.mjs';
+import { loadPolicy } from './policy.mjs';
 
 export const lockDir = (env = process.env, home = homedir()) => env.HUB_LOCK_DIR || join(home, '.cache/mobile-deploy-hub/locks');
 
@@ -186,10 +188,12 @@ export async function withLock(name, fn, {
   beforeRetire,
   afterTake = () => {},
   processStart: startOf = processStart,
+  policy = null,
+  deadlineSeams = {},
 } = {}) {
   if (!/^[a-z0-9-]+$/.test(name)) throw new Error(`bad lock name "${name}"`);
   if (kind !== 'job' && kind !== 'hub-job') throw new Error(`bad lock holder kind "${kind}" (job or hub-job)`);
-  if (isQueued(name)) return queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf });
+  if (isQueued(name)) return queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams });
   const dir = lockDir(env);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${name}.lock`);
@@ -514,7 +518,7 @@ export function poolRequest(pool, { id = newLeaseId(), holder, why, forMs = null
 // `timeoutMs` of 0 or less is a try: no ticket, no event unless it acquires. Events (AD-9) follow acquireLease's: `request` once
 // the ticket is in place, `acquire` once the ticket is claimed, and `timeout` or `cancel` once this waiter's own unlink of its
 // ticket succeeds. A wait that runs out throws HUB_LOCK_TIMEOUT, wording `host lock <name> is held ...` as before.
-async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf }) {
+async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, sleep, now, kind, hostId, host, timers, beforeRetire, afterTake, startOf, policy, deadlineSeams }) {
   const dir = lockDir(env);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${name}.lock`);
@@ -522,8 +526,12 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
   const asked = { ...me, ...more };
   const seams = { env, hostId };
   const requested = now();
-  const deadline = requested + timeoutMs;
   const tryOnly = !(timeoutMs > 0);
+  // A deploy job's wait ends before GitHub's `timeout-minutes` would kill it (AD-12, Story 2.4): the job's deadline, from the
+  // policy's queue block and HUB_JOB_TIMEOUT_MINUTES, when it comes sooner than the caller's own timeout. The ticket carries it.
+  const limit = kind === 'job' && !tryOnly && jobTimeoutMs(env) !== null ? jobDeadline({ env, policy: policy ?? loadPolicy().policy, now, ...deadlineSeams }) : null;
+  const capped = limit !== null && limit.at < requested + timeoutMs ? limit : null;
+  const deadline = capped ? Math.max(requested, capped.at) : requested + timeoutMs;
   const start = cachedStart(startOf, now);
   let ticket = null;
   let ticketFile = null;
@@ -549,7 +557,10 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
     return failure('HUB_LOCK_TIMEOUT', message);
   };
   const view = () => queueView(name, { env, prune: true, now, host, hostId, processStart: start });
-  const gaveUp = `gave up after ${Math.round(timeoutMs / 60_000)} min. Another deploy is using the device; run again when it finishes.`;
+  const gaveUp = capped
+    ? `gave up after ${Math.round((deadline - requested) / 60_000)} min, ahead of this job's ${Math.round(capped.timeout_ms / 60_000)}-minute timeout. Another deploy is using the device; run again when it finishes.`
+    : `gave up after ${Math.round(timeoutMs / 60_000)} min. Another deploy is using the device; run again when it finishes.`;
+  if (capped) log(`HUB_LOCK_DEADLINE ${name} wait ends ${iso(deadline)} (job timeout ${Math.round(capped.timeout_ms / 60_000)} min, margin ${Math.round(capped.margin_ms / 60_000)} min, later holds ${Math.round(capped.allowance_ms / 60_000)} min)`);
   let waiting = false;
   let vanished = 0;
   let failed = true;

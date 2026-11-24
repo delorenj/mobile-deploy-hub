@@ -80,6 +80,12 @@ What it pins: bump levels (patch by default, never "none"), one Bloodbank event 
 
 If adopted in a separate policy release, `required.devices: lanes` would require each lane's device; `required.testflight: store` would require TestFlight for every `ios.store` app; `lane_unavailable: refuse` would stop a real run before its bump if the required Mac lane cannot run; and `reruns: 1` would permit one automatic same-version rerun in ship. Until that separate release, absent `completion` means `devices: never`, `testflight: never`, `lane_unavailable: skip`, `reruns: 0`; the caller's TestFlight input remains opt-in. The parser and tests support both contracts, but the release-notes change does not activate the stricter one.
 
+### Queue tuning (`queue` block)
+
+One strict block that each Queue story grows by its own keys only (an unknown or missing key refuses the policy). Callers never pass these and no env or input overrides them; a writer stamps what governs others into its record (`deadline_at`), and changing a value is a hub release.
+
+- **`wait_margin_min`** (2) and **`hold_allowance_min`** (`plan`, `android`, `ios`; whole minutes): a deploy job that waits for a device in the Queue stops waiting at `job_start + timeout - margin - allowance`, so it can report its own reason before GitHub kills it at `timeout-minutes` (a killed job ends `cancelled`: no `finally`, no `deliver-*`). The allowance covers every hold the job still has to take; `ios` takes `mac-ios` up to twice. `timeout` is `HUB_JOB_TIMEOUT_MINUTES`, set in `mobile-deploy.yml` beside each of those jobs' `timeout-minutes` (a test keeps the two equal), and `job_start` is the start of the nearest `Runner.Worker` ancestor, else the tool's own start. A job with no allowance (`deliver-*`), a catch-up and a person at a shell keep their caller's timeout. The wait's ticket and events carry the deadline as `deadline_at`, and its timeout reads `gave up after N min, ahead of this job's M-minute timeout`.
+
 ### TestFlight groups, the iOS version train and the 90-day clock
 
 An app that ships to TestFlight (its manifest declares `ios.store`) may carry one more block in its `apps.<repo>` entry. Without it nothing changes for the app: Owner Testing, and the iOS marketing version is the deploy's own.

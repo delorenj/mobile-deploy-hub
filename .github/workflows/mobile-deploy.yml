@@ -194,6 +194,9 @@ jobs:
     if: ${{ !cancelled() && needs.gate.result == 'success' && (needs.preflight-ios.result == 'success' || needs.preflight-ios.result == 'skipped') }}
     runs-on: [self-hosted, Linux]
     timeout-minutes: 20
+    # Keep equal to timeout-minutes (a test checks): the wait deadline ends a Queue wait before GitHub kills the job (AD-12).
+    env:
+      HUB_JOB_TIMEOUT_MINUTES: '20'
     concurrency:
       group: mobile-deploy-plan-${{ github.repository }}
       cancel-in-progress: false
@@ -256,9 +259,10 @@ jobs:
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run_android == 'true' }}
     runs-on: [self-hosted, Linux]
     timeout-minutes: 45
-    concurrency:
-      group: mobile-deploy-android-${{ github.repository }}
-      cancel-in-progress: false
+    # Keep equal to timeout-minutes (a test checks). No concurrency group: the device Queue orders runs, and a group would
+    # drop all but one pending run of a repo before the Queue could serve it (AD-21).
+    env:
+      HUB_JOB_TIMEOUT_MINUTES: '45'
     permissions:
       contents: write
       id-token: write
@@ -375,9 +379,9 @@ jobs:
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run_ios == 'true' && (needs.ios-export.result == 'success' || needs.ios-export.result == 'skipped') }}
     runs-on: [self-hosted, macOS]
     timeout-minutes: 120
-    concurrency:
-      group: mobile-deploy-ios-${{ github.repository }}
-      cancel-in-progress: false
+    # Keep equal to timeout-minutes (a test checks). No concurrency group (AD-21), as on android.
+    env:
+      HUB_JOB_TIMEOUT_MINUTES: '120'
     permissions:
       contents: read
       actions: read

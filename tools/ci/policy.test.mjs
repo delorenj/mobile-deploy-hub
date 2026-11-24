@@ -3,7 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { defaultGroups, iosVersionOf, loadPolicy, maxReruns, parsePolicy, policyFile, requiredTargets, testflightPolicyOf } from './lib/policy.mjs';
+import { defaultGroups, iosVersionOf, loadPolicy, maxReruns, parsePolicy, policyFile, queueJobs, requiredTargets, testflightPolicyOf } from './lib/policy.mjs';
 
 const source = readFileSync(policyFile, 'utf8');
 
@@ -151,4 +151,41 @@ test('a testflight block is parsed strictly: groups are plain unique names, the 
     change(copy);
     assert.throws(() => parsePolicy(JSON.stringify(copy)), /policy\.json: /, name);
   }
+});
+
+// ---------------------------------------------------------------------------------------------------- MOBI-33 (AD-11)
+
+test('the queue block is strict: the margin and one allowance per waiting job, nothing else, every value a whole number of minutes', () => {
+  const base = JSON.parse(source);
+  assert.deepEqual(base.queue, { wait_margin_min: 2, hold_allowance_min: { plan: 5, android: 15, ios: 60 } });
+  assert.deepEqual(loadPolicy().policy.queue, base.queue);
+  assert.deepEqual([...queueJobs], ['plan', 'android', 'ios']);
+  const bad = {
+    'no queue block': p => { delete p.queue; },
+    'queue is not an object': p => { p.queue = 2; },
+    'an unknown queue key (a later story adds its own key and its own test)': p => { p.queue.reservation_grace_min = 10; },
+    'no margin': p => { delete p.queue.wait_margin_min; },
+    'margin zero': p => { p.queue.wait_margin_min = 0; },
+    'margin fractional': p => { p.queue.wait_margin_min = 1.5; },
+    'margin as text': p => { p.queue.wait_margin_min = '2'; },
+    'no allowances': p => { delete p.queue.hold_allowance_min; },
+    'allowances is a list': p => { p.queue.hold_allowance_min = [5, 15, 60]; },
+    'an allowance for a job that does not wait': p => { p.queue.hold_allowance_min['deliver-android'] = 5; },
+    'plan allowance missing': p => { delete p.queue.hold_allowance_min.plan; },
+    'android allowance missing': p => { delete p.queue.hold_allowance_min.android; },
+    'ios allowance missing': p => { delete p.queue.hold_allowance_min.ios; },
+    'an allowance of zero': p => { p.queue.hold_allowance_min.ios = 0; },
+    'a negative allowance': p => { p.queue.hold_allowance_min.android = -5; },
+    'a fractional allowance': p => { p.queue.hold_allowance_min.plan = 4.5; },
+    'an allowance as text': p => { p.queue.hold_allowance_min.plan = '5'; },
+  };
+  for (const [name, change] of Object.entries(bad)) {
+    const copy = structuredClone(base);
+    change(copy);
+    assert.throws(() => parsePolicy(JSON.stringify(copy)), /policy\.json: /, name);
+  }
+  const copy = structuredClone(base);
+  copy.queue.wait_margin_min = 3;
+  copy.queue.hold_allowance_min.ios = 90;
+  assert.doesNotThrow(() => parsePolicy(JSON.stringify(copy)), 'a tuning change is a valid release, not a parse error');
 });
