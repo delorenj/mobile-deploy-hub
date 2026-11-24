@@ -714,7 +714,7 @@ async function laneHost(f) {
     JAVA_HOME: join(f.root, 'java'),
     HUB_ADB: join(bin, 'adb'),
     HUB_BB_EMIT: join(bin, 'bb-emit'),
-    HUB_LOCK_DIR: join(f.root, 'locks'),
+    HUB_LOCK_DIR: join(f.root, 'locks'), HUB_EVENT_DIR: join(f.root, 'events'),
     HUB_ADB_WAIT_MS: '2000',
     HUB_ADB_LANE_WAIT_MS: '2000',
     GITHUB_OUTPUT: output,

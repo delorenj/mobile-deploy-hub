@@ -243,7 +243,7 @@ async function appHost({ manifest = twoEditions() } = {}) {
   const remote = args => git(root, ['--git-dir', origin, ...args], baseEnv).trim();
   const env = {
     ...baseEnv, PATH: `${bin}:${baseEnv.PATH}`, ANDROID_HOME: sdk, JAVA_HOME: join(root, 'java'), HUB_ADB: join(bin, 'adb'), HUB_BB_EMIT: join(bin, 'bb-emit'),
-    HUB_LOCK_DIR: join(root, 'locks'), HUB_ADB_WAIT_MS: '2000', HUB_ADB_LANE_WAIT_MS: '2000', GITHUB_OUTPUT: output,
+    HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events'), HUB_ADB_WAIT_MS: '2000', HUB_ADB_LANE_WAIT_MS: '2000', GITHUB_OUTPUT: output,
     GITHUB_REPOSITORY: 'delorenj/example-app', GITHUB_RUN_ID: '777', GITHUB_RUN_ATTEMPT: '1', GITHUB_REF: 'refs/heads/main', GITHUB_SHA: remote(['rev-parse', 'main']),
   };
   const configure = (command, extra = []) => ({ ...parseConfig([command, '--manifest', 'mobile-deploy.json', '--out', out, ...extra], env), cwd: app });
@@ -359,7 +359,7 @@ async function deliverHost({ policyPublic = true, manifestPublic = true, betaByt
     // The android lane's own receipt names every edition it built (android.mjs), private ones included.
     editions: [{ edition: 'beta', package: 'io.example.beta', staged: { name: 'example-app-beta-0.2.2-5.apk', bytes: betaBytes.length, sha256: sha(betaBytes) }, public: manifestPublic }] }));
   if (betaReceipt) await writeFile(join(receipts, 'hub-receipt-android-edition-beta.json'), JSON.stringify({ lane: 'android-edition-beta', outcome: 'success', version: '0.2.2', edition: { name: 'beta', package: 'io.example.beta', device: false, public: manifestPublic }, staged: { name: 'example-app-beta-0.2.2-5.apk', bytes: betaBytes.length, sha256: sha(betaBytes) } }));
-  const env = { PATH: process.env.PATH, ANDROID_HOME: sdk, JAVA_HOME: join(root, 'java'), GITHUB_REPOSITORY: 'delorenj/example-app', GITHUB_RUN_ID: '777', GITHUB_RUN_ATTEMPT: '1', HUB_REF: 'local', HUB_LOCK_DIR: join(root, 'locks'), HUB_NEEDS: JSON.stringify({ plan: { result: 'success' }, android: { result: deviceOutcome } }) };
+  const env = { PATH: process.env.PATH, ANDROID_HOME: sdk, JAVA_HOME: join(root, 'java'), GITHUB_REPOSITORY: 'delorenj/example-app', GITHUB_RUN_ID: '777', GITHUB_RUN_ATTEMPT: '1', HUB_REF: 'local', HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events'), HUB_NEEDS: JSON.stringify({ plan: { result: 'success' }, android: { result: deviceOutcome } }) };
   const configure = (extra = []) => ({ ...parseConfig(['deliver', '--scope', 'android', '--manifest', 'mobile-deploy.json', '--out', out, '--version', '0.2.2', '--android-code', '5', '--build-sha', 'b'.repeat(40), ...extra], env), cwd: app });
   const writes = [];
   const s3 = { putText(text, key) { writes.push({ op: 'put', key, text }); }, put(file, key) { writes.push({ op: 'put', key, file }); }, remove(key) { writes.push({ op: 'rm', key }); }, list() { return []; } };

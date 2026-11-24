@@ -64,7 +64,7 @@ if (path === ${JSON.stringify(runPath)}) process.stdout.write(readFileSync(dir +
 else if (path === ${JSON.stringify(runPath + '/attempts/1/jobs?per_page=100&page=1')}) process.stdout.write(readFileSync(dir + '/jobs.json'));
 else process.exit(42);
 `, { mode: 0o700 });
-  const env = { ...base, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, HOME: dir, GH_CONFIG_DIR: join(dir, 'no-saved-login'), GH_TOKEN: mode === 'absent' ? '' : marker, TMPDIR: tmpdir(), HUB_LOCK_DIR: join(dir, 'locks') };
+  const env = { ...base, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, HOME: dir, GH_CONFIG_DIR: join(dir, 'no-saved-login'), GH_TOKEN: mode === 'absent' ? '' : marker, TMPDIR: tmpdir(), HUB_LOCK_DIR: join(dir, 'locks'), HUB_EVENT_DIR: join(dir, 'events') };
   const config = { testflight: true, dryRun: false, out: join(dir, 'out'), cwd: dir };
   const requests = () => existsSync(join(dir, 'requests.jsonl')) ? readFileSync(join(dir, 'requests.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) : [];
   return { dir, file, env, config, requests };

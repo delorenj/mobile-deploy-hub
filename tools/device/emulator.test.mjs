@@ -122,7 +122,7 @@ function fixture({ image = 'google_apis' } = {}) {
     chmodSync(join(bin, name), 0o755);
   }
   const env = {
-    PATH: process.env.PATH, HOME: join(root, 'home'), USER: 'tester', DISPLAY: ':0', WAYLAND_DISPLAY: 'wayland-0', HUB_LOCK_DIR: join(root, 'locks'), ANDROID_HOME: sdk, ANDROID_AVD_HOME: userAvd,
+    PATH: process.env.PATH, HOME: join(root, 'home'), USER: 'tester', DISPLAY: ':0', WAYLAND_DISPLAY: 'wayland-0', HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events'), ANDROID_HOME: sdk, ANDROID_AVD_HOME: userAvd,
     HUB_ADB: join(bin, 'adb'), HUB_EMULATOR: join(bin, 'emulator'), HUB_AVDMANAGER: join(bin, 'avdmanager'),
     HUB_DEVICE_POLL_MS: '5', HUB_EMULATOR_POLL_MS: '20', HUB_EMULATOR_KILL_GRACE_MS: '400', HUB_EMULATOR_ADB_PORTS: '25000-25099',
     HUB_EMULATOR_DIR: join(root, 'emulators'), TMPDIR: join(root, 'tmp'),

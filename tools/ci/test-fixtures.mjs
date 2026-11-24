@@ -1,4 +1,7 @@
 // Shared test fixtures (not a test file: node --test runs only *.test.mjs).
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { deflateRawSync } from 'node:zlib';
 import { apkKey, installUrl, ipaKey, publicUrl } from './lib/latest.mjs';
 
@@ -20,9 +23,19 @@ export const device = (name, model, status, extra = {}) => ({ name, model, statu
 // runner as at a shell: the plan does not refuse the test as a foreign caller (the runner's check.yml), readObject does
 // not ask 1Password for the writer's keys, and receipts do not land in the check job's summary. A test that wants job
 // context sets it on the env it passes, as before. Call once at the top of a test file.
+//
+// The Event Log: lock transitions on Queued names append to HUB_EVENT_DIR, which defaults to the real
+// ~/.local/state. hermetic() points it at a per-process temp dir, so a test that spreads process.env (or a child that
+// inherits it) never writes host history. A test that builds its env from scratch still passes its own HUB_EVENT_DIR.
 const jobVariable = name => /^(GITHUB_|RUNNER_|ACTIONS_|HUB_)/.test(name) || name === 'CI' || name === 'GH_TOKEN';
+let eventScratch = null;
 export function hermetic() {
   for (const name of Object.keys(process.env)) if (jobVariable(name)) delete process.env[name];
+  if (!eventScratch) {
+    eventScratch = mkdtempSync(join(tmpdir(), 'hub-test-events-'));
+    process.on('exit', () => { try { rmSync(eventScratch, { recursive: true, force: true }); } catch { /* temp */ } });
+  }
+  process.env.HUB_EVENT_DIR = eventScratch;
   globalThis.fetch = async input => { throw new Error(`a test reached the network (${typeof input === 'string' ? input : input?.url ?? String(input)}); inject fetchImpl instead`); };
 }
 

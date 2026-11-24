@@ -7,15 +7,18 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { acquireLease, listLocks, listWaiters, releaseLease, updateLease, withLock } from '../ci/lib/lock.mjs';
+import { QUEUED, acquireLease, isQueued, listLocks, listWaiters, releaseLease, updateLease, withLock } from '../ci/lib/lock.mjs';
+import { readEvents } from '../ci/lib/events.mjs';
 import { pause } from '../ci/lib/pause.mjs';
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'hub-lease-'));
-  const env = { HUB_LOCK_DIR: join(root, 'locks'), GITHUB_REPOSITORY: 'delorenj/example', GITHUB_RUN_ID: '9' };
+  const env = { HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events'), GITHUB_REPOSITORY: 'delorenj/example', GITHUB_RUN_ID: '9' };
   const logs = [];
   return { root, env, logs, log: line => logs.push(line), lock: join(root, 'locks/adb.lock'), cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
+const events = f => [...readEvents({ env: f.env })];
+const tombs = f => { try { return readdirSync(join(f.root, 'locks')).filter(entry => entry.includes('.tomb-')); } catch { return []; } };
 const lease = (f, extra = {}) => acquireLease('adb', { holder: 'agent-a', why: 'device proof', forMs: 60_000, env: f.env, log: f.log, pollMs: 5, ...extra });
 const owner = f => JSON.parse(readFileSync(join(f.lock, 'owner.json'), 'utf8'));
 const deadPid = () => { const child = spawnSync(process.execPath, ['-e', '']); return child.pid; };
@@ -216,7 +219,11 @@ test('a release that lands while the lease is being taken wins: the record is ta
     const queue = join(f.root, 'locks/adb.queue');
     await assert.rejects(lease(f, { id: 'racing-2', beforeClaim: () => { for (const file of readdirSync(queue)) rmSync(join(queue, file)); } }), error => error.code === 'HUB_LEASE_CANCELLED');
     assert.ok(!existsSync(f.lock), 'its own record is gone too');
+    assert.deepEqual(events(f).map(event => [event.event, event.lease_id]), [['release', 'racing']], 'the release is recorded once; a give-back is not a release');
+    assert.deepEqual(tombs(f), []);
     assert.equal((await lease(f, { id: 'after' })).lease_id, 'after', 'the lock is free for the next taker');
+    assert.equal(releaseLease('adb', null, { env: f.env }).released, true);
+    assert.deepEqual(events(f).at(-1).reason, 'any', 'a release without an id says so');
   } finally { f.cleanup(); }
 });
 
@@ -254,4 +261,166 @@ test('pause honours an injected sleep and returns at once on abort', async () =>
   const started = Date.now();
   await pause(60_000, { signal: controller.signal });
   assert.ok(Date.now() - started < 100, 'an aborted signal does not wait');
+});
+
+// ---- exactly-once release and reclaim (AD-9, MOBI-25) ----
+
+const lockUrl = new URL('../ci/lib/lock.mjs', import.meta.url).href;
+// Another process acting on the same lock dir, synchronously, from inside a seam: the deterministic interleaving.
+const otherProcess = (f, body) => {
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', `const lock = await import(${JSON.stringify(lockUrl)}); ${body}`], { env: { PATH: process.env.PATH, HUB_LOCK_DIR: f.env.HUB_LOCK_DIR, HUB_EVENT_DIR: f.env.HUB_EVENT_DIR }, encoding: 'utf8' });
+  assert.equal(child.status, 0, child.stderr);
+};
+const staleJob = (f, run = '41') => {
+  mkdirSync(f.lock, { recursive: true });
+  writeFileSync(join(f.lock, 'owner.json'), JSON.stringify({ pid: deadPid(), host: hostname(), repo: 'delorenj/gruvato', run, started_at: new Date(Date.now() - 5000).toISOString() }));
+};
+
+test('the Queued set is adb, s24, mac-ios, the emulator gate and its slots; nothing else', () => {
+  assert.deepEqual([...QUEUED], ['adb', 's24', 'mac-ios', 'emulator']);
+  assert.deepEqual(['adb', 's24', 'mac-ios', 'emulator', 'emulator-0', 'emulator-12'].filter(isQueued).length, 6);
+  assert.deepEqual(['s3-tolt', 's3-index', 'emulator-reaper', 'emulator-x', 's26', 'adbx'].filter(isQueued), []);
+});
+
+test('a release is recorded exactly once, by the holder, and leaves no tomb', async () => {
+  const f = fixture();
+  try {
+    let clock = Date.parse('2026-11-23T10:00:00Z');
+    await lease(f, { id: 'once', now: () => clock });
+    clock += 30_000;
+    assert.equal(releaseLease('adb', 'once', { env: f.env, now: () => clock }).released, true);
+    assert.equal(releaseLease('adb', 'once', { env: f.env, now: () => clock }).reason, 'none');
+    // A job that waits 5 s behind a lease: its held_ms is the hold alone, not the wait.
+    await lease(f, { id: 'blocker', now: () => clock });
+    const sleep = async () => { clock += 5000; releaseLease('adb', 'blocker', { env: f.env, now: () => clock }); };
+    await withLock('adb', async () => { clock += 1000; }, { env: f.env, log: f.log, now: () => clock, sleep, pollMs: 1 });
+    const got = events(f);
+    assert.deepEqual(got.map(event => [event.event, event.lock, event.hold_kind, event.lease_id, event.reason, event.held_ms]), [
+      ['release', 'adb', 'lease', 'once', 'by-id', 30_000],
+      ['release', 'adb', 'lease', 'blocker', 'by-id', 5000],
+      ['release', 'adb', 'job', null, 'done', 1000],
+    ]);
+    assert.deepEqual(got[0].claimant, { holder: 'agent-a', repo: 'delorenj/example', run: '9' });
+    assert.equal(got[0].ts, '2026-11-23T10:00:30.000Z');
+    assert.equal(got[0].format, 1);
+    assert.ok(!existsSync(f.lock));
+    assert.deepEqual(tombs(f), []);
+  } finally { f.cleanup(); }
+});
+
+test('a reclaim is recorded once with why, and an expired lease is held only until its expiry', async () => {
+  const f = fixture();
+  try {
+    let clock = Date.parse('2026-11-23T10:00:00Z');
+    await lease(f, { id: 'old', forMs: 60_000, now: () => clock });
+    clock += 3600_000;
+    await lease(f, { id: 'new', now: () => clock });
+    const got = events(f);
+    assert.deepEqual(got.map(event => [event.event, event.lease_id, event.reason, event.held_ms]), [['reclaim', 'old', 'expired', 60_000]]);
+    assert.ok(f.logs.some(line => /^HUB_LOCK_RECLAIMED adb from lease old/.test(line)), 'the log line is unchanged');
+    assert.deepEqual(tombs(f), []);
+  } finally { f.cleanup(); }
+});
+
+test('two reclaimers race on one stale lock: one reclaim event, and the loser never removes the lock a third process took', async () => {
+  const f = fixture();
+  try {
+    staleJob(f);
+    let raced = false;
+    // B judged the job stale. Before its rename, A (another process) reclaims it too and takes the lock as a lease.
+    const beforeRetire = step => { if (step === 'rename' && !raced) { raced = true; otherProcess(f, "await lock.acquireLease('adb', { holder: 'agent-c', why: 'third', forMs: 60000, id: 'third', pollMs: 5, log: () => {} });"); } };
+    await assert.rejects(withLock('adb', async () => { throw new Error('B must not run'); }, { env: f.env, log: f.log, timeoutMs: 60, pollMs: 5, beforeRetire }), /held by lease third/);
+    assert.ok(raced);
+    assert.equal(owner(f).lease_id, 'third', "the third process's lock survives B's rename");
+    const got = events(f);
+    assert.deepEqual(got.map(event => [event.event, event.hold_kind, event.claimant.run, event.reason]), [['reclaim', 'job', '41', 'holder-gone']], 'exactly one reclaim, by A');
+    assert.ok(!f.logs.some(line => line.startsWith('HUB_LOCK_RECLAIMED')), 'the loser does not claim a reclaim');
+    assert.deepEqual(tombs(f), []);
+  } finally { f.cleanup(); }
+});
+
+test('the same race through acquireLease: the losing lease reclaimer writes nothing and leaves the winner alone', async () => {
+  const f = fixture();
+  try {
+    staleJob(f);
+    let raced = false;
+    // A deploy job in another process reclaims and finishes; a third holder (an older pin's bare mkdir) takes the lock.
+    const third = { pid: process.pid, host: hostname(), repo: 'delorenj/third', run: '3', started_at: new Date().toISOString() };
+    const beforeRetire = step => {
+      if (step !== 'rename' || raced) return;
+      raced = true;
+      otherProcess(f, "await lock.withLock('adb', async () => {}, { log: () => {}, pollMs: 5 });");
+      mkdirSync(f.lock);
+      writeFileSync(join(f.lock, 'owner.json'), JSON.stringify(third));
+    };
+    await assert.rejects(lease(f, { id: 'loser', waitMs: 60, beforeRetire }), error => error.code === 'HUB_LOCK_TIMEOUT' && /held by delorenj\/third run 3/.test(error.message));
+    assert.deepEqual(owner(f), third);
+    assert.deepEqual(events(f).map(event => event.event), ['reclaim', 'release']);
+    assert.deepEqual(tombs(f), []);
+  } finally { f.cleanup(); }
+});
+
+test('a rename that finds the lock gone writes nothing and is not an error', async () => {
+  const f = fixture();
+  try {
+    staleJob(f);
+    let raced = false;
+    // A reclaims, runs and releases before B renames: B's rename hits ENOENT, and B then takes the free lock.
+    const beforeRetire = step => { if (step === 'rename' && !raced) { raced = true; otherProcess(f, "await lock.withLock('adb', async () => {}, { log: () => {}, pollMs: 5 });"); } };
+    const ran = [];
+    await withLock('adb', async () => { ran.push('B'); }, { env: f.env, log: f.log, timeoutMs: 2000, pollMs: 5, beforeRetire });
+    assert.deepEqual(ran, ['B']);
+    assert.deepEqual(events(f).map(event => [event.event, event.reason]), [['reclaim', 'holder-gone'], ['release', 'done'], ['release', 'done']]);
+    assert.ok(!existsSync(f.lock));
+    assert.deepEqual(tombs(f), []);
+  } finally { f.cleanup(); }
+});
+
+test('a lock retaken between the rename and the put-back is dropped with HUB_LOCK_LOST and no event', async () => {
+  const f = fixture();
+  try {
+    staleJob(f);
+    let raced = false;
+    const fourth = { pid: process.pid, host: hostname(), started_at: new Date().toISOString(), kind: 'lease', lease_id: 'fourth', holder: 'agent-d', why: 'd', expires_at: new Date(Date.now() + 60_000).toISOString() };
+    const beforeRetire = step => {
+      if (step === 'rename' && !raced) { raced = true; otherProcess(f, "await lock.acquireLease('adb', { holder: 'agent-c', why: 'third', forMs: 60000, id: 'third', pollMs: 5, log: () => {} });"); }
+      if (step === 'restore') { mkdirSync(f.lock); writeFileSync(join(f.lock, 'owner.json'), JSON.stringify(fourth)); }
+    };
+    await assert.rejects(withLock('adb', async () => {}, { env: f.env, log: f.log, timeoutMs: 60, pollMs: 5, beforeRetire }), /held by lease fourth/);
+    assert.ok(f.logs.some(line => /^HUB_LOCK_LOST adb lease third of agent-c/.test(line)));
+    assert.equal(owner(f).lease_id, 'fourth');
+    assert.deepEqual(events(f).map(event => event.event), ['reclaim'], "only A's reclaim");
+    assert.deepEqual(tombs(f), []);
+  } finally { f.cleanup(); }
+});
+
+test('a lock outside the Queued set retires through a tomb and writes no event', async () => {
+  const f = fixture();
+  try {
+    const path = join(f.root, 'locks/s3-tolt.lock');
+    mkdirSync(path, { recursive: true });
+    writeFileSync(join(path, 'owner.json'), JSON.stringify({ pid: deadPid(), host: hostname(), repo: 'r', run: '1', started_at: new Date().toISOString() }));
+    const ran = [];
+    await withLock('s3-tolt', async () => { ran.push('job'); }, { env: f.env, log: f.log, pollMs: 5 });
+    assert.deepEqual(ran, ['job']);
+    assert.ok(f.logs.some(line => line.startsWith('HUB_LOCK_RECLAIMED s3-tolt')));
+    assert.ok(!existsSync(path));
+    assert.deepEqual(tombs(f), []);
+    assert.ok(!existsSync(f.env.HUB_EVENT_DIR), 'no event was written');
+  } finally { f.cleanup(); }
+});
+
+test('a tomb is never listed and never blocks the lock name, not even for an old bare mkdir', async () => {
+  const f = fixture();
+  try {
+    const tomb = join(f.root, 'locks/adb.lock.tomb-1700000000000-4242');
+    mkdirSync(tomb, { recursive: true });
+    writeFileSync(join(tomb, 'owner.json'), JSON.stringify({ pid: process.pid, host: hostname(), started_at: new Date().toISOString() }));
+    assert.deepEqual(listLocks({ env: f.env }), []);
+    mkdirSync(f.lock); // what a pinned pre-tomb version does to take the lock
+    writeFileSync(join(f.lock, 'owner.json'), JSON.stringify({ pid: process.pid, host: hostname(), repo: 'r', run: '2', started_at: new Date().toISOString() }));
+    assert.deepEqual(listLocks({ env: f.env }).map(entry => entry.name), ['adb']);
+    rmSync(f.lock, { recursive: true });
+    assert.equal((await lease(f, { id: 'beside-a-tomb' })).lease_id, 'beside-a-tomb');
+  } finally { f.cleanup(); }
 });

@@ -57,7 +57,7 @@ function fixture() {
   const adb = join(root, 'adb');
   writeFileSync(adb, fakeAdb(state));
   chmodSync(adb, 0o755);
-  const env = { PATH: process.env.PATH, HOME: root, USER: 'tester', HUB_ADB: adb, HUB_LOCK_DIR: join(root, 'locks'), HUB_DEVICE_POLL_MS: '5', HUB_DEVICE_PHONE_SLICE_MS: '300', HUB_ADB_SERVER_PORT: '5037' };
+  const env = { PATH: process.env.PATH, HOME: root, USER: 'tester', HUB_ADB: adb, HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events'), HUB_DEVICE_POLL_MS: '5', HUB_DEVICE_PHONE_SLICE_MS: '300', HUB_ADB_SERVER_PORT: '5037' };
   const run = async (argv, extra = {}) => {
     const out = [];
     const err = [];
@@ -434,7 +434,7 @@ exit 0
       await settle(10);
     }
     // a stray ANDROID_ADB_SERVER_PORT names a dead port; the presence query must go to the hub port regardless
-    const child = spawn(process.execPath, [tool, 'status'], { env: { PATH: process.env.PATH, HOME: root, USER: 'tester', HUB_ADB: adb, HUB_LOCK_DIR: join(root, 'locks'), HUB_ADB_SERVER_PORT: '5039', ANDROID_ADB_SERVER_PORT: '15170' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [tool, 'status'], { env: { PATH: process.env.PATH, HOME: root, USER: 'tester', HUB_ADB: adb, HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events'), HUB_ADB_SERVER_PORT: '5039', ANDROID_ADB_SERVER_PORT: '15170' }, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';
     child.stdout.on('data', chunk => { out += chunk; });
     child.stderr.resume();
@@ -633,7 +633,7 @@ esac
         const args = command === 'run'
           ? ['run', 's26', '--wait', '30s', '--', process.execPath, '-e', 'process.exit(0)']
           : ['lease', 's26', '--for', '5m', '--why', 'slow adb', '--wait', '30s'];
-        const child = spawn(process.execPath, [tool, ...args], { env: { ...process.env, HUB_ADB: adb, HUB_LOCK_DIR: join(root, 'locks') }, stdio: ['ignore', 'pipe', 'pipe'] });
+        const child = spawn(process.execPath, [tool, ...args], { env: { ...process.env, HUB_ADB: adb, HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events') }, stdio: ['ignore', 'pipe', 'pipe'] });
         child.stdout.resume();
         child.stderr.resume();
         const exit = new Promise(done => child.on('close', (status, how) => done({ status, how })));
@@ -921,7 +921,7 @@ test('install.sh installs a hub-device wrapper into ~/.local/bin without touchin
     shim('launchctl', `echo "$*" >> "${home}/launchctl.log"; exit 0`);
     shim('plutil', 'exit 0');
     shim('uname', 'echo Linux');
-    const env = { PATH: `${shims}:${process.env.PATH}`, HOME: home, HUB_LOCK_DIR: join(home, 'locks') };
+    const env = { PATH: `${shims}:${process.env.PATH}`, HOME: home, HUB_LOCK_DIR: join(home, 'locks'), HUB_EVENT_DIR: join(home, 'events') };
     const install = spawnSync('bash', [join(hubRoot, 'tools/catchup/units/install.sh'), 'mobi2-test'], { env, encoding: 'utf8' });
     assert.equal(install.status, 0, install.stdout + install.stderr);
     const link = join(home, '.local/bin/hub-device');

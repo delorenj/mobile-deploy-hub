@@ -58,7 +58,7 @@ async function fixture({ app = manifest(), policyText = strictPolicyText } = {})
   if (policyText) { policyFile = join(root, 'policy.json'); await writeFile(policyFile, policyText); }
   const env = {
     PATH: process.env.PATH, HOME: root, GITHUB_REPOSITORY: 'delorenj/tower-of-lost-things', GITHUB_WORKFLOW_REF: 'delorenj/tower-of-lost-things/.github/workflows/deploy.yml@refs/heads/main',
-    GITHUB_REF: 'refs/heads/main', GITHUB_RUN_ID: '555', GITHUB_OUTPUT: output, HUB_REF: 'v1.3.0', HUB_LOCK_DIR: join(root, 'locks'),
+    GITHUB_REF: 'refs/heads/main', GITHUB_RUN_ID: '555', GITHUB_OUTPUT: output, HUB_REF: 'v1.3.0', HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events'),
   };
   const writes = [];
   const s3 = { putText(text, key) { writes.push(['put', key]); }, put(file, key) { writes.push(['put', key]); }, remove(key) { writes.push(['rm', key]); }, list: () => [] };

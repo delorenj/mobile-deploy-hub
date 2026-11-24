@@ -145,7 +145,7 @@ async function gateFixture({ manifest = towerManifest(), caller = template, repo
   await writeFile(output, '');
   const env = {
     PATH: process.env.PATH, HOME: root, GITHUB_REPOSITORY: repo, GITHUB_WORKFLOW_REF: `${repo}/.github/workflows/deploy.yml@refs/heads/main`,
-    GITHUB_REF: 'refs/heads/main', GITHUB_RUN_ID: '555', GITHUB_OUTPUT: output, HUB_REF: 'v1.1.0', HUB_LOCK_DIR: join(root, 'locks'),
+    GITHUB_REF: 'refs/heads/main', GITHUB_RUN_ID: '555', GITHUB_OUTPUT: output, HUB_REF: 'v1.1.0', HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events'),
   };
   const configure = (extra = [], more = {}) => ({ ...parseConfig(['gate', '--manifest', 'tools/ci/mobile-deploy.json', '--out', join(root, 'out'), ...extra], { ...env, ...more }), cwd: app });
   const s3 = fakeS3();
@@ -369,7 +369,7 @@ async function deliverFixture({ iosSent = true, iosStatus = 'pending', androidSt
   await mkdir(receipts, { recursive: true });
   await writeFile(join(receipts, 'hub-receipt-android.json'), JSON.stringify({ lane: 'android', outcome: 'success', version: '0.2.2', staged: { name: apkName, bytes: 22, sha256: apkSha }, quickdrop: { status: 'written', name: apkName }, delivery: { platform: 'android', status: androidStatus, reason: androidStatus === 'pending' ? "not on big-chungus's adb" : null, sha256: apkSha } }));
   await writeFile(join(receipts, 'hub-receipt-ios.json'), JSON.stringify({ lane: 'ios', outcome: 'success', version: '0.2.2', ipa: { verified: true, sha256: sha('ipa bytes'), bytes: 9, build: '5', sent: iosSent, staged_name: iosSent ? ipaName : null }, delivery: { platform: 'ios', status: iosStatus, reason: iosStatus === 'pending' ? 'asleep or away' : null }, mac_bytes: { in: 1000, out: 9 } }));
-  const env = { PATH: process.env.PATH, ANDROID_HOME: join(root, 'sdk'), JAVA_HOME: join(root, 'java'), GITHUB_REPOSITORY: 'delorenj/tower-of-lost-things', GITHUB_RUN_ID: '777', GITHUB_RUN_ATTEMPT: '1', HUB_REF: 'v1.1.0', HUB_LOCK_DIR: join(root, 'locks'), HUB_NEEDS: JSON.stringify({ plan: { result: 'success' }, android: { result: 'success' }, ios: { result: 'success' } }) };
+  const env = { PATH: process.env.PATH, ANDROID_HOME: join(root, 'sdk'), JAVA_HOME: join(root, 'java'), GITHUB_REPOSITORY: 'delorenj/tower-of-lost-things', GITHUB_RUN_ID: '777', GITHUB_RUN_ATTEMPT: '1', HUB_REF: 'v1.1.0', HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events'), HUB_NEEDS: JSON.stringify({ plan: { result: 'success' }, android: { result: 'success' }, ios: { result: 'success' } }) };
   const configure = (extra = []) => ({ ...parseConfig(['deliver', '--manifest', 'mobile-deploy.json', '--out', out, '--version', '0.2.2', '--android-code', '5', '--build-sha', 'b'.repeat(40), ...extra], env), cwd: app });
   const s3 = fakeS3();
   const pages = { writes: [] };

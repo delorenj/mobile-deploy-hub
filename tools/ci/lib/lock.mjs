@@ -6,14 +6,23 @@
 // A lease is the same lock taken by a person or an agent instead of a job: acquire returns and the lock persists past the
 // process that took it, until release or `expires_at`. It lives in the same directory under the same name (`adb` is the
 // S26), so withLock callers and leases exclude each other both ways. Waiters for a lease queue FIFO in `<name>.queue/`.
+//
+// Removal is exactly once (AD-9): a release or reclaim renames `<name>.lock` to a tomb, and only the process whose rename
+// succeeded deletes it and records the event in the Event Log (events.mjs). This module is the only caller of appendEvent.
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { join } from 'node:path';
+import { appendEvent } from './events.mjs';
 import { pause, sleep as realSleep } from './pause.mjs';
 
 export const lockDir = (env = process.env, home = homedir()) => env.HUB_LOCK_DIR || join(home, '.cache/mobile-deploy-hub/locks');
+
+// The Queued set (AD-4): the device locks whose transitions are history. `emulator` is the pool gate; its slots are
+// `emulator-<n>`. Every other name (s3-*, s3-index, emulator-reaper) writes no events.
+export const QUEUED = Object.freeze(['adb', 's24', 'mac-ios', 'emulator']);
+export const isQueued = name => QUEUED.includes(name) || /^emulator-\d+$/.test(name);
 
 const alive = pid => {
   try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
@@ -38,27 +47,76 @@ const describe = owner => {
 
 // Stale: a job whose pid is gone or that outlived staleMs; a lease past its expires_at or whose holder_pid (when it
 // names one) is gone or is now another process (holder_process_start differs). A lease is not judged by pid (the
-// process that took it is long gone) or by age.
-function stale(path, owner, { now, staleMs }) {
+// process that took it is long gone) or by age. Returns why (`gone`, `abandoned`, `expired`, `holder-gone`, `too-old`),
+// or null while the lock is live.
+function staleness(path, owner, { now, staleMs }) {
   let age = 0;
-  try { age = now() - statSync(path).mtimeMs; } catch { return true; }
+  try { age = now() - statSync(path).mtimeMs; } catch { return 'gone'; }
   // owner.json is written right after mkdir; a lock without one for a minute was abandoned mid-creation.
-  if (!owner) return age > 60_000;
+  if (!owner) return age > 60_000 ? 'abandoned' : null;
   if (Number.isFinite(expiresAt(owner))) {
-    if (expiresAt(owner) <= now()) return true;
-    if (owner.host !== hostname() || !Number.isSafeInteger(owner.holder_pid)) return false;
-    if (!alive(owner.holder_pid)) return true;
-    return Boolean(owner.holder_process_start) && processStart(owner.holder_pid) !== owner.holder_process_start;
+    if (expiresAt(owner) <= now()) return 'expired';
+    if (owner.host !== hostname() || !Number.isSafeInteger(owner.holder_pid)) return null;
+    if (!alive(owner.holder_pid)) return 'holder-gone';
+    return owner.holder_process_start && processStart(owner.holder_pid) !== owner.holder_process_start ? 'holder-gone' : null;
   }
-  if (owner.host === hostname() && Number.isSafeInteger(owner.pid) && !alive(owner.pid)) return true;
-  return age > staleMs;
+  if (owner.host === hostname() && Number.isSafeInteger(owner.pid) && !alive(owner.pid)) return 'holder-gone';
+  return age > staleMs ? 'too-old' : null;
+}
+const stale = (path, owner, options) => staleness(path, owner, options) !== null;
+
+const sameOwner = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+// The release/reclaim event body; Story 1.4 adds the rest of the AD-9 shape. held_ms runs from started_at to now, and a
+// lease's ends no later than its expires_at.
+function holdEvent(event, name, owner, reason, at) {
+  const lease = isLease(owner);
+  const started = Date.parse(owner?.started_at);
+  const end = Number.isFinite(expiresAt(owner)) ? Math.min(at, expiresAt(owner)) : at;
+  return {
+    event, lock: name, hold_kind: owner ? (lease ? 'lease' : 'job') : null,
+    claimant: { holder: owner?.holder ?? null, repo: owner?.repo ?? null, run: owner?.run ?? null },
+    lease_id: lease ? owner.lease_id ?? null : null,
+    held_ms: Number.isFinite(started) ? Math.max(0, end - started) : null,
+    reason,
+  };
 }
 
-// Removes a stale lock unless it changed hands since it was judged.
-function reclaim(path, judged) {
-  const current = readOwner(path);
-  if (JSON.stringify(current) !== JSON.stringify(judged)) return false;
-  rmSync(path, { recursive: true, force: true });
+let lastTomb = 0;
+
+// Retires a lock: renames <name>.lock to <name>.lock.tomb-<ms>-<pid> (a name that never ends in .lock, so it never blocks
+// the lock name, not even for an older pinned version's bare mkdir, and listLocks never lists it). The rename decides
+// (AD-9): ENOENT means another process got there first, and the loser writes nothing. A tomb that holds anything but
+// the owner that was judged means the lock changed hands after the judgement; it is put back. Only the winner deletes
+// its tomb and, when `as` names an event and the name is Queued, appends it. True for the winner. beforeRetire is a test
+// seam, called with 'rename' before the rename and 'restore' before a put-back.
+function retire(name, path, judged, { as = null, reason = null, env = process.env, now = Date.now, log = console.error, beforeRetire = () => {} } = {}) {
+  if (!sameOwner(readOwner(path), judged)) return false;
+  beforeRetire('rename');
+  const at = now();
+  // Monotonic per process, so two retirements in one millisecond (or under a frozen test clock) never share a tomb.
+  lastTomb = Math.max(Number.isFinite(at) ? Math.trunc(at) : 0, lastTomb + 1);
+  const tomb = `${path}.tomb-${lastTomb}-${process.pid}`;
+  try {
+    renameSync(path, tomb);
+  } catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  }
+  const moved = readOwner(tomb);
+  if (!sameOwner(moved, judged)) {
+    beforeRetire('restore');
+    try {
+      renameSync(tomb, path);
+    } catch {
+      // Taken again in the instant between the two renames: the moved holder's lock cannot be put back.
+      log(`HUB_LOCK_LOST ${name} ${describe(moved)}: it changed hands while a stale holder was being reclaimed`);
+      try { rmSync(tomb, { recursive: true }); } catch { /* a tomb never blocks the name */ }
+    }
+    return false;
+  }
+  try { rmSync(tomb, { recursive: true }); } catch { /* a tomb never blocks the name */ }
+  if (as && isQueued(name)) appendEvent(holdEvent(as, name, judged, reason, at), { env, now: () => at });
   return true;
 }
 
@@ -70,25 +128,28 @@ export async function withLock(name, fn, {
   log = console.log,
   sleep = ms => new Promise(done => setTimeout(done, ms)),
   now = Date.now,
+  beforeRetire,
 } = {}) {
   if (!/^[a-z0-9-]+$/.test(name)) throw new Error(`bad lock name "${name}"`);
   const dir = lockDir(env);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${name}.lock`);
-  const me = { pid: process.pid, host: hostname(), repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null, started_at: new Date(now()).toISOString() };
+  const me = { pid: process.pid, host: hostname(), repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null };
   const deadline = now() + timeoutMs;
   let waiting = false;
   for (;;) {
     try {
       mkdirSync(path);
-      writeFileSync(join(path, 'owner.json'), JSON.stringify(me));
+      // started_at is when the lock was taken, not when the wait began, so a release's held_ms is the hold alone.
+      writeFileSync(join(path, 'owner.json'), JSON.stringify({ ...me, started_at: new Date(now()).toISOString() }));
       break;
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
     }
     const owner = readOwner(path);
-    if (stale(path, owner, { now, staleMs })) {
-      if (reclaim(path, owner)) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
+    const verdict = staleness(path, owner, { now, staleMs });
+    if (verdict) {
+      if (retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
       continue;
     }
     if (now() >= deadline) throw new Error(`host lock ${name} is held by ${describe(owner)}; gave up after ${Math.round(timeoutMs / 60_000)} min. Another deploy is using the device; run again when it finishes.`);
@@ -100,7 +161,7 @@ export async function withLock(name, fn, {
     return await fn();
   } finally {
     const owner = readOwner(path);
-    if (owner?.pid === me.pid && !isLease(owner)) rmSync(path, { recursive: true, force: true });
+    if (owner?.pid === me.pid && !isLease(owner)) retire(name, path, owner, { as: 'release', reason: 'done', env, now, log });
   }
 }
 
@@ -190,6 +251,7 @@ export async function acquireLease(name, {
   now = Date.now,
   signal,
   beforeClaim = () => {},
+  beforeRetire,
 } = {}) {
   const path = lockPath(name, env);
   if (!(forMs > 0) || forMs > MAX_LEASE_MS) throw new Error(`a lease runs for more than 0 and at most ${MAX_LEASE_MS / 3600_000}h`);
@@ -233,15 +295,16 @@ export async function acquireLease(name, {
             unlinkSync(ticketFile);
           } catch (error) {
             if (error.code !== 'ENOENT') throw error;
-            reclaim(path, record);
+            retire(name, path, record, { env, now, log });
             throw failure('HUB_LEASE_CANCELLED', `lease ${lease_id} was released while it was being taken for ${name}`);
           }
           log(`HUB_LEASE ${name} ${lease_id} until ${record.expires_at}`);
           return record;
         }
         const owner = readOwner(path);
-        if (stale(path, owner, { now, staleMs })) {
-          if (reclaim(path, owner)) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
+        const verdict = staleness(path, owner, { now, staleMs });
+        if (verdict) {
+          if (retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
           continue;
         }
         if (now() >= deadline) throw failure('HUB_LOCK_TIMEOUT', `host lock ${name} is held by ${describe(owner)}; gave up after ${Math.round(waitMs / 1000)}s`);
@@ -259,8 +322,9 @@ export async function acquireLease(name, {
 }
 
 // Releases a lease by id (the lease of a waiter that has not been served yet is cancelled). Never touches a job's lock,
-// another holder's lease or a lock that has moved on. Returns {released, cancelled, reason}.
-export function releaseLease(name, id, { env = process.env } = {}) {
+// another holder's lease or a lock that has moved on. Returns {released, cancelled, reason}. A release writes one
+// `release` event (reason `by-id`, or `any` when no id was given).
+export function releaseLease(name, id, { env = process.env, now = Date.now } = {}) {
   const path = lockPath(name, env);
   let cancelled = 0;
   if (id) {
@@ -281,7 +345,7 @@ export function releaseLease(name, id, { env = process.env } = {}) {
   }
   if (!isLease(owner)) return { released: false, cancelled, reason: 'not-a-lease' };
   if (id && owner.lease_id !== id) return { released: false, cancelled, reason: 'other-lease', owner };
-  if (!reclaim(path, owner)) return { released: false, cancelled, reason: 'changed' };
+  if (!retire(name, path, owner, { as: 'release', reason: id ? 'by-id' : 'any', env, now })) return { released: false, cancelled, reason: 'changed' };
   return { released: true, cancelled, reason: 'released', owner };
 }
 

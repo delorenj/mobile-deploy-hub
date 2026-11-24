@@ -191,7 +191,7 @@ async function deliverHost({ needs, receipts, scope = 'both', dryRun = false }) 
   await mkdir(app, { recursive: true });
   await writeFile(join(app, 'mobile-deploy.json'), JSON.stringify(towerManifest()));
   for (const [lane, receipt] of Object.entries(receipts)) await writeFile(join(out, 'receipts', `hub-receipt-${lane}.json`), JSON.stringify({ lane, ...receipt }));
-  const env = { PATH: process.env.PATH, GITHUB_REPOSITORY: 'delorenj/tower-of-lost-things', GITHUB_RUN_ID: '777', GITHUB_RUN_ATTEMPT: '2', HUB_REF: 'v1.1.3', HUB_LOCK_DIR: join(root, 'locks'), HUB_NEEDS: JSON.stringify(needs) };
+  const env = { PATH: process.env.PATH, GITHUB_REPOSITORY: 'delorenj/tower-of-lost-things', GITHUB_RUN_ID: '777', GITHUB_RUN_ATTEMPT: '2', HUB_REF: 'v1.1.3', HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events'), HUB_NEEDS: JSON.stringify(needs) };
   const config = { ...parseConfig(['deliver', '--manifest', 'mobile-deploy.json', '--out', out, '--version', '0.2.2', '--android-code', '5', '--build-sha', 'b'.repeat(40), '--scope', scope, '--dry-run', String(dryRun)], env), cwd: app };
   const writes = [];
   const s3 = { putText: (text, key) => writes.push(key), put: (file, key) => writes.push(key), remove: key => writes.push(`rm ${key}`), list: () => [] };
