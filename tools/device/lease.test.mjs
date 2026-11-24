@@ -7,8 +7,8 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ALIVE_MS, QUEUED, acquireLease, isQueued, listLocks, listWaiters, releaseLease, updateLease, withLock } from '../ci/lib/lock.mjs';
-import { readEvents } from '../ci/lib/events.mjs';
+import { ALIVE_MS, QUEUED, TICKET_ABSENT_MS, acquireLease, buildTicket, isQueued, jobLeaseId, listLocks, listWaiters, processStart as processStartOf, releaseLease, sameHost, ticketKind, ticketStaleness, updateLease, withLock } from '../ci/lib/lock.mjs';
+import { hostId, readEvents } from '../ci/lib/events.mjs';
 import { pause } from '../ci/lib/pause.mjs';
 
 function fixture() {
@@ -185,17 +185,21 @@ test('a ticket with a reused live pid but a different process start is stale and
   } finally { f.cleanup(); }
 });
 
-test('a legacy ticket without process_start is stale even when its pid is still alive', async () => {
+// INTENDED CHANGE (Story 2.1, AD-3): until v1.2.43 a ticket with no recorded process_start was stale even with a live pid. A
+// ticket is now stale only on positive evidence of death, and a start time nobody recorded is no such evidence.
+test('a ticket with a live pid and no recorded process_start is live (intended change: AD-3 needs positive evidence of death)', async () => {
   const f = fixture();
   try {
     const queue = join(f.root, 'locks/adb.queue');
     mkdirSync(queue, { recursive: true });
-    const ghost = join(queue, '000000000000001-000000-00000001.json');
-    writeFileSync(ghost, JSON.stringify({ lease_id: 'legacy', holder: 'old', why: 'gone', pid: process.pid, host: hostname(), enqueued_at: new Date().toISOString() }));
-    assert.equal(listWaiters('adb', { env: f.env })[0].stale, true, 'reported stale, not trusted');
-    assert.ok(existsSync(ghost), 'observing never prunes');
-    assert.equal((await lease(f, { id: 'next', waitMs: 100 })).lease_id, 'next', 'the legacy ticket cannot starve a free lock');
-    assert.ok(!existsSync(ghost), 'acquisition prunes it');
+    const waiting = join(queue, '000000000000001-000000-00000001.json');
+    writeFileSync(waiting, JSON.stringify({ lease_id: 'legacy', holder: 'old', why: 'waiting', pid: process.pid, host: hostname(), enqueued_at: new Date().toISOString() }));
+    assert.equal(listWaiters('adb', { env: f.env })[0].stale, false, 'its process is alive: live');
+    await assert.rejects(lease(f, { id: 'next', waitMs: 40 }), error => error.code === 'HUB_LOCK_TIMEOUT' && /1 waiter ahead of lease next/.test(error.message), 'it keeps its place ahead');
+    assert.ok(existsSync(waiting), 'acquisition does not prune a live ticket');
+    writeFileSync(waiting, JSON.stringify({ lease_id: 'legacy', holder: 'old', why: 'gone', pid: deadPid(), host: hostname(), enqueued_at: new Date().toISOString() }));
+    assert.equal((await lease(f, { id: 'after', waitMs: 100 })).lease_id, 'after', 'a dead pid is positive evidence: pruned');
+    assert.ok(!existsSync(waiting));
   } finally { f.cleanup(); }
 });
 
@@ -656,5 +660,192 @@ test('owners written by v1.2.43 (no format, kind for jobs, attempt, job or host_
     await lease(f, { id: 'after' });
     const job = events(f).filter(event => event.event === 'reclaim').at(-1);
     assert.deepEqual([job.hold_kind, job.claimant.kind, job.claimant.run, job.reason], ['job', 'deploy', '7', 'holder-gone']);
+  } finally { f.cleanup(); }
+});
+
+// ---- Story 2.1: ticket format v1 and machine identity (AD-2, AD-3, AD-8) ----
+
+const AD3_KEYS = ['format', 'kind', 'lease_id', 'holder', 'why', 'pid', 'host', 'host_id', 'process_start', 'enqueued_at', 'deadline_at', 'expires_at', 'repo', 'run', 'attempt', 'job', 'reservation', 'request', 'pool', 'eta', 'delivery'];
+const NOW = Date.parse('2026-11-23T12:00:00.000Z');
+const ago = ms => new Date(NOW - ms).toISOString();
+const ahead = ms => new Date(NOW + ms).toISOString();
+// Every seam injected: this host is `big-chungus` (machine id M1); pid 100 is alive with start 's100'; pid 200 is gone.
+const seams = (extra = {}) => ({ now: () => NOW, host: 'big-chungus', hostId: 'M1', isAlive: pid => pid !== 200, processStart: pid => (pid === 100 ? 's100' : pid === 101 ? null : 'other'), ...extra });
+const ticketOf = (extra = {}) => ({ format: 1, kind: 'lease', lease_id: 'x', holder: 'h', why: 'w', host: 'big-chungus', host_id: 'M1', enqueued_at: ago(1000), ...extra });
+
+test('a Lease ticket carries exactly the AD-3 keys in order, keeps its file name, and says who and where', async () => {
+  const f = fixture();
+  try {
+    await lease(f, { id: 'holder', hostId: 'M1', host: 'big-chungus' });
+    const waiting = lease(f, { id: 'waiter', holder: 'agent-b', why: 'second', waitMs: 10_000, hostId: 'M1', host: 'big-chungus', env: { ...f.env, GITHUB_RUN_ATTEMPT: '2', GITHUB_JOB: 'android' } });
+    await settle(30);
+    const queue = join(f.root, 'locks/adb.queue');
+    const [name] = readdirSync(queue);
+    assert.match(name, /^\d{15}-\d{6}-\d{8}\.json$/, 'the file name is still <ms15>-<counter6>-<pid8>.json');
+    assert.equal(name.slice(-13, -5), String(process.pid).padStart(8, '0'));
+    const ticket = JSON.parse(readFileSync(join(queue, name), 'utf8'));
+    assert.deepEqual(Object.keys(ticket), AD3_KEYS);
+    assert.deepEqual({ format: ticket.format, kind: ticket.kind, lease_id: ticket.lease_id, holder: ticket.holder, why: ticket.why, pid: ticket.pid, host: ticket.host, host_id: ticket.host_id }, { format: 1, kind: 'lease', lease_id: 'waiter', holder: 'agent-b', why: 'second', pid: process.pid, host: 'big-chungus', host_id: 'M1' });
+    assert.ok(ticket.process_start, 'the process lifetime is named');
+    assert.equal(Date.parse(ticket.deadline_at) - Date.parse(ticket.enqueued_at), 10_000);
+    assert.deepEqual([ticket.repo, ticket.run, ticket.attempt, ticket.job], ['delorenj/example', '9', '2', 'android']);
+    assert.deepEqual([ticket.expires_at, ticket.reservation, ticket.request, ticket.pool, ticket.eta, ticket.delivery], [null, null, null, null, null, null], 'the keys later stories fill are present and empty');
+    releaseLease('adb', 'waiter', { env: f.env });
+    await assert.rejects(waiting, error => error.code === 'HUB_LEASE_CANCELLED');
+  } finally { f.cleanup(); }
+});
+
+test('job and hub-job tickets use job:<repo>#<run>.<attempt>/<job> ids and always name a holder and why; this format writes no remote tickets', () => {
+  const env = { GITHUB_REPOSITORY: 'delorenj/gruvato', GITHUB_RUN_ID: '77', GITHUB_RUN_ATTEMPT: '3', GITHUB_JOB: 'ios' };
+  const job = buildTicket('job', { env, requested: NOW, deadline: NOW + 5000, host: 'mommymac.local', hostId: 'U1', pid: 4242, processStart: () => 'ps:start' });
+  assert.deepEqual(Object.keys(job), AD3_KEYS);
+  assert.deepEqual([job.format, job.kind, job.lease_id, job.holder, job.why], [1, 'job', 'job:delorenj/gruvato#77.3/ios', 'delorenj/gruvato#77', 'ios']);
+  assert.deepEqual([job.pid, job.host, job.host_id, job.process_start, job.enqueued_at, job.deadline_at], [4242, 'mommymac.local', 'U1', 'ps:start', new Date(NOW).toISOString(), new Date(NOW + 5000).toISOString()]);
+  assert.equal(jobLeaseId({ repo: 'a/b', run: 1, attempt: 2, job: 'plan' }), 'job:a/b#1.2/plan');
+  assert.ok(!/^[a-z0-9][a-z0-9-]{0,63}$/.test(job.lease_id), 'a job id can never be a valid Lease id, so the two never collide');
+  const hub = buildTicket('hub-job', { env: {}, requested: NOW, pid: 55, host: 'h', hostId: null, processStart: () => null });
+  assert.deepEqual([hub.kind, hub.lease_id, hub.holder, hub.why, hub.host_id, hub.process_start, hub.repo, hub.run], ['hub-job', 'job:local#local-55.1/job', 'catch-up', 'catch-up install', null, null, null, null]);
+  const named = buildTicket('job', { env, requested: NOW, holder: 'me', why: 'because', pid: 1, host: 'h', hostId: 'x', processStart: () => null });
+  assert.deepEqual([named.holder, named.why], ['me', 'because']);
+  assert.throws(() => buildTicket('remote', { requested: NOW }), /bad ticket kind "remote"/);
+  assert.throws(() => buildTicket('mystery', { requested: NOW }), /bad ticket kind "mystery"/);
+  assert.throws(() => buildTicket('lease', { requested: NOW, lease_id: 'x', holder: 'h' }), /names its lease id, holder and why/);
+  assert.throws(() => buildTicket('job', {}), /real request time/);
+});
+
+test('ticket liveness follows AD-3 in order, one row per rule', () => {
+  assert.equal(ticketKind({}), 'lease');
+  assert.equal(ticketKind({ kind: null }), 'lease');
+  assert.equal(ticketKind({ kind: 'job' }), 'job');
+  assert.equal(ticketKind({ kind: 'remote' }), 'remote');
+  assert.equal(ticketKind({ kind: 'from-the-future' }), 'from-the-future');
+  const rows = [
+    // rule 1: a missing kind is a lease, judged by pid
+    ['no kind, pid alive with its recorded start', ticketOf({ kind: undefined, pid: 100, process_start: 's100' }), null],
+    ['no kind, pid gone', ticketOf({ kind: undefined, pid: 200, process_start: 's200' }), 'gone'],
+    // rule 2: the pid rule, positive evidence of death only
+    ['pid alive, same start', ticketOf({ pid: 100, process_start: 's100' }), null],
+    ['pid alive but now another process (start differs)', ticketOf({ pid: 100, process_start: 'old' }), 'pid-reused'],
+    ['pid gone', ticketOf({ pid: 200, process_start: 's200' }), 'gone'],
+    ['pid alive, start unreadable now', ticketOf({ pid: 101, process_start: 'recorded' }), null],
+    ['pid alive, start never recorded', ticketOf({ pid: 100, process_start: null }), null],
+    ['pid alive, expires_at long past (a pid ticket ignores it)', ticketOf({ pid: 100, process_start: 's100', expires_at: ago(3600_000) }), null],
+    ['pid gone, expires_at in the future (the pid rule wins)', ticketOf({ pid: 200, expires_at: ahead(3600_000) }), 'gone'],
+    // rule 3: no pid, expires_at
+    ['no pid, expires_at in the future', ticketOf({ expires_at: ahead(1) }), null],
+    ['no pid, expires_at past', ticketOf({ expires_at: ago(1) }), 'expired'],
+    ['no pid, expires_at exactly now', ticketOf({ expires_at: ahead(0) }), 'expired'],
+    ['no pid, expires_at future, enqueued_at long ago (expiry wins over age)', ticketOf({ expires_at: ahead(1000), enqueued_at: ago(3600_000) }), null],
+    // rule 4: no pid, no expires_at: 60 s after enqueued_at
+    ['no pid, no expiry, enqueued 59.999 s ago', ticketOf({ enqueued_at: ago(TICKET_ABSENT_MS - 1) }), null],
+    ['no pid, no expiry, enqueued 60 s ago', ticketOf({ enqueued_at: ago(TICKET_ABSENT_MS) }), 'abandoned'],
+    ['no pid, unparseable expiry, enqueued 61 s ago', ticketOf({ expires_at: 'soon', enqueued_at: ago(61_000) }), 'abandoned'],
+    ['no pid, no expiry, no enqueued_at, no mtime', ticketOf({ enqueued_at: undefined }), 'abandoned'],
+    // an unknown kind is never pruned for its kind alone
+    ['unknown kind, pid alive', ticketOf({ kind: 'from-the-future', pid: 100, process_start: 's100' }), null],
+    ['unknown kind, no pid, fresh', ticketOf({ kind: 'from-the-future', enqueued_at: ago(1000) }), null],
+    ['unknown kind, no pid, future expiry', ticketOf({ kind: 'from-the-future', expires_at: ahead(5000), enqueued_at: ago(3600_000) }), null],
+    ['unknown kind, pid gone (stale for the pid, not the kind)', ticketOf({ kind: 'from-the-future', pid: 200 }), 'gone'],
+    ['remote, no pid, future expiry', ticketOf({ kind: 'remote', host: 'elsewhere', host_id: 'ELSE', expires_at: ahead(5000) }), null],
+    // same host, by machine id then hostname (AD-8)
+    ['same machine id, drifted hostname, pid alive', ticketOf({ host: 'big-chungus-2.local', pid: 100, process_start: 's100' }), null],
+    ['same machine id, drifted hostname, pid gone', ticketOf({ host: 'big-chungus-2.local', pid: 200 }), 'gone'],
+    ['no machine id on the ticket, same hostname, pid gone', ticketOf({ host_id: undefined, pid: 200 }), 'gone'],
+    ['no machine id on the ticket, same hostname, pid alive', ticketOf({ host_id: undefined, pid: 100, process_start: 's100' }), null],
+    // another host: a pid cannot be checked here
+    ['v1, other host, pid, fresh', ticketOf({ host: 'elsewhere', host_id: 'ELSE', pid: 200, enqueued_at: ago(10_000) }), null],
+    ['v1, other host, pid, 60 s old', ticketOf({ host: 'elsewhere', host_id: 'ELSE', pid: 200, enqueued_at: ago(60_000) }), 'abandoned'],
+    ['v1, other host, pid, future expiry', ticketOf({ host: 'elsewhere', host_id: 'ELSE', pid: 200, expires_at: ahead(5000), enqueued_at: ago(3600_000) }), null],
+    ['before v1a, other host, pid (pruned, AD-8)', ticketOf({ format: undefined, kind: undefined, host_id: undefined, host: 'elsewhere', pid: 100, process_start: 's100', enqueued_at: ago(10) }), 'foreign-host'],
+  ];
+  for (const [label, ticket, verdict] of rows) assert.equal(ticketStaleness(ticket, seams()), verdict, label);
+  assert.equal(ticketStaleness(ticketOf({ enqueued_at: 'junk' }), seams({ mtimeMs: NOW - 5000 })), null, 'a junk enqueued_at falls back to the file mtime');
+  assert.equal(ticketStaleness(ticketOf({ enqueued_at: 'junk' }), seams({ mtimeMs: NOW - 60_000 })), 'abandoned');
+});
+
+test('same host: equal machine ids win over drifted hostnames, otherwise the hostname decides', () => {
+  assert.equal(sameHost({ host: 'mommymac.local', host_id: 'U1' }, { host: 'mommymac-2.local', host_id: 'U1' }), true, 'hostname drift');
+  assert.equal(sameHost({ host: 'mommymac.local', host_id: 'U1' }, { host: 'mommymac.local', host_id: 'U1' }), true);
+  assert.equal(sameHost({ host: 'a', host_id: 'U1' }, { host: 'b', host_id: 'U2' }), false, 'two ids and two names');
+  assert.equal(sameHost({ host: 'a' }, { host: 'a', host_id: 'U1' }), true, 'one side has no id: the hostname decides');
+  assert.equal(sameHost({ host: 'a', host_id: 'U1' }, { host: 'b' }), false);
+  assert.equal(sameHost({ host: 'a', host_id: null }, { host: 'a', host_id: null }), true);
+  assert.equal(sameHost({}, {}), false, 'a record with no host is on no host we can name');
+  assert.equal(sameHost({ host: '' }, { host: '' }), false);
+  assert.equal(sameHost(null, undefined), false);
+});
+
+test('hostId is the one machine id: cached per process by default, injectable, and what the writers record', () => {
+  assert.equal(hostId(), hostId(), 'the default lookup is cached');
+  assert.equal(hostId({ platform: 'linux', readFile: () => 'abc123\n' }), 'abc123', 'a test seam gets a fresh lookup');
+  assert.equal(hostId(), hostId(), 'and does not disturb the cache');
+});
+
+test('a v1.2.43 lease ticket (no kind, no host_id) is a live lease by its pid and release <id> still cancels it', async () => {
+  const f = fixture();
+  try {
+    const queue = join(f.root, 'locks/adb.queue');
+    mkdirSync(queue, { recursive: true });
+    const old = join(queue, '000000000000001-000000-00000001.json');
+    const body = { lease_id: 'old-waiter', holder: 'agent-old', why: 'from v1.2.43', pid: process.pid, host: hostname(), process_start: processStartOf(process.pid), enqueued_at: new Date().toISOString() };
+    writeFileSync(old, JSON.stringify(body));
+    const [waiter] = listWaiters('adb', { env: f.env });
+    assert.deepEqual([waiter.lease_id, waiter.stale, ticketKind(waiter)], ['old-waiter', false, 'lease']);
+    assert.deepEqual(releaseLease('adb', 'old-waiter', { env: f.env }), { released: false, cancelled: 1, reason: 'none' });
+    assert.ok(!existsSync(old), 'cancelled by lease id');
+    assert.deepEqual(events(f).map(event => [event.event, event.lease_id, event.reason]), [['cancel', 'old-waiter', 'released']]);
+    // and it blocks a newer lease ahead of it, as it always did
+    writeFileSync(old, JSON.stringify(body));
+    await assert.rejects(lease(f, { id: 'newer', waitMs: 40 }), /1 waiter ahead of lease newer/);
+    assert.ok(existsSync(old));
+  } finally { f.cleanup(); }
+});
+
+test('a ticket with no pid never strands the queue: live while its expiry is ahead, pruned once it is past or 60 s old', async () => {
+  const f = fixture();
+  try {
+    const queue = join(f.root, 'locks/adb.queue');
+    mkdirSync(queue, { recursive: true });
+    const remote = join(queue, '000000000000001-000000-00000001.json');
+    const write = body => writeFileSync(remote, JSON.stringify({ format: 1, kind: 'remote', lease_id: 'far', holder: 'elsewhere', why: 'waiting', pid: null, host: 'elsewhere', host_id: 'ELSE', ...body }));
+    write({ expires_at: new Date(Date.now() + 60_000).toISOString(), enqueued_at: new Date(Date.now() - 3600_000).toISOString() });
+    assert.deepEqual(listWaiters('adb', { env: f.env }).map(waiter => [waiter.lease_id, waiter.stale]), [['far', false]]);
+    await assert.rejects(lease(f, { id: 'behind', waitMs: 40 }), /1 waiter ahead of lease behind/, 'a live pid-less ticket keeps its place');
+    write({ expires_at: new Date(Date.now() - 1).toISOString(), enqueued_at: new Date().toISOString() });
+    assert.equal(listWaiters('adb', { env: f.env })[0].stale, true, 'observing reports it');
+    assert.ok(existsSync(remote), 'and never prunes');
+    assert.equal((await lease(f, { id: 'free', waitMs: 100 })).lease_id, 'free', 'an expired ticket cannot starve a free lock');
+    assert.ok(!existsSync(remote));
+    releaseLease('adb', 'free', { env: f.env });
+    write({ enqueued_at: new Date(Date.now() - 61_000).toISOString() });
+    assert.equal((await lease(f, { id: 'free2', waitMs: 100 })).lease_id, 'free2', 'no pid and no expiry: pruned 60 s after enqueue');
+  } finally { f.cleanup(); }
+});
+
+test('owner liveness uses the machine id: a drifted hostname is still this host, another machine id is not', async () => {
+  const f = fixture();
+  try {
+    const dead = deadPid();
+    const hold = extra => {
+      mkdirSync(f.lock, { recursive: true });
+      writeFileSync(join(f.lock, 'owner.json'), JSON.stringify({ pid: dead, host: 'mommymac-2.local', repo: null, run: null, started_at: new Date().toISOString(), kind: 'job', format: 1, host_id: 'U1', ...extra }));
+    };
+    // the Mac came back as mommymac.local: same machine id, so its dead job is reclaimed rather than honoured for 4 h
+    hold({});
+    assert.equal(listLocks({ env: f.env, host: 'mommymac.local', hostId: 'U1' })[0].stale, true);
+    // a different machine id and a different name: another host, honoured
+    assert.equal(listLocks({ env: f.env, host: 'mommymac.local', hostId: 'U2' })[0].stale, false);
+    // an owner from before v1a has no machine id: the hostname decides, as before
+    hold({ host_id: undefined });
+    assert.equal(listLocks({ env: f.env, host: 'mommymac.local', hostId: 'U1' })[0].stale, false, 'other hostname, no id: honoured');
+    assert.equal(listLocks({ env: f.env, host: 'mommymac-2.local', hostId: 'U1' })[0].stale, true, 'same hostname: judged by its dead pid');
+    // a Lease holder pid on a drifted hostname
+    writeFileSync(join(f.lock, 'owner.json'), JSON.stringify({ pid: process.pid, host: 'mommymac-2.local', host_id: 'U1', started_at: new Date().toISOString(), kind: 'lease', lease_id: 'l', holder: 'a', why: 'w', expires_at: new Date(Date.now() + 60_000).toISOString(), holder_pid: dead, holder_process_start: null }));
+    assert.equal(listLocks({ env: f.env, host: 'mommymac.local', hostId: 'U1' })[0].stale, true, 'its holder pid is gone on this machine');
+    assert.equal(listLocks({ env: f.env, host: 'mommymac.local', hostId: 'U2' })[0].stale, false, 'on another machine it cannot be checked');
+    // withLock and acquireLease take the seams too
+    const reclaimed = await lease(f, { id: 'took', host: 'mommymac.local', hostId: 'U1' });
+    assert.equal(reclaimed.host, 'mommymac.local');
+    assert.equal(reclaimed.host_id, 'U1');
   } finally { f.cleanup(); }
 });

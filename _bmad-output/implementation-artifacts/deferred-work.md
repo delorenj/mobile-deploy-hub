@@ -6,3 +6,9 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-4-record-holds-queued-locks-liveness.md`
   summary: Pool requests (`phone` via takeAnyPhone, the emulator slot probes) write only an `acquire` on success and nothing on a Pool timeout, so Pool contention is invisible until Pool-level events land.
   evidence: Story 1.4 treats every waitMs 0 call as a try (Story 2.2 semantics); AD-4's one Pool-level request plus acquire/timeout with waited_ms from the outer request is Story 2.2's AC.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-1-ticket-format-v1-machine-identity.md`
+  summary: `emulator.mjs` `doomed()` (`:279`, `:282`) still compares `record.host`/`owner.host` to `hostname()` instead of using `sameHost`, so an emulator record on a Mac-style drifted hostname is judged foreign.
+  evidence: Story 2.1 moves lock.mjs ticket and owner liveness onto `sameHost` (AD-8). Emulator records carry no `host_id` and the emulator pool runs on big-chungus only in v1a, where the hostname does not drift; the parsing moves onto `queueView` and host helpers in Story 2.2 (AD-1).
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-1-ticket-format-v1-machine-identity.md`
+  summary: `withLock` still writes no ticket, so `buildTicket('job'|'hub-job')` has no production caller until Story 2.3 joins deploy jobs and the catch-up to the Queue.
+  evidence: Story 2.1 freezes the format and exports the constructor with tests; AD-4/AD-6 FIFO for `withLock` is Stories 2.2-2.3.

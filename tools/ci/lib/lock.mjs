@@ -53,19 +53,28 @@ const describe = owner => {
 // names one) is gone or is now another process (holder_process_start differs). A lease is not judged by pid (the
 // process that took it is long gone) or by age. Returns why (`gone`, `abandoned`, `expired`, `holder-gone`, `too-old`),
 // or null while the lock is live.
-function staleness(path, owner, { now, staleMs }) {
+function staleness(path, owner, { now, staleMs, host = hostname(), hostId = machineId() }) {
   let age = 0;
   try { age = now() - statSync(path).mtimeMs; } catch { return 'gone'; }
   // owner.json is written right after mkdir; a lock without one for a minute was abandoned mid-creation.
   if (!owner) return age > 60_000 ? 'abandoned' : null;
+  // Same host by machine id when both records carry one, else by hostname (AD-8): a drifted mDNS name is still this Mac.
+  const here = sameHost(owner, { host, host_id: hostId });
   if (Number.isFinite(expiresAt(owner))) {
     if (expiresAt(owner) <= now()) return 'expired';
-    if (owner.host !== hostname() || !Number.isSafeInteger(owner.holder_pid)) return null;
+    if (!here || !Number.isSafeInteger(owner.holder_pid)) return null;
     if (!alive(owner.holder_pid)) return 'holder-gone';
     return owner.holder_process_start && processStart(owner.holder_pid) !== owner.holder_process_start ? 'holder-gone' : null;
   }
-  if (owner.host === hostname() && Number.isSafeInteger(owner.pid) && !alive(owner.pid)) return 'holder-gone';
+  if (here && Number.isSafeInteger(owner.pid) && !alive(owner.pid)) return 'holder-gone';
   return age > staleMs ? 'too-old' : null;
+}
+
+// Two records are on the same host when both carry a host_id and the ids are equal; otherwise hostname equality decides
+// (AD-8). A record with no hostname is on no host we can name.
+export function sameHost(a, b) {
+  if (a?.host_id && b?.host_id && a.host_id === b.host_id) return true;
+  return typeof a?.host === 'string' && a.host !== '' && a.host === b?.host;
 }
 const stale = (path, owner, options) => staleness(path, owner, options) !== null;
 
@@ -163,6 +172,7 @@ export async function withLock(name, fn, {
   now = Date.now,
   kind = 'job',
   hostId = machineId(),
+  host = hostname(),
   timers = { setInterval, clearInterval },
   beforeRetire,
 } = {}) {
@@ -172,7 +182,7 @@ export async function withLock(name, fn, {
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${name}.lock`);
   // owner.json keeps every key older versions read (pid, host, repo, run, started_at) and adds the AD-2 keys after them.
-  const me = { pid: process.pid, host: hostname(), repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null };
+  const me = { pid: process.pid, host, repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null };
   const more = { format: OWNER_FORMAT, kind, attempt: env.GITHUB_RUN_ATTEMPT ?? null, job: env.GITHUB_JOB ?? null, host_id: hostId };
   const seams = { env, hostId };
   const requested = now();
@@ -193,7 +203,7 @@ export async function withLock(name, fn, {
       if (error.code !== 'EEXIST') throw error;
     }
     const owner = readOwner(path);
-    const verdict = staleness(path, owner, { now, staleMs });
+    const verdict = staleness(path, owner, { now, staleMs, host, hostId });
     if (verdict) {
       if (retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, hostId, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
       continue;
@@ -270,36 +280,103 @@ export function processStart(pid) {
   return start ? `ps:${start}` : null;
 }
 
-function staleWaiter(ticket) {
-  // Queue tickets are new in this change, so a valid one always names the exact process that took it. A ticket
-  // missing its process identity, or whose pid now belongs to a different process, is stale.
-  if (ticket.host !== hostname() || !Number.isSafeInteger(ticket.pid) || !ticket.process_start) return true;
-  if (!alive(ticket.pid)) return true;
-  const actual = processStart(ticket.pid);
-  return actual !== ticket.process_start;
+// ---- ticket format v1 (AD-3), frozen at the first queue-joining release ----
+//
+// A ticket is <name>.queue/<ms15>-<counter6>-<pid8>.json. Pinned versions read the same files, so the file name and every
+// key a v1.2.43 reader uses (lease_id, holder, why, pid, host, process_start, enqueued_at) keep their meaning; the rest is
+// additive. `kind` is lease, job, hub-job or remote; v1 writes no remote tickets (a v2 may, once every pin from before
+// this format has aged out), but the reader never prunes a ticket for its kind alone.
+export const TICKET_FORMAT = 1;
+export const TICKET_KINDS = Object.freeze(['lease', 'job', 'hub-job']);
+export const TICKET_ABSENT_MS = 60_000;
+
+// A ticket from before kinds existed is a Lease (rule 1). Any other value is kept as written, known or not.
+export const ticketKind = ticket => (ticket?.kind === undefined || ticket.kind === null || ticket.kind === '' ? 'lease' : ticket.kind);
+
+// A job's ticket id can never collide with a Lease id: Lease ids are [a-z0-9-] only (leaseId), this one has `:`, `#`, `/`.
+export const jobLeaseId = ({ repo, run, attempt, job }) => `job:${repo}#${run}.${attempt}/${job}`;
+
+// The ticket body, in AD-3 order. `kind` lease takes the Lease's own id, holder and why. A job or hub-job takes its identity
+// from the runner's GITHUB_* variables and always gets a holder and a why (the status text and the logs name them). The
+// caller supplies requested/deadline times (ms) so the ticket carries the real request time.
+export function buildTicket(kind, {
+  env = process.env, requested, deadline = null, lease_id = null, holder = null, why = null,
+  host = hostname(), hostId = machineId(), pid = process.pid, processStart: startOf = processStart,
+  expires_at = null, reservation = null, request = null, pool = null, eta = null, delivery = null,
+} = {}) {
+  if (!TICKET_KINDS.includes(kind)) throw new Error(`bad ticket kind "${kind}" (${TICKET_KINDS.join(', ')}; this format writes no remote tickets)`);
+  if (!Number.isFinite(requested)) throw new TypeError('a ticket carries the real request time');
+  const repo = env.GITHUB_REPOSITORY ?? null;
+  const run = env.GITHUB_RUN_ID ?? null;
+  const attempt = env.GITHUB_RUN_ATTEMPT ?? null;
+  const job = env.GITHUB_JOB ?? null;
+  let id = lease_id;
+  let who = holder;
+  let because = why;
+  if (kind === 'lease') {
+    if (!id || !who || !because) throw new Error('a lease ticket names its lease id, holder and why');
+  } else {
+    id ??= jobLeaseId({ repo: repo ?? 'local', run: run ?? `local-${pid}`, attempt: attempt ?? 1, job: job ?? 'job' });
+    who ||= kind === 'hub-job' ? 'catch-up' : repo ? `${repo}#${run ?? '-'}` : `local-${pid}`;
+    because ||= kind === 'hub-job' ? 'catch-up install' : job ?? 'deploy';
+  }
+  return {
+    format: TICKET_FORMAT, kind, lease_id: id, holder: who, why: because,
+    pid, host, host_id: hostId ?? null, process_start: startOf(pid),
+    enqueued_at: iso(requested), deadline_at: Number.isFinite(deadline) ? iso(deadline) : null, expires_at,
+    repo, run, attempt, job, reservation, request, pool, eta, delivery,
+  };
+}
+
+// Why a ticket is dead, or null while it is live, applying AD-3 in order:
+//   1. a missing `kind` is a lease (ticketKind), and no kind is ever pruned for being unfamiliar;
+//   2. a ticket with a pid is judged by that process, on the same host (sameHost): stale on positive evidence of death (the
+//      pid is gone, or now has another start time), never because its start time cannot be read or was never recorded;
+//   3. a ticket with no pid is live while its expires_at is in the future;
+//   4. one with neither is stale TICKET_ABSENT_MS after enqueued_at (or after its file's mtime when enqueued_at is junk).
+// A pid on another host cannot be checked here. A ticket from before this format (no `format`) is pruned, as AD-8 states and
+// as staleWaiter always did; a v1 ticket falls through to rules 3 and 4.
+export function ticketStaleness(ticket, { now = Date.now, host = hostname(), hostId = machineId(), processStart: startOf = processStart, isAlive = alive, mtimeMs = null } = {}) {
+  if (Number.isSafeInteger(ticket.pid)) {
+    if (sameHost(ticket, { host, host_id: hostId })) {
+      if (!isAlive(ticket.pid)) return 'gone';
+      const actual = ticket.process_start ? startOf(ticket.pid) : null;
+      return actual && actual !== ticket.process_start ? 'pid-reused' : null;
+    }
+    if (ticket.format === undefined) return 'foreign-host';
+  }
+  const expires = Date.parse(ticket.expires_at);
+  if (Number.isFinite(expires)) return expires > now() ? null : 'expired';
+  const enqueued = Date.parse(ticket.enqueued_at);
+  const since = Number.isFinite(enqueued) ? enqueued : mtimeMs;
+  return Number.isFinite(since) && now() - since < TICKET_ABSENT_MS ? null : 'abandoned';
 }
 
 // The waiters for a lock, oldest first. Observers only report stale tickets; acquire prunes them.
-export function listWaiters(name, { env = process.env, prune = false } = {}) {
+export function listWaiters(name, { env = process.env, prune = false, now = Date.now, host, hostId, processStart: startOf, isAlive } = {}) {
   const dir = queuePath(name, env);
   let files = [];
   try { files = readdirSync(dir).filter(file => file.endsWith('.json')).sort(); } catch { return []; }
+  const seams = { now, ...(host === undefined ? {} : { host }), ...(hostId === undefined ? {} : { hostId }), ...(startOf ? { processStart: startOf } : {}), ...(isAlive ? { isAlive } : {}) };
   const waiters = [];
   for (const file of files) {
     let ticket = null;
     try { ticket = JSON.parse(readFileSync(join(dir, file), 'utf8')); } catch { /* being written, or junk */ }
-    if (ticket && staleWaiter(ticket)) {
-      if (prune) rmSync(join(dir, file), { force: true });
-      else waiters.push({ ...ticket, file, stale: true });
+    if (ticket && typeof ticket === 'object' && !Array.isArray(ticket)) {
+      let mtimeMs = null;
+      if (!Number.isFinite(Date.parse(ticket.enqueued_at))) { try { mtimeMs = statSync(join(dir, file)).mtimeMs; } catch { continue; } }
+      const why = ticketStaleness(ticket, { ...seams, mtimeMs });
+      if (why) {
+        if (prune) rmSync(join(dir, file), { force: true });
+        else waiters.push({ ...ticket, file, stale: true });
+        continue;
+      }
+      waiters.push({ ...ticket, file, stale: false });
       continue;
     }
-    if (!ticket) {
-      let age = 0;
-      try { age = Date.now() - statSync(join(dir, file)).mtimeMs; } catch { continue; }
-      if (prune && age > 60_000) rmSync(join(dir, file), { force: true });
-      continue;
-    }
-    waiters.push({ ...ticket, file, stale: false });
+    let age = 0;
+    try { age = now() - statSync(join(dir, file)).mtimeMs; } catch { continue; }
+    if (prune && age > 60_000) rmSync(join(dir, file), { force: true });
   }
   return waiters;
 }
@@ -331,6 +408,8 @@ export async function acquireLease(name, {
   beforeClaim = () => {},
   beforeRetire,
   hostId = machineId(),
+  host = hostname(),
+  processStart: startOf = processStart,
 } = {}) {
   const path = lockPath(name, env);
   if (!(forMs > 0) || forMs > MAX_LEASE_MS) throw new Error(`a lease runs for more than 0 and at most ${MAX_LEASE_MS / 3600_000}h`);
@@ -344,9 +423,9 @@ export async function acquireLease(name, {
   const ticketFile = join(queue, ticket);
   // Write-then-rename, like owner.json: a reader never sees a half-written ticket.
   const pending = `${ticketFile}.tmp`;
-  writeFileSync(pending, JSON.stringify({ lease_id, holder, why, pid: process.pid, host: hostname(), process_start: processStart(process.pid), enqueued_at: new Date(requested).toISOString() }), { flag: 'wx' });
-  renameSync(pending, ticketFile);
   const deadline = requested + waitMs;
+  writeFileSync(pending, JSON.stringify(buildTicket('lease', { env, requested, deadline, lease_id, holder, why, host, hostId, processStart: startOf })), { flag: 'wx' });
+  renameSync(pending, ticketFile);
   const attempt = env.GITHUB_RUN_ATTEMPT ?? null;
   const job = env.GITHUB_JOB ?? null;
   const asked = { kind: 'lease', lease_id, holder, repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null, attempt, job };
@@ -374,14 +453,14 @@ export async function acquireLease(name, {
     for (;;) {
       signal?.throwIfAborted();
       try { statSync(ticketFile); } catch { throw failure('HUB_LEASE_CANCELLED', `lease ${lease_id} was released while it waited for ${name}`); }
-      const waiters = listWaiters(name, { env, prune: true });
+      const waiters = listWaiters(name, { env, prune: true, now, host, hostId, processStart: startOf });
       const position = waiters.findIndex(waiter => waiter.file === ticket);
       if (position === 0) {
         const started = now();
         const record = {
-          pid: process.pid, host: hostname(), repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null, started_at: new Date(started).toISOString(),
+          pid: process.pid, host, repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null, started_at: new Date(started).toISOString(),
           kind: 'lease', lease_id, holder, why, expires_at: new Date(started + forMs).toISOString(),
-          holder_pid: holderPid, holder_process_start: Number.isSafeInteger(holderPid) ? processStart(holderPid) : null,
+          holder_pid: holderPid, holder_process_start: Number.isSafeInteger(holderPid) ? startOf(holderPid) : null,
           format: OWNER_FORMAT, attempt, job, host_id: hostId,
         };
         let taken = false;
@@ -408,7 +487,7 @@ export async function acquireLease(name, {
           return record;
         }
         const owner = readOwner(path);
-        const verdict = staleness(path, owner, { now, staleMs });
+        const verdict = staleness(path, owner, { now, staleMs, host, hostId });
         if (verdict) {
           if (retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, hostId, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
           continue;
@@ -483,13 +562,13 @@ export function updateLease(name, id, fields, { env = process.env } = {}) {
 }
 
 // Every lock in the directory, read only: leases and jobs' locks, each with whether it is stale now.
-export function listLocks({ env = process.env, now = Date.now, staleMs = 4 * 3600_000 } = {}) {
+export function listLocks({ env = process.env, now = Date.now, staleMs = 4 * 3600_000, host, hostId } = {}) {
   const dir = lockDir(env);
   let entries = [];
   try { entries = readdirSync(dir).filter(entry => entry.endsWith('.lock')).sort(); } catch { return []; }
   return entries.map(entry => {
     const path = join(dir, entry);
     const owner = readOwner(path);
-    return { name: entry.slice(0, -'.lock'.length), kind: isLease(owner) ? 'lease' : 'lock', owner, stale: stale(path, owner, { now, staleMs }), describe: describe(owner) };
+    return { name: entry.slice(0, -'.lock'.length), kind: isLease(owner) ? 'lease' : 'lock', owner, stale: stale(path, owner, { now, staleMs, ...(host === undefined ? {} : { host }), ...(hostId === undefined ? {} : { hostId }) }), describe: describe(owner) };
   });
 }
