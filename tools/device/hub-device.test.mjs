@@ -582,6 +582,26 @@ test('releasing a lease that is still queued cancels it (the adapter hold waits 
   } finally { f.cleanup(); }
 });
 
+test('lease --wait behind a deploy job prints the wait line on stderr; stdout holds only export lines (FR-16)', async () => {
+  const f = fixture();
+  try {
+    let done;
+    const job = withLock('adb', () => new Promise(resolve => { done = resolve; }), { env: f.env, log: () => {} });
+    await settle(20);
+    const waiting = f.run(['lease', 's26', '--for', '10m', '--why', 'wait line', '--no-connect', '--id', 'wait-line', '--wait', '30s']);
+    await settle(120);
+    done();
+    await job;
+    const result = await waiting;
+    assert.equal(result.code, 0, result.err.join('\n'));
+    const lines = result.err.filter(line => line.startsWith('HUB_LOCK_WAIT'));
+    assert.equal(lines.length, 1, 'one wait line while nothing changes');
+    assert.match(lines[0], /^HUB_LOCK_WAIT adb held by .+ \(pid \d+, since \S+\) position=1 eta=\S+/);
+    assert.ok(result.out.length > 0 && result.out.every(line => /^export /.test(line)), `stdout is export lines only: ${result.out.join(' | ')}`);
+    await f.run(['release', 'wait-line']);
+  } finally { f.cleanup(); }
+});
+
 test('run exports the phone to the command, holds the lease meanwhile, returns its exit code and releases', async () => {
   const f = fixture();
   try {
