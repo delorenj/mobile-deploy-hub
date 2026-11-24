@@ -89,3 +89,19 @@ context:
 **Commands:**
 - `node --test tools/device/lease.test.mjs tools/catchup/catchup.test.mjs tools/device/hub-device.test.mjs tools/device/emulator.test.mjs` -- expected: all pass
 - `heavy mise run check` -- expected: green
+
+## Review (independent)
+
+Checked against the Story 2.3 ACs in `epics-v1a.md` and AD-3, AD-4, AD-5, AD-6, AD-15 (commit `0832ee1`):
+
+- **ACs.** Job ticket identity, hub-job kind, coded timeout wording with holder and places, Lease timeout wording (`lease.test.mjs` intended change named), internal names bare, free-and-empty at once, FIFO both ways, catch-up `hub-job` `timeout`: all exercised by the new tests (not merely present); the catch-up regexes at `catchup.mjs:469` and `:591` match.
+- **Races.** 12 and 16 child processes asking `withLock('adb')` at once (staggered and simultaneous): no overlapping holds, staggered arrivals served in arrival order, no ticket or tomb left. A waiter SIGKILLed mid-wait does not strand the Queue (dead pid pruned, the next waiter runs). The post-`mkdir` re-check, tombstone give-back and the ticket-claim ENOENT path read correct against `acquireLease`'s.
+- **Compatibility.** The v1.2.43 `acquireLease` (no kinds, no `host_id`) reading a live job ticket neither prunes it nor jumps it; a v1.2.43 bare `withLock` still excludes by `mkdir` only (it can jump the Queue, which AD-20's pin ageing accepts). Tombstones stay outside `*.lock`.
+- **Liveness.** A ticket is judged only by AD-3 (pid and process start on the same host, else `expires_at`, else 60 s); the 2 s start cache cannot outlive one poll pass.
+- **Hermetic and CLI.** New tests pass `HUB_LOCK_DIR`/`HUB_EVENT_DIR` temp dirs and injected clocks; `hub-device` exit codes and `HUB_DEVICE_*` lines are unchanged; `status` lists job tickets as waiters (additive, the story's point).
+
+**Fixed (1 confirmed).** `releaseLease(name, <job ticket id>)` cancelled a job's or catch-up's ticket but wrote the `cancel` event as a Lease (`hold_kind: lease`, claimant `agent`, `lease_id` = the job id, no run identity), so the one `cancel` could not be paired with its `request` (claimant `deploy`/`hub-job`, `lease_id: null`). It is now written as the job's own claimant from the ticket's kind and run identity. The 2.3 test had pinned the wrong shape (it filtered on `lease_id` to find it); it now asserts the pair. Lease tickets are unchanged.
+
+**Dismissed.** `JOB_POLL_MS` is the existing 2 s default, not a queue tuning value (AD-11 lists the policy keys); the forced `rmSync` of an already-claimed ticket in `finally` mirrors `acquireLease` and is a no-op after the unlink.
+
+**Deferred** (`deferred-work.md`): a waiter killed mid-wait leaves a `request` with no ending (no `prune` event is written by any story).

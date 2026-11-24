@@ -1191,7 +1191,10 @@ test('a Queued withLock whose ticket is released while it waits is cancelled, no
     await assert.rejects(waiting, error => error.code === 'HUB_LEASE_CANCELLED' && /^job job:delorenj\/example#9\.1\/android was released while it waited for adb$/.test(error.message));
     assert.deepEqual(queueOf(f), []);
     assert.equal(owner(f).lease_id, 'holder', 'the holder was not touched');
-    assert.deepEqual(events(f).filter(event => event.claimant.job === 'android' || event.lease_id === ticket.lease_id).map(event => [event.event, event.reason, event.lease_id]), [['request', null, null], ['cancel', 'released', ticket.lease_id]], 'the release wrote the one cancel; the waiter, finding its ticket gone, wrote none');
+    // Independent review: the cancel is written as the job it cancels (claimant `deploy`, the run identity, no lease_id), not as a Lease.
+    assert.deepEqual(events(f).filter(event => event.claimant.job === 'android').map(event => [event.event, event.hold_kind, event.claimant.kind, event.claimant.repo, event.claimant.run, event.reason, event.lease_id]),
+      [['request', 'job', 'deploy', 'delorenj/example', '9', null, null], ['cancel', 'job', 'deploy', 'delorenj/example', '9', 'released', null]], 'the release wrote the one cancel; the waiter, finding its ticket gone, wrote none');
+    assert.equal(events(f).filter(event => event.event === 'cancel').length, 1);
     // an error while waiting (the lock path is not a directory we can take) leaves one cancel
     releaseLease('adb', 'holder', { env: f.env });
     const failing = asJob(f, 'ios', { afterTake: () => { throw new Error('boom'); } });

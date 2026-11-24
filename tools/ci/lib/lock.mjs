@@ -807,7 +807,13 @@ export function releaseLease(name, id, { env = process.env, now = Date.now, reas
         cancelled += 1;
         const at = now();
         const enqueued = Date.parse(ticket.enqueued_at);
-        note(name, eventOf('cancel', name, { kind: 'lease', lease_id: id, holder: ticket.holder ?? null }, { waited_ms: Number.isFinite(enqueued) ? Math.max(0, at - enqueued) : null, reason: 'released' }), { env, at, hostId });
+        // A job's or the catch-up's ticket cancels as that job (the claimant its own `request` named, lease_id null as for every
+        // job event), never as a Lease: a reader that pairs request and cancel by claimant sees one waiter.
+        const kind = ticketKind(ticket);
+        const subject = kind === 'job' || kind === 'hub-job'
+          ? { kind, repo: ticket.repo ?? null, run: ticket.run ?? null, attempt: ticket.attempt ?? null, job: ticket.job ?? null }
+          : { kind: 'lease', lease_id: id, holder: ticket.holder ?? null };
+        note(name, eventOf('cancel', name, subject, { waited_ms: Number.isFinite(enqueued) ? Math.max(0, at - enqueued) : null, reason: 'released' }), { env, at, hostId });
       } catch { /* gone, or being written */ }
     }
   }
