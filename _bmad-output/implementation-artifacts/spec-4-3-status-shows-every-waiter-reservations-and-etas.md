@@ -5,7 +5,7 @@ created: '2026-11-24'
 status: done
 review_loop_iteration: 0
 baseline_revision: '51cc70a8100110cc3353a95b7436486f7dae2d98'
-followup_review_recommended: true
+followup_review_recommended: false
 context:
   - '{project-root}/_bmad-output/implementation-artifacts/epic-4-context.md'
 warnings: ['oversized']
@@ -124,6 +124,33 @@ operator_actions:
   - `[low]` `[reject]` Intent: the perf bound is checked in-process, not as a spawned CLI on big-chungus. Evidence: the suite runs on big-chungus (self-hosted CI and local), and process start is not part of "answers".
   - `[medium]` `[patch]` Intent: `hub-job` JSON and text are not exercised. Same group as the CATCH-UP verification-gap row. Fixed by the same test.
 
+### 2026-11-24 — Review pass (follow-up, after release v1.2.48)
+- verdicts: 24 findings — high 0, medium 0, low 22, false 2, maybe-false 0
+- findings:
+  - `[low]` `[reject]` carried: Blind: status `#n` and the wait line's `position=` number differently. Evidence: documented in the README and protected by the "no renames" rule.
+  - `[false]` `[reject]` carried: Blind and Edge (two rows): the Reservation expiry prints `NaN`. Evidence: `readReservation` (`lock.mjs`, `Number.isFinite(expires)`) returns null for a record without a finite `expires_at`, so a `reservation` entry always has one.
+  - `[low]` `[reject]` carried: Blind: an ETA failure leaves no reason in status. Evidence: the spec makes status swallow it and show `eta=?`; the throw path is tested.
+  - `[low]` `[reject]` carried: Blind: the 200 ms wall-clock test may flake. Evidence: measured 23-30 ms, about 8x headroom, and the AC requires the bound.
+  - `[low]` `[reject]` carried: Blind: status on big-chungus cannot see the Mac's `mac-ios` queue. Evidence: by design, that lock lives on the Mac's disk.
+  - `[low]` `[reject]` Blind: the `job:` regex in `release` duplicates the id format minted by `jobLeaseId`. Evidence: one parse site, and a drift would only change the wording of a refusal that still exits 2 and touches nothing.
+  - `[low]` `[reject]` Blind: JSON `eta: null` means stale, failed or missing. Evidence: `stale` disambiguates the dead ticket, and a failed ETA is the only other case for a live waiter; no consumer needs a third field yet.
+  - `[low]` `[reject]` Blind: `grace`, `kind` values and unknown kinds under-documented. Evidence: cosmetic; v1 writes only lease, job and hub-job (`TICKET_KINDS`).
+  - `[low]` `[reject]` Blind: the ETA glue in `status` is hard to follow (three-state `history`). Evidence: developer-only with no named harm; the state is local to one function and commented.
+  - `[low]` `[reject]` Edge: the README says a `job:` id is "shown by `status`" but the text row omits the id. Evidence: `--json` carries it as `lease_id`, and the text row shows repo, run and job, which is all the refusal tells you to use.
+  - `[low]` `[reject]` Edge: a `remote` kind renders as a Lease row. Evidence: `TICKET_KINDS` is `lease, job, hub-job`; this format writes no remote tickets.
+  - `[low]` `[reject]` Edge: the head ticket can take the lock between `queueView` and `readOwnerOf`, so it counts twice in an ETA. Evidence: a microsecond window, and the ETA is an advisory range; closing it needs a retry or a reordering that changes the 4.1 `enqueueEta` contract.
+  - `[low]` `[reject]` Edge: `release job:…` used to exit 0 and now exits 2, against "never change existing exit codes". Evidence: the intent itself mandates exit 2 for `job:` ids, and the release notes list the change.
+  - `[low]` `[reject]` Edge: a malformed `job:` id gets only "cancel its run instead". Evidence: it still exits 2 and touches nothing; the id is the caller's own input.
+  - `[low]` `[reject]` Verification gap: nothing pins `position` with a Reservation or a stale ticket ahead. Evidence: the Reservation half is pinned by the Story 2.5 test (`s26 #1 next` behind a head Reservation, `hub-device.test.mjs` "status leaves Reservations out of the waiters"); the stale half only documents what the README states.
+  - `[low]` `[reject]` Verification gap: the history window is not observable in the 200 ms test. Evidence: the `since` bound lives in `etaHistory`, which the enqueue tests exercise, and the failure would be a slowdown, not a wrong answer.
+  - `[low]` `[reject]` Verification gap: `release emulator job:…` and `--any` with `HUB_LEASE_ID=job:…` are untested. Evidence: the `given` line reads `words[2]` for the emulator form and ignores the id under `--any`, as the code shows; a mistake would change wording only.
+  - `[low]` `[reject]` Intent: the observer is two exports plus glue in `hub-device.mjs`, not one entry point. Evidence: `etaHistory` and `waiterEtas` are the shared pieces; the v1b Hub API is not built, so the harm is speculative.
+  - `[low]` `[reject]` Intent: no test counts Event Log reads, and `etaHistory` has no direct test. Evidence: `low_data: false` in the month test proves the history was read, and the enqueue path covers `etaHistory`.
+  - `[low]` `[reject]` Intent: the read-only check compares file names, not contents. Evidence: `status` has no write path (`queueView` without prune, no grace start), so the listing check is enough.
+  - `[low]` `[reject]` Intent: `release` has three message variants and refuses the emulator form too. Evidence: the extra variants name the local process and a malformed id; the spec's quoted line is the GitHub-run form.
+  - `[low]` `[reject]` Intent: the new v1.2.47 notes and README go beyond the intent. Evidence: the spec's tasks list them.
+  - `[low]` `[reject]` Intent: the perf bound is measured in-process, not as a spawned CLI. Evidence: same as the first pass; process start is not part of "answers".
+
 ## Design Notes
 
 **Why `position` keeps its meaning.** The AC asks for "no renames or removals", and Story 2.5's test pins the numbering (a Reservation is not a waiter, a stale ticket keeps its number). The wait line's `position` counts blocking entries ahead; status shows the Reservation in its own section with its `place`, and the waiter's ETA already includes a blocking Reservation's grace. The two agree whenever no stale ticket or blocking Reservation sits ahead.
@@ -232,6 +259,10 @@ One level up (belsky-doctrine): Jarad asked to see the line for the S26. Every Q
 - On big-chungus, status shows nothing for `mac-ios`, because that lock lives on the Mac. Run status on the Mac to see the iPad line.
 - Until about 20 holds per repo and job accumulate in the 30-day window, most status ETAs read `low-data`.
 - v1.2.46 has still not been proven by a real deploy (see the hub memory), and v1.2.47 stacks on it.
+
+## Follow-up Review Result (2026-11-24, after v1.2.48)
+
+Second pass over the story's own diff (`51cc70a..377e741`, excluding `_bmad-output`) with all four layers. 24 findings: high 0, medium 0, low 22, false 2. No patches, nothing deferred, no code changed. `followup_review_recommended` is `false`: the pass patched nothing. No hub release is owed by this review.
 
 ## Operator Confirmation
 
