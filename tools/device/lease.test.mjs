@@ -849,3 +849,23 @@ test('owner liveness uses the machine id: a drifted hostname is still this host,
     assert.equal(reclaimed.host_id, 'U1');
   } finally { f.cleanup(); }
 });
+
+// Review (independent) of Story 2.1: kill(0, 0) and kill(-1, 0) succeed, and a pid rule that needs positive evidence of death
+// would call such a ticket live for ever (v1.2.43 pruned it for its missing or unreadable process start).
+test('a ticket whose pid is 0 or negative is no pid: it cannot strand the queue as an immortal process', async () => {
+  for (const pid of [0, -1, -5]) {
+    const live = ticketOf({ pid, process_start: null, enqueued_at: ago(1000) });
+    assert.equal(ticketStaleness(live, { ...seams(), isAlive: () => true }), null, `pid ${pid}, fresh: judged as a pid-less ticket, still inside its 60 s`);
+    assert.equal(ticketStaleness({ ...live, enqueued_at: ago(TICKET_ABSENT_MS) }, { ...seams(), isAlive: () => true }), 'abandoned', `pid ${pid}, 60 s old: pruned`);
+    assert.equal(ticketStaleness({ ...live, enqueued_at: ago(TICKET_ABSENT_MS), expires_at: ahead(5000) }, { ...seams(), isAlive: () => true }), null, `pid ${pid} with a future expiry: live`);
+  }
+  const f = fixture();
+  try {
+    const queue = join(f.root, 'locks/adb.queue');
+    mkdirSync(queue, { recursive: true });
+    const junk = join(queue, '000000000000001-000000-00000001.json');
+    writeFileSync(junk, JSON.stringify({ lease_id: 'ghost', holder: 'x', why: 'y', pid: 0, host: hostname(), process_start: null, enqueued_at: new Date(Date.now() - 61_000).toISOString() }));
+    assert.equal((await lease(f, { id: 'free' , waitMs: 100 })).lease_id, 'free', 'a pid-0 ticket cannot starve a free lock');
+    assert.ok(!existsSync(junk));
+  } finally { f.cleanup(); }
+});

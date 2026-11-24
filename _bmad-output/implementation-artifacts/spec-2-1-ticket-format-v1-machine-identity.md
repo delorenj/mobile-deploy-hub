@@ -93,3 +93,13 @@ A v1 ticket from another host with a pid cannot be pid-checked here, so it falls
 **Commands:**
 - `node --test tools/device/lease.test.mjs tools/device/hub-device.test.mjs tools/device/emulator.test.mjs tools/catchup/catchup.test.mjs` -- expected: all pass
 - `heavy mise run check` -- expected: green
+
+## Review (independent)
+
+Reviewed `3ce85f4` against Story 2.1's ACs (epics-v1a.md) and AD-2, AD-3, AD-8, with the lock.mjs diff, the 8 new tests and the callers in `hub-device.mjs` and `emulator.mjs`.
+
+**Checked, no defect:** ticket body (21 AD-3 keys in order, file name unchanged, `deadline_at` and `expires_at` null-safe); job id `job:<repo>#<run>.<attempt>/<job>` can never be a valid Lease id; `remote` and unknown kinds refused on write, never pruned on read; liveness order and the 59.999 s / 60 s boundary; same-host by `host_id` then hostname for tickets and owners; the old `staleness` verdicts are unchanged when a side lacks `host_id`; a v1.2.43 pin reading a v1 ticket (reads only `host`, `pid`, `process_start`, which keep their meaning; `process_start` is still recorded); tmp-rename ticket writes (`.json.tmp` is not listed); `listWaiters` observing never prunes; `releaseLease` by id on a no-kind ticket; no event, exit-code or `hub-device` output change beyond the named legacy-ticket flip; no policy values, timers or real host state in the tests (they read `/etc/machine-id` through the cached `hostId()` only); no race added (no new mkdir, rename or tombstone path; pruning is the same unlink-by-name).
+
+**Confirmed and fixed:** a ticket whose `pid` is 0 or negative was judged live for ever on its own host. `kill(0, 0)` and `kill(-1, 0)` succeed, so `alive()` is true, and AD-3 rule 2 (unreadable or unrecorded start keeps it live) then leaves nothing to prune it. v1.2.43 pruned such a ticket because its `process_start` was missing or unreadable, so the story introduced a way for one malformed ticket to strand the Queue (the exact thing AD-3 "Prevents"). `ticketStaleness` now treats a pid that is not a positive integer as no pid, so rules 3 and 4 apply. Regression test: "a ticket whose pid is 0 or negative is no pid" (fails without the fix).
+
+**Dismissed:** foreign-host v1 ticket with a pid falls to the 60 s rule (AD-3 does not define it; recorded design, a v1 ticket is only foreign across machines). A Mac whose `ioreg` fails (null `host_id`) and whose hostname drifts reads its own v1 ticket as foreign: needs two faults, no spec fix without a second identity source. Owner pid 0: pre-existing, deferred.

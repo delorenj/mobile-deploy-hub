@@ -337,7 +337,9 @@ export function buildTicket(kind, {
 // A pid on another host cannot be checked here. A ticket from before this format (no `format`) is pruned, as AD-8 states and
 // as staleWaiter always did; a v1 ticket falls through to rules 3 and 4.
 export function ticketStaleness(ticket, { now = Date.now, host = hostname(), hostId = machineId(), processStart: startOf = processStart, isAlive = alive, mtimeMs = null } = {}) {
-  if (Number.isSafeInteger(ticket.pid)) {
+  // kill(0, 0) and kill(-1, 0) succeed (process group, every process), so a pid of 0 or less is no pid: it falls to rules 3 and 4
+  // instead of reading as a live process that nothing can ever prove dead.
+  if (Number.isSafeInteger(ticket.pid) && ticket.pid > 0) {
     if (sameHost(ticket, { host, host_id: hostId })) {
       if (!isAlive(ticket.pid)) return 'gone';
       const actual = ticket.process_start ? startOf(ticket.pid) : null;

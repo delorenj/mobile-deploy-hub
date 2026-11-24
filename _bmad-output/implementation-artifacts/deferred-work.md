@@ -12,3 +12,9 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-1-ticket-format-v1-machine-identity.md`
   summary: `withLock` still writes no ticket, so `buildTicket('job'|'hub-job')` has no production caller until Story 2.3 joins deploy jobs and the catch-up to the Queue.
   evidence: Story 2.1 freezes the format and exports the constructor with tests; AD-4/AD-6 FIFO for `withLock` is Stories 2.2-2.3.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-1-ticket-format-v1-machine-identity.md`
+  summary: Owner liveness in `staleness` (`owner.holder_pid`, `owner.pid`) still takes any safe integer as a pid, so an `owner.json` with pid 0 or -1 reads as alive (`kill(0, 0)` succeeds). Tickets were fixed in the independent review; owners are untouched.
+  evidence: Pre-existing before Story 2.1 (the old owner check was the same); an owner is written only by `lock.mjs` from `process.pid`/a real holder pid, so only a hand-edited or corrupt `owner.json` hits it. Fold into Story 2.2/2.3 owner parsing if it recurs.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-1-ticket-format-v1-machine-identity.md`
+  summary: `emulator.test.mjs` "an emulator Lease is recorded as exactly..." asserts `got[2].waited_ms === 0` for the slot try, which flaked once under `heavy mise run check` load (a millisecond tick between `requested` and the acquire's `now()`); it passed 3 of 3 alone and in the full rerun.
+  evidence: Pre-existing from Story 1.4, not touched by Story 2.1. Loosen to a small bound or inject `now` when that test is next edited.
