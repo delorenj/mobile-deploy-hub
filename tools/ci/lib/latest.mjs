@@ -16,6 +16,14 @@ const isoPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
 const keyPattern = /^[a-z0-9][a-z0-9.-]*\/\d+\.\d+\.\d+\/[A-Za-z0-9._-]+$/;
 
 export const statuses = Object.freeze(['installed', 'pending', 'skipped', 'failed']);
+// The one public wording of a delivery that waited for a busy device and ran out of wait (FR-30): coarse, never a holder. A
+// pending device shows it as its reason, possibly followed by the catch-up note (`; catch-up off ...`).
+export const busyReason = name => `${name} busy`;
+export const isBusyPending = device => {
+  if (device?.status !== 'pending' || typeof device.reason !== 'string' || typeof device.name !== 'string') return false;
+  const busy = busyReason(device.name);
+  return device.reason === busy || device.reason.startsWith(`${busy}; `);
+};
 export const installers = Object.freeze(['deploy', 'catch-up', 'manual']);
 export const platforms = Object.freeze(['android', 'ios']);
 

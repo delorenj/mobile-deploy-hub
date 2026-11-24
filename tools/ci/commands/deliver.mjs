@@ -308,7 +308,7 @@ export async function deliver(config, { env = process.env, home = homedir(), fet
 export function publicReceipts(receipts) {
   const kept = Object.fromEntries(Object.entries(receipts).filter(([name]) => !isEditionLane(name)));
   for (const [name, receipt] of Object.entries(kept)) {
-    if (receipt && typeof receipt === 'object' && 'editions' in receipt) { const { editions: _dropped, ...rest } = receipt; kept[name] = rest; }
+    if (receipt && typeof receipt === 'object' && ('editions' in receipt || 'contention' in receipt)) { const { editions: _editions, contention: _contention, ...rest } = receipt; kept[name] = rest; }
   }
   return kept;
 }

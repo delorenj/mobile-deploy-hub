@@ -21,7 +21,8 @@ import { macLink, macProbeScript, parseMacProbe, runnerStatusOver } from './lib/
 import { deviceLine, releaseLabel } from './lib/pages.mjs';
 import { dropApk, s26OnLan, syncthingGui } from './lib/quickdrop.mjs';
 import { catchupNote, installCurrent, readCatchupMode } from './commands/common.mjs';
-import { deliver, deviceOf, inflightAfter, mergeLatest } from './commands/deliver.mjs';
+import { deliver, deviceOf, inflightAfter, mergeLatest, publicReceipts } from './commands/deliver.mjs';
+import { summaryMarkdown } from './lib/receipt.mjs';
 import { findLostMac } from './commands/announce.mjs';
 import { checkConformance, checkPins, gate } from './commands/gate.mjs';
 import { sendIpa } from './commands/ios.mjs';
@@ -455,6 +456,9 @@ test('device lines read plainly on a phone: the release first, plain reasons, no
   assert.equal(deviceLine('android', { version: '0.2.2', code: 4, device: device('pending', { reason: "not on big-chungus's adb" }) }), "S26 0.2.2 (4): pending, installs when it is back (not on big-chungus's adb)");
   assert.equal(deviceLine('ios', { version: '0.2.5', build: '0.2.5', device: { ...device('pending', { reason: 'asleep or away' }), name: 'iPad' } }), 'iPad 0.2.5: pending, installs when it is back (asleep or away)');
   assert.equal(deviceLine('ios', { version: '0.2.2', build: '4', device: { ...device('installed'), name: 'iPad' } }), 'iPad 0.2.2 (4): installed by deploy');
+  // A busy S26 is not away: its page line says it installs when it is free.
+  assert.equal(deviceLine('android', { version: '0.2.2', code: 4, device: device('pending', { reason: 'S26 busy' }) }), 'S26 0.2.2 (4): pending, installs when it is free (S26 busy)');
+  assert.match(deviceLine('android', { version: '0.2.2', code: 4, device: device('pending', { reason: 'S26 busy; catch-up off on big-chungus (catchup.mjs mode live)' }) }), /^S26 0\.2\.2 \(4\): pending \(S26 busy; catch-up off/);
   assert.equal(releaseLabel('0.2.5', '0.2.5'), '0.2.5');
   assert.equal(releaseLabel('0.2.2', 4), '0.2.2 (4)');
 });
@@ -523,3 +527,17 @@ test('keeping the checkout ref never fails the ios job, never hands git a creden
   const body = source.slice(source.indexOf('export async function ios('));
   assert.ok(body.indexOf('rememberCheckout({ cwd: config.cwd') > 0 && body.indexOf('rememberCheckout({ cwd: config.cwd') < body.indexOf('applyBump(config, env)'), 'the ref is kept before the bump and the build');
 });
+
+test('contention stays private: the bucket copy of a receipt has no contention, the run summary names the Holds, and deliver carries only "S26 busy"', () => {
+  const contention = { lock: 'adb', reason: 'delivery-pending', blocked_by: [{ role: 'holder', kind: 'lease', holder: 'agent-a', until: '2026-11-24T11:00:00Z' }, { role: 'ahead', place: 1, kind: 'job', holder: 'delorenj/other#1' }] };
+  const receipt = { lane: 'android', outcome: 'success', notes: ['the S26 stayed busy past the wait'], artifacts: [], delivery: { platform: 'android', target: 'SM-S948U', status: 'pending', reason: 'S26 busy' }, contention, editions: [] };
+  const shown = publicReceipts({ android: receipt, 'android-play': { lane: 'android-play' } });
+  assert.deepEqual(Object.keys(shown.android).includes('contention'), false);
+  assert.doesNotMatch(JSON.stringify(shown), /agent-a|delorenj\/other/);
+  assert.equal(receipt.contention, contention, 'the lane\'s own receipt is not edited');
+  assert.match(summaryMarkdown(receipt), /- contention on adb \(delivery-pending\): holder lease agent-a until 2026-11-24T11:00:00Z; ahead job delorenj\/other#1\n/);
+  const state = deviceOf(devices.android, receipt, { stamp: '2026-11-24T10:00:00Z' });
+  assert.deepEqual([state.status, state.reason, state.by], ['pending', 'S26 busy', null]);
+  assert.doesNotMatch(JSON.stringify(deviceLines(state)), /agent-a/);
+});
+const deviceLines = state => [deviceLine('android', { version: '0.2.2', code: 4, device: state })];

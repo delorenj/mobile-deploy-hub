@@ -74,6 +74,11 @@ export function summaryMarkdown(receipt) {
     const d = receipt.delivery;
     lines.push('', `- delivery: ${d.platform} ${d.target} ${d.version ?? '-'} (${d.build ?? '-'}) ${d.verified ? 'verified' : 'not verified'}${d.note ? `: ${d.note}` : ''}`);
   }
+  if (receipt.contention) {
+    const c = receipt.contention;
+    const holds = (c.blocked_by ?? []).map(hold => `${hold.role} ${hold.kind ?? '-'} ${hold.holder ?? hold.lease_id ?? '-'}${hold.until ? ` until ${hold.until}` : ''}`);
+    lines.push('', `- contention on ${c.lock} (${c.reason}): ${holds.length > 0 ? holds.join('; ') : 'no holder named'}`);
+  }
   for (const note of receipt.notes) lines.push('', `- ${note}`);
   return `${lines.join('\n')}\n`;
 }

@@ -2,6 +2,8 @@
 // from latest.json, with no external scripts or fonts, so Safari on the iPad and Chrome on the S26 open them directly.
 // builds/index.html lists every app; builds/<slug>/index.html is one app's page: Install APK, Install on iPad, each
 // device's state, sizes, commit, run and the APK history. builds/index.json carries the same as data.
+import { isBusyPending } from './latest.mjs';
+
 const html = text => String(text ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 const attr = url => html(safeUrl(url));
 const safeUrl = url => {
@@ -32,7 +34,7 @@ export function deviceLine(platform, block) {
   const head = `${device.name} ${releaseLabel(block.version, platform === 'android' ? block.code : block.build)}`;
   const why = device.reason ? ` (${device.reason})` : '';
   if (device.status === 'installed') return `${head}: installed${device.by ? ` by ${device.by}` : ''}`;
-  if (device.status === 'pending') return `${head}: pending${/catch-up off/.test(device.reason ?? '') ? '' : ', installs when it is back'}${why}`;
+  if (device.status === 'pending') return `${head}: pending${/catch-up off/.test(device.reason ?? '') ? '' : isBusyPending(device) ? ', installs when it is free' : ', installs when it is back'}${why}`;
   return `${head}: ${device.status}${why}`;
 }
 
