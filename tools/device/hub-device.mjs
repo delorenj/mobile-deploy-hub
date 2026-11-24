@@ -37,7 +37,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { findPhone, idMatchesSerial } from '../ci/lib/adb.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
-import { MAX_LEASE_MS, acquireLease, isLease, listLocks, listWaiters, lockDir, readOwner, releaseLease, updateLease } from '../ci/lib/lock.mjs';
+import { MAX_LEASE_MS, acquireLease, isLease, listLocks, lockDir, poolRequest, queueView, readOwner, releaseLease, updateLease } from '../ci/lib/lock.mjs';
 import { pause, sleep as realSleep } from '../ci/lib/pause.mjs';
 import { createAsyncAdb } from './async-adb.mjs';
 import { GATE, LEASE_ID, PROFILES, emulatorStatus, exportsOf as emulatorExports, hostPool, isEmulatorLease, isEmulatorLock, provision, readRecord, reap, releaseEmulator, teardownNow } from './emulator.mjs';
@@ -131,7 +131,7 @@ function setup(parsed, { needForWhy, fleet, env }) {
   if (flags.id !== undefined) {
     const onPhone = fleet.find(phone => {
       const owner = readOwnerOf(phone.lock, env);
-      return (isLease(owner) && owner.lease_id === flags.id) || listWaiters(phone.lock, { env }).some(waiter => waiter.lease_id === flags.id);
+      return (isLease(owner) && owner.lease_id === flags.id) || queueView(phone.lock, { env, includeStale: true }).some(waiter => waiter.lease_id === flags.id);
     });
     if (onPhone) throw usage(`--id ${flags.id} already names a lease or a waiter on ${onPhone.device}; a lease id names one lease`);
     if (isEmulatorLease(env, flags.id)) throw usage(`--id ${flags.id} already names an emulator lease; a lease id names one lease`);
@@ -206,24 +206,32 @@ function noPhoneError(fleet, states, waitMs, context) {
 async function takeAnyPhone(fleet, options, context) {
   const { env, timing } = context;
   const sliceMs = Number(env.HUB_DEVICE_PHONE_SLICE_MS) || 10_000;
+  // One Pool-level request for the whole wait (AD-4): each pass below is a try, and the try that takes a phone writes the
+  // one `acquire`, with waited_ms from this request. A request that ends without a phone settles as one timeout or cancel.
+  const pool = poolRequest('phone', { id: options.id ?? undefined, holder: options.holder, why: options.why, forMs: options.forMs, waitMs: options.waitMs, env, now: timing.now });
   const deadline = timing.now() + options.waitMs;
   const states = new Map();
-  for (;;) {
-    for (const phone of fleet) {
-      const left = deadline - timing.now();
-      try {
-        return await takeLease(phone, { ...options, waitMs: 0, phoneWaitMs: left > 0 ? Math.min(sliceMs, left) : 0 }, context);
-      } catch (error) {
-        if (error.code === 'HUB_LOCK_TIMEOUT') { states.set(phone.device, 'held'); continue; }
-        if (away(error)) { states.set(phone.device, error.reason ?? 'absent'); continue; }
-        throw error;
+  try {
+    for (;;) {
+      for (const phone of fleet) {
+        const left = deadline - timing.now();
+        try {
+          return await takeLease(phone, { ...options, id: pool.id, pool: pool.tag, waitMs: 0, phoneWaitMs: left > 0 ? Math.min(sliceMs, left) : 0 }, context);
+        } catch (error) {
+          if (error.code === 'HUB_LOCK_TIMEOUT') { states.set(phone.device, 'held'); continue; }
+          if (away(error)) { states.set(phone.device, error.reason ?? 'absent'); continue; }
+          throw error;
+        }
       }
+      if (timing.now() >= deadline) break;
+      await pause(timing.leasePollMs, { signal: options.signal, sleep: timing.sleep });
     }
-    if (timing.now() >= deadline) break;
-    await pause(timing.leasePollMs, { signal: options.signal, sleep: timing.sleep });
+    options.signal?.throwIfAborted();
+    throw noPhoneError(fleet, states, options.waitMs, context);
+  } catch (error) {
+    pool.settle(error, { signal: options.signal });
+    throw error;
   }
-  options.signal?.throwIfAborted();
-  throw noPhoneError(fleet, states, options.waitMs, context);
 }
 
 function exportsOf(lease, device, envSerial, phone) {
@@ -390,7 +398,7 @@ async function release(parsed, context) {
       const owner = readOwnerOf(phone.lock, env);
       return isLease(owner) && owner.lease_id === id;
     }) ?? null;
-    if (!found) found = fleet.find(phone => listWaiters(phone.lock, { env }).some(waiter => waiter.lease_id === id)) ?? null;
+    if (!found) found = fleet.find(phone => queueView(phone.lock, { env, includeStale: true }).some(waiter => waiter.lease_id === id)) ?? null;
     if (!found) {
       stdout(`HUB_DEVICE_NOT_HELD phone ${id} (no phone lease by that id)`);
       for (const phone of fleet) {
@@ -512,7 +520,7 @@ async function status(parsed, context) {
   });
   const waiters = [];
   for (const name of new Set([...fleet.map(phone => phone.lock), GATE, ...locks.map(entry => entry.lock)])) {
-    listWaiters(name, { env }).forEach((waiter, index) => waiters.push({ lock: name, device: nameOf(fleet, name), position: index + 1, lease_id: waiter.lease_id, holder: waiter.holder, why: waiter.why, since: waiter.enqueued_at, stale: waiter.stale }));
+    queueView(name, { env, includeStale: true }).forEach(waiter => waiters.push({ lock: name, device: nameOf(fleet, name), position: waiter.place, lease_id: waiter.lease_id, holder: waiter.holder, why: waiter.why, since: waiter.enqueued_at, stale: waiter.stale }));
   }
   const found = (context.inventory ?? inventory)({ lockRoot: lockDir(env), hubAdbPort: Number(env.HUB_ADB_SERVER_PORT) || 5037 });
   const reach = await phonePresence(fleet, context, found);

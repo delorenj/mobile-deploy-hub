@@ -4,13 +4,14 @@
 // real emulator, AVD or adb server is touched.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { hostId } from '../ci/lib/events.mjs';
 import { releaseLease, withLock } from '../ci/lib/lock.mjs';
 import { choosePorts, doomed, liveStart, portsInUse, releaseEmulator, resolveImage, stopProcesses } from './emulator.mjs';
 import { inventory } from './inventory.mjs';
@@ -352,6 +353,11 @@ test('the reaper: an emulator acquire tears down an expired lease, a lease whose
     assert.deepEqual(JSON.parse((await f.run(['status', '--json'])).out.join('\n')).emulators, []);
     assert.ok(await refused(Number(live.ANDROID_ADB_SERVER_PORT)));
     assert.equal(doomed({ host: 'elsewhere', lease_id: 'x' }, null), null, 'another host\'s record is never judged here');
+    // Story 2.2 (AD-8): an owner on a drifted hostname but this machine id is still this host, so its dead holder is judged
+    const deadPid = spawnSync(process.execPath, ['-e', '']).pid;
+    const owner = { kind: 'lease', lease_id: 'x', expires_at: new Date(Date.now() + 60_000).toISOString(), holder_pid: deadPid, holder_process_start: null, host: 'drifted-name.local' };
+    assert.equal(doomed({ host: hostname(), lease_id: 'x' }, { ...owner, host_id: hostId() }), hostId() ? 'holder gone' : null, 'same machine id: its holder pid is checked here');
+    assert.equal(doomed({ host: hostname(), lease_id: 'x' }, { ...owner, host_id: 'another-machine' }), null, 'another machine id: its holder pid cannot be judged here');
     f.clean();
   } finally { f.cleanup(); }
 });
@@ -625,13 +631,14 @@ test('status is read-only: a dead lease is neither reaped nor logged by looking;
     f.env.HUB_EMULATOR_POOL = '3';
     const holder = sleeper();
     const [SHORT, TIED, GONE] = [uid('short'), uid('tied'), uid('gone')];
-    assert.equal((await f.run(['lease', 'emulator', '--for', '1s', '--why', 'short', '--id', SHORT])).code, 0);
+    // 3s, not 1s: under a loaded host the two leases below can take over a second, and an acquire reaps an expired lease
+    assert.equal((await f.run(['lease', 'emulator', '--for', '3s', '--why', 'short', '--id', SHORT])).code, 0);
     assert.equal((await f.run(['lease', 'emulator', '--for', '30m', '--why', 'tied', '--id', TIED, '--pid', String(holder.pid)])).code, 0);
     assert.equal((await f.run(['lease', 'emulator', '--for', '30m', '--why', 'orphan', '--id', GONE])).code, 0);
     holder.kill('SIGKILL');
     await waitFor(() => gone(holder.pid));
     releaseLease('emulator-3', GONE, { env: f.env });   // its record stays: an orphan
-    await settle(1100);
+    await settle(Math.max(0, Date.parse(f.owner('emulator-1').expires_at) - Date.now()) + 100);
     const eventsBefore = logged(f).length;
     const before = snapshot(join(f.root, 'locks'), join(f.root, 'events'));
     assert.ok(Object.keys(before).some(path => path.endsWith(`${SHORT}.json`)), 'the dead leases have records');
@@ -771,7 +778,9 @@ test('--for runs from READY: a boot longer than the lease never expires it mid-b
   } finally { f.cleanup(); }
 });
 
-test('an emulator Lease is recorded as exactly: request and acquire on the gate, acquire on its slot, the gate let go, the slot released', async () => {
+// INTENDED CHANGE (Story 2.2, AD-4): an emulator request opens with one Pool-level `request` (pool `emulator`, no lock); the slot
+// probe is a try whose own acquire carries the Pool and measures waited_ms from that request.
+test('an emulator Lease is recorded as exactly: the Pool request, request and acquire on the gate, the tagged acquire on its slot, the gate let go, the slot released', async () => {
   const f = fixture();
   try {
     f.env.HUB_EMULATOR_POOL = '1';
@@ -780,16 +789,46 @@ test('an emulator Lease is recorded as exactly: request and acquire on the gate,
     assert.equal(leased.code, 0, leased.err.join('\n'));
     assert.equal((await f.run(['release', 'emulator', id])).code, 0);
     const got = logged(f);
-    assert.deepEqual(got.map(event => [event.event, event.lock, event.lease_id, event.reason]), [
-      ['request', 'emulator', id, null],
-      ['acquire', 'emulator', id, null],
-      ['acquire', 'emulator-1', id, null],
-      ['release', 'emulator', id, 'by-id'],
-      ['release', 'emulator-1', id, 'by-id'],
+    assert.deepEqual(got.map(event => [event.event, event.lock, event.lease_id, event.reason, event.pool ?? null]), [
+      ['request', null, id, null, 'emulator'],
+      ['request', 'emulator', id, null, null],
+      ['acquire', 'emulator', id, null, null],
+      ['acquire', 'emulator-1', id, null, 'emulator'],
+      ['release', 'emulator', id, 'by-id', null],
+      ['release', 'emulator-1', id, 'by-id', null],
     ]);
     assert.ok(got.every(event => event.hold_kind === 'lease' && event.claimant.kind === 'agent' && event.claimant.holder === `tester@${hostname()}`));
-    assert.equal(got[0].deadline_at !== null && got[0].for_ms > 0, true, 'the gate request says how long it may wait and hold');
-    assert.ok(got[4].held_ms >= 0 && got[2].waited_ms === 0, 'the slot is a try: taken at once, without a request of its own');
+    assert.equal(got[0].request, id, 'the Pool request is named by the lease id');
+    assert.equal(got[1].deadline_at !== null && got[1].for_ms > 0, true, 'the gate request says how long it may wait and hold');
+    assert.ok(got[3].request === id && got[3].waited_ms >= got[2].waited_ms, 'the slot acquire runs from the outer request, so it includes the gate wait');
+    assert.ok(got[5].held_ms >= 0);
+    f.clean();
+  } finally { f.cleanup(); }
+});
+
+test('an emulator request that finds the Pool full ends in one Pool timeout, and a try that fails writes no ticket and no event', async () => {
+  const f = fixture();
+  try {
+    f.env.HUB_EMULATOR_POOL = '1';
+    const first = uid('held');
+    assert.equal((await f.run(['lease', 'emulator', '--for', '30m', '--why', 'holds the slot', '--id', first])).code, 0);
+    const before = logged(f).length;
+    const late = uid('late');
+    const busy = await f.run(['lease', 'emulator', '--for', '30m', '--why', 'too late', '--id', late, '--wait', '0']);
+    assert.equal(busy.code, 76, busy.err.join('\n'));
+    const mine = logged(f).slice(before).filter(event => event.lease_id === late);
+    // the gate take is a try (no request of its own), then its acquire and release, and the slot try wrote nothing
+    assert.deepEqual(mine.map(event => [event.event, event.lock, event.pool ?? null, event.reason]), [
+      ['request', null, 'emulator', null],
+      ['acquire', 'emulator', null, null],
+      ['timeout', null, 'emulator', 'deadline'],
+      ['release', 'emulator', null, 'by-id'],
+    ]);
+    assert.ok(mine[2].waited_ms >= 0 && /the emulator pool is full/.test(mine[2].blocked_by));
+    assert.ok(mine.every(event => event.lock !== 'emulator-1'), 'the failed slot try wrote nothing');
+    assert.ok(!existsSync(join(f.root, 'locks/emulator-1.queue')), 'and no ticket');
+    assert.equal(mine.filter(event => event.event === 'timeout').length, 1, 'one ending for the Pool request');
+    await f.run(['release', 'emulator', first]);
     f.clean();
   } finally { f.cleanup(); }
 });

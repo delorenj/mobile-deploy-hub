@@ -76,6 +76,8 @@ export function sameHost(a, b) {
   if (a?.host_id && b?.host_id && a.host_id === b.host_id) return true;
   return typeof a?.host === 'string' && a.host !== '' && a.host === b?.host;
 }
+// This machine as a record sees it, for a caller outside lock.mjs that asks sameHost (AD-8).
+export const localHost = ({ host = hostname(), hostId = machineId() } = {}) => ({ host, host_id: hostId });
 const stale = (path, owner, options) => staleness(path, owner, options) !== null;
 
 const sameOwner = (a, b) => JSON.stringify(a) === JSON.stringify(b);
@@ -383,16 +385,96 @@ export function listWaiters(name, { env = process.env, prune = false, now = Date
   return waiters;
 }
 
-// Takes the lock as a lease and returns the record. Waiters are served first in, first out. Throws code
+// ---- the one queue view (AD-6) ----
+//
+// Every caller that needs to know who is ahead, who blocks or what a position is reads it here and never parses tickets
+// (AD-1). Entries are the live tickets in order, each the ticket as written plus:
+//   file      the ticket's file name (its identity in the Queue)
+//   kind      lease, job, hub-job or remote (ticketKind: a missing kind is a lease)
+//   place     1-based, in the order returned
+//   blocking  whether a Claimant behind it must wait for it: every live ticket blocks (Story 2.5 adds Reservation entries,
+//             `kind: 'reservation'` with `grace`, of which only the first in line blocks, and only until its grace ends)
+//   stale     true for a dead ticket, which `includeStale` keeps in the list so read-only status can still show it
+// Order is the sort key (a ticket's file name; a Reservation will bring its own) and then the full name. `prune` removes dead
+// tickets, as acquirers do; observers never pass it. `policy` is accepted for the Reservation grace of Story 2.5 and unused.
+const sortKey = entry => entry.file;
+const inOrder = (a, b) => (sortKey(a) < sortKey(b) ? -1 : sortKey(a) > sortKey(b) ? 1 : a.file < b.file ? -1 : a.file > b.file ? 1 : 0);
+
+export function queueView(name, { env = process.env, now = Date.now, policy = null, includeStale = false, prune = false, host, hostId, processStart: startOf, isAlive } = {}) {
+  void policy;
+  const tickets = listWaiters(name, { env, prune, now, host, hostId, processStart: startOf, isAlive });
+  return tickets
+    .filter(ticket => includeStale || !ticket.stale)
+    .map(ticket => ({ ...ticket, kind: ticketKind(ticket), blocking: !ticket.stale }))
+    .sort(inOrder)
+    .map((entry, index) => ({ ...entry, place: index + 1 }));
+}
+
+// What blocks a Claimant: the blocking entries ahead of its own ticket, or every blocking entry for a try (which has no
+// ticket and so no place; it takes a free lock only when nothing waits).
+const blockersAhead = (view, file = null) => view.filter(entry => entry.blocking && (file === null || inOrder(entry, { file }) < 0));
+
+// A fresh lease id, for a caller that must name its request before the first take (a Pool request).
+export const newLeaseId = () => `l-${randomBytes(6).toString('hex')}`;
+
+// ---- Pool requests (AD-4) ----
+//
+// A Pool request (`phone`, `emulator`) is one request that is served by one of several locks, probed with tries. It writes one
+// Pool-level `request` event here, and ends in exactly one of: the `acquire` of the lock a try took (that try is passed
+// `tag`, so its own acquire event carries `pool` and `request` and its `waited_ms` runs from this request, never from the
+// probe), or a `timeout` or `cancel` written by `settle`. `lock` is null on Pool-level events. A try that took a lock the
+// caller then gave back (a phone that was not there) is an acquire and a release, true history, and the request goes on.
+// Returns {id, tag, settle(error, {signal})}; settle writes the one ending, once, and is never fatal. No event for a name
+// outside the Queued pools (AD-4 names only phone and emulator).
+export function poolRequest(pool, { id = newLeaseId(), holder, why, forMs = null, waitMs = 0, env = process.env, now = Date.now, hostId = machineId() } = {}) {
+  const since = now();
+  const deadline = since + waitMs;
+  const tag = { name: pool, request: id, since, deadline };
+  const subject = { kind: 'lease', lease_id: id, holder: holder ?? null, repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null, attempt: env.GITHUB_RUN_ATTEMPT ?? null, job: env.GITHUB_JOB ?? null };
+  const write = (event, fields = {}) => {
+    const at = now();
+    appendEvent(eventOf(event, null, subject, { pool, request: id, for_ms: forMs, deadline_at: iso(deadline), ...fields }), { env, now: () => at, hostId });
+    return at;
+  };
+  write('request');
+  let ended = false;
+  return {
+    id,
+    tag,
+    // A busy or away Pool ends as a timeout (reason `deadline`, or `away` when no phone was there to take), an abort or any
+    // other error as a cancel (a request released while it waited says `released`).
+    settle(error, { signal } = {}) {
+      if (ended) return;
+      ended = true;
+      const waited = at => ({ waited_ms: Math.max(0, at - since) });
+      if (error?.code === 'HUB_LOCK_TIMEOUT' || error?.code === 'HUB_PHONE_AWAY') {
+        const at = now();
+        write('timeout', { ...waited(at), reason: error.code === 'HUB_PHONE_AWAY' ? 'away' : 'deadline', blocked_by: String(error.message ?? '').slice(0, 500) });
+      } else {
+        const at = now();
+        write('cancel', { ...waited(at), reason: signal?.aborted || error?.name === 'AbortError' ? 'aborted' : error?.code === 'HUB_LEASE_CANCELLED' ? 'released' : 'error' });
+      }
+    },
+  };
+}
+
+// Takes the lock as a lease and returns the record. Waiters are served first in, first out, through queueView: a waiter
+// takes the lock only when nothing that blocks is ahead of its ticket, and after the mkdir it reads the view again; if a
+// blocking entry now stands ahead it gives the lock back by tombstone (no event) and keeps waiting (AD-6). Throws code
 // HUB_LOCK_TIMEOUT when waitMs passes, HUB_LEASE_CANCELLED when releaseLease removed its place in the queue.
+//
+// A call with waitMs 0 is a try (AD-6): it writes no ticket, takes the lock only when it is free and nothing blocks (every
+// live ticket does), records its acquire, and records nothing at all when it fails. A try carrying `pool` (poolRequest's tag)
+// is one probe of a Pool request: its acquire event names the Pool and measures waited_ms from that request.
+//
 // holderPid, when given, ties the lease to a process: the lease is reclaimed when that process is gone. The queue
 // ticket is claimed (unlinked) only after the record is written: a release that removed the ticket first wins, and the
 // record is taken back. beforeClaim is a test seam that runs between the two.
 //
 // Events (AD-9), each written only by the step that decided it: `request` once the ticket is in place, `acquire` once
-// the ticket is claimed, `timeout` and `cancel` (an abort or an error while queued) once this waiter's own unlink of its
-// ticket succeeds. A releaseLease that removes the ticket first records the cancel itself. A call with waitMs 0 is a
-// try: it records its acquire and nothing when it fails, so pool probes never flood the log.
+// the ticket is claimed (or, for a try, once the lock survived the re-check), `timeout` and `cancel` (an abort or an error
+// while queued) once this waiter's own unlink of its ticket succeeds. A releaseLease that removes the ticket first records
+// the cancel itself.
 export async function acquireLease(name, {
   holder,
   why,
@@ -408,30 +490,37 @@ export async function acquireLease(name, {
   now = Date.now,
   signal,
   beforeClaim = () => {},
+  afterTake = () => {},
   beforeRetire,
   hostId = machineId(),
   host = hostname(),
   processStart: startOf = processStart,
+  pool = null,
 } = {}) {
   const path = lockPath(name, env);
   if (!(forMs > 0) || forMs > MAX_LEASE_MS) throw new Error(`a lease runs for more than 0 and at most ${MAX_LEASE_MS / 3600_000}h`);
   if (!holder || !why) throw new Error('a lease names its holder and why');
-  const lease_id = id ? leaseId(id) : `l-${randomBytes(6).toString('hex')}`;
+  const lease_id = id ? leaseId(id) : newLeaseId();
   mkdirSync(lockDir(env), { recursive: true });
-  const queue = queuePath(name, env);
-  mkdirSync(queue, { recursive: true });
   const requested = now();
-  const ticket = `${String(requested).padStart(15, '0')}-${String(ticketCounter++).padStart(6, '0')}-${String(process.pid).padStart(8, '0')}.json`;
-  const ticketFile = join(queue, ticket);
-  // Write-then-rename, like owner.json: a reader never sees a half-written ticket.
-  const pending = `${ticketFile}.tmp`;
   const deadline = requested + waitMs;
-  writeFileSync(pending, JSON.stringify(buildTicket('lease', { env, requested, deadline, lease_id, holder, why, host, hostId, processStart: startOf })), { flag: 'wx' });
-  renameSync(pending, ticketFile);
+  const tryOnly = !(waitMs > 0);
+  // A try has no place in line, so it writes no ticket. A waiter writes one, write-then-rename like owner.json, so a reader
+  // never sees a half-written ticket.
+  let ticket = null;
+  let ticketFile = null;
+  if (!tryOnly) {
+    const queue = queuePath(name, env);
+    mkdirSync(queue, { recursive: true });
+    ticket = `${String(requested).padStart(15, '0')}-${String(ticketCounter++).padStart(6, '0')}-${String(process.pid).padStart(8, '0')}.json`;
+    ticketFile = join(queue, ticket);
+    const pending = `${ticketFile}.tmp`;
+    writeFileSync(pending, JSON.stringify(buildTicket('lease', { env, requested, deadline, lease_id, holder, why, host, hostId, processStart: startOf })), { flag: 'wx' });
+    renameSync(pending, ticketFile);
+  }
   const attempt = env.GITHUB_RUN_ATTEMPT ?? null;
   const job = env.GITHUB_JOB ?? null;
   const asked = { kind: 'lease', lease_id, holder, repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null, attempt, job };
-  const tryOnly = !(waitMs > 0);
   const seams = { env, hostId };
   const waitedTo = at => ({ for_ms: forMs, deadline_at: iso(deadline), waited_ms: Math.max(0, at - requested) });
   if (!tryOnly) note(name, eventOf('request', name, asked, { for_ms: forMs, deadline_at: iso(deadline) }), { ...seams, at: requested });
@@ -442,22 +531,26 @@ export async function acquireLease(name, {
     try { unlinkSync(ticketFile); } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
     left = true;
     const at = now();
-    if (!tryOnly) note(name, eventOf(as, name, asked, { ...waitedTo(at), ...fields }), { ...seams, at });
+    note(name, eventOf(as, name, asked, { ...waitedTo(at), ...fields }), { ...seams, at });
     return true;
   };
   const timedOut = (message, owner) => {
+    if (tryOnly) return failure('HUB_LOCK_TIMEOUT', message);
     if (!leave('timeout', { reason: 'deadline', blocked_by: describe(owner) })) return failure('HUB_LEASE_CANCELLED', `lease ${lease_id} was released while it waited for ${name}`);
     return failure('HUB_LOCK_TIMEOUT', message);
   };
+  const view = () => queueView(name, { env, prune: true, now, host, hostId, processStart: startOf });
+  const cancelled = text => failure('HUB_LEASE_CANCELLED', `lease ${lease_id} ${text} ${name}`);
   let waiting = false;
   let failed = true;
   try {
     for (;;) {
       signal?.throwIfAborted();
-      try { statSync(ticketFile); } catch { throw failure('HUB_LEASE_CANCELLED', `lease ${lease_id} was released while it waited for ${name}`); }
-      const waiters = listWaiters(name, { env, prune: true, now, host, hostId, processStart: startOf });
-      const position = waiters.findIndex(waiter => waiter.file === ticket);
-      if (position === 0) {
+      if (ticketFile) { try { statSync(ticketFile); } catch { throw cancelled('was released while it waited for'); } }
+      let current = view();
+      if (ticket && !current.some(entry => entry.file === ticket)) throw cancelled('lost its place in the queue for');
+      let blockers = blockersAhead(current, ticket);
+      if (blockers.length === 0) {
         const started = now();
         const record = {
           pid: process.pid, host, repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null, started_at: new Date(started).toISOString(),
@@ -474,41 +567,60 @@ export async function acquireLease(name, {
           if (error.code !== 'EEXIST') throw error;
         }
         if (taken) {
+          // The re-check (AD-6): a blocking entry that appeared ahead between the view and the mkdir takes the place.
+          // afterTake is a test seam that runs between the mkdir and the re-check.
+          afterTake();
+          blockers = blockersAhead(view(), ticket);
+          if (blockers.length > 0) {
+            retire(name, path, record, { env, now, log, hostId, beforeRetire });
+            taken = false;
+          }
+        }
+        if (taken) {
           beforeClaim();
-          try {
-            unlinkSync(ticketFile);
-          } catch (error) {
-            if (error.code !== 'ENOENT') throw error;
-            retire(name, path, record, { env, now, log });
-            throw failure('HUB_LEASE_CANCELLED', `lease ${lease_id} was released while it was being taken for ${name}`);
+          if (ticketFile) {
+            try {
+              unlinkSync(ticketFile);
+            } catch (error) {
+              if (error.code !== 'ENOENT') throw error;
+              retire(name, path, record, { env, now, log });
+              throw cancelled('was released while it was being taken for');
+            }
           }
           left = true;
-          note(name, eventOf('acquire', name, record, { deadline_at: iso(deadline), waited_ms: Math.max(0, started - requested) }), { ...seams, at: started });
+          const tag = pool ? { pool: pool.name, request: pool.request } : {};
+          const waitedMs = Math.max(0, started - (pool?.since ?? requested));
+          note(name, eventOf('acquire', name, record, { deadline_at: iso(pool?.deadline ?? deadline), waited_ms: waitedMs, ...tag }), { ...seams, at: started });
           log(`HUB_LEASE ${name} ${lease_id} until ${record.expires_at}`);
           failed = false;
           return record;
         }
-        const owner = readOwner(path);
-        const verdict = staleness(path, owner, { now, staleMs, host, hostId });
-        if (verdict) {
-          if (retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, hostId, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
-          continue;
+        if (blockers.length === 0) {
+          const owner = readOwner(path);
+          const verdict = staleness(path, owner, { now, staleMs, host, hostId });
+          if (verdict) {
+            if (retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, hostId, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
+            continue;
+          }
+          if (now() >= deadline) throw timedOut(`host lock ${name} is held by ${describe(owner)}; gave up after ${Math.round(waitMs / 1000)}s`, owner);
+          if (!waiting) { log(`HUB_LOCK_WAIT ${name} held by ${describe(owner)}`); waiting = true; }
         }
-        if (now() >= deadline) throw timedOut(`host lock ${name} is held by ${describe(owner)}; gave up after ${Math.round(waitMs / 1000)}s`, owner);
-        if (!waiting) { log(`HUB_LOCK_WAIT ${name} held by ${describe(owner)}`); waiting = true; }
-      } else {
-        if (position === -1) throw failure('HUB_LEASE_CANCELLED', `lease ${lease_id} lost its place in the queue for ${name}`);
-        if (now() >= deadline) { const owner = readOwner(path); throw timedOut(`host lock ${name} has ${position} waiter${position === 1 ? '' : 's'} ahead of lease ${lease_id} (held by ${describe(owner)}); gave up after ${Math.round(waitMs / 1000)}s`, owner); }
-        if (!waiting) { log(`HUB_LOCK_WAIT ${name} queued behind ${position} (${describe(readOwner(path))})`); waiting = true; }
+      }
+      if (blockers.length > 0) {
+        const ahead = blockers.length;
+        if (now() >= deadline) { const owner = readOwner(path); throw timedOut(`host lock ${name} has ${ahead} waiter${ahead === 1 ? '' : 's'} ahead of lease ${lease_id} (held by ${describe(owner)}); gave up after ${Math.round(waitMs / 1000)}s`, owner); }
+        if (!waiting) { log(`HUB_LOCK_WAIT ${name} queued behind ${ahead} (${describe(readOwner(path))})`); waiting = true; }
       }
       await pause(pollMs, { signal, sleep });
     }
   } finally {
     // Anything else that ends the wait (an abort, an error) leaves the queue as a cancel.
-    if (failed && !left) {
-      try { leave('cancel', { reason: signal?.aborted ? 'aborted' : 'error' }); } catch { /* the rmSync below still clears it */ }
+    if (ticketFile) {
+      if (failed && !left) {
+        try { leave('cancel', { reason: signal?.aborted ? 'aborted' : 'error' }); } catch { /* the rmSync below still clears it */ }
+      }
+      rmSync(ticketFile, { force: true });
     }
-    rmSync(ticketFile, { force: true });
   }
 }
 

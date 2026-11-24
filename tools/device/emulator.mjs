@@ -21,7 +21,7 @@ import { homedir, hostname, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { adbEnv, adbPath } from '../ci/lib/adb.mjs';
 import { androidSdk, javaHome } from '../ci/lib/android.mjs';
-import { MAX_LEASE_MS, acquireLease, isLease, lockDir, processStart, readOwner, releaseLease, updateLease, withLock } from '../ci/lib/lock.mjs';
+import { MAX_LEASE_MS, acquireLease, isLease, lockDir, localHost, poolRequest, processStart, queueView, readOwner, releaseLease, sameHost, updateLease, withLock } from '../ci/lib/lock.mjs';
 import { pause, sleep as realSleep } from '../ci/lib/pause.mjs';
 import { createAdbWire } from './adb-wire.mjs';
 import { inventory } from './inventory.mjs';
@@ -276,10 +276,13 @@ export function teardownNow(record, { env = process.env } = {}) {
 // Why a record must go, or null while its lease stands: its slot no longer holds it, its lease expired, or the process the
 // lease is tied to is gone (or is now another process).
 export function doomed(record, owner, now = Date.now()) {
-  if (record.host !== hostname()) return null;
+  // Same host by machine id when both sides carry one, else by hostname (AD-8). A pool record has no host_id, so it is judged
+  // by hostname; an owner written since Story 1.4 has one, and a drifted hostname no longer makes the owner foreign.
+  const here = localHost();
+  if (!sameHost(record, here)) return null;
   if (!isLease(owner) || owner.lease_id !== record.lease_id) return 'orphaned';
   if (!(Date.parse(owner.expires_at) > now)) return 'expired';
-  if (Number.isSafeInteger(owner.holder_pid) && owner.host === hostname()) {
+  if (Number.isSafeInteger(owner.holder_pid) && sameHost(owner, here)) {
     const start = liveStart(owner.holder_pid);
     if (!start || (owner.holder_process_start && start !== owner.holder_process_start)) return 'holder gone';
   }
@@ -326,10 +329,8 @@ function slotHolding(env, id) {
 export function isEmulatorLease(env, id) {
   if (!id) return false;
   if (readRecord(env, id) || slotHolding(env, id) || readOwnerOf(GATE, env)?.lease_id === id) return true;
-  try {
-    const dir = join(lockDir(env), `${GATE}.queue`);
-    return readdirSync(dir).some(file => { try { return JSON.parse(readFileSync(join(dir, file), 'utf8')).lease_id === id; } catch { return false; } });
-  } catch { return false; }
+  // A ticket still counts while it is only stale: the id is not free to reuse until an acquirer has pruned it.
+  return queueView(GATE, { env, includeStale: true }).some(entry => entry.lease_id === id);
 }
 
 export const LEASE_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
@@ -481,12 +482,17 @@ export async function provision({
   const image = resolveImage(profileName, { env });
   const { profile } = image;
   const deadline = now() + waitMs;
+  // One Pool-level request for the whole wait (AD-4): the gate is its queue and each slot probe below a try. The probe that
+  // takes a slot writes the one `acquire`, tagged with the request, waited_ms from here; a request that ends before any
+  // slot is taken settles as one timeout or cancel.
+  const request = poolRequest('emulator', { id, holder, why, forMs, waitMs, env, now });
   // The acquire path has just reaped; the gate loop below reaps again without waiting on another reaper.
   try {
     await acquireLease(GATE, { id, holder, why: `next for an emulator: ${why}`, forMs: Math.min(MAX_LEASE_MS, waitMs + 600_000), waitMs, holderPid: process.pid, env, log, pollMs, sleep, now, signal });
   } catch (error) {
-    if (error.code !== 'HUB_LOCK_TIMEOUT') throw error;
-    throw failure('HUB_LOCK_TIMEOUT', `the emulator pool is full, with other requests ahead of ${id} (${error.message})`);
+    const out = error.code !== 'HUB_LOCK_TIMEOUT' ? error : failure('HUB_LOCK_TIMEOUT', `the emulator pool is full, with other requests ahead of ${id} (${error.message})`);
+    request.settle(out, { signal });
+    throw out;
   }
   let slot = null;
   let record = null;
@@ -501,7 +507,7 @@ export async function provision({
         for (let k = 1; k <= pool && !slot; k += 1) {
           if (unreaped.has(slotName(k))) continue;
           try {
-            await acquireLease(slotName(k), { id, holder, why, forMs: Math.min(MAX_LEASE_MS, bootTimeoutMs + forMs + 120_000), waitMs: 0, holderPid: process.pid, env, log, pollMs, sleep, now, signal });
+            await acquireLease(slotName(k), { id, holder, why, forMs: Math.min(MAX_LEASE_MS, bootTimeoutMs + forMs + 120_000), waitMs: 0, holderPid: process.pid, env, log, pollMs, sleep, now, signal, pool: request.tag });
             slot = slotName(k);
           } catch (error) {
             if (error.code !== 'HUB_LOCK_TIMEOUT') throw error;
@@ -514,6 +520,10 @@ export async function provision({
         await pause(pollMs, { signal, sleep });
       }
       record = claim({ env, id, slot, image, profileName });
+    } catch (error) {
+      // A request that never took a slot ends as a Pool timeout or cancel; one that did has its acquire already.
+      if (!slot) request.settle(error, { signal });
+      throw error;
     } finally {
       releaseLease(GATE, id, { env });
     }

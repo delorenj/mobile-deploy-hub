@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ALIVE_MS, QUEUED, TICKET_ABSENT_MS, acquireLease, buildTicket, isQueued, jobLeaseId, listLocks, listWaiters, processStart as processStartOf, releaseLease, sameHost, ticketKind, ticketStaleness, updateLease, withLock } from '../ci/lib/lock.mjs';
+import { ALIVE_MS, QUEUED, TICKET_ABSENT_MS, acquireLease, buildTicket, isQueued, jobLeaseId, listLocks, listWaiters, poolRequest, processStart as processStartOf, queueView, releaseLease, sameHost, ticketKind, ticketStaleness, updateLease, withLock } from '../ci/lib/lock.mjs';
 import { hostId, readEvents } from '../ci/lib/events.mjs';
 import { pause } from '../ci/lib/pause.mjs';
 
@@ -160,6 +160,7 @@ test('a waiter whose process died is dropped from the queue, and releasing a wai
   try {
     await lease(f, { id: 'holder' });
     const queue = join(f.root, 'locks/adb.queue');
+    mkdirSync(queue, { recursive: true });   // a try writes no ticket, so nothing has made the queue yet
     writeFileSync(join(queue, '000000000000001-000000-00000001.json'), JSON.stringify({ lease_id: 'ghost', holder: 'ghost', why: 'gone', pid: deadPid(), host: hostname(), enqueued_at: new Date(0).toISOString() }));
     const waiting = lease(f, { id: 'real', waitMs: 10_000 });
     await settle(30);
@@ -219,14 +220,16 @@ test('a waiter that times out leaves the queue; a queued lease says how many are
 test('a release that lands while the lease is being taken wins: the record is taken back and acquire says cancelled', async () => {
   const f = fixture();
   try {
-    await assert.rejects(lease(f, { id: 'racing', beforeClaim: () => releaseLease('adb', 'racing', { env: f.env }) }), error => error.code === 'HUB_LEASE_CANCELLED');
+    // INTENDED CHANGE (Story 2.2): a try (waitMs 0) has no ticket, so the claim race belongs to a waiter, which has one.
+    await assert.rejects(lease(f, { id: 'racing', waitMs: 1000, beforeClaim: () => releaseLease('adb', 'racing', { env: f.env }) }), error => error.code === 'HUB_LEASE_CANCELLED');
     assert.ok(!existsSync(f.lock), 'no orphan record');
     // a release that removed the ticket but had not yet looked at the record: acquire takes its own record back
     const queue = join(f.root, 'locks/adb.queue');
-    await assert.rejects(lease(f, { id: 'racing-2', beforeClaim: () => { for (const file of readdirSync(queue)) rmSync(join(queue, file)); } }), error => error.code === 'HUB_LEASE_CANCELLED');
+    await assert.rejects(lease(f, { id: 'racing-2', waitMs: 1000, beforeClaim: () => { for (const file of readdirSync(queue)) rmSync(join(queue, file)); } }), error => error.code === 'HUB_LEASE_CANCELLED');
     assert.ok(!existsSync(f.lock), 'its own record is gone too');
-    // Intended change (Story 1.4): the release cancelled a request that never acquired, so its history is one cancel.
-    assert.deepEqual(events(f).map(event => [event.event, event.lease_id, event.reason]), [['cancel', 'racing', 'released']], 'one cancel; a give-back is neither a release nor an acquire');
+    // Intended change (Story 1.4): the release cancelled a request that never acquired, so its history is one cancel. (The
+    // second ticket was removed by the test, not by a release, so it has no cancel.)
+    assert.deepEqual(events(f).map(event => [event.event, event.lease_id, event.reason]), [['request', 'racing', null], ['cancel', 'racing', 'released'], ['request', 'racing-2', null]], 'a give-back is neither a release nor an acquire');
     assert.deepEqual(tombs(f), []);
     assert.equal((await lease(f, { id: 'after' })).lease_id, 'after', 'the lock is free for the next taker');
     assert.equal(releaseLease('adb', null, { env: f.env }).released, true);
@@ -867,5 +870,116 @@ test('a ticket whose pid is 0 or negative is no pid: it cannot strand the queue 
     writeFileSync(junk, JSON.stringify({ lease_id: 'ghost', holder: 'x', why: 'y', pid: 0, host: hostname(), process_start: null, enqueued_at: new Date(Date.now() - 61_000).toISOString() }));
     assert.equal((await lease(f, { id: 'free' , waitMs: 100 })).lease_id, 'free', 'a pid-0 ticket cannot starve a free lock');
     assert.ok(!existsSync(junk));
+  } finally { f.cleanup(); }
+});
+
+// ---- Story 2.2: one queue view, and tries (AD-6) ----
+
+const putTicket = (f, name, body = {}) => {
+  const queue = join(f.root, 'locks/adb.queue');
+  mkdirSync(queue, { recursive: true });
+  const file = join(queue, name);
+  writeFileSync(file, JSON.stringify({ lease_id: name.slice(16, 22), holder: 'someone', why: 'waiting', pid: process.pid, host: hostname(), enqueued_at: new Date().toISOString(), ...body }));
+  return file;
+};
+
+test('queueView lists live tickets in file-name order with place, blocking, kind and identity; stale ones only on request, and only acquirers prune', async () => {
+  const f = fixture();
+  try {
+    assert.deepEqual(queueView('adb', { env: f.env }), [], 'no queue directory is an empty view');
+    putTicket(f, '000000000000030-000001-00000009.json', { lease_id: 'third', kind: 'job', repo: 'o/r', run: '7', attempt: '1', job: 'android' });
+    putTicket(f, '000000000000010-000000-00000009.json', { lease_id: 'first' });
+    const ghost = putTicket(f, '000000000000020-000000-00000009.json', { lease_id: 'ghost', pid: deadPid() });
+    putTicket(f, '000000000000040-000000-00000009.json', { lease_id: 'hub', kind: 'hub-job' });
+    putTicket(f, '000000000000050-000000-00000009.json', { lease_id: 'odd', kind: 'something-new' });
+    writeFileSync(join(f.root, 'locks/adb.queue/not-a-ticket.txt'), 'x');
+    const view = queueView('adb', { env: f.env });
+    assert.deepEqual(view.map(entry => [entry.place, entry.lease_id, entry.kind, entry.blocking]), [
+      [1, 'first', 'lease', true], [2, 'third', 'job', true], [3, 'hub', 'hub-job', true], [4, 'odd', 'something-new', true],
+    ], 'file-name order, a missing kind is a lease, an unfamiliar kind still blocks');
+    assert.deepEqual([view[1].repo, view[1].run, view[1].attempt, view[1].job, view[1].file], ['o/r', '7', '1', 'android', '000000000000030-000001-00000009.json']);
+    assert.deepEqual(queueView('adb', { env: f.env, includeStale: true }).map(entry => [entry.place, entry.lease_id, entry.stale, entry.blocking]), [
+      [1, 'first', false, true], [2, 'ghost', true, false], [3, 'third', false, true], [4, 'hub', false, true], [5, 'odd', false, true],
+    ], 'status keeps showing a dead ticket, in its place, and it blocks nothing');
+    assert.ok(existsSync(ghost), 'observing prunes nothing');
+    assert.equal(queueView('adb', { env: f.env, prune: true, policy: { queue: {} } }).length, 4);
+    assert.ok(!existsSync(ghost), 'an acquirer prunes it');
+  } finally { f.cleanup(); }
+});
+
+test('a try writes no ticket: it takes a free lock with one acquire, and fails with no ticket and no event when the lock is held or anyone waits', async () => {
+  const f = fixture();
+  try {
+    const got = await lease(f, { id: 'tried' });
+    assert.equal(got.lease_id, 'tried');
+    assert.ok(!existsSync(join(f.root, 'locks/adb.queue')), 'a try never even makes the queue directory');
+    assert.deepEqual(events(f).map(event => [event.event, event.lease_id]), [['acquire', 'tried']]);
+    // held
+    await assert.rejects(lease(f, { id: 'held-out' }), error => error.code === 'HUB_LOCK_TIMEOUT' && /^host lock adb is held by lease tried of agent-a .*; gave up after 0s$/.test(error.message));
+    // a waiter in line: even a free lock is not the try's to take
+    releaseLease('adb', 'tried', { env: f.env });
+    putTicket(f, '000000000000001-000000-00000009.json', { lease_id: 'waiting' });
+    const before = events(f).length;
+    await assert.rejects(lease(f, { id: 'jumper' }), error => error.code === 'HUB_LOCK_TIMEOUT' && /^host lock adb has 1 waiter ahead of lease jumper \(held by an unknown holder\); gave up after 0s$/.test(error.message));
+    assert.ok(!existsSync(f.lock), 'it did not take the lock');
+    assert.deepEqual(readdirSync(join(f.root, 'locks/adb.queue')), ['000000000000001-000000-00000009.json'], 'and left no ticket');
+    assert.equal(events(f).length, before, 'the failed tries wrote no event');
+    assert.deepEqual(tombs(f), []);
+  } finally { f.cleanup(); }
+});
+
+// AD-6: the mkdir can win a lock that a blocking entry was about to be first for. afterTake lands that entry between the mkdir
+// and the re-check, the way a slower writer's earlier ticket would.
+test('an acquirer whose mkdir won gives the lock back by tombstone when a blocking entry stands ahead, writes nothing, and keeps waiting', async () => {
+  const f = fixture();
+  try {
+    let injected = null;
+    const taking = lease(f, { id: 'late', waitMs: 10_000, afterTake: () => { injected ??= putTicket(f, '000000000000001-000000-00000009.json', { lease_id: 'earlier' }); } });
+    await settle(40);
+    assert.ok(injected && !existsSync(f.lock), 'the lock was given back, and the waiter has not taken it');
+    assert.deepEqual(events(f).map(event => event.event), ['request'], 'a give-back is neither an acquire, a release nor a reclaim');
+    assert.deepEqual(tombs(f), [], 'the tombstone was deleted by the winner');
+    assert.deepEqual(queueView('adb', { env: f.env }).map(entry => entry.lease_id), ['earlier', 'late'], 'it kept its own place');
+    rmSync(injected);
+    const record = await taking;
+    assert.equal(record.lease_id, 'late');
+    assert.deepEqual(events(f).map(event => event.event), ['request', 'acquire']);
+    // a try gives it back too, and fails instead of waiting
+    releaseLease('adb', 'late', { env: f.env });
+    const before = events(f).length;
+    await assert.rejects(lease(f, { id: 'quick', afterTake: () => { injected = putTicket(f, '000000000000002-000000-00000009.json', { lease_id: 'earlier-2' }); } }), error => error.code === 'HUB_LOCK_TIMEOUT' && /1 waiter ahead of lease quick/.test(error.message));
+    assert.ok(!existsSync(f.lock) && events(f).length === before, 'nothing held, nothing written');
+  } finally { f.cleanup(); }
+});
+
+test('a Pool request writes one request and one ending; a try tagged with it names the Pool and measures waited_ms from the request', async () => {
+  const f = fixture();
+  try {
+    let clock = T0;
+    const now = () => clock;
+    const request = poolRequest('phone', { id: 'req-1', holder: 'agent-a', why: 'any phone', forMs: 600_000, waitMs: 30_000, env: f.env, now, hostId: HOST_ID });
+    assert.equal(request.id, 'req-1');
+    clock += 12_000;
+    await lease(f, { id: 'req-1', now, hostId: HOST_ID, pool: request.tag, forMs: 600_000 });
+    const got = events(f);
+    assert.deepEqual(got.map(event => [event.event, event.lock, event.pool, event.request, event.waited_ms]), [
+      ['request', null, 'phone', 'req-1', null],
+      ['acquire', 'adb', 'phone', 'req-1', 12_000],
+    ], 'the acquire is the request\'s ending: nothing more is written for it');
+    assert.equal(got[0].deadline_at, new Date(T0 + 30_000).toISOString());
+    assert.equal(got[0].for_ms, 600_000);
+    assert.equal(got[1].deadline_at, got[0].deadline_at, 'the take carries the request\'s deadline');
+    assert.deepEqual([got[0].hold_kind, got[0].claimant.kind, got[0].claimant.holder, got[0].lease_id], ['lease', 'agent', 'agent-a', 'req-1']);
+    releaseLease('adb', 'req-1', { env: f.env, now, hostId: HOST_ID });
+    // endings: busy and away are one timeout each, an abort and any other error a cancel; settling twice is one ending
+    const endings = [];
+    for (const [error, signal] of [[Object.assign(new Error('busy'), { code: 'HUB_LOCK_TIMEOUT' }), undefined], [Object.assign(new Error('gone'), { code: 'HUB_PHONE_AWAY' }), undefined], [new Error('boom'), undefined], [Object.assign(new Error('x'), { name: 'AbortError' }), undefined], [Object.assign(new Error('r'), { code: 'HUB_LEASE_CANCELLED' }), undefined]]) {
+      const ending = poolRequest('emulator', { id: 'e-1', holder: 'a', why: 'w', env: f.env, now, hostId: HOST_ID });
+      ending.settle(error, { signal });
+      ending.settle(new Error('again'));
+      endings.push(events(f).filter(event => event.request === 'e-1').slice(-2).map(event => [event.event, event.reason]));
+    }
+    assert.deepEqual(endings.map(pair => pair[1]), [['timeout', 'deadline'], ['timeout', 'away'], ['cancel', 'error'], ['cancel', 'aborted'], ['cancel', 'released']]);
+    assert.equal(events(f).filter(event => event.request === 'e-1').length, 10, 'five requests, five endings, never six');
   } finally { f.cleanup(); }
 });

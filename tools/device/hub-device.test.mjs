@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { createAdb, findPhone } from '../ci/lib/adb.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
 import { acquireLease, releaseLease, withLock } from '../ci/lib/lock.mjs';
+import { readEvents } from '../ci/lib/events.mjs';
 import { runAdb } from './async-adb.mjs';
 import { inventory } from './inventory.mjs';
 import { leaseSupport, main, parseArgs, parseDuration } from './hub-device.mjs';
@@ -49,6 +50,9 @@ esac
 `;
 
 const serialOf = { s24: S24_SERIAL, s26: SERIAL };
+
+// The tickets waiting on a lock; a lock nobody has waited on has no queue directory yet (a try writes no ticket).
+const queued = (f, lock = 'adb') => { try { return readdirSync(join(f.root, `locks/${lock}.queue`)); } catch { return []; } };
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'hub-device-'));
@@ -311,6 +315,45 @@ test('phone with every phone held is BUSY naming the holders; with every free ph
   } finally { f.cleanup(); }
 });
 
+// Story 2.2 (AD-4): `phone` is one Pool request. The event log holds its one request, then either the acquire of the phone a
+// try took (tagged with the Pool and request, waited_ms from the request) or one timeout or cancel. Tries write nothing else.
+test('a phone Pool request is recorded as one request and one acquire, or one timeout; the tries between write nothing', async () => {
+  const f = fixture();
+  try {
+    const events = () => [...readEvents({ env: f.env })];
+    const taken = await f.run(['lease', 'phone', '--for', '5m', '--why', 'any phone', '--id', 'pool-1']);
+    assert.equal(taken.code, 0, taken.err.join('\n'));
+    assert.deepEqual(events().map(event => [event.event, event.lock, event.pool ?? null, event.request ?? null, event.lease_id]), [
+      ['request', null, 'phone', 'pool-1', 'pool-1'],
+      ['acquire', 's24', 'phone', 'pool-1', 'pool-1'],
+    ]);
+    assert.ok(events()[1].waited_ms >= 0 && events()[0].for_ms === 300_000);
+    // the s24 held, the s26 free: the busy try on the s24 wrote nothing, the s26 is the one acquire
+    const second = await f.run(['lease', 'phone', '--for', '5m', '--why', 'fallback', '--id', 'pool-2']);
+    assert.equal(second.code, 0, second.err.join('\n'));
+    assert.deepEqual(events().slice(2).map(event => [event.event, event.lock, event.request ?? null]), [['request', null, 'pool-2'], ['acquire', 'adb', 'pool-2']]);
+    // every phone held: the request ends in one timeout naming why, and no ticket was written by any try
+    const before = events().length;
+    const busy = await f.run(['lease', 'phone', '--for', '5m', '--why', 'x', '--wait', '0', '--id', 'pool-3']);
+    assert.equal(busy.code, 76);
+    const mine = events().slice(before);
+    assert.deepEqual(mine.map(event => [event.event, event.lock, event.pool, event.reason]), [['request', null, 'phone', null], ['timeout', null, 'phone', 'deadline']]);
+    assert.match(mine[1].blocked_by, /every phone is held/);
+    assert.deepEqual([queued(f), queued(f, 's24')], [[], []], 'a try is not a place in line');
+    await f.run(['release', 'pool-1']);
+    await f.run(['release', 'pool-2']);
+    // free but away: AWAY ends the request as a timeout with reason away
+    f.away('s24');
+    f.away('s26');
+    const mark = events().length;
+    assert.equal((await f.run(['lease', 'phone', '--for', '5m', '--why', 'x', '--wait', '0', '--id', 'pool-4'])).code, 75);
+    // each phone was taken to be looked for and given back (an acquire and a release, true history), then one ending
+    assert.deepEqual(events().slice(mark).map(event => [event.event, event.lock, event.reason]), [
+      ['request', null, null], ['acquire', 's24', null], ['release', 's24', 'by-id'], ['acquire', 'adb', null], ['release', 'adb', 'by-id'], ['timeout', null, 'away'],
+    ]);
+  } finally { f.cleanup(); }
+});
+
 test('the s24 away says why on stderr: absent, unauthorized', async () => {
   const f = fixture();
   try {
@@ -567,9 +610,9 @@ test('waiting runs are served in order once the lease is released', async () => 
     const runs = [];
     for (const name of ['one', 'two', 'three']) {
       runs.push(spawnRun(f, ['run', 's26', '--wait', '60s', '--why', name, '--', process.execPath, '-e', `require('fs').appendFileSync(${JSON.stringify(log)},'${name}\\n')`]));
-      for (let i = 0; i < 200 && readdirSync(join(f.root, 'locks/adb.queue')).length < runs.length; i += 1) await settle(20);
+      for (let i = 0; i < 200 && queued(f).length < runs.length; i += 1) await settle(20);
     }
-    assert.equal(readdirSync(join(f.root, 'locks/adb.queue')).length, 3);
+    assert.equal(queued(f).length, 3);
     releaseLease('adb', 'held', { env: f.env });
     const results = await Promise.all(runs.map(run => run.exit));
     assert.deepEqual(results.map(result => result.code), [0, 0, 0]);
@@ -735,7 +778,7 @@ test('a lease released while the phone was being found exits 1 holding nothing',
     assert.equal(code, 1, 'the tool exits 1, not AWAY or BUSY');
     assert.ok(err.some(line => /^HUB_DEVICE_CANCELLED s26 lease late-id was released while the phone was being found/.test(line)), err.join('\n'));
     assert.ok(!existsSync(f.lock), 'nothing is held');
-    assert.deepEqual(readdirSync(join(f.root, 'locks/adb.queue')), [], 'no ticket left');
+    assert.deepEqual(queued(f), [], 'no ticket left');
   } finally { f.cleanup(); }
 });
 
