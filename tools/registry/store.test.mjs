@@ -141,7 +141,12 @@ test('two concurrent writers at if_rev 0: one wins at rev 1, the other conflicts
 });
 
 test('an unreadable file reads as the seed with one warning, and every write refuses it with the bytes unchanged', async () => {
-  for (const [label, bytes, reason] of [['garbage', 'not json{', /not valid JSON/], ['format 2', JSON.stringify({ format: 2, rev: 9, resources: [], pools: [] }), /format 2/], ['bad shape', JSON.stringify({ format: 1, rev: 1, resources: {}, pools: [] }), /resources/]]) {
+  for (const [label, bytes, reason] of [['garbage', 'not json{', /not valid JSON/], ['format 2', JSON.stringify({ format: 2, rev: 9, resources: [], pools: [] }), /format 2/], ['bad shape', JSON.stringify({ format: 1, rev: 1, resources: {}, pools: [] }), /resources/],
+  ['duplicate resource id', JSON.stringify({ format: 1, rev: 1, resources: [{ id: 'a', lock: 'a' }, { id: 'a', lock: 'b' }], pools: [] }), /repeats the id "a"/],
+  ['record without a lock', JSON.stringify({ format: 1, rev: 1, resources: [{ id: 'a' }], pools: [] }), /resources\[0\] must be an object with an id and a lock/],
+  ['duplicate pool name', JSON.stringify({ format: 1, rev: 1, resources: [], pools: [{ name: 'p' }, { name: 'p' }] }), /repeats the name "p"/],
+  ['pool without a name', JSON.stringify({ format: 1, rev: 1, resources: [], pools: [{ members: [] }] }), /pools\[0\] must be an object with a name/],
+]) {
     const s = scratch();
     try {
       mkdirSync(s.env.HUB_LOCK_DIR, { recursive: true });
@@ -298,6 +303,12 @@ test('writeFileAtomic leaves no tmp when the rename fails, and the target keeps 
     assert.equal(readFileSync(join(dir, 'file.json'), 'utf8'), 'two');
     assert.equal(statSync(join(dir, 'file.json')).mode & 0o777, 0o640);
     assert.deepEqual(readdirSync(dir).sort(), ['file.json', 'target']);
+    // fchmod is what makes the mode exact: openSync's mode is masked by the umask, fchmod is not.
+    const previous = process.umask(0o077);
+    try {
+      writeFileAtomic(join(dir, 'masked.json'), 'x', { mode: 0o640 });
+      assert.equal(statSync(join(dir, 'masked.json')).mode & 0o777, 0o640);
+    } finally { process.umask(previous); }
   } finally { s.cleanup(); }
 });
 
