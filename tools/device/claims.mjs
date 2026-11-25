@@ -7,7 +7,8 @@
 // refusal is `code: 'HUB_USAGE'`. The context every action takes is the one `createContext` builds: `env`, `log`, `warn`,
 // `timing`, `emulator`, `adbFactory`, `inventory`, `policy` and `fleet`.
 import { randomBytes } from 'node:crypto';
-import { statSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { findPhone, idMatchesSerial } from '../ci/lib/adb.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
@@ -37,6 +38,7 @@ export const EXIT_CODES = Object.freeze({
   HUB_LEASE_CANCELLED: 1,
   HUB_LEASE_EXTEND_REFUSED: 1,
   HUB_LEASE_LOST: 1,
+  HUB_HOST_UNKNOWN: 1,
 });
 export const exitCodeOf = error => (Object.hasOwn(EXIT_CODES, error?.code) ? EXIT_CODES[error.code] : EXIT_FAILURE);
 
@@ -44,6 +46,31 @@ const usage = message => Object.assign(new Error(message), { code: 'HUB_USAGE' }
 const failure = (code, message) => Object.assign(new Error(message), { code });
 const away = error => error?.code === 'HUB_PHONE_AWAY';
 const readOwnerOf = (name, env) => readOwner(join(lockDir(env), `${name}.lock`));
+
+// ---- the host key (AD-47) ----
+
+// The host key is the devices.json host block this machine is (`linux` is big-chungus, `mac` is the Mac), written by
+// `mise run hosts:install` and never derived from `uname` or a hostname: the platform is only a check, so a second
+// Linux machine cannot believe it is big-chungus. This is the one vocabulary; hosts.mjs imports it.
+export const HOST_PLATFORMS = Object.freeze({ linux: 'linux', mac: 'darwin' });
+export const HOST_KEY_FILE = '.config/mobile-deploy-hub/host-key';
+export const hostKeyPath = home => join(home, HOST_KEY_FILE);
+
+// This host's key; throws HUB_HOST_UNKNOWN for a missing or unreadable file, an empty or unknown key, or a key whose platform is not this one.
+export function hostKey({ env = process.env, home = env.HOME || homedir(), platform = process.platform, readFile = readFileSync } = {}) {
+  const file = hostKeyPath(home);
+  const unknown = reason => failure('HUB_HOST_UNKNOWN', `this host does not know which host it is: ${reason}; run \`mise run hosts:install\` on it to write ${file}`);
+  let text;
+  try { text = String(readFile(file, 'utf8')); } catch (error) { throw unknown(`cannot read ${file} (${error?.code ?? error?.message ?? error})`); }
+  const key = text.trim();
+  if (!key) throw unknown(`${file} is empty`);
+  if (!Object.hasOwn(HOST_PLATFORMS, key)) throw unknown(`${file} holds "${key}", not one of ${Object.keys(HOST_PLATFORMS).join(', ')}`);
+  if (HOST_PLATFORMS[key] !== platform) throw unknown(`${file} holds "${key}", which is a ${HOST_PLATFORMS[key]} host, but this is ${platform}`);
+  return key;
+}
+
+// The one locality test: a record is local when it names this host's key. An unknown host propagates; it never decides.
+export const isLocal = (record, { hostKey: keyOf = hostKey } = {}) => record?.host === keyOf();
 
 // ---- context ----
 

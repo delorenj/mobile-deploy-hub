@@ -312,7 +312,7 @@ That diagnostic proves authenticated history access only, not upload eligibility
 mise run check          # actionlint on the workflow, then node --test 'tools/**/*.test.mjs' (the catch-up included)
 mise run --tool node@26 check   # the same task on Node 26 (the task pins 24); check.yml runs both legs on every push
 mise run conformance    # every app still deploys only through the hub (gh api); every deploy's gate runs it on its own checkout too
-mise run hosts:install  # the bucket index, hub-mac, the Mac's quickdrop .stignore and handoff cache, the catch-up units and the Mac watchdog
+mise run hosts:install  # the bucket index, hub-mac, each host's key (~/.config/mobile-deploy-hub/host-key), the Mac's quickdrop .stignore and handoff cache, the catch-up units and the Mac watchdog
 ```
 
 The catch-up installs only on a host in live mode, and both are live since 2026-10-09 (`catchup.mjs mode` prints it; every gate logs `HUB_CATCHUP_MODE`, and a pending device on a host in watch mode reads "catch-up off" in the event and on the page):
