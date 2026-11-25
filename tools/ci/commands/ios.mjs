@@ -25,7 +25,7 @@ import { rememberCheckout } from '../lib/git.mjs';
 import { readHistory } from '../lib/history-probe.mjs';
 import { handoffFolder, receiveHandoff, repoFolder, retried, sendHandoffDelta } from '../lib/handoff.mjs';
 import { compareBuild, compareSemver, ipaName } from '../lib/latest.mjs';
-import { withLock } from '../lib/lock.mjs';
+import { holdsOf, withLock } from '../lib/lock.mjs';
 import { loadManifest } from '../lib/manifest.mjs';
 import { macGatewayLink, parseRsyncStats } from '../lib/metered.mjs';
 import { buildReceipt, sha256File, writeReceipt } from '../lib/receipt.mjs';
@@ -223,7 +223,47 @@ export function testflightStep({ spec, config, store, storeIpa = null, hooks, up
   }
 }
 
-export async function ios(config, { env = process.env, home = homedir(), log = console.log, runner = runBounded, sleep, now, linkNow = null } = {}) {
+// The Mac's `mac-ios` lock is taken twice by the ios job (the device build, then a store build), and both takes wait in its Queue
+// the same way (AD-22). `entered` tells a wait that ran out from an error raised while the lane holds the Mac: only the wait
+// is contention. The lock wrote the one `timeout` event (`reason: ios-lane-contention`); the lane records who blocked it as the
+// same `contention` record Android writes, logs it, and rethrows, so the job goes red (iOS has no `pending` on contention: the
+// build and the lane hold are one, FR-30 does not reach it in v1). A caller's `onBusy` fixes the receipt's stage and records.
+export async function macLane(fn, { track, what, env, log = console.log, lockOptions = {}, onBusy = () => {}, ...options }) {
+  let entered = false;
+  try {
+    return await withLock('mac-ios', async () => { entered = true; return fn(); }, { env, timeoutReason: 'ios-lane-contention', ...options, ...lockOptions });
+  } catch (error) {
+    if (!entered && error?.code === 'HUB_LOCK_TIMEOUT') {
+      track.receipt.contention = { lock: 'mac-ios', reason: 'ios-lane-contention', blocked_by: error.holds ?? holdsOf(error.owner) };
+      log(`HUB_IOS_LANE_BUSY ${what} code=${error.code}: ${firstLine(error.message)}`);
+      onBusy(error);
+    }
+    throw error;
+  }
+}
+
+// The receipt's TestFlight record, as the ios lane starts it. The marketing version is the app's train (HUB_IOS_VERSION), the
+// deploy's own version without one.
+export function storeRecord({ config, env, policy, storeIpa = null, ...fields }) {
+  return { status: 'checked', version: config.iosVersion || config.version, build: storeIpa?.build ?? (config.iosBuild || null), groups: testflightPolicyOf(policy.apps[env.GITHUB_REPOSITORY ?? '']).groups, uploaded: null, state: null, review: null, reason: null, ...fields };
+}
+
+// The second `mac-ios` take: a Mac-only app (ios.store.build) builds and signs its App Store IPA here, a dry run included. A wait
+// that runs out is reported at stage deliver with a failed `store` record and no holder name in it: the iPad's own delivery (an
+// install already read back) stands, and only the store step is red.
+export async function storeTake({ track, spec, config, policy, out, team, hooks, env, runner, log = console.log, lockOptions = {}, build = buildStoreIpa }) {
+  const storeIpa = await macLane(() => build({ spec, config, out, team, hooks, env, runner, log }), {
+    track, what: 'store', env, log, lockOptions, timeoutMs: 40 * 60_000, endsReservation: true,
+    onBusy: () => {
+      track.stage = 'deliver';
+      track.receipt.store = storeRecord({ config, env, policy, status: 'failed', reason: "mac-ios busy: the App Store IPA was not built; the iPad's delivery stands" });
+    },
+  });
+  track.receipt.store_ipa = receiptStoreIpa(storeIpa);
+  return storeIpa;
+}
+
+export async function ios(config, { env = process.env, home = homedir(), log = console.log, runner = runBounded, sleep, now, linkNow = null, lockOptions = {} } = {}) {
   const { policy } = policyBanner(log);
   const manifest = await loadManifest(config.cwd, config.manifest);
   return guarded('ios', join(config.out, 'ios'), config, env, async track => {
@@ -276,7 +316,8 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
     // The run's Reservation of the Mac ends with its last `mac-ios` hold (Story 2.6): this one, unless a TestFlight build takes the
     // Mac a second time below. A device that failed keeps it, so a rerun of this job is served at the run's place.
     const needsStoreTake = Boolean(config.testflight && spec.store?.build);
-    await withLock('mac-ios', async () => {
+    track.stage = 'preflight';
+    await macLane(async () => {
       track.stage = 'preflight';
       checkDisk(home, devices, { log });
       if (!canBuild) {
@@ -344,7 +385,7 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
         Object.assign(delivery, { verified: false, status: 'failed', reason: firstLine(error.message).replace(/^::error::/, '').slice(0, 300) });
         log(`HUB_IPAD_FAILED at ${deviceStage}: ${delivery.reason}; the checked IPA is still published for Install on iPad`);
       }
-    }, { env, timeoutMs: 40 * 60_000, endsReservation: () => !deviceError && !needsStoreTake });
+    }, { track, what: 'device', env, log, lockOptions, timeoutMs: 40 * 60_000, endsReservation: () => !deviceError && !needsStoreTake });
 
     // The IPA goes back to big-chungus when the iPad will need it over the air (a real run that did not install it),
     // or when the link costs nothing, read again here on the Mac: the gate's reading can be an hour old by now. A dry
@@ -390,13 +431,11 @@ export async function ios(config, { env = process.env, home = homedir(), log = c
       // (bundle, version, build, distribution signer, App Store profile) before anything can be uploaded.
       if (spec.store.build) {
         track.stage = 'build';
-        storeIpa = await withLock('mac-ios', () => buildStoreIpa({ spec, config, out, team: devices.apple.team, hooks, env, runner, log }), { env, timeoutMs: 40 * 60_000, endsReservation: true });
-        track.receipt.store_ipa = receiptStoreIpa(storeIpa);
+        storeIpa = await storeTake({ track, spec, config, policy, out, team: devices.apple.team, hooks, env, runner, log, lockOptions });
       }
       // Publishing, not the device: a failed upload or assign is reported at stage deliver and the iPad keeps its status.
       track.stage = 'deliver';
-      // The store build's marketing version is the app's train (HUB_IOS_VERSION), the deploy's own version without one.
-      track.receipt.store = { status: 'checked', version: config.iosVersion || config.version, build: storeIpa?.build ?? (config.iosBuild || null), groups: testflightPolicyOf(policy.apps[env.GITHUB_REPOSITORY ?? '']).groups, uploaded: null, state: null, review: null, reason: null };
+      track.receipt.store = storeRecord({ config, env, policy, storeIpa });
       testflight = testflightStep({ spec, config, store: track.receipt.store, storeIpa, hooks, uploadHooks, log });
       notes.push(`TestFlight: ${testflight}`);
       if (storeIpa) log(`HUB_TESTFLIGHT ${config.dryRun ? 'DRY RUN' : 'UPLOADED'} ${storeIpa.bundle} ${storeIpa.version} (${storeIpa.build}) sha256=${short(storeIpa.sha256)}`);

@@ -1,0 +1,11 @@
+{
+  "actions": [
+    "After the orchestrator merges this story branch to main, cut the hub release from a fresh clean clone of main: `mise run release -- 1.2.49`. The `## v1.2.49` section of docs/hub-releases.md is already written.",
+    "Run `mise run hosts:install` from a clean checkout at tag v1.2.49 on big-chungus and on the Mac. Then check that both hosts' `current` is v1.2.49 and that the catch-up candybars still fire."
+  ],
+  "followup_review_recommended": false,
+  "parked_at": "2026-11-24",
+  "run_id": "20261124-184840-c119",
+  "spec_file": "_bmad-output/implementation-artifacts/spec-3-5-ios-contention-is-red-and-says-who.md",
+  "story_key": "3-5-ios-contention-is-red-and-says-who"
+}

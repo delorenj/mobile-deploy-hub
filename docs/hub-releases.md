@@ -4,6 +4,16 @@ One section per hub release, headed `## vX.Y.Z`. `mise run release -- X.Y.Z` (`t
 
 A section is plain text read in a terminal: everything after its heading up to the next `## ` heading. Use `###` for sub-headings and `-` lists; do not start a section line with `## `.
 
+## v1.2.49
+
+Story 3.5 (AD-22): iOS contention is red, and says who. Nothing here changes the Queue protocol, the policy, the deadline or `latest.json`; install it on both hosts (`mise run hosts:install`).
+
+### What changed
+
+- The `ios` job's two `mac-ios` takes (the device build, then the store IPA build) go through one `macLane` helper in `ios.mjs`. A wait that runs out before the hold is `HUB_LOCK_TIMEOUT`, rethrown, so the job goes red. The lock writes the one `timeout` event on the Mac with `reason: ios-lane-contention`; the receipt records `contention {lock: mac-ios, reason: ios-lane-contention, blocked_by}` (the same shape Android writes), the job summary lists the holder and the waiters ahead, and the log has `HUB_IOS_LANE_BUSY <device|store> code=HUB_LOCK_TIMEOUT`. An error raised inside a hold fails as before. The run's Reservation is kept for the rerun.
+- A store-IPA take that times out after the iPad install was read back is reported at stage `deliver` with a failed `store` record (`mac-ios busy: the App Store IPA was not built; the iPad's delivery stands`). The iPad stays `installed`; only the store step is red.
+- Public copies stay coarse. `publicReason(receipt)` (`lib/receipt.mjs`) turns the reason of a lane receipt that recorded `contention` for the wait that failed it into `mac-ios busy: the wait for it ran out (HUB_LOCK_TIMEOUT); the run summary names who held it` for the bucket receipts, `latest.json`'s failed reason and the Bloodbank event. Holder names stay in the receipt, the summary, the log and the Event Log.
+
 ## v1.2.48
 
 v1.2.47 plus the Mac disk fix. v1.2.47 was tagged and rolled back, never on `v1`: green-in-between's release dry run stopped in `preflight-ios` with the Mac at 14.9 of the 15 GiB floor. Everything in the v1.2.47 section below ships in this pin; install it on both hosts (`mise run hosts:install`).

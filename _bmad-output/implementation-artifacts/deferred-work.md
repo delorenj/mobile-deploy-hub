@@ -83,3 +83,11 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-8-ship-the-freeze-set.md`
   summary: The emulator fixture's boots are real child processes and a hosted runner needs ~5 s per lease (probably the boot loop's 5 s adb re-registration; not proven), so `tools/device/emulator.test.mjs` takes minutes there; other tests in it still take a short real `--for` or wait on wall-clock expiry (the reaper and `run emulator reaps` tests use 1 s leases).
   evidence: Only `status is read-only` (3 s lease) and `dies while booting` (wording race) failed on the runner; the others have one lease each, so a slow take cannot expire a neighbour. A suite-wide fake clock for the emulator tests would remove the class.
+
+### DW-1: A lock-timeout failure in a lane that records no `contention` (plan's `adb` Peek wait, gate, preflight-ios) still puts the holder-naming `host lock <name> is held by …` message into public copies.
+origin: spec-deferred 3d11c5a8124e
+location: tools/ci/lib/receipt.mjs publicReason; tools/ci/commands/plan.mjs:250
+source_spec: `spec-3-5-ios-contention-is-red-and-says-who.md`
+severity: low
+reason: publicReason (tools/ci/lib/receipt.mjs) redacts only when the receipt carries `contention`, which only the android and ios lanes write. This behaviour predates story 3.5: those lanes' raw lock messages already reached the bucket receipts and announce. One level up would be to have every Queued withLock caller record `contention` on its timeout, or to key publicReason on the AD-5 prefix alone.
+status: open
