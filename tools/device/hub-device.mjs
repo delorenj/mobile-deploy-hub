@@ -17,6 +17,11 @@
 //
 //   hub-device lease s24|s26|phone --for 30m --why "device proof" [--wait 2m] [--no-connect] [--id ID] [--pid N] [--holder WHO]
 //                    [--env-serial NAME]... [--json] [--verbose]
+//   hub-device lease --match <key=value[,key>=n][,key<=n]> --for 30m --why "device proof" [--wait 2m] ...   (a phone by Capability instead of by name:
+//                    the matcher (registry/match.mjs) picks the phones that fit, a dedicated-QA phone only for a request that names it or asks for
+//                    dedicated_qa, and the first free one is taken as one Pool request; no match is HUB_NO_MATCH (exit 2) with a reason for each
+//                    Resource left out, every match away is HUB_DEVICE_AWAY (75); report lines say `match:<query>` where a device word goes;
+//                    `run --match <query> ... -- <cmd...>` is the same for run)
 //   hub-device release [<lease_id>|--any]    (no id: $HUB_LEASE_ID; --any: whichever lease holds a phone; a `job:` id is a deploy job's place in
 //                    line, not a lease: exit 2, HUB_DEVICE_JOB_ID names the run to cancel)
 //   hub-device status [--json]   (read only: locks, every waiter with its position and live ETA, the Reservations, the inventory; --json
@@ -48,6 +53,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { formatEta } from '../ci/lib/eta.mjs';
 import { sleep as realSleep } from '../ci/lib/pause.mjs';
+import { canonical, parseQuery } from '../registry/match.mjs';
 import { NO_ANSWER, NO_DEVICECTL, NO_SERVER } from '../registry/reachability.mjs';
 import * as claims from './claims.mjs';
 
@@ -63,7 +69,7 @@ export function parseDuration(text, flag = 'duration') {
   return parts.reduce((total, [, count, unit]) => total + Number(count) * { d: 86_400_000, h: 3_600_000, m: 60_000, s: 1000 }[unit], 0);
 }
 
-const VALUE_FLAGS = new Set(['for', 'why', 'wait', 'id', 'pid', 'holder', 'env-serial', 'profile', 'pool', 'run', 'name']);
+const VALUE_FLAGS = new Set(['for', 'why', 'wait', 'id', 'pid', 'holder', 'env-serial', 'profile', 'pool', 'run', 'name', 'match']);
 const SWITCHES = new Set(['no-connect', 'json', 'verbose', 'any']);
 
 // Words, flags (`--flag value` or `--flag=value`), and everything after `--` as the command.
@@ -88,7 +94,7 @@ export function parseArgs(argv) {
 
 const shellQuote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 
-const USAGE = 'usage: hub-device lease s24|s26|phone --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | lease emulator [--profile NAME] --for <dur> --why <text> [--wait <dur>] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] | release [emulator] [<lease_id>|--any] | status [--json] | discover [--json] | reservation release --run <key> [--name adb|mac-ios] [--json] | run s24|s26|phone|emulator [--profile NAME] [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...>';
+const USAGE = 'usage: hub-device lease s24|s26|phone --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | lease emulator [--profile NAME] --for <dur> --why <text> [--wait <dur>] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] | release [emulator] [<lease_id>|--any] | status [--json] | discover [--json] | reservation release --run <key> [--name adb|mac-ios] [--json] | run s24|s26|phone|emulator [--profile NAME] [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...> | lease --match <query> --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | run --match <query> [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...>';
 
 // Leases are honoured only by a hub whose lock.mjs knows them. The catch-up runs from the installed release, and an
 // older one sees a lease's short-lived pid as a dead job and reclaims the lock at once, so lease and run say so.
@@ -106,28 +112,41 @@ function warnOldHub(context) {
 
 // The flags every lease and run share, checked in the order the CLI always checked them: the device word, then --id's
 // uniqueness, --for's bounds (and a deploy phone's cap), --why, --wait and --pid. The rules are the library's.
-function setup(parsed, { needForWhy, fleet, env, policy = null }) {
+// With --match there is no device word: the --for, --why, --wait, --pid and --id checks run first, and the matcher last, so a usage
+// mistake never reads as a missing phone.
+function setup(parsed, { needForWhy, fleet, env, policy = null, context }) {
   const { flags } = parsed;
   const device = parsed.words[1] ?? null;
+  const matching = flags.match !== undefined;
+  if (matching && device !== null) throw usage(`${parsed.words[0]} takes a device word or --match, not both`);
   // The device word is checked first, as before, so a typo never reads as a missing flag.
-  const resolved = claims.resolve(device, { fleet, env, ids: false });
+  const resolved = matching ? { kind: 'pool', by: 'match', members: fleet } : claims.resolve(device, { fleet, env, ids: false });
   claims.checkLeaseId(flags.id, { fleet, env });
   let forMs;
   if (flags.for !== undefined) forMs = parseDuration(flags.for, '--for');
   else if (needForWhy) throw usage('--for <duration> is required');
   else forMs = 3_600_000;
-  const target = claims.checkBounds(resolved, { forMs, forText: flags.for, fleet, policy });
+  const bounded = claims.checkBounds(resolved, { forMs, forText: flags.for, fleet, policy });
   const why = flags.why ?? (needForWhy ? null : `run ${(parsed.command ?? []).join(' ').slice(0, 80)}`);
   if (!why) throw usage('--why <text> is required');
   const waitMs = flags.wait !== undefined ? parseDuration(flags.wait, '--wait') : 120_000;
   const holderPid = claims.checkPid(flags.pid);
+  const target = matching ? claims.matchTarget(flags.match, { forMs }, context) : bounded;
   return { device, target, forMs, why, waitMs, holderPid };
+}
+
+// What report lines call the device: the word, or `match:<canonical query>` for --match (the raw text when it does not parse).
+function labelOf(parsed) {
+  if (parsed.flags.match === undefined) return parsed.words[1] ?? 's26';
+  try { return `match:${canonical(parseQuery(parsed.flags.match))}`; } catch { return `match:${parsed.flags.match}`; }
 }
 
 function report(error, parsed, context) {
   const { stdout, stderr } = context;
-  const device = parsed.words[1] ?? 's26';
+  const device = labelOf(parsed);
   const code = claims.exitCodeOf(error);
+  // These exit 2 like a usage error, but say what they are.
+  if (error.code === 'HUB_NO_MATCH' || error.code === 'HUB_POOL_CROSS_HOST') { stderr(`${error.code} ${device} ${error.message}`); return code; }
   if (code === claims.EXIT_CODES.HUB_USAGE) { stderr(`hub-device: ${error.message}`); return code; }
   // A cancelled lease says so even when its last error was the phone not arriving: it never held anything to report.
   if (error.code === 'HUB_LEASE_CANCELLED') { stderr(`HUB_DEVICE_CANCELLED ${device} ${error.message}`); return code; }
@@ -149,7 +168,7 @@ function emulatorLine(record) {
 
 async function leaseEmulator(parsed, context) {
   const { stdout, env, signals } = context;
-  const { target, forMs, why, waitMs, holderPid } = setup(parsed, { needForWhy: true, fleet: context.fleet, env: context.env, policy: context.policy });
+  const { target, forMs, why, waitMs, holderPid } = setup(parsed, { needForWhy: true, fleet: context.fleet, env: context.env, policy: context.policy, context });
   const { profile, pool } = claims.emulatorBounds({ noConnect: parsed.flags['no-connect'], profile: parsed.flags.profile, pool: parsed.flags.pool }, env);
   const holder = parsed.flags.holder ?? env.HUB_DEVICE_HOLDER ?? `${env.USER ?? 'unknown'}@${hostname()}`;
   const id = parsed.flags.id ?? claims.newLeaseId('emulator');
@@ -182,7 +201,7 @@ async function leaseEmulator(parsed, context) {
 async function lease(parsed, context) {
   if (parsed.words[1] === 'emulator') return leaseEmulator(parsed, context);
   const { stdout, env, signals } = context;
-  const { target, forMs, why, waitMs, holderPid } = setup(parsed, { needForWhy: true, fleet: context.fleet, env: context.env, policy: context.policy });
+  const { target, forMs, why, waitMs, holderPid } = setup(parsed, { needForWhy: true, fleet: context.fleet, env: context.env, policy: context.policy, context });
   const holder = parsed.flags.holder ?? env.HUB_DEVICE_HOLDER ?? `${env.USER ?? 'unknown'}@${hostname()}`;
   warnOldHub(context);
   const abort = new AbortController();
@@ -409,7 +428,7 @@ async function discover(parsed, context) {
 async function runEmulator(parsed, context) {
   const { env, stderr, signals } = context;
   if (!parsed.command || parsed.command.length === 0) throw usage('run needs a command after --');
-  const { target, forMs, why, waitMs, holderPid } = setup(parsed, { needForWhy: false, fleet: context.fleet, env: context.env });
+  const { target, forMs, why, waitMs, holderPid } = setup(parsed, { needForWhy: false, fleet: context.fleet, env: context.env, context });
   const { profile, pool } = claims.emulatorBounds({ noConnect: parsed.flags['no-connect'], profile: parsed.flags.profile, pool: parsed.flags.pool }, env);
   const id = claims.newLeaseId('run');
   const holder = parsed.flags.holder ?? env.HUB_DEVICE_HOLDER ?? `${env.USER ?? 'unknown'}@${hostname()}`;
@@ -457,7 +476,7 @@ async function runCommand(parsed, context) {
   if (parsed.words[1] === 'emulator') return runEmulator(parsed, context);
   const { env, stderr, signals } = context;
   if (!parsed.command || parsed.command.length === 0) throw usage('run needs a command after --');
-  const { target, forMs, why, waitMs, holderPid } = setup(parsed, { needForWhy: false, fleet: context.fleet, env: context.env, policy: context.policy });
+  const { target, forMs, why, waitMs, holderPid } = setup(parsed, { needForWhy: false, fleet: context.fleet, env: context.env, policy: context.policy, context });
   const id = claims.newLeaseId('run');
   const holder = parsed.flags.holder ?? env.HUB_DEVICE_HOLDER ?? `${env.USER ?? 'unknown'}@${hostname()}`;
   warnOldHub(context);
@@ -519,16 +538,20 @@ export async function main(argv, {
   sleep = realSleep,
   now = Date.now,
   policy = null,
+  qaDevices,
+  registry,
 } = {}) {
   let parsed = { flags: {}, words: [], envSerial: [], command: null };
   const context = {
-    ...claims.createContext({ env, sleep, now, log: line => stderr(line), warn: message => stderr(`hub-device: warning: ${message}`), adbFactory, adbWire, devicectl, hostKey, inventory: inventoryImpl, policy }),
+    ...claims.createContext({ env, sleep, now, log: line => stderr(line), warn: message => stderr(`hub-device: warning: ${message}`), adbFactory, adbWire, devicectl, hostKey, inventory: inventoryImpl, policy, qaDevices, registry }),
     stdout, stderr, signals, killGraceMs: Number(env.HUB_DEVICE_KILL_GRACE_MS) || 10_000,
   };
   try {
     parsed = parseArgs(argv);
     // `--run` and `--name` belong to `reservation release` alone: every other command still refuses them as unknown flags (AD-17: exit 2 stays exit 2).
     if (parsed.words[0] !== 'reservation') for (const flag of ['run', 'name']) if (parsed.flags[flag] !== undefined) throw usage(`unknown flag --${flag}`);
+    // `--match` belongs to `lease` and `run` alone.
+    if (parsed.flags.match !== undefined && parsed.words[0] !== 'lease' && parsed.words[0] !== 'run') throw usage('unknown flag --match');
     // The phones this checkout's devices.json names; a broken one is a tool failure, named like any other.
     context.fleet = claims.loadFleet(env);
     switch (parsed.words[0]) {
