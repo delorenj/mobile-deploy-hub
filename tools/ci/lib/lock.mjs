@@ -617,6 +617,33 @@ export const TICKET_ABSENT_MS = 60_000;
 // A ticket from before kinds existed is a Lease (rule 1). Any other value is kept as written, known or not.
 export const ticketKind = ticket => (ticket?.kind === undefined || ticket.kind === null || ticket.kind === '' ? 'lease' : ticket.kind);
 
+// ---- attribution notes (Story 7.5) ----
+//
+// cancelRequest cannot write a waiter's ending event without racing the waiter, so it leaves <ticket>.cancel beside the ticket
+// ({format, cancel: {actor, why, at}}; atomic, never ending in `.json`, with no `lease_id`, so every ticket reader and releaseLease
+// ignore it) and then unlinks the ticket. The waiter that finds its ticket gone reads the note and fails naming the canceller.
+export const CANCEL_NOTE_FORMAT = 1;
+const cancelNotePath = ticketPath => `${ticketPath}.cancel`;
+
+// {actor, why} from a ticket's note, or null when there is none (or it is junk: a note is never trusted past its own shape).
+function readCancelNote(ticketPath) {
+  try {
+    const found = JSON.parse(readFileSync(cancelNotePath(ticketPath), 'utf8'))?.cancel;
+    const actor = checkActor(found?.actor);
+    return actor ? { actor, why: typeof found.why === 'string' ? found.why : null } : null;
+  } catch { return null; }
+}
+
+// What a waiter whose ticket was taken out from under it fails with: HUB_LEASE_CANCELLED, and when a note names the canceller,
+// `reason: cancelled` and `cancel: {actor, why}` (the Pool request's settle writes the ending from it).
+function cancelledError(message, note) {
+  if (!note) return failure('HUB_LEASE_CANCELLED', message);
+  const text = `${message} (cancelled by ${note.actor.holder}${note.why ? `: ${note.why}` : ''})`;
+  return Object.assign(failure('HUB_LEASE_CANCELLED', text), { reason: 'cancelled', cancel: note });
+}
+
+const dropNote = ticketPath => { try { rmSync(cancelNotePath(ticketPath), { force: true }); } catch { /* the next prune removes it */ } };
+
 // A job's ticket id can never collide with a Lease id: Lease ids are [a-z0-9-] only (leaseId), this one has `:`, `#`, `/`.
 export const jobLeaseId = ({ repo, run, attempt, job }) => `job:${repo}#${run}.${attempt}/${job}`;
 
@@ -716,10 +743,23 @@ export function listWaiters(name, { env = process.env, prune = false, now = Date
       try { age = now() - statSync(join(dir, file)).mtimeMs; } catch { continue; }
       if (prune && age > 60_000) remove(file, null, 'unreadable', now());
     }
+    if (prune) pruneOrphanNotes(dir, now);
   } finally {
     if (pruned.length > 0) notePruned(name, pruned, { env, hostId });
   }
   return waiters;
+}
+
+// A note whose ticket is gone and that nobody read for TICKET_ABSENT_MS (its waiter died) is garbage; removed without an event.
+function pruneOrphanNotes(dir, now) {
+  let notes = [];
+  try { notes = readdirSync(dir).filter(file => file.endsWith('.cancel')); } catch { return; }
+  for (const file of notes) {
+    try {
+      if (existsSync(join(dir, file.slice(0, -'.cancel'.length)))) continue;
+      if (now() - statSync(join(dir, file)).mtimeMs > TICKET_ABSENT_MS) rmSync(join(dir, file), { force: true });
+    } catch { /* a reader got there first */ }
+  }
 }
 
 // The `prune` events for the tickets one call removed (see listWaiters). A ticket's claimant is the one its `request` named (the
@@ -1165,7 +1205,8 @@ export function poolRequest(pool, { id = newLeaseId(), holder, why, forMs = null
     id,
     tag,
     // A busy or away Pool ends as a timeout (reason `deadline`, or `away` when no phone was there to take), an abort or any
-    // other error as a cancel (a request released while it waited says `released`).
+    // other error as a cancel (a request released while it waited says `released`, one cancelRequest took out says `cancelled` and
+    // names the canceller).
     settle(error, { signal } = {}) {
       if (ended) return;
       ended = true;
@@ -1175,7 +1216,9 @@ export function poolRequest(pool, { id = newLeaseId(), holder, why, forMs = null
         write('timeout', { ...waited(at), reason: error.code === 'HUB_PHONE_AWAY' ? 'away' : 'deadline', blocked_by: String(error.message ?? '').slice(0, 500) });
       } else {
         const at = now();
-        write('cancel', { ...waited(at), reason: signal?.aborted || error?.name === 'AbortError' ? 'aborted' : error?.code === 'HUB_LEASE_CANCELLED' ? 'released' : 'error' });
+        // A request cancelled through cancelRequest names its canceller (error.cancel, read off the note): that actor, and the why it gave.
+        const by = error?.code === 'HUB_LEASE_CANCELLED' && error.cancel ? { actor: error.cancel.actor, ...(error.cancel.why ? { why: error.cancel.why } : {}) } : null;
+        write('cancel', { ...waited(at), reason: by ? 'cancelled' : signal?.aborted || error?.name === 'AbortError' ? 'aborted' : error?.code === 'HUB_LEASE_CANCELLED' ? 'released' : 'error', ...by });
       }
     },
   };
@@ -1266,6 +1309,8 @@ export async function acquirePool(pool, members, {
       } catch { try { rmSync(ticketPath(name), { force: true }); } catch { /* a stale ticket is pruned by the next acquirer */ } }
     }
     placed.clear();
+    // The notes of a cancelRequest: read by now, or never to be (this request is leaving).
+    if (file) for (const name of names) dropNote(ticketPath(name));
   };
   let request = null;
   try {
@@ -1276,7 +1321,7 @@ export async function acquirePool(pool, members, {
       }
     }
     request = poolRequest(pool, { id: lease_id, holder, why, forMs, waitMs, env, now, hostId, claimantKind, actor: who, ...(tryOnly ? {} : { eta: estimate }) });
-    const cancelled = text => failure('HUB_LEASE_CANCELLED', `lease ${lease_id} ${text} ${pool}`);
+    const cancelled = text => cancelledError(`lease ${lease_id} ${text} ${pool}`, file ? names.map(name => readCancelNote(ticketPath(name))).find(Boolean) ?? null : null);
     const view = name => queueView(name, { env, prune: true, now, host, hostId, processStart: startOf });
     const report = tryOnly ? () => {} : waitReporter(pool, {
       ticket: file, deadline, estimate, requested, env, now, policy, host, hostId, processStart: startOf, log, afterEta,
@@ -1648,11 +1693,11 @@ export async function acquireLease(name, {
   };
   const timedOut = (message, owner) => {
     if (tryOnly) return failure('HUB_LOCK_TIMEOUT', message);
-    if (!leave('timeout', { reason: 'deadline', blocked_by: describe(owner) })) return failure('HUB_LEASE_CANCELLED', `lease ${lease_id} was released while it waited for ${name}`);
+    if (!leave('timeout', { reason: 'deadline', blocked_by: describe(owner) })) return cancelled('was released while it waited for');
     return failure('HUB_LOCK_TIMEOUT', message);
   };
   const view = () => queueView(name, { env, prune: true, now, host, hostId, processStart: startOf });
-  const cancelled = text => failure('HUB_LEASE_CANCELLED', `lease ${lease_id} ${text} ${name}`);
+  const cancelled = text => cancelledError(`lease ${lease_id} ${text} ${name}`, ticketFile ? readCancelNote(ticketFile) : null);
   const report = tryOnly ? () => {} : waitReporter(name, { ticket, deadline, estimate, requested, env, now, policy, host, hostId, processStart: startOf, log, afterEta });
   let vanished = 0;
   let failed = true;
@@ -1736,6 +1781,7 @@ export async function acquireLease(name, {
         try { leave('cancel', { reason: signal?.aborted ? 'aborted' : 'error' }); } catch { /* the rmSync below still clears it */ }
       }
       rmSync(ticketFile, { force: true });
+      dropNote(ticketFile);
     }
   }
 }
@@ -1786,6 +1832,86 @@ export function releaseLease(name, id, { env = process.env, now = Date.now, reas
   const as = cancelled > 0 && id ? null : 'release';
   if (!retire(name, path, owner, { as, reason: reason ?? (id ? 'by-id' : 'any'), fields: by, env, now, hostId })) return { released: false, cancelled, reason: 'changed' };
   return { released: true, cancelled, reason: 'released', owner };
+}
+
+// Takes a waiting request out of the line (Story 7.5): `lease_id`'s ticket on `name`, or, for a Pool request (its ticket carries
+// `pool` and `request`), its ticket in every member's queue. The one writer of the other half of a waiter's ending: it leaves the
+// attribution note (see readCancelNote) before it unlinks, so the waiter's own failure names `actor`; a request on a single lock
+// then ends with one lock-level `cancel` event written here (the unlink decided it, as in releaseLease), and a Pool request with
+// none, because its own settle writes the one Pool ending. It never touches an owner record: a request that already holds a lock is
+// `held`, not cancelled.
+// `pool` narrows what may be cancelled: undefined takes the ticket as it is, a string only a request of that Pool, null only a
+// request on one lock; a ticket that does not fit is `none`, as is an id with no ticket.
+// Returns {cancelled: true, pool, request, locks} (the locks it removed a ticket from) or {cancelled: false, reason}: `none` (no
+// such waiter), `gone` (it was granted or withdrew between the find and the unlink) or `held` (it holds a lock). Throws
+// HUB_DEVICE_JOB_ID for a job's id or ticket and HUB_CANCEL_RESERVATION for a Reservation key (deploy jobs are cancelled through
+// GitHub, a Reservation is force-released), both before anything is written; TypeError without an actor.
+export function cancelRequest(name, lease_id, { actor, why = null, pool, env = process.env, now = Date.now, hostId = machineId() } = {}) {
+  const who = checkActor(actor);
+  if (!who) throw new TypeError('a cancel names its actor ({holder, via})');
+  if (why !== null && typeof why !== 'string') throw new TypeError('why must be a string');
+  if (typeof lease_id !== 'string' || lease_id === '') throw new TypeError('a cancel names the request id');
+  leaseName(name);
+  const jobTicket = () => Object.assign(failure('HUB_DEVICE_JOB_ID', `${lease_id} is a deploy job, not a Lease request: cancel it through GitHub`), { id: lease_id });
+  if (lease_id.startsWith('job:')) throw jobTicket();
+  if (readReservations(name, env).some(found => found.key === lease_id)) {
+    throw Object.assign(failure('HUB_CANCEL_RESERVATION', `${lease_id} is a Reservation on ${name}, not a queued request: force-release it`), { id: lease_id });
+  }
+  const none = { cancelled: false, reason: 'none' };
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(lease_id)) return none;
+  // The ticket of this id in a queue directory, read raw (a stale ticket is a request too), with the lock's name.
+  const ticketIn = lock => {
+    const dir = queuePath(lock, env);
+    let files = [];
+    try { files = readdirSync(dir).filter(file => file.endsWith('.json')).sort(); } catch { return null; }
+    for (const file of files) {
+      try {
+        const ticket = JSON.parse(readFileSync(join(dir, file), 'utf8'));
+        if (ticket?.lease_id === lease_id) return { name: lock, file, path: join(dir, file), ticket };
+      } catch { /* gone, or being written */ }
+    }
+    return null;
+  };
+  const holds = lock => { const owner = readOwner(lockPath(lock, env)); return isLease(owner) && owner.lease_id === lease_id; };
+  // Every lock name with a queue or a lock directory here, and whether the request holds any of them.
+  const lockNames = () => { try { return [...new Set(readdirSync(lockDir(env)).filter(entry => /^[a-z0-9-]+\.(queue|lock)$/.test(entry)).map(entry => entry.replace(/\.(queue|lock)$/, '')))]; } catch { return []; } };
+  const anyHolds = () => lockNames().some(holds);
+  const first = ticketIn(name);
+  if (!first) return holds(name) ? { cancelled: false, reason: 'held' } : none;
+  const kind = ticketKind(first.ticket);
+  if (kind === 'job' || kind === 'hub-job') throw jobTicket();
+  const tagged = typeof first.ticket.pool === 'string' && typeof first.ticket.request === 'string';
+  if (pool !== undefined && (pool === null ? tagged : first.ticket.pool !== pool)) return none;
+  let targets = [first];
+  if (tagged) {
+    // Every member's queue holds the identical ticket (same file name); a member the request took has none, and holds it instead.
+    if (anyHolds()) return { cancelled: false, reason: 'held' };
+    targets = lockNames().map(ticketIn).filter(found => found && found.ticket.pool === first.ticket.pool && found.ticket.request === first.ticket.request);
+    if (!targets.some(found => found.name === name)) targets.unshift(first);
+  }
+  const removed = [];
+  for (const target of targets) {
+    writeFileAtomic(cancelNotePath(target.path), JSON.stringify({ format: CANCEL_NOTE_FORMAT, cancel: { actor: who, why, at: iso(now()) } }));
+    try {
+      unlinkSync(target.path);
+    } catch (error) {
+      // Granted or withdrawn first: the waiter owns that ending, and no note of ours may outlive it.
+      dropNote(target.path);
+      if (error.code === 'ENOENT') continue;
+      throw error;
+    }
+    removed.push(target);
+  }
+  if (removed.length === 0) return { cancelled: false, reason: 'gone' };
+  if (tagged) {
+    if (anyHolds()) return { cancelled: false, reason: 'held' };
+  } else {
+    const at = now();
+    const enqueued = Date.parse(first.ticket.enqueued_at);
+    const subject = { kind: 'lease', lease_id, holder: first.ticket.holder ?? null, claimant_kind: first.ticket.claimant_kind ?? 'agent' };
+    note(name, eventOf('cancel', name, subject, { waited_ms: Number.isFinite(enqueued) ? Math.max(0, at - enqueued) : null, reason: 'cancelled', actor: who, ...(why ? { why } : {}) }), { env, at, hostId });
+  }
+  return { cancelled: true, pool: tagged ? first.ticket.pool : null, request: tagged ? first.ticket.request : null, locks: removed.map(target => target.name) };
 }
 
 // Changes the lease record this id holds: metadata (the phone's adb id once connected) or an earlier expiry. Never a later one

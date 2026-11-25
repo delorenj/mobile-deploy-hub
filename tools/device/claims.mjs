@@ -26,7 +26,7 @@ import { findPhone, idMatchesSerial } from '../ci/lib/adb.mjs';
 import { createDevicectl } from '../ci/lib/devicectl.mjs';
 import { earliest } from '../ci/lib/eta.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
-import { CLAIMANT_KINDS, MAX_LEASE_MS, RESERVABLE, SEED_RESOURCES, acquireLease, acquirePool, cachedProcessStart, capText, checkActor, deployTargetCapMs, etaHistory, extendLease, heldText, isLease, listLocks, lockDir, newLeaseId as newLockLeaseId, queueView, readOwner, releaseLease, releaseReservation, resourceOf, updateLease, waiterEtas } from '../ci/lib/lock.mjs';
+import { CLAIMANT_KINDS, MAX_LEASE_MS, RESERVABLE, SEED_RESOURCES, acquireLease, acquirePool, cachedProcessStart, cancelRequest, capText, checkActor, deployTargetCapMs, etaHistory, extendLease, heldText, isLease, listLocks, lockDir, newLeaseId as newLockLeaseId, queueView, readOwner, releaseLease, releaseReservation, resourceOf, updateLease, waiterEtas } from '../ci/lib/lock.mjs';
 import { sleep as realSleep } from '../ci/lib/pause.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { createAdbWire } from './adb-wire.mjs';
@@ -65,6 +65,10 @@ export const EXIT_CODES = Object.freeze({
   HUB_LEASE_NOT_FOUND: 2,
   HUB_LEASE_SUPERSEDED: 1,
   HUB_API_RESTARTING: 1,
+  // Story 7.5: a cancel of a request that is not waiting (unknown, or already holding its lock: release it), of a Reservation (force-release it), or addressed to another host.
+  HUB_REQUEST_NOT_FOUND: 2,
+  HUB_CANCEL_RESERVATION: 2,
+  HUB_WRONG_HOST: 2,
   // Story 7.4: an emulator that would not boot (or whose teardown would not finish) through a service: the host's trouble, the busy exit's opposite.
   HUB_EMULATOR_FAILED: 1,
   HUB_HOST_UNKNOWN: 1,
@@ -110,6 +114,10 @@ export const HTTP_ANSWERS = Object.freeze({
   HUB_LEASE_EXTEND_REFUSED: Object.freeze({ status: 409 }),
   HUB_LEASE_LOST: Object.freeze({ status: 409 }),
   HUB_LEASE_SUPERSEDED: Object.freeze({ status: 409, reason: 'superseded' }),
+  // Story 7.5: HUB_REQUEST_NOT_FOUND carries its own `reason` (`unknown`, or `held` for a request that already holds its lock).
+  HUB_REQUEST_NOT_FOUND: Object.freeze({ status: 404 }),
+  HUB_CANCEL_RESERVATION: Object.freeze({ status: 409, reason: 'reservation' }),
+  HUB_WRONG_HOST: Object.freeze({ status: 409, reason: 'wrong-host' }),
   HUB_API_RESTARTING: Object.freeze({ status: 503, reason: 'restarting' }),
   HUB_PHONE_AWAY: Object.freeze({ status: 503, reason: 'away' }),
   HUB_DEVICE_AWAY: Object.freeze({ status: 503, reason: 'away' }),
@@ -1199,6 +1207,102 @@ function emulatorReleaseAnswer(id, result) {
     case 'stuck': throw failure('HUB_EMULATOR_FAILED', `emulator ${id}: pids ${(result.result?.survivors ?? []).join(',')} would not stop; ${result.slot} stays out of the pool until they do`);
     default: return { lease_id: id, outcome: 'none', resource: null, lock: null, device: null };
   }
+}
+
+// ---- cancel a queued request (Story 7.5) ----
+
+const CANCEL_BODY_KEYS = Object.freeze(['resource', 'pool', 'host', 'why', 'holder', 'actor']);
+
+// Checks the body of a service's cancel into `{resource, pool, host, why, holder, actor}` (`pool`, `host`, `why`, `holder` and `actor` null
+// when absent). HUB_USAGE with a `reason`, before anything is read: bad-body (not an object, or a key outside the list), no-resource and
+// bad-resource (`resource` names the Resource the request waits on: a non-empty string), bad-pool, bad-host, bad-why (a non-empty string),
+// bad-actor, no-holder (neither an `actor` nor a `holder`).
+export function checkCancelBody(body) {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) throw bodyUsage('bad-body', 'the body must be a JSON object');
+  for (const key of Object.keys(body)) if (!CANCEL_BODY_KEYS.includes(key)) throw bodyUsage('bad-body', `the body has no key "${key}" (${CANCEL_BODY_KEYS.join(', ')})`);
+  if (body.resource === undefined) throw bodyUsage('no-resource', 'name the Resource the request waits on: a resource (a device word or Resource id)');
+  if (!isText(body.resource)) throw bodyUsage('bad-resource', 'resource must be a non-empty string');
+  if (body.pool !== undefined && !isText(body.pool)) throw bodyUsage('bad-pool', 'pool must be a non-empty string (the Pool a Pool request was made on, `phone`)');
+  const { host } = body;
+  if (host !== undefined && !isText(host)) throw bodyUsage('bad-host', 'host must be a non-empty string (a host key)');
+  if (body.why !== undefined && !isText(body.why)) throw bodyUsage('bad-why', 'why must be a non-empty string');
+  const actor = bodyActor(body);
+  if (actor === null && !isText(body.holder)) throw bodyUsage('no-holder', 'say who is cancelling: an actor or a holder');
+  return { resource: body.resource, pool: body.pool ?? null, host: host ?? null, why: body.why ?? null, holder: body.holder ?? null, actor };
+}
+
+const requestNotFound = (reason, message) => Object.assign(failure('HUB_REQUEST_NOT_FOUND', message), { reason });
+
+// The locks a request on `resource` can wait in, on this host: the emulator gate for `emulator`, every phone's for the `phone` Pool, the phone's
+// lock for a device word or Resource id, else the lock of the Registry record the word names (a Resource id, name, lock or word). Never a search
+// of the fleet by request id. An unknown word is HUB_REQUEST_NOT_FOUND (`unknown`).
+export function requestLocks(resource, ctx) {
+  const env = ctx.env ?? process.env;
+  if (resource === EMULATOR) return [GATE];
+  const fleet = ctx.fleet ?? loadFleet(env, { warn: ctx.warn });
+  if (resource === PHONE) return fleet.map(phone => phone.lock);
+  const phone = fleet.find(entry => entry.lock === resource || resourceOf(entry.lock) === resource || entry.device === resource);
+  if (phone) return [phone.lock];
+  const record = readRegistry({ env, qaDevices: () => [], warn: ctx.warn }).resources
+    .find(entry => entry.id === resource || entry.name === resource || entry.lock === resource || (Array.isArray(entry.words) && entry.words.includes(resource)));
+  if (record) return [record.lock];
+  throw requestNotFound('unknown', `no Resource "${resource}" is known here, so no request of it can be cancelled`);
+}
+
+// Every lock on this host that has a queue: where `hub-device cancel <id>` looks when it is not told the Resource (a CLI looks on its own host; a
+// service never does).
+const queuedLocks = env => {
+  try { return readdirSync(lockDir(env)).filter(entry => /^[a-z0-9-]+\.queue$/.test(entry)).map(entry => entry.slice(0, -'.queue'.length)).sort(); } catch { return []; }
+};
+
+// One lock's waiters after the cancel, as a `Cancel` carries them (the tickets only: a Reservation is not a request). Read only.
+function queueAnswer(lock, ctx) {
+  const waiters = queueView(lock, { env: ctx.env, now: ctx.timing?.now })
+    .filter(entry => entry.kind !== 'reservation')
+    .map(entry => ({
+      place: entry.place, lease_id: entry.lease_id ?? null, holder: entry.holder ?? null, why: entry.why ?? null, kind: entry.kind,
+      enqueued_at: entry.enqueued_at ?? null, deadline_at: entry.deadline_at ?? null, pool: typeof entry.pool === 'string' ? entry.pool : null,
+    }));
+  return { lock, resource: resourceOf(lock), waiters };
+}
+
+// `POST /requests/{id}/cancel` (and `hub-device cancel <id>`, and the Host Agent's): takes the waiting request `id` out of the line, in every member's
+// queue for a Pool request, and touches no Hold. `input` is `checkCancelBody`'s result with the actor defaulted by the caller (a cancel always has
+// an actor, recorded on the one ending event; the waiter's own wait ends HUB_LEASE_CANCELLED naming it). `input.resource` null (the CLI only) looks
+// on this host for the request; a given one names the Resource it waits on, and `input.pool` the Pool of a Pool request (a Pool request cancelled
+// without its `pool`, or with another, is not found). `input.host`, when given, must be this host's key.
+//
+// Answers `{request_id, outcome: 'cancelled', resource, pool, queues: [{lock, resource, waiters}]}`: the resulting queue of every lock the request was
+// taken out of. Throws HUB_DEVICE_JOB_ID (a job's id or ticket), HUB_CANCEL_RESERVATION, HUB_WRONG_HOST, HUB_HOST_UNKNOWN (this host's key is
+// unreadable) and HUB_REQUEST_NOT_FOUND with `reason` `unknown` (nothing waits under the id, or it was granted or withdrew as the cancel ran) or
+// `held` (it already holds its lock: release it), all before or instead of any write.
+export function cancel(id, input, ctx) {
+  const actor = checkActor(input?.actor);
+  if (actor === null) throw usage('a cancel names its actor ({holder, via})');
+  const local = serviceHold(id, ctx);
+  const { host } = input;
+  if (host !== null && host !== undefined) {
+    const own = (local.hostKey ?? hostKey)({ env: local.env });
+    if (host !== own) throw failure('HUB_WRONG_HOST', `this request is for host ${host}; this is host ${own}, and a cancel never reaches another host`);
+  }
+  const named = input.resource !== null && input.resource !== undefined;
+  const locks = named ? requestLocks(input.resource, local) : queuedLocks(local.env);
+  // A Pool request is found only by its Pool; with a Resource named, a request on one lock only by none (the CLI's lookup takes whatever it finds).
+  // The emulator request is a Pool request whose one queue is the gate's (a plain ticket): `emulator` is its Pool, and naming it is not a mismatch.
+  const gate = named && locks.length === 1 && locks[0] === GATE;
+  const pool = gate && (input.pool ?? EMULATOR) === EMULATOR ? undefined : input.pool ?? (named ? null : undefined);
+  let held = false;
+  for (const lock of locks) {
+    const result = cancelRequest(lock, id, { actor, why: input.why ?? null, pool, env: local.env, now: local.timing.now });
+    if (result.cancelled) {
+      const queues = result.locks.slice().sort().map(name => queueAnswer(name, local));
+      return { request_id: id, outcome: 'cancelled', resource: queues[0].resource, pool: result.pool ?? (gate ? EMULATOR : null), queues };
+    }
+    held ||= result.reason === 'held';
+  }
+  if (!held && locks.includes(GATE)) held = slotHolding(local.env, id) !== null || readRecord(local.env, id) !== null;
+  if (held) throw requestNotFound('held', `request ${id} already holds its lock, so there is no waiting request to cancel; release it (hub-device release ${id}, POST /leases/${id}/release)`);
+  throw requestNotFound('unknown', `no request waits under the id "${id}"${named ? ` on ${input.resource}` : ' on this host'}${input.pool ? ` in the Pool ${input.pool}` : ''}`);
 }
 
 // ---- status ----
