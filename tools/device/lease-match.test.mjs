@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readEvents } from '../ci/lib/events.mjs';
@@ -12,6 +12,7 @@ import { loadDevices } from '../ci/lib/devices.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { hermetic } from '../ci/test-fixtures.mjs';
 import { seed } from '../registry/seed.mjs';
+import { registryPath, writeRegistry } from '../registry/store.mjs';
 import * as claims from './claims.mjs';
 import { main } from './hub-device.mjs';
 import { fakeWire } from './wire-fixtures.mjs';
@@ -428,5 +429,47 @@ test('take() of a match target is the same Pool request the CLI makes, and a lib
     assert.equal(claims.exitCodeOf(error), 75);
     assert.equal(error.reason, 's26 absent');
     assert.ok(!existsSync(join(s.env.HUB_EVENT_DIR)) || s.events().length === 0);
+  } finally { s.cleanup(); }
+});
+
+// ---- the Registry file (Story 6.2): read fresh on every call, the seed when it is missing or unreadable ----
+
+const seededFile = () => structuredClone(seed(loadDevices({}), { qaDevices: () => [] }));
+const withLevel = (resources, id, level) => resources.map(record => (record.id === id ? { ...record, capabilities: { ...record.capabilities, api_level: level } } : record));
+
+test('--match reads registry.json on every call: a file giving s24 api_level 34 leases s24, and a second edit is seen by the next call', async () => {
+  const s = side({ qaDevices: () => [] });
+  try {
+    const { resources, pools } = seededFile();
+    await writeRegistry({ env: s.env, if_rev: 0, resources: withLevel(resources, 's24', 34), pools, log: () => {} });
+    const first = await s.cli(lease('--match', 'api_level>=34'));
+    assert.equal(first.code, 0, first.err.join('\n'));
+    assert.equal(first.out[1], "export HUB_DEVICE='s24'");
+    assert.equal(s.owner('s24').lease_id, 'l-aaaaaaaaaaaa');
+    assert.deepEqual(first.err.filter(line => /warning/.test(line)), []);
+    const release = await s.cli(['release', 'l-aaaaaaaaaaaa']);
+    assert.equal(release.code, 0, release.err.join('\n'));
+    await writeRegistry({ env: s.env, if_rev: 1, resources: withLevel(withLevel(resources, 's24', 30), 's26', 35), pools, log: () => {} });
+    const second = await s.cli(lease('--match', 'api_level>=34'));
+    assert.equal(second.code, 0, second.err.join('\n'));
+    assert.equal(second.out[1], "export HUB_DEVICE='s26'", 'the second edit of the file was seen');
+  } finally { s.cleanup(); }
+});
+
+test('a garbage registry.json warns HUB_REGISTRY_FORMAT once on stderr, the lease still resolves from the seed, and the file is untouched', async () => {
+  const s = side();
+  try {
+    mkdirSync(s.env.HUB_LOCK_DIR, { recursive: true });
+    writeFileSync(registryPath(s.env), 'not json{');
+    const result = await s.cli(lease('--match', 'kind=phone'));
+    assert.equal(result.code, 0, result.err.join('\n'));
+    assert.equal(result.out[1], "export HUB_DEVICE='s26'", 'the seed: the S24 is dedicated, so the S26');
+    const warned = result.err.filter(line => line.includes('HUB_REGISTRY_FORMAT'));
+    assert.equal(warned.length, 1);
+    assert.match(warned[0], /^hub-device: warning: HUB_REGISTRY_FORMAT: /);
+    assert.equal(readFileSync(registryPath(s.env), 'utf8'), 'not json{');
+    const { resources, pools } = seededFile();
+    await assert.rejects(writeRegistry({ env: s.env, if_rev: 0, resources, pools, log: () => {} }), error => error.code === 'HUB_REGISTRY_FORMAT');
+    assert.equal(readFileSync(registryPath(s.env), 'utf8'), 'not json{');
   } finally { s.cleanup(); }
 });
