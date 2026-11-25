@@ -21,6 +21,7 @@ import { homedir, hostname, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { adbEnv, adbPath } from '../ci/lib/adb.mjs';
 import { androidSdk, javaHome } from '../ci/lib/android.mjs';
+import { inHeavy } from '../ci/lib/heavy.mjs';
 import { MAX_LEASE_MS, acquireLease, isLease, lockDir, localHost, poolRequest, processStart, queueView, readOwner, releaseLease, sameHost, updateLease, withLock } from '../ci/lib/lock.mjs';
 import { pause, sleep as realSleep } from '../ci/lib/pause.mjs';
 import { createAdbWire } from './adb-wire.mjs';
@@ -413,12 +414,27 @@ function runTool(command, args, { env, input = '', signal, timeout = 180_000 }) 
   });
 }
 
+// The emulator spawn seam (Story 6.11, AD-45): the command and arguments a long-lived process of the lease is spawned with. On Linux
+// with `heavy` on the launch env's PATH it is `heavy <command> <args...>`; heavy execs all the way down (`systemd-run --scope`), so
+// the pid spawn returns is still the process's own and its start time is unchanged. The process then runs in its own systemd scope
+// under batch.slice, outside the Hub API service's cgroup, so a stop of the service (KillMode=mixed: SIGTERM to the main process,
+// then SIGKILL to the rest of the cgroup) never kills an emulator or the adb server the service started for a lease. Elsewhere
+// (macOS, no heavy) the command is unchanged. The emulator runs with a private XDG_RUNTIME_DIR, which would hide the user manager from
+// heavy (it would fall back to nice and stay in the cgroup): `manager` is the env heavy reaches the manager with, and the process's own
+// values are restored by an `env` prefix.
+export function bootCommand(command, args = [], { env = process.env, platform = process.platform, manager = env } = {}) {
+  const { command: spawned, args: spawnedArgs, env: spawnedEnv } = inHeavy(command, args, { env, platform, manager });
+  return { command: spawned, args: spawnedArgs, env: spawnedEnv };
+}
+
 // A long-lived process of the lease: its own session (a terminal's ^C never reaches it), output to a log file, and not
-// waited for, so `lease` can return while it runs. Resolves with its pid once it has started.
-async function launch(command, args, env, logFile) {
+// waited for, so `lease` can return while it runs. Resolves with its pid once it has started. Every one goes through
+// `bootCommand`: the pool has no other spawn of a long-lived process.
+async function launch(command, args, env, logFile, manager = env) {
   const out = openSync(logFile, 'a');
+  const boot = bootCommand(command, args, { env, manager });
   let child;
-  try { child = spawn(command, args, { env, detached: true, stdio: ['ignore', out, out] }); } finally { closeSync(out); }
+  try { child = spawn(boot.command, boot.args, { env: boot.env, detached: true, stdio: ['ignore', out, out] }); } finally { closeSync(out); }
   await new Promise((done, fail) => {
     child.once('spawn', done);
     child.once('error', error => fail(new Error(`cannot start ${command}: ${error.message}`)));
@@ -585,7 +601,7 @@ export async function provision({
     // emulator tries a window renderer and never boots.
     const emulatorEnv = { ...base, TMPDIR: record.tmp, XDG_RUNTIME_DIR: join(record.tmp, 'run') };
     for (const name of ['DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY']) delete emulatorEnv[name];
-    const emulatorPid = await launch(emulatorBin, args, emulatorEnv, join(record.dir, 'emulator.log'));
+    const emulatorPid = await launch(emulatorBin, args, emulatorEnv, join(record.dir, 'emulator.log'), base);
     const emulator = { pid: emulatorPid, start: liveStart(emulatorPid), role: 'emulator', program: basename(emulatorBin) };
     if (!recordPids(env, record, [emulator])) throw cancelled(id);
     log(`HUB_EMULATOR_START ${record.serial} pid ${emulatorPid}, adb server ${record.adb_server_port} pid ${serverPid}, ${slot}`);

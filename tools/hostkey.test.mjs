@@ -176,6 +176,13 @@ test('hostKeyScript refuses a key for the wrong platform, writing nothing, and a
 
 // ---- hosts:install ----
 
+// No network, except the Hub API's own /health (Story 6.11): the fake run answers every other step `ok`, so that step needs an answer
+// for the ref the fake git gives (`main-ok`) to pass, and these tests are about the build directory and the host keys.
+const offline = async url => {
+  if (String(url).endsWith('/health')) return new Response(JSON.stringify({ ok: true, service: 'hub-api', hub_version: 'main-ok' }), { status: 200 });
+  throw new Error('offline');
+};
+
 function fakeHosts({ macOs = 'Darwin' } = {}) {
   const linux = shimmed('Linux');
   const mac = shimmed(macOs);
@@ -184,6 +191,12 @@ function fakeHosts({ macOs = 'Darwin' } = {}) {
     calls.push([command, ...args]);
     if (command === 'sh' && args.join(' ') === '-s') { const r = linux.exec(input); return { ok: r.status === 0, out: `${r.stdout}${r.stderr}`.trim() }; }
     if (command === 'ssh' && args.at(-1) === 'sh -s') { const r = mac.exec(input); return { ok: r.status === 0, out: `${r.stdout}${r.stderr}`.trim() }; }
+    // The catch-up installer puts the release copy in place (the Hub API step reads its units installer from there).
+    if (command === 'bash' && /catchup\/units\/install\.sh$/.test(args[0])) {
+      const dir = join(linux.home, '.local/share/mobile-deploy-hub/releases', args[1], 'tools/hosts/units');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'install.sh'), '');
+    }
     return { ok: true, out: 'ok' };
   };
   const cleanup = () => { rmSync(linux.home, { recursive: true, force: true }); rmSync(mac.home, { recursive: true, force: true }); };
@@ -195,7 +208,7 @@ test('hostsInstall writes and reads back each host key, and other steps fail on 
   const lines = [];
   try {
     await assert.rejects(
-      hostsInstall({ log: line => lines.push(line), run: fake.run, fetchImpl: async () => { throw new Error('no network in tests'); } }),
+      hostsInstall({ home: fake.linux.home, log: line => lines.push(line), run: fake.run, fetchImpl: offline }),
       error => { assert.equal(error.message, 'hosts:install: build directory failed'); return true; },
     );
     assert.equal(readFileSync(claims.hostKeyPath(fake.linux.home), 'utf8'), 'linux\n');
@@ -214,7 +227,7 @@ test('hostsInstall fails a host key step whose readback disagrees, and only that
   const run = (command, args, options) => (command === 'ssh' && args.at(-1) === 'sh -s' ? { ok: true, out: 'HOST_KEY=linux' } : fake.run(command, args, options));
   try {
     await assert.rejects(
-      hostsInstall({ log: line => lines.push(line), run, fetchImpl: async () => { throw new Error('offline'); } }),
+      hostsInstall({ home: fake.linux.home, log: line => lines.push(line), run, fetchImpl: offline }),
       /hosts:install: build directory, host key on the Mac failed/,
     );
     assert.ok(lines.some(line => line.startsWith('HOSTS_FAILED host key on the Mac: read back')), lines.join('\n'));
@@ -226,7 +239,7 @@ test('hostsInstall fails the Mac key step when the alias reaches a Linux box, wr
   const lines = [];
   try {
     await assert.rejects(
-      hostsInstall({ log: line => lines.push(line), run: fake.run, fetchImpl: async () => { throw new Error('offline'); } }),
+      hostsInstall({ home: fake.linux.home, log: line => lines.push(line), run: fake.run, fetchImpl: offline }),
       /hosts:install: build directory, host key on the Mac failed/,
     );
     assert.ok(lines.some(line => /^HOSTS_FAILED host key on the Mac: .*darwin host but this is linux/.test(line)), lines.join('\n'));
@@ -244,7 +257,7 @@ test('hostsInstall accepts a correct Mac write when ssh adds notices around the 
   };
   try {
     await assert.rejects(
-      hostsInstall({ log: line => lines.push(line), run, fetchImpl: async () => { throw new Error('offline'); } }),
+      hostsInstall({ home: fake.linux.home, log: line => lines.push(line), run, fetchImpl: offline }),
       error => { assert.equal(error.message, 'hosts:install: build directory failed'); return true; },
     );
     assert.ok(lines.some(line => /^HOSTS host key on the Mac: .*"mac"/.test(line)), lines.join('\n'));

@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { hostId } from '../ci/lib/events.mjs';
 import { releaseLease, updateLease, withLock } from '../ci/lib/lock.mjs';
 import { choosePorts, doomed, isEmulatorLease, liveStart, portsInUse, releaseEmulator, resolveImage, stopProcesses } from './emulator.mjs';
+import { heavyShim } from '../ci/test-fixtures.mjs';
 import { inventory } from './inventory.mjs';
 import { main } from './hub-device.mjs';
 
@@ -123,7 +124,7 @@ function fixture({ image = 'google_apis' } = {}) {
     chmodSync(join(bin, name), 0o755);
   }
   const env = {
-    PATH: process.env.PATH, HOME: join(root, 'home'), USER: 'tester', DISPLAY: ':0', WAYLAND_DISPLAY: 'wayland-0', HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events'), ANDROID_HOME: sdk, ANDROID_AVD_HOME: userAvd,
+    PATH: `${heavyShim(join(root, 'heavy'))}:${process.env.PATH}`, HOME: join(root, 'home'), USER: 'tester', DISPLAY: ':0', WAYLAND_DISPLAY: 'wayland-0', HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events'), ANDROID_HOME: sdk, ANDROID_AVD_HOME: userAvd,
     HUB_ADB: join(bin, 'adb'), HUB_EMULATOR: join(bin, 'emulator'), HUB_AVDMANAGER: join(bin, 'avdmanager'),
     HUB_DEVICE_POLL_MS: '5', HUB_EMULATOR_POLL_MS: '20', HUB_EMULATOR_KILL_GRACE_MS: '400', HUB_EMULATOR_ADB_PORTS: '25000-25099',
     HUB_EMULATOR_DIR: join(root, 'emulators'), TMPDIR: join(root, 'tmp'),
@@ -147,7 +148,7 @@ function fixture({ image = 'google_apis' } = {}) {
     assert.deepEqual(readdirSync(join(root, 'tmp')).filter(name => name.startsWith('hub-emu-')), [], 'no temp folder left');
   };
   return {
-    root, env, state, sdk, userAvd, run, exportsOf, record, owner, records, read, strays, clean,
+    root, env, state, sdk, userAvd, heavyLog: () => { try { return readFileSync(join(root, 'heavy/heavy.log'), 'utf8'); } catch { return ''; } }, run, exportsOf, record, owner, records, read, strays, clean,
     // Every pid a record named stays dead once its lease is gone; the cleanup kills nothing that is not a fake of this test.
     cleanup: () => {
       for (const file of readdirSync(state).filter(name => /^(emulator|adb-server)-\d+\.json$/.test(name))) strays.add(JSON.parse(readFileSync(join(state, file), 'utf8')).pid);
@@ -165,6 +166,36 @@ const refused = port => new Promise(done => {
   socket.on('error', error => done(error.code === 'ECONNREFUSED'));
 });
 const waitFor = async (check, ms = 5000) => { for (const end = Date.now() + ms; Date.now() < end && !check();) await settle(20); return check(); };
+
+test('the emulator and its adb server both boot through heavy (the spawn seam), and the recorded pids are still theirs', { skip: process.platform !== 'linux' }, async () => {
+  const f = fixture();
+  try {
+    const leased = await f.run(['lease', 'emulator', '--for', '30m', '--why', 'heavy seam']);
+    assert.equal(leased.code, 0, leased.err.join('\n'));
+    const vars = f.exportsOf(leased.out);
+    const consolePort = Number(/^emulator-(\d+)$/.exec(vars.ANDROID_SERIAL)[1]);
+    const serverPort = Number(vars.ANDROID_ADB_SERVER_PORT);
+    const lines = f.heavyLog().trim().split('\n');
+    assert.deepEqual(lines.filter(line => line.startsWith(join(f.root, 'bin/adb'))), [`${join(f.root, 'bin/adb')} -L tcp:localhost:${serverPort} server nodaemon`], 'the adb server went through heavy');
+    const record = f.record(vars.HUB_LEASE_ID);
+    // The emulator's private XDG_RUNTIME_DIR would hide the user manager from the real heavy, so heavy is spawned without it and an
+    // `env` prefix puts the private one back for the emulator.
+    const emulatorLines = lines.filter(line => line.startsWith(`env XDG_RUNTIME_DIR=${join(record.tmp, 'run')} ${join(f.root, 'bin/emulator')} `));
+    assert.equal(emulatorLines.length, 1, 'the emulator went through heavy, with its private runtime dir put back by env');
+    assert.match(emulatorLines[0], new RegExp(`-port ${consolePort} `));
+    assert.equal(lines.length, 2, 'heavy saw those two long-lived processes and nothing else (avdmanager is short-lived)');
+    // heavy execs: the pid spawn returned is the process's own, so its record still names it, with its start time.
+    const emulatorRun = JSON.parse(f.read(`emulator-${consolePort}.json`));
+    assert.equal(emulatorRun.xdg, join(record.tmp, 'run'), 'the emulator still runs with its private XDG_RUNTIME_DIR');
+    const server = JSON.parse(f.read(`adb-server-${serverPort}.json`));
+    const pidOf = role => record.pids.find(entry => entry.role === role);
+    assert.equal(pidOf('emulator').pid, emulatorRun.pid, 'the recorded emulator pid is the live emulator\'s');
+    assert.equal(pidOf('adb-server').pid, server.pid, 'the recorded adb server pid is the live adb server\'s');
+    for (const entry of [pidOf('emulator'), pidOf('adb-server')]) assert.equal(liveStart(entry.pid), entry.start);
+    assert.equal((await f.run(['release', vars.HUB_LEASE_ID])).code, 0);
+    f.clean();
+  } finally { f.cleanup(); }
+});
 
 test('lease emulator makes a throwaway emulator, records every pid with its start time, and release tears exactly that down', async () => {
   const f = fixture();

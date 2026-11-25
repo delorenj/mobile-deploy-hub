@@ -132,3 +132,11 @@ source_spec: `spec-5-5-deploy-targets-are-marked-from-the-committed-declarations
 severity: low
 reason: resourceOf (lock.mjs, Story 5.2) maps only the committed seed's locks, and an extra phone such as `Pixel` (lock `pixel`) already read resource null under Story 5.4. Story 5.5 only derives deploy_target from that resource. This is the known pre-existing gap where a non-S24 devices.json phone sits on a bare lock, and fixing it needs the decision on whether new phones are added in devices.json or through the Registry. seed.test.mjs and names.test.mjs fail the moment devices.json changes, so it cannot ship silently.
 status: open
+
+### DW-7: No in-suite test runs the real `heavy` / `systemd-run --user --scope`, so pid preservation and batch.slice placement are proven only by the exec-ing shim and one manual check.
+origin: spec-deferred 7704764bfb94
+location: tools/device/emulator.mjs bootCommand / tools/ci/lib/heavy.mjs inHeavy
+source_spec: `spec-6-11-the-service-runs-from-a-release-and-a-stop-never-kills-an-emulator.md`
+severity: medium
+reason: tools/ci/test-fixtures.mjs heavyShim encodes the exec assumption; no test reads /proc/<pid>/cgroup. A suite test would need a live user manager, which the hermetic rule (CLAUDE.md "Running and verifying") forbids. Settled live by a 6.12 operator check: lease an emulator, `systemctl --user restart mobile-deploy-hub-api`, and confirm the emulator pid survives in a batch.slice scope.
+status: open
