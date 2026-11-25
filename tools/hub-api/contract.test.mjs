@@ -106,16 +106,24 @@ export function fieldDiff(docFields, codeFields) {
 const contract = parseContract(readFileSync(DOC, 'utf8'));
 const routeKey = route => `${route.method} ${route.path}`;
 
-// What each route parameter is replaced with when the test calls a route (a parameter not listed here fails the test).
+// What each route parameter is replaced with when the test calls a GET route (a parameter not listed here fails the test).
 const PARAM_SAMPLES = Object.freeze({ id: 's26' });
 
-// The request body each POST route is called with (a POST route with no sample fails the test). Each call gets a fresh scratch.
+// How each POST route is called (a POST route with no sample fails the test): `body`, `status` (the success status it must answer),
+// `params` (its own route parameters, over PARAM_SAMPLES) and `setup` (the paths of other POST samples called first, in order, on the
+// same fresh scratch). Each call gets a fresh scratch.
 const POST_SAMPLES = Object.freeze({
-  '/registry/resources': { kind: 'phone', name: 'pixel', host: 'linux', identity: { serial: 'PX9', model: 'Pixel 9' }, capabilities: { api_level: 35 }, holder: 'contract-test' },
+  '/registry/resources': { status: 201, body: { kind: 'phone', name: 'pixel', host: 'linux', identity: { serial: 'PX9', model: 'Pixel 9' }, capabilities: { api_level: 35 }, holder: 'contract-test' } },
+  // After the seed (rev 1) and the setup register (rev 2), the edit is based on rev 2.
+  '/registry/resources/{id}': { status: 200, params: { id: 'res-pixel' }, setup: ['/registry/resources'], body: { if_rev: 2, name: 'pixel-9', capabilities: { api_level: 36 }, holder: 'contract-test' } },
+  '/registry/resources/{id}/retire': { status: 200, params: { id: 'res-pixel' }, setup: ['/registry/resources'], body: { holder: 'contract-test' } },
 });
-export function sampleBody(route, samples = POST_SAMPLES) {
+const sampleOf = (route, samples = POST_SAMPLES) => {
   if (!Object.hasOwn(samples, route.path)) throw new Error(`no request body sample for ${route.method} ${route.path}: add it to POST_SAMPLES`);
-  return structuredClone(samples[route.path]);
+  return samples[route.path];
+};
+export function sampleBody(route, samples = POST_SAMPLES) {
+  return structuredClone(sampleOf(route, samples).body);
 }
 const postRoutes = () => ROUTES.filter(candidate => candidate.method === 'POST');
 export function samplePath(path, samples = PARAM_SAMPLES) {
@@ -123,6 +131,17 @@ export function samplePath(path, samples = PARAM_SAMPLES) {
     if (!Object.hasOwn(samples, name)) throw new Error(`no sample for the route parameter {${name}} in ${path}: add it to PARAM_SAMPLES`);
     return samples[name];
   });
+}
+
+// Calls a POST route as its sample says: the setup routes first (their answers must be successes), then the route itself. Returns the answer.
+async function callPost(route, ctx) {
+  const sample = sampleOf(route);
+  for (const path of sample.setup ?? []) {
+    const earlier = ROUTES.find(candidate => candidate.method === 'POST' && candidate.path === path);
+    const answer = await handle({ method: 'POST', url: samplePath(path, { ...PARAM_SAMPLES, ...sampleOf(earlier).params }), body: sampleBody(earlier) }, ctx);
+    assert.equal(answer.status, sampleOf(earlier).status, `setup ${path}`);
+  }
+  return handle({ method: 'POST', url: samplePath(route.path, { ...PARAM_SAMPLES, ...sample.params }), body: sampleBody(route) }, ctx);
 }
 
 function scratch() {
@@ -171,13 +190,13 @@ test('each GET route answers with exactly the field list of its shape', async ()
   } finally { s.cleanup(); }
 });
 
-test('each POST route answers 201 with exactly the field list of its shape', async () => {
+test('each POST route answers its success status with exactly the field list of its shape', async () => {
   assert.ok(postRoutes().length > 0);
   for (const route of postRoutes()) {
     const s = scratch();
     try {
-      const answer = await handle({ method: 'POST', url: samplePath(route.path), body: sampleBody(route) }, s.ctx);
-      assert.equal(answer.status, 201, routeKey(route));
+      const answer = await callPost(route, s.ctx);
+      assert.equal(answer.status, sampleOf(route).status, routeKey(route));
       assert.deepEqual(fieldDiff(contract.shapes[route.shape], shapeFields(route.shape, answer.body)), [], routeKey(route));
     } finally { s.cleanup(); }
   }
@@ -190,7 +209,7 @@ test('the Problem extensions of the document equal PROBLEM_EXTENSIONS both ways,
   for (const code of Object.keys(PROBLEM_EXTENSIONS)) assert.ok(code in contract.codes, `${code} is described as an error code`);
   const s = scratch();
   try {
-    const route = ROUTES.find(candidate => candidate.method === 'POST');
+    const route = ROUTES.find(candidate => candidate.method === 'POST' && candidate.path === '/registry/resources');
     const post = body => handle({ method: 'POST', url: route.path, body }, s.ctx);
     const base = sampleBody(route);
     assert.equal((await post(base)).status, 201);
@@ -251,7 +270,7 @@ test('every key, in the document and in a response, is snake_case', async () => 
     for (const route of postRoutes()) {
       const t = scratch();
       try {
-        const body = (await handle({ method: 'POST', url: samplePath(route.path), body: sampleBody(route) }, t.ctx)).body;
+        const body = (await callPost(route, t.ctx)).body;
         for (const path of shapeFields(route.shape, body)) for (const key of keysOf(path)) keys.add(key);
       } finally { t.cleanup(); }
     }

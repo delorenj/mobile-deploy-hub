@@ -88,7 +88,7 @@ development_status:
   6-4-the-hub-api-runs-answers-health-and-has-a-contract: done
   6-5-read-the-registry-through-the-api: done
   6-6-register-a-resource-through-the-api: done
-  6-7-edit-and-retire-a-resource: backlog
+  6-7-edit-and-retire-a-resource: done
   6-8-registry-verbs-in-hub-device-and-a-clear-message-when-the-ap: backlog
   6-9-a-registered-phone-is-leasable-within-a-minute: backlog
   6-10-reachability-and-discovery-through-the-api: backlog
