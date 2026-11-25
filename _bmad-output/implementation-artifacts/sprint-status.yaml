@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 11-24-2026 08:06
-last_updated: 2026-11-24
+last_updated: 11-24-2026 22:59
 project: Mobile Deploy Hub
 project_key: MOBI
 tracking_system: file-system
@@ -67,3 +67,72 @@ development_status:
   4-2-position-and-eta-in-the-wait-line: done
   4-3-status-shows-every-waiter-reservations-and-etas: done
   epic-4-retrospective: optional
+
+  epic-5: backlog
+  5-1-one-claims-library-under-an-unchanged-cli: backlog
+  5-2-one-reserved-word-list-one-slug-rule-res-locks-queue: backlog
+  5-3-a-host-knows-its-own-key: backlog
+  5-4-status-through-one-builder-with-reachability: backlog
+  5-5-deploy-targets-are-marked-from-the-committed-declarations: backlog
+  5-6-discover-unregistered-devices-from-the-cli: backlog
+  5-7-ask-for-a-phone-by-capability: backlog
+  5-8-phone-holds-a-place-in-line: backlog
+  5-9-no-extension-while-a-pool-or-gate-waiter-sits-behind: backlog
+  5-10-ship-the-cli-release: backlog
+  epic-5-retrospective: optional
+
+  epic-6: backlog
+  6-1-event-log-vocabulary-for-registry-reachability-and-prune: backlog
+  6-2-the-registry-store-has-one-writer: backlog
+  6-3-seed-at-start-import-qa-phones-on-first-creation: backlog
+  6-4-the-hub-api-runs-answers-health-and-has-a-contract: backlog
+  6-5-read-the-registry-through-the-api: backlog
+  6-6-register-a-resource-through-the-api: backlog
+  6-7-edit-and-retire-a-resource: backlog
+  6-8-registry-verbs-in-hub-device-and-a-clear-message-when-the-ap: backlog
+  6-9-a-registered-phone-is-leasable-within-a-minute: backlog
+  6-10-reachability-and-discovery-through-the-api: backlog
+  6-11-the-service-runs-from-a-release-and-a-stop-never-kills-an-em: backlog
+  6-12-ship-the-registry-and-the-hub-api: backlog
+  epic-6-retrospective: optional
+
+  epic-7: backlog
+  7-1-take-a-lease-through-the-api: backlog
+  7-2-wait-for-a-lease-through-the-api: backlog
+  7-3-extend-and-release-a-lease-with-a-recorded-override: backlog
+  7-4-lease-an-emulator-through-the-api: backlog
+  7-5-cancel-a-queued-request: backlog
+  7-6-force-release-a-lease: backlog
+  7-7-force-release-a-reservation: backlog
+  7-8-force-release-an-emulator-slot: backlog
+  7-9-ship-leases-through-the-api: backlog
+  epic-7-retrospective: optional
+
+  epic-8: backlog
+  8-1-one-status-document-from-the-api: backlog
+  8-2-reads-and-waits-never-block-the-event-loop: backlog
+  8-3-live-reachability-from-one-adb-socket: backlog
+  8-4-one-stream-on-the-candybar-wire: backlog
+  8-5-a-change-reaches-subscribers-within-two-seconds: backlog
+  8-6-a-restart-loses-nothing: backlog
+  8-7-ship-the-live-status: backlog
+  epic-8-retrospective: optional
+
+  epic-9: backlog
+  9-1-cross-host-calls-go-through-one-client: backlog
+  9-2-the-host-agent-serves-the-mac-s-own-state: backlog
+  9-3-forwarded-actions-reach-the-right-host: backlog
+  9-4-lease-ipad-and-lease-mac-take-the-ios-lane: backlog
+  9-5-the-host-agent-pushes-changes-and-only-changes: backlog
+  9-6-an-asleep-mac-reads-offline-and-fails-fast: backlog
+  9-7-the-host-agent-runs-on-the-mac-as-its-own-launchagent: backlog
+  9-8-ship-the-mac-host-agent: backlog
+  epic-9-retrospective: optional
+
+  epic-10: backlog
+  10-1-replicate-the-mac-s-event-log: backlog
+  10-2-query-history-across-both-hosts: backlog
+  10-3-utilisation-per-resource: backlog
+  10-4-freeze-the-contract-and-prove-nothing-leaks: backlog
+  10-5-ship-v1b: backlog
+  epic-10-retrospective: optional
