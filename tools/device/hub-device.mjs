@@ -19,7 +19,9 @@
 //                    [--env-serial NAME]... [--json] [--verbose]
 //   hub-device release [<lease_id>|--any]    (no id: $HUB_LEASE_ID; --any: whichever lease holds a phone; a `job:` id is a deploy job's place in
 //                    line, not a lease: exit 2, HUB_DEVICE_JOB_ID names the run to cancel)
-//   hub-device status [--json]   (read only: locks, every waiter with its position and live ETA, the Reservations, the inventory)
+//   hub-device status [--json]   (read only: locks, every waiter with its position and live ETA, the Reservations, the inventory; --json
+//                    gives every row its `resource` and its `reachability` {state, checked_at, age_ms, stale}, read over the adb wire on the
+//                    Linux host and through devicectl on the Mac, and none at all on a host that does not know its key)
 //   hub-device run s24|s26|phone [--for 1h] [--why TEXT] [--wait 2m] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...>
 //   hub-device lease emulator [--profile default|playstore] --for 30m --why TEXT [--wait 2m] [--id ID] [--pid N] [--holder WHO]
 //                    [--env-serial NAME]... [--json]
@@ -297,7 +299,11 @@ function age(ms) {
 async function status(parsed, context) {
   const { stdout, timing } = context;
   const nowMs = timing.now();
-  const result = await claims.statusData(context);
+  // The host key says which Resources this host may read. A host that does not know which host it is still shows status:
+  // every reading is then missing (unknown, stale), never reachable.
+  let key = null;
+  try { key = (context.hostKey ?? claims.hostKey)({ env: context.env }); } catch (error) { if (error?.code !== 'HUB_HOST_UNKNOWN') throw error; }
+  const result = await claims.statusView(key, { audience: 'local' }, context);
   const { phones, locks, waiters, reservations, inventory: found, emulators } = result;
   if (parsed.flags.json) { stdout(JSON.stringify(result, null, 2)); return 0; }
   stdout('PHONES (read only; adb is queried, never connected)');
@@ -463,6 +469,9 @@ export async function main(argv, {
   stderr = line => process.stderr.write(`${line}\n`),
   signals = process,
   adbFactory,
+  adbWire,
+  devicectl,
+  hostKey,
   inventory: inventoryImpl,
   sleep = realSleep,
   now = Date.now,
@@ -470,7 +479,7 @@ export async function main(argv, {
 } = {}) {
   let parsed = { flags: {}, words: [], envSerial: [], command: null };
   const context = {
-    ...claims.createContext({ env, sleep, now, log: line => stderr(line), warn: message => stderr(`hub-device: warning: ${message}`), adbFactory, inventory: inventoryImpl, policy }),
+    ...claims.createContext({ env, sleep, now, log: line => stderr(line), warn: message => stderr(`hub-device: warning: ${message}`), adbFactory, adbWire, devicectl, hostKey, inventory: inventoryImpl, policy }),
     stdout, stderr, signals, killGraceMs: Number(env.HUB_DEVICE_KILL_GRACE_MS) || 10_000,
   };
   try {

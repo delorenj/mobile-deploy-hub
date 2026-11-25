@@ -5,18 +5,21 @@
 //
 // Everything that writes the lock directory goes through lock.mjs and emulator.mjs (AD-1); reads may look at it directly. Errors carry a `code`; a usage
 // refusal is `code: 'HUB_USAGE'`. The context every action takes is the one `createContext` builds: `env`, `log`, `warn`,
-// `timing`, `emulator`, `adbFactory`, `inventory`, `policy` and `fleet`.
+// `timing`, `emulator`, `adbFactory`, `adbWire`, `devicectl`, `hostKey`, `inventory`, `policy` and `fleet`.
 import { randomBytes } from 'node:crypto';
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { findPhone, idMatchesSerial } from '../ci/lib/adb.mjs';
+import { createDevicectl } from '../ci/lib/devicectl.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
-import { MAX_LEASE_MS, RESERVABLE, acquireLease, capText, deployTargetCapMs, etaHistory, extendLease, isLease, listLocks, lockDir, nameRefusal, newLeaseId as newLockLeaseId, poolRequest, queueView, readOwner, releaseLease, releaseReservation, updateLease, waiterEtas } from '../ci/lib/lock.mjs';
+import { MAX_LEASE_MS, RESERVABLE, SEED_RESOURCES, acquireLease, capText, deployTargetCapMs, etaHistory, extendLease, isLease, listLocks, lockDir, nameRefusal, newLeaseId as newLockLeaseId, poolRequest, queueView, readOwner, releaseLease, releaseReservation, resourceOf, updateLease, waiterEtas } from '../ci/lib/lock.mjs';
 import { pause, sleep as realSleep } from '../ci/lib/pause.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
+import { createAdbWire } from './adb-wire.mjs';
 import { createAsyncAdb } from './async-adb.mjs';
-import { GATE, LEASE_ID, PROFILES, emulatorStatus, exportsOf as emulatorExports, hostPool, isEmulatorLease, isEmulatorLock, provision, readRecord, reap, releaseEmulator as releaseEmulatorLease, teardownNow } from './emulator.mjs';
+import { GATE, LEASE_ID, MAX_POOL, PROFILES, emulatorStatus, exportsOf as emulatorExports, hostPool, isEmulatorLease, isEmulatorLock, provision, readRecord, reap, releaseEmulator as releaseEmulatorLease, teardownNow } from './emulator.mjs';
+import { REACHABILITY, phoneReachability, present, readIpad, stamp } from '../registry/reachability.mjs';
 import { inventory as realInventory } from './inventory.mjs';
 
 export const PHONE = 'phone';
@@ -75,9 +78,9 @@ export const isLocal = (record, { hostKey: keyOf = hostKey } = {}) => record?.ho
 // ---- context ----
 
 // Timing and emulator settings from the environment, as the CLI always read them; every key can be overridden by a seam.
-export function createContext({ env = process.env, sleep = realSleep, now = Date.now, log = () => {}, warn = () => {}, adbFactory, inventory, policy = null, fleet } = {}) {
+export function createContext({ env = process.env, sleep = realSleep, now = Date.now, log = () => {}, warn = () => {}, adbFactory, adbWire, devicectl, hostKey: hostKeyOf, inventory, policy = null, fleet } = {}) {
   return {
-    env, log, warn, policy, adbFactory, inventory, fleet,
+    env, log, warn, policy, adbFactory, adbWire, devicectl, hostKey: hostKeyOf, inventory, fleet,
     timing: { sleep, now, leasePollMs: Number(env.HUB_DEVICE_POLL_MS) || 1000, phonePollMs: Number(env.HUB_DEVICE_POLL_MS) || 3000 },
     emulator: {
       graceMs: Number(env.HUB_EMULATOR_KILL_GRACE_MS) || 15_000,
@@ -457,49 +460,101 @@ export function extend(id, { forMs }, ctx) {
   return extendLease(lock, id, { forMs, env, now: timing?.now, policy });
 }
 
+
 // ---- status ----
 
-// Which phones are on the adb server, without connecting to any of them: `adb devices` (a query) plus `adb mdns
-// services` (to tie a bare host:port id, what a manual `adb connect` leaves, back to its serial). Only asked when
-// the inventory shows the server already running, so status can never start one; anything it cannot answer says
-// so instead of failing. The query goes to the hub's server whatever the caller's environment says (a stray
-// ANDROID_ADB_SERVER_PORT would ask the wrong server — and start one if it were down), and both queries are
-// bounded: the race is settled within 5s and its abort kills a wedged query child at once, so status never
-// lingers on a slow one.
-async function phonePresence(fleet, ctx, found) {
-  const { env, adbFactory, timing } = ctx;
-  const notes = new Map(fleet.map(phone => [phone.device, 'no adb server']));
+const NO_SERVER = 'no adb server';
+const NO_ANSWER = 'adb did not answer';
+const PROBE_MS = 5000;
+const SERIAL_READ_MS = 1500;
+
+// Which phones are on the hub's adb server, read over the wire and never through the adb client: `host:version`, then
+// `host:devices-l`, plus one `host:transport:<id>` + `shell:getprop ro.serialno` for each `host:port` id in `device` state, which is
+// how a bare endpoint (what a manual `adb connect` leaves) is tied back to its phone. An id that cannot be read (unauthorized,
+// offline) is not matched, so that phone reads absent. Returns each fleet phone's observation: the state adb lists it in, null
+// when the server does not list it, or a note saying why nobody could look. Only asked when the inventory shows the hub's server
+// already running, so status can never start one (and a Mac, with no /proc, asks nothing). The whole probe is bounded: it is
+// settled within 5s and its abort closes every socket at once, so status never lingers on a wedged server.
+async function readWire(wire, fleet, { sleep, signal }) {
+  await wire.version();
+  const listed = await wire.devicesLong();
+  const serials = new Map();
+  // Each serial read is bounded on its own: one wedged `host:port` phone is unmatched, and never costs the rest their listed states.
+  await Promise.all(listed.filter(entry => entry.state === 'device' && /^[^:\s]+:\d+$/.test(entry.id)).map(async entry => {
+    const read = Promise.resolve().then(() => wire.shell(entry.id, 'getprop ro.serialno')).then(text => String(text).trim(), () => null);
+    const serial = await Promise.race([read, sleep(SERIAL_READ_MS, signal).then(() => null)]);
+    if (serial) serials.set(entry.id, serial);
+  }));
+  return new Map(fleet.map(phone => {
+    const entry = listed.find(device => idMatchesSerial(device.id, phone.serial) || (Boolean(serials.get(device.id)) && serials.get(device.id) === phone.serial));
+    return [phone.device, entry ? entry.state : null];
+  }));
+}
+
+async function phoneObservations(fleet, ctx, found) {
+  const { env, adbWire, timing } = ctx;
   const hubPort = Number(env.HUB_ADB_SERVER_PORT) || 5037;
-  if (!found.adb_servers.some(server => server.port === hubPort)) return notes;
-  const queryEnv = { ...env, ANDROID_ADB_SERVER_PORT: String(hubPort) };
-  delete queryEnv.ANDROID_SERIAL;
-  const stopQuery = new AbortController();   // kills the query children the moment presence is done with them
+  if (!found.adb_servers.some(server => server.port === hubPort)) return new Map(fleet.map(phone => [phone.device, NO_SERVER]));
+  const unanswered = () => new Map(fleet.map(phone => [phone.device, NO_ANSWER]));
+  const stopQuery = new AbortController();   // closes the wire's sockets the moment the probe is done with them
   const giveUp = new AbortController();      // clears the race's timer once it settles
   try {
-    const adb = adbFactory ? adbFactory({ env: queryEnv, signal: stopQuery.signal }) : createAsyncAdb({ env: queryEnv, signal: stopQuery.signal });
-    const asked = adb.devices();
+    const asked = readWire((adbWire ?? createAdbWire)(hubPort, { signal: stopQuery.signal }), fleet, { sleep: timing.sleep, signal: giveUp.signal });
     asked.catch(() => {});   // the race below may stop waiting first
-    const services = (adb.mdnsServices ? adb.mdnsServices() : Promise.resolve(new Map()));
-    services.catch(() => {});
-    // A query that fails (no adb on this host's paths, a wedged server) is an answer, not a failure: status never fails on it.
-    const answered = await Promise.race([Promise.all([asked.then(found => found, () => null), services.then(found => found, () => null)]), timing.sleep(5000, giveUp.signal).then(() => null)]);
-    if (!answered) { for (const phone of fleet) notes.set(phone.device, 'adb did not answer'); return notes; }
-    const [listed, mdns] = answered;
-    if (!listed) { for (const phone of fleet) notes.set(phone.device, 'adb did not answer'); return notes; }
-    for (const phone of fleet) {
-      const entry = listed.find(device => idMatchesSerial(device.id, phone.serial, mdns ?? new Map()));
-      notes.set(phone.device, entry?.state === 'device' ? 'reachable' : entry?.state ?? 'absent');
-    }
-    return notes;
+    // A query that fails (a wedged or foreign server) is an answer, not a failure: status never fails on it.
+    return await Promise.race([asked.then(observed => observed, () => null), timing.sleep(PROBE_MS, giveUp.signal).then(() => null)]) ?? unanswered();
+  } catch {
+    return unanswered();
   } finally {
     giveUp.abort();
     stopQuery.abort();
   }
 }
 
-// Everything `status` shows, as the `--json` object: {phones, locks, waiters, reservations, inventory, emulators}. Read only:
-// it writes nothing to the lock dir or the Event Log (FR-13).
-export async function statusData(ctx) {
+// What `presence` has always said for an observation: adb's own word for a state, `reachable` for `device`, `absent` for none.
+const presenceOf = observed => (observed === 'device' ? 'reachable' : observed === null ? 'absent' : observed);
+
+// Every lock name status walks. Today's names come first and in their order (the fleet's locks, the emulator gate, the reservable
+// names, every held lock); then every name the lock dir holds a `.lock`, `.queue` or `.reservations` for that is a seeded lock, a
+// `res-<slug>` or an `emulator-<n>` slot of the pool, sorted. That is how a free `res-*` or `emulator-<n>` queue with waiters shows.
+// Directory entries are only names: a service, `registry.json` or an `s3-*` lock is never walked unless it is held.
+function walkSet(fleet, env, held) {
+  const names = new Set([...fleet.map(phone => phone.lock), GATE, ...RESERVABLE, ...held]);
+  const slot = name => { const match = /^emulator-(\d+)$/.exec(name); return match !== null && String(Number(match[1])) === match[1] && Number(match[1]) >= 1 && Number(match[1]) <= MAX_POOL; };
+  const walkable = name => Object.hasOwn(SEED_RESOURCES, name) || (name.startsWith('res-') && resourceOf(name) === name) || slot(name);
+  let entries = [];
+  try { entries = readdirSync(lockDir(env)); } catch { /* no lock dir: nothing is held */ }
+  const found = new Set();
+  for (const entry of entries) {
+    const match = /^(.+)\.(?:lock|queue|reservations)$/.exec(entry);
+    if (match !== null && walkable(match[1])) found.add(match[1]);
+  }
+  for (const name of [...found].sort()) names.add(name);
+  return names;
+}
+
+// A service sees no phone serial, UDID or adb id of a Resource in its QA set; the keys stay, their values are null.
+function redact(row) {
+  for (const key of ['serial', 'udid', 'adb_id']) if (key in row) row[key] = null;
+  for (const key of ['phone', 'device']) {
+    const nested = row[key];
+    if (nested !== null && typeof nested === 'object') row[key] = { ...nested, ...('serial' in nested ? { serial: null } : {}), ...('adb_id' in nested ? { adb_id: null } : {}) };
+  }
+}
+
+const AUDIENCES = Object.freeze(['local', 'service']);
+
+// Everything `status` shows, as the `--json` object: {phones, locks, waiters, reservations, inventory, emulators}. Read only: it
+// walks the lock dir and the hub's adb server (over the wire), and writes nothing to the lock dir or the Event Log (FR-13).
+// Every row of those lists that names a Resource carries `resource` (resourceOf(lock)) and then `reachability`
+// ({state, checked_at, age_ms, stale}), beside the v1a keys, which keep their values; both are null for a lock that is no Resource.
+// A reading is taken only on the host that owns the Resource (`hostKey`: the Linux host reads the phones, the Mac the iPad) and
+// only for what a row names; every other row shows the missing reading, unknown and stale, never reachable. A null key (this host
+// does not know which host it is) reads nothing. `audience` is `local` or `service`; a service sees the `qa_ids` Resources' serials,
+// UDIDs and adb ids as null.
+export async function statusView(key, options, ctx) {
+  const { audience, qa_ids: qaIds = [] } = options ?? {};
+  if (!AUDIENCES.includes(audience)) throw usage(`status audience is one of ${AUDIENCES.join(', ')}, not "${audience}"`);
   const { env, timing, fleet } = ctx;
   const nowMs = timing.now();
   const locks = listLocks({ env, now: timing.now }).map(entry => {
@@ -515,19 +570,22 @@ export async function statusData(ctx) {
   });
   const waiters = [];
   const reservations = [];
+  // The policy is read once and never fails status: a broken one leaves every reading stale and every ETA null.
+  let policyRead = false;
+  let settings = null;
+  const policyOf = () => {
+    if (!policyRead) { policyRead = true; try { settings = ctx.policy ?? loadPolicy().policy; } catch { settings = null; } }
+    return settings;
+  };
   // The ETAs come from one windowed read of the Event Log and one policy, shared by every waiter and read only when a live waiter
   // exists; a failure of either leaves those waiters with `eta: null` (`eta=?`) and never fails status.
   let history = null;
-  let settings = null;
   const loadEtaInputs = () => {
     if (history !== null) return;
     history = false;
-    try {
-      settings = ctx.policy ?? loadPolicy().policy;
-      history = etaHistory({ env, now: nowMs, policy: settings });
-    } catch { history = false; }
+    try { history = policyOf() ? etaHistory({ env, now: nowMs, policy: policyOf() }) : false; } catch { history = false; }
   };
-  for (const name of new Set([...fleet.map(phone => phone.lock), GATE, ...RESERVABLE, ...locks.map(entry => entry.lock)])) {
+  for (const name of walkSet(fleet, env, locks.map(entry => entry.lock))) {
     const view = queueView(name, { env, includeStale: true, now: timing.now });
     const device = nameOf(fleet, name);
     // A run's Reservation holds a place but is no waiter: it has its own section, and the tickets are numbered without it.
@@ -550,7 +608,7 @@ export async function statusData(ctx) {
     }
   }
   const found = (ctx.inventory ?? realInventory)({ lockRoot: lockDir(env), hubAdbPort: Number(env.HUB_ADB_SERVER_PORT) || 5037 });
-  const reach = await phonePresence(fleet, ctx, found);
+  const observed = await phoneObservations(fleet, ctx, found);
   const phones = fleet.map(phone => {
     const lock = locks.find(entry => entry.lock === phone.lock) ?? null;
     const owner = lock?.kind === 'lease' ? { lease_id: lock.lease_id, holder: lock.holder, why: lock.why, expires_at: lock.expires_at, adb_id: lock.phone?.adb_id ?? null } : null;
@@ -558,7 +616,7 @@ export async function statusData(ctx) {
       device: phone.device, lock: phone.lock, deploy: phone.deploy, name: phone.name, model: phone.model, serial: phone.serial,
       held: lock ? lock.kind : 'free', holder: owner?.holder ?? null, lease_id: owner?.lease_id ?? null, why: owner?.why ?? null,
       expires_at: owner?.expires_at ?? null, adb_id: owner?.adb_id ?? null, repo: lock?.repo ?? null, run: lock?.run ?? null,
-      presence: reach.get(phone.device) ?? 'absent',
+      presence: presenceOf(observed.get(phone.device) ?? null),
     };
   });
   // The pool's own processes are managed and carry their lease id: a pid counts only while it is still the recorded process.
@@ -566,6 +624,37 @@ export async function statusData(ctx) {
   const owners = new Map(emulators.flatMap(entry => entry.pids.filter(pid => pid.alive).map(pid => [pid.pid, entry.lease_id])));
   for (const list of [found.adb_servers, found.emulators, found.xvfb]) {
     for (const item of list) if (owners.has(item.pid)) Object.assign(item, { managed: true, lease_id: owners.get(item.pid) });
+  }
+
+  // Every row gets its Resource; the readings come after, so the iPad is asked only when a row names it.
+  const rowsOf = [[phones, phone => phone.lock], [locks, entry => entry.lock], [waiters, waiter => waiter.lock], [reservations, entry => entry.lock], [emulators, entry => entry.slot]];
+  for (const [rows, lockOf] of rowsOf) for (const row of rows) row.resource = resourceOf(lockOf(row));
+  const readings = new Map();   // Resource id -> stored reading
+  if (key === 'linux') {
+    const readAt = timing.now();
+    for (const phone of fleet) {
+      const resource = resourceOf(phone.lock);
+      if (resource !== null) readings.set(resource, stamp(phoneReachability(observed.get(phone.device) ?? null), { checkedAt: readAt, receivedAt: readAt }));
+    }
+  }
+  if (key === 'mac' && rowsOf.some(([rows]) => rows.some(row => row.resource === 'ios-lane'))) {
+    let state = REACHABILITY.unknown;
+    try {
+      const { udid, model } = loadDevices(env).ios;
+      const devicectl = ctx.devicectl ?? createDevicectl({ env });
+      state = await readIpad({ list: () => devicectl(['list', 'devices'], 10), udid, model });
+    } catch { /* an iPad nobody could ask is unknown */ }
+    const readAt = timing.now();
+    readings.set('ios-lane', stamp(state, { checkedAt: readAt, receivedAt: readAt }));
+  }
+  const maxAgeS = policyOf()?.registry?.reachability_max_age_s;
+  const at = timing.now();
+  for (const [rows] of rowsOf) {
+    for (const row of rows) row.reachability = row.resource === null ? null : present(readings.get(row.resource) ?? null, { now: at, maxAgeS });
+  }
+  if (audience === 'service') {
+    const qa = new Set(Array.isArray(qaIds) ? qaIds : []);
+    for (const [rows] of rowsOf) for (const row of rows) if (row.resource !== null && qa.has(row.resource)) redact(row);
   }
   return { phones, locks, waiters, reservations, inventory: found, emulators };
 }

@@ -159,7 +159,7 @@ export const editionPinOf = (app, name) => app?.android?.editions?.[name] ?? nul
 export function parsePolicy(source) {
   let policy;
   try { policy = JSON.parse(source); } catch (error) { fail(`not valid JSON (${error.message})`); }
-  exact('policy', policy, ['schema', 'bump', 'event', 'manifest_schema', 'apps', 'callers', 'runners', 'devices', 'delivery', 'mac', 'catch_up', 'queue'], ['completion', 'shared_bundle_allowlist']);
+  exact('policy', policy, ['schema', 'bump', 'event', 'manifest_schema', 'apps', 'callers', 'runners', 'devices', 'delivery', 'mac', 'catch_up', 'queue', 'registry'], ['completion', 'shared_bundle_allowlist']);
   if (policy.schema !== 1) fail('schema must be 1');
 
   exact('bump', policy.bump, ['levels', 'default']);
@@ -260,6 +260,7 @@ export function parsePolicy(source) {
   positive('catch_up.max_failures', policy.catch_up.max_failures);
 
   queueBlock(policy.queue);
+  registryBlock(policy.registry);
 
   // What "shipped" means, for every app at once (TOWE-76): the required targets, what the gate does when a required
   // lane cannot run, and how many same-version reruns `ship` may do on its own. No per-app switch exists on purpose:
@@ -300,6 +301,13 @@ function queueBlock(queue) {
   positive('queue.eta_low_data_min_holds', queue.eta_low_data_min_holds);
   exact('queue.hold_allowance_min', queue.hold_allowance_min, queueJobs);
   for (const job of queueJobs) positive(`queue.hold_allowance_min.${job}`, queue.hold_allowance_min[job]);
+}
+
+// The Registry's tuning (AD-46), one strict block that each Registry story grows by its own keys and no others. Story 5.4 adds how
+// old a Reachability reading may be, in seconds, before status shows it as stale (it is always shown with its age).
+function registryBlock(registry) {
+  exact('registry', registry, ['reachability_max_age_s']);
+  positive('registry.reachability_max_age_s', registry.reachability_max_age_s);
 }
 
 export const completionDevices = Object.freeze(['lanes', 'never']);

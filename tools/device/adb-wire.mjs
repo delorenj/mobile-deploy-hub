@@ -63,6 +63,17 @@ const payload = text => {
   return text.slice(4, 4 + length);
 };
 
+// `host:devices-l`: one line per device, `<id> <state> [usb:..] [product:..] [model:..] [device:..] [transport_id:..]`. A key that is
+// absent (an unauthorized phone shows no model) is null. The id is the first word and the state the second, so the long state
+// `no permissions (...)` reads as `no` and is never taken for `device`.
+export function parseDevicesLong(text) {
+  return String(text ?? '').split('\n').map(line => line.trim()).filter(Boolean).map(line => {
+    const [id, state, ...rest] = line.split(/\s+/);
+    const keys = new Map(rest.filter(word => word.includes(':')).map(word => [word.slice(0, word.indexOf(':')), word.slice(word.indexOf(':') + 1)]));
+    return { id, state: state ?? '', model: keys.get('model') ?? null, product: keys.get('product') ?? null, device: keys.get('device') ?? null, transport_id: keys.get('transport_id') ?? null };
+  });
+}
+
 export function createAdbWire(port, { signal } = {}) {
   return {
     port,
@@ -71,6 +82,8 @@ export function createAdbWire(port, { signal } = {}) {
     // [{id, state}] for every device this server knows.
     devices: async () => payload(await exchange(port, ['host:devices'], { signal })).split('\n').map(line => line.trim()).filter(Boolean)
       .map(line => { const [id, state] = line.split(/\s+/); return { id, state }; }),
+    // [{id, state, model, product, device, transport_id}] with the model details (what status reads); a read-only query, 5s.
+    devicesLong: async () => parseDevicesLong(payload(await exchange(port, ['host:devices-l'], { signal, timeout: 5000 }))),
     // Tells the server an emulator listens on adbPort (what the emulator itself does at start); the server sends no reply.
     registerEmulator: adbPort => exchange(port, [`host:emulator:${adbPort}`], { signal, noReply: true, timeout: 5000 }),
     // Runs a shell command on one device and returns its output.

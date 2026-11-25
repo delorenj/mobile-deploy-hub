@@ -50,7 +50,7 @@ async function startWaiter(s, id, lock = 's24') {
 const emptyAdb = () => ({ startServer: async () => {}, devices: async () => [], prop: async () => '' });
 
 test('the library exports the whole action surface and the exit table as frozen data', () => {
-  for (const name of ['resolve', 'take', 'release', 'extend', 'newLeaseId', 'checkBounds', 'checkLeaseId', 'usableFleet', 'emulatorBounds', 'statusData', 'leaseExports', 'jobTicket', 'releaseEmulatorNow', 'releaseReservations', 'exitCodeOf', 'fleetOf', 'loadFleet', 'hostKey', 'isLocal', 'hostKeyPath']) {
+  for (const name of ['resolve', 'take', 'release', 'extend', 'newLeaseId', 'checkBounds', 'checkLeaseId', 'usableFleet', 'emulatorBounds', 'statusView', 'leaseExports', 'jobTicket', 'releaseEmulatorNow', 'releaseReservations', 'exitCodeOf', 'fleetOf', 'loadFleet', 'hostKey', 'isLocal', 'hostKeyPath']) {
     assert.equal(typeof claims[name], 'function', name);
   }
   assert.equal(claims.PHONE, 'phone');
@@ -346,7 +346,7 @@ test('status data writes nothing to the lock dir or the Event Log', async () => 
   try {
     mkdirSync(s.env.HUB_LOCK_DIR, { recursive: true });
     const before = readdirSync(s.env.HUB_LOCK_DIR);
-    const data = await claims.statusData(s.ctx);
+    const data = await claims.statusView(null, { audience: 'local' }, s.ctx);
     assert.deepEqual(Object.keys(data), ['phones', 'locks', 'waiters', 'reservations', 'inventory', 'emulators']);
     assert.deepEqual(data.phones.map(phone => [phone.device, phone.held, phone.presence]), [['s24', 'free', 'no adb server'], ['s26', 'free', 'no adb server']]);
     assert.deepEqual(readdirSync(s.env.HUB_LOCK_DIR), before);

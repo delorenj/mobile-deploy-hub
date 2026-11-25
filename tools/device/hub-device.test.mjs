@@ -14,6 +14,7 @@ import { readEvents } from '../ci/lib/events.mjs';
 import { createAsyncAdb, runAdb } from './async-adb.mjs';
 import { inventory } from './inventory.mjs';
 import { leaseSupport, main, parseArgs, parseDuration } from './hub-device.mjs';
+import { fakeHub, fakeWire } from './wire-fixtures.mjs';
 
 const tool = fileURLToPath(new URL('./hub-device.mjs', import.meta.url));
 const hubRoot = fileURLToPath(new URL('../../', import.meta.url));
@@ -62,15 +63,17 @@ function fixture() {
   writeFileSync(adb, fakeAdb(state));
   chmodSync(adb, 0o755);
   const env = { PATH: process.env.PATH, HOME: root, USER: 'tester', HUB_ADB: adb, HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events'), HUB_DEVICE_POLL_MS: '5', HUB_DEVICE_PHONE_SLICE_MS: '300', HUB_ADB_SERVER_PORT: '5037' };
+  // The same two phones on the hub's adb wire (status asks it, never the adb binary): `away-<serial>` leaves one out, `unauth-<serial>` lists it unauthorized.
+  const wire = fakeWire({ listed: () => [S24_SERIAL, SERIAL].filter(serial => !existsSync(join(state, `away-${serial}`))).map(serial => ({ id: `adb-${serial}-zz._adb-tls-connect._tcp`, state: existsSync(join(state, `unauth-${serial}`)) ? 'unauthorized' : 'device', model: serial === SERIAL ? 'SM_S948U' : 'SM_S928U' })) });
   const run = async (argv, extra = {}) => {
     const out = [];
     const err = [];
-    const code = await main(argv, { env, stdout: line => out.push(line), stderr: line => err.push(line), inventory: () => ({ adb_servers: [], emulators: [], xvfb: [] }), ...extra });
+    const code = await main(argv, { env, stdout: line => out.push(line), stderr: line => err.push(line), inventory: () => ({ adb_servers: [], emulators: [], xvfb: [] }), adbWire: wire, ...extra });
     return { code, out, err };
   };
   const flag = (name, on) => { const file = join(state, name); if (on) writeFileSync(file, ''); else rmSync(file, { force: true }); };
   return {
-    root, env, state, run, lock: join(root, 'locks/adb.lock'), s24lock: join(root, 'locks/s24.lock'),
+    root, env, state, run, wire, lock: join(root, 'locks/adb.lock'), s24lock: join(root, 'locks/s24.lock'),
     away: (device, on = true) => flag(`away-${serialOf[device]}`, on),
     unauth: (device, on = true) => flag(`unauth-${serialOf[device]}`, on),
     calls: () => { try { return readFileSync(join(state, 'calls.log'), 'utf8'); } catch { return ''; } },
@@ -468,63 +471,50 @@ test('release --any frees whichever phone lease is held; a deploy job on one pho
   } finally { f.cleanup(); }
 });
 
-test('status settles as soon as the phones are answered: the query timeout is cleared, not left holding the process open', async () => {
+const bothPhones = [{ id: `adb-${S24_SERIAL}-zz._adb-tls-connect._tcp`, state: 'device', model: 'SM_S928U' }, { id: `adb-${SERIAL}-zz._adb-tls-connect._tcp`, state: 'device', model: 'SM_S948U' }];
+
+test('status settles as soon as the phones are answered: the wire timeout is cleared, not left holding the process open', async () => {
   const f = fixture();
-  let decoy = null;
+  let hub = null;
   try {
-    // a decoy posing as the adb server on 5039 (the inventory reads /proc and matches adb ... server); the fake
-    // HUB_ADB answers at once, so any lingering five-second query timer would show up as the process not exiting.
-    decoy = spawn('/bin/sh', ['-c', 'while :; do sleep 5; done', 'server'], { argv0: 'adb', env: { ...process.env, ANDROID_ADB_SERVER_PORT: '5039' }, stdio: 'ignore' });
-    for (let i = 0; i < 200; i += 1) {
-      let cmdline = '';
-      try { cmdline = readFileSync(`/proc/${decoy.pid}/cmdline`, 'utf8'); } catch { /* not yet */ }
-      if (/^adb\0.*server\0/.test(cmdline)) break;
-      await settle(10);
-    }
+    // A TCP fake on the hub port answers the wire at once, so any lingering five-second timer would show up as the process not exiting;
+    // the fake HUB_ADB records every run, and the wire never runs it.
+    hub = await fakeHub({ listed: bothPhones });
     const started = Date.now();
-    const child = spawn(process.execPath, [tool, 'status'], { env: { ...f.env, HUB_ADB_SERVER_PORT: '5039' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [tool, 'status'], { env: { ...f.env, HUB_ADB_SERVER_PORT: String(hub.server.port) }, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';
     child.stdout.on('data', chunk => { out += chunk; });
     child.stderr.resume();
-    const closed = new Promise(done => child.on('close', (code, signal) => done({ code, signal })));
-    const result = await closed;
+    const result = await new Promise(done => child.on('close', (code, signal) => done({ code, signal })));
     const elapsed = Date.now() - started;
     assert.equal(result.code, 0, out);
-    assert.ok(elapsed < 1500, `status took ${elapsed}ms to exit after the phones were answered; the query timer should be cleared`);
-    assert.match(out, /s24  free  reachable/, 'the fake adb answered the presence query');
+    assert.ok(elapsed < 1500, `status took ${elapsed}ms to exit after the phones were answered; the wire timer should be cleared`);
+    assert.match(out, /s24  free  reachable/, 'the wire answered the presence query');
     assert.match(out, /s26  free  reachable/);
+    assert.equal(f.calls(), '', 'the adb binary never ran');
+    assert.deepEqual(hub.server.requests, ['host:version', 'host:devices-l']);
   } finally {
-    decoy?.kill('SIGKILL');
+    await hub?.stop();
     f.cleanup();
   }
 });
 
 test('status asks the hub port whatever a stray ANDROID_ADB_SERVER_PORT says, and starts no server', async () => {
   const root = mkdtempSync(join(tmpdir(), 'hub-presence-'));
-  let decoy = null;
+  let hub = null;
   try {
     const state = join(root, 'state');
     mkdirSync(state, { recursive: true });
     const adb = join(root, 'adb');
-    // The fake serves devices only on the hub port (5039); any other ANDROID_ADB_SERVER_PORT is recorded and fails,
-    // the way a real adb would reach a different server — or start one on a dead port.
+    // The adb binary must never run: any call is recorded and fails.
     writeFileSync(adb, `#!/bin/sh
 echo "$*" >> "${state}/calls.log"
-echo "$ANDROID_ADB_SERVER_PORT" >> "${state}/ports.log"
-[ "$ANDROID_ADB_SERVER_PORT" = "5039" ] || { echo "stray port $ANDROID_ADB_SERVER_PORT" >> "${state}/stray.log"; exit 1; }
-[ "$1" = devices ] && printf 'List of devices attached\\nadb-${S24_SERIAL}-zz._adb-tls-connect._tcp\\tdevice\\nadb-${SERIAL}-zz._adb-tls-connect._tcp\\tdevice\\n'
-exit 0
+exit 1
 `);
     chmodSync(adb, 0o755);
-    decoy = spawn('/bin/sh', ['-c', 'while :; do sleep 5; done', 'server'], { argv0: 'adb', env: { ...process.env, ANDROID_ADB_SERVER_PORT: '5039' }, stdio: 'ignore' });
-    for (let i = 0; i < 200; i += 1) {
-      let cmdline = '';
-      try { cmdline = readFileSync(`/proc/${decoy.pid}/cmdline`, 'utf8'); } catch { /* not yet */ }
-      if (/^adb\0.*server\0/.test(cmdline)) break;
-      await settle(10);
-    }
+    hub = await fakeHub({ listed: bothPhones });
     // a stray ANDROID_ADB_SERVER_PORT names a dead port; the presence query must go to the hub port regardless
-    const child = spawn(process.execPath, [tool, 'status'], { env: { PATH: process.env.PATH, HOME: root, USER: 'tester', HUB_ADB: adb, HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events'), HUB_ADB_SERVER_PORT: '5039', ANDROID_ADB_SERVER_PORT: '15170' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [tool, 'status'], { env: { PATH: process.env.PATH, HOME: root, USER: 'tester', HUB_ADB: adb, HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events'), HUB_ADB_SERVER_PORT: String(hub.server.port), ANDROID_ADB_SERVER_PORT: '15170' }, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';
     child.stdout.on('data', chunk => { out += chunk; });
     child.stderr.resume();
@@ -532,11 +522,10 @@ exit 0
     assert.equal(result.code, 0, out);
     assert.match(out, /s24  free  reachable/, 'the hub port answered for both phones');
     assert.match(out, /s26  free  reachable/);
-    assert.ok(!existsSync(join(state, 'stray.log')), 'the stray port never reached the adb client');
-    assert.ok(readFileSync(join(state, 'ports.log'), 'utf8').trim().split('\n').every(port => port === '5039'), 'every query went to the hub port');
-    assert.doesNotMatch(readFileSync(join(state, 'calls.log'), 'utf8'), /start-server/, 'status starts nothing');
+    assert.ok(hub.server.requests.length > 0 && hub.server.requests.every(request => ['host:version', 'host:devices-l'].includes(request)), 'only the read-only queries reached the hub port');
+    assert.ok(!existsSync(join(state, 'calls.log')), 'the adb client never ran: no start-server, no connect, no mdns');
   } finally {
-    decoy?.kill('SIGKILL');
+    await hub?.stop();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -1035,7 +1024,8 @@ test('status lists leases, waiters and the marked inventory, changes nothing and
     assert.match(text, /emulator  avd tower-pixel  console port 5730  adb server 15170  pid 200  foreign/);
     assert.match(text, /Xvfb  display :100  pid 300  foreign/);
     assert.doesNotMatch(f.calls(), /connect|start-server/, 'status queries adb; it never connects or starts anything');
-    assert.match(f.calls(), /^devices$/m, 'the phones were looked up in adb devices');
+    assert.equal(f.calls(), '', 'the adb binary never ran');
+    assert.deepEqual(f.wire.requests, ['host:version', 'host:devices-l', 'host:version', 'host:devices-l'], 'each status looked the phones up on the adb wire: the version, then the long device list');
     assert.deepEqual(readdirSync(join(f.root, 'locks')).sort(), before, 'status changed nothing');
     assert.equal(f.owner().lease_id, 'held');
     releaseLease('adb', 'next', { env: f.env });

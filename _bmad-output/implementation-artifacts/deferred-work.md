@@ -115,3 +115,11 @@ source_spec: `spec-5-2-one-reserved-word-list-one-slug-rule-res-locks-queue.md`
 severity: medium
 reason: isQueued covers only the frozen v1a QUEUED set, emulator-<n> and res-<slug>, and SEED_RESOURCES maps only adb, s24 and mac-ios, so a lock named "pixel" gets no queue ticket and no events. This predates Story 5.2 (any extra phone but s24 was already bare). names.test.mjs fails when the committed devices.json gains such a phone, but a HUB_DEVICES override file does not run that test. Settling it means choosing whether devices.json may still declare new phones (then seed and queue them) or new phones must be registered as res-<slug> (then refuse unseeded android_extra names).
 status: open
+
+### DW-5: A phone listed twice by the adb server (a stale USB or offline entry plus a live host:port id) takes the first listed entry's state, so it can read offline or absent while it is usable.
+origin: spec-deferred c0614269caff
+location: tools/device/claims.mjs:readWire
+source_spec: `spec-5-4-status-through-one-builder-with-reachability.md`
+severity: low
+reason: readWire matches with listed.find(...), first match wins; the v1a phonePresence had the same find-first semantics over `adb devices`, so this predates Story 5.4 (status now also derives reachability from it). Fix would prefer a `device` entry among the matches.
+status: open

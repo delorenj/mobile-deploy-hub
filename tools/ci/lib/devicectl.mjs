@@ -22,29 +22,42 @@ export function createDevicectl({ env = process.env, runner = runBounded, xcrun 
   };
 }
 
-// The approved iPad: physical, the pinned model, paired, Developer Mode on.
-export function pickIpad(document, { udid, model }) {
+// What devicectl's record says about the approved iPad: physical, the pinned model, paired, Developer Mode on. It returns
+// the fields pickIpad always did plus `proven` (the record carried the hardware details devicectl reads live) and
+// `boot_state` (deviceProperties.bootState, or null). A refusal is an Error with the same message as ever and a `reason`
+// (not-listed, unpaired, developer-mode, identity) that the Registry's Reachability mapper reads instead of the text.
+const refuse = (reason, message) => Object.assign(new Error(message), { reason });
+
+export function inspectIpad(document, { udid, model }) {
   const devices = document?.result?.devices ?? [];
   const matches = devices.filter(device => (device.hardwareProperties ?? device.properties?.hardware ?? {}).udid === udid);
-  if (matches.length !== 1) throw new Error(`the iPad ${model} (UDID ${udid}) is not listed by devicectl on this Mac; wake it, keep it on the same Wi-Fi and check \`xcrun devicectl list devices\``);
+  if (matches.length !== 1) throw refuse('not-listed', `the iPad ${model} (UDID ${udid}) is not listed by devicectl on this Mac; wake it, keep it on the same Wi-Fi and check \`xcrun devicectl list devices\``);
   const [device] = matches;
   const hardware = device.hardwareProperties ?? {};
   const connection = device.connectionProperties ?? {};
   const properties = device.deviceProperties ?? {};
+  const boot_state = properties.bootState ?? null;
   // devicectl can list the iPad by UDID with the hardware details it reads live left out (a run logged "undefined
   // iPad14,5" and failed the whole deploy, 2026-10-24; seen with the iPad away, the record's cause is not captured).
   // An unproven identity is never reachable: it is reported as tunnel 'unavailable', which reachIpad and the catch-up
   // treat as pending. A state the record states explicitly and wrongly (unpaired, Developer Mode off, simulated,
   // another model) stays a hard error.
   if (hardware.reality === undefined && (hardware.productType === undefined || hardware.productType === model)) {
-    if (connection.pairingState !== undefined && connection.pairingState !== 'paired') throw new Error(`the iPad is not paired with this Mac (pairingState ${connection.pairingState})`);
-    if (properties.developerModeStatus && properties.developerModeStatus !== 'enabled') throw new Error('Developer Mode is off on the iPad (Settings > Privacy & Security > Developer Mode)');
-    return { identifier: device.identifier, name: properties.name ?? null, os: properties.osVersionNumber ?? null, transport: connection.transportType ?? null, tunnel: 'unavailable' };
+    if (connection.pairingState !== undefined && connection.pairingState !== 'paired') throw refuse('unpaired', `the iPad is not paired with this Mac (pairingState ${connection.pairingState})`);
+    if (properties.developerModeStatus && properties.developerModeStatus !== 'enabled') throw refuse('developer-mode', 'Developer Mode is off on the iPad (Settings > Privacy & Security > Developer Mode)');
+    return { identifier: device.identifier, name: properties.name ?? null, os: properties.osVersionNumber ?? null, transport: connection.transportType ?? null, tunnel: 'unavailable', proven: false, boot_state };
   }
-  if (hardware.reality !== 'physical' || hardware.productType !== model) throw new Error(`devicectl lists ${udid} as ${hardware.reality} ${hardware.productType}, not the physical ${model}`);
-  if (connection.pairingState !== 'paired') throw new Error(`the iPad is not paired with this Mac (pairingState ${connection.pairingState})`);
-  if (properties.developerModeStatus && properties.developerModeStatus !== 'enabled') throw new Error('Developer Mode is off on the iPad (Settings > Privacy & Security > Developer Mode)');
-  return { identifier: device.identifier, name: properties.name ?? null, os: properties.osVersionNumber ?? null, transport: connection.transportType ?? null, tunnel: connection.tunnelState ?? null };
+  if (hardware.reality !== 'physical' || hardware.productType !== model) throw refuse('identity', `devicectl lists ${udid} as ${hardware.reality} ${hardware.productType}, not the physical ${model}`);
+  if (connection.pairingState !== 'paired') throw refuse('unpaired', `the iPad is not paired with this Mac (pairingState ${connection.pairingState})`);
+  if (properties.developerModeStatus && properties.developerModeStatus !== 'enabled') throw refuse('developer-mode', 'Developer Mode is off on the iPad (Settings > Privacy & Security > Developer Mode)');
+  return { identifier: device.identifier, name: properties.name ?? null, os: properties.osVersionNumber ?? null, transport: connection.transportType ?? null, tunnel: connection.tunnelState ?? null, proven: true, boot_state };
+}
+
+// The approved iPad as the deploy path has always had it: inspectIpad without the two Registry-only fields.
+export function pickIpad(document, options) {
+  const { proven, boot_state, ...picked } = inspectIpad(document, options);
+  void proven; void boot_state;
+  return picked;
 }
 
 export function pickApp(document, bundle) {
