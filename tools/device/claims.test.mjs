@@ -50,7 +50,7 @@ async function startWaiter(s, id, lock = 's24') {
 const emptyAdb = () => ({ startServer: async () => {}, devices: async () => [], prop: async () => '' });
 
 test('the library exports the whole action surface and the exit table as frozen data', () => {
-  for (const name of ['resolve', 'take', 'release', 'extend', 'newLeaseId', 'checkBounds', 'checkLeaseId', 'usableFleet', 'emulatorBounds', 'emulatorPool', 'serviceLease', 'statusView', 'leaseExports', 'jobTicket', 'releaseEmulatorNow', 'releaseReservations', 'extendHeld', 'serviceExtend', 'cancel', 'checkCancelBody', 'requestLocks', 'forceReleaseLease', 'checkForceReleaseBody', 'serviceRelease', 'checkExtendBody', 'checkReleaseBody', 'exitCodeOf', 'fleetOf', 'loadFleet', 'matchTarget', 'hostKey', 'isLocal', 'hostKeyPath']) {
+  for (const name of ['resolve', 'take', 'release', 'extend', 'newLeaseId', 'checkBounds', 'checkLeaseId', 'usableFleet', 'emulatorBounds', 'emulatorPool', 'serviceLease', 'statusView', 'leaseExports', 'jobTicket', 'releaseEmulatorNow', 'releaseReservations', 'extendHeld', 'serviceExtend', 'cancel', 'checkCancelBody', 'requestLocks', 'forceReleaseLease', 'checkForceReleaseBody', 'forceReleaseReservation', 'checkReservationForceReleaseBody', 'serviceRelease', 'checkExtendBody', 'checkReleaseBody', 'exitCodeOf', 'fleetOf', 'loadFleet', 'matchTarget', 'hostKey', 'isLocal', 'hostKeyPath']) {
     assert.equal(typeof claims[name], 'function', name);
   }
   assert.equal(claims.PHONE, 'phone');
@@ -80,6 +80,8 @@ test('the library exports the whole action surface and the exit table as frozen 
     HUB_REQUEST_NOT_FOUND: 2, HUB_CANCEL_RESERVATION: 2, HUB_WRONG_HOST: 2,
     // Story 7.6: a force-release of a deploy job's Hold.
     HUB_FORCE_RELEASE_JOB: 2,
+    // Story 7.7: a force-release of a Reservation that is gone.
+    HUB_RESERVATION_NOT_FOUND: 2,
     // Story 6.8: the same-host client's two answers.
     HUB_API_DOWN: 1, HUB_API_UNKNOWN: 1,
   });

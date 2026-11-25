@@ -71,6 +71,8 @@ export const EXIT_CODES = Object.freeze({
   HUB_WRONG_HOST: 2,
   // Story 7.6: a force-release of a deploy job's Hold (a Job Hold is only ended by cancelling its run).
   HUB_FORCE_RELEASE_JOB: 2,
+  // Story 7.7: a force-release of a run's Reservation that no longer exists (already released, never reserved).
+  HUB_RESERVATION_NOT_FOUND: 2,
   // Story 7.4: an emulator that would not boot (or whose teardown would not finish) through a service: the host's trouble, the busy exit's opposite.
   HUB_EMULATOR_FAILED: 1,
   HUB_HOST_UNKNOWN: 1,
@@ -122,6 +124,8 @@ export const HTTP_ANSWERS = Object.freeze({
   HUB_WRONG_HOST: Object.freeze({ status: 409, reason: 'wrong-host' }),
   // Story 7.6: carries its own `repo`, `run` and `job` members (null when unknown).
   HUB_FORCE_RELEASE_JOB: Object.freeze({ status: 409, reason: 'job' }),
+  // Story 7.7: carries its own `reason` (`unknown`).
+  HUB_RESERVATION_NOT_FOUND: Object.freeze({ status: 404 }),
   HUB_API_RESTARTING: Object.freeze({ status: 503, reason: 'restarting' }),
   HUB_PHONE_AWAY: Object.freeze({ status: 503, reason: 'away' }),
   HUB_DEVICE_AWAY: Object.freeze({ status: 503, reason: 'away' }),
@@ -1379,6 +1383,52 @@ export function forceReleaseLease(id, input, ctx) {
     throw Object.assign(failure('HUB_LEASE_LOST', message), { reason: result.reason === 'unknown-holder' ? 'being-taken' : 'changed-hands' });
   }
   return { lease_id: id, outcome: 'force-released', resource: resourceOf(found.name), lock: found.name, device: nameOf(local.fleet, found.name), holder: result.owner.holder ?? null, why };
+}
+
+// ---- force-release a Reservation (Story 7.7) ----
+
+const RESERVATION_FORCE_RELEASE_BODY_KEYS = Object.freeze(['why', 'holder', 'actor', 'name']);
+
+// Checks the body of a service's Reservation force-release into `{why, holder, actor, name}` (`holder`, `actor` and `name` null when absent). HUB_USAGE
+// with a `reason`, before anything is read: bad-body (not an object, or a key outside `why`, `holder`, `actor`, `name`), no-why, bad-why, bad-actor,
+// no-holder (neither an `actor` nor a `holder`), bad-name (`name` is not a non-empty string; which names are reservable is `forceReleaseReservation`'s).
+export function checkReservationForceReleaseBody(body) {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) throw bodyUsage('bad-body', 'the body must be a JSON object');
+  for (const key of Object.keys(body)) if (!RESERVATION_FORCE_RELEASE_BODY_KEYS.includes(key)) throw bodyUsage('bad-body', `the body has no key "${key}" (${RESERVATION_FORCE_RELEASE_BODY_KEYS.join(', ')})`);
+  const why = checkWhy(body.why);
+  const actor = bodyActor(body);
+  if (actor === null && !isText(body.holder)) throw bodyUsage('no-holder', 'say who is force-releasing: an actor or a holder');
+  if (body.name !== undefined && !isText(body.name)) throw bodyUsage('bad-name', `name must be one of ${RESERVABLE.join(', ')}`);
+  return { why, holder: body.holder ?? null, actor, name: body.name ?? null };
+}
+
+// `POST /reservations/{run_key}/force-release` (and `hub-device force-release --reservation <run_key> --why`; the Host Agent's too): ends the Reservation a
+// deploy run holds on a reservable lock of this host, from outside the run (a dead run's Reservation is first in line until its 3 h ceiling), through the
+// one protocol writer `releaseReservation` with an actor. `input` is `{why, actor, name}`: both `why` and `actor` are required and recorded on the one
+// `force-release` event; `name` (`adb` or `mac-ios`) narrows it to one lock, absent tries every reservable name in this host's lock dir (a run key can hold
+// one on each host). Answers `{run_key, outcome: 'force-released', repo, run, released: [{lock, resource, reserved_at, expires_at}], why}`.
+//
+// Refusals, in order, before anything is written: HUB_USAGE (an actor, `no-why` / `bad-why`, `bad-run-key`, `bad-name`); HUB_RESERVATION_NOT_FOUND
+// (`unknown`: no Reservation of that run key on this host, one already released, or one whose record is unreadable). The rename decides, so a force-release
+// racing the run's own release or a ceiling prune ends it once with one event, and the loser is the 404.
+export function forceReleaseReservation(runKey, input, ctx) {
+  const actor = checkActor(input?.actor);
+  if (actor === null) throw usage('a force-release names its actor ({holder, via})');
+  const why = checkWhy(input?.why);
+  if (typeof runKey !== 'string' || !RUN_KEY.test(runKey)) throw bodyUsage('bad-run-key', `force-release: "${runKey}" is not a run key (owner--repo--run)`);
+  const name = input?.name ?? null;
+  if (name !== null && !RESERVABLE.includes(name)) throw bodyUsage('bad-name', `force-release: --name is one of ${RESERVABLE.join(', ')}`);
+  const local = serviceLocal(ctx);
+  const released = [];
+  let ended = null;
+  for (const lock of name ? [name] : RESERVABLE) {
+    const result = releaseReservation(lock, { env: local.env, key: runKey, now: local.timing.now, actor, why });
+    if (result.status !== 'released') continue;
+    ended ??= result.reservation;
+    released.push({ lock, resource: resourceOf(lock), reserved_at: result.reservation.reserved_at, expires_at: result.reservation.expires_at });
+  }
+  if (released.length === 0) throw Object.assign(failure('HUB_RESERVATION_NOT_FOUND', `no Reservation of ${runKey} on ${name ?? RESERVABLE.join(' or ')} of this host (already released, never reserved, or its record is unreadable)`), { reason: 'unknown' });
+  return { run_key: runKey, outcome: 'force-released', repo: ended.repo, run: String(ended.run), released, why };
 }
 
 // ---- status ----

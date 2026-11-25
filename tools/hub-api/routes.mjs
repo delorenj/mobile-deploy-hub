@@ -14,7 +14,7 @@
 // handler as `request.params`; a literal route wins over a parameterised one.
 import { STATUS_CODES } from 'node:http';
 import { idMatchesSerial } from '../ci/lib/adb.mjs';
-import { HOST_PLATFORMS, cancel, checkCancelBody, checkExtendBody, checkForceReleaseBody, checkLeaseBody, checkReleaseBody, discover as discoverHost, exitCodeOf, findLease, forceReleaseLease, hostKey as realHostKey, httpAnswerOf, leaseRequestId, lockActivity, serviceExtend, serviceLease, serviceRelease } from '../device/claims.mjs';
+import { HOST_PLATFORMS, cancel, checkCancelBody, checkExtendBody, checkForceReleaseBody, checkLeaseBody, checkReleaseBody, checkReservationForceReleaseBody, discover as discoverHost, exitCodeOf, findLease, forceReleaseLease, forceReleaseReservation, hostKey as realHostKey, httpAnswerOf, leaseRequestId, lockActivity, serviceExtend, serviceLease, serviceRelease } from '../device/claims.mjs';
 import { hubRef } from '../ci/lib/receipt.mjs';
 import { NO_READING } from '../registry/reachability.mjs';
 import { loadQaDevices } from '../registry/seed.mjs';
@@ -320,6 +320,15 @@ export function forceReleaseLeaseRoute(ctx, { body, params }) {
   return forceReleaseLease(params.id, { why: input.why, actor }, serviceContext(ctx));
 }
 
+// POST /reservations/{run_key}/force-release: ends a deploy run's Reservation by force (Story 7.7), exactly `hub-device force-release --reservation <run_key> --why ...`:
+// `forceReleaseReservation` is the one function every front door calls, and the status of a refusal comes from its HTTP table. The body is checked first
+// (`checkReservationForceReleaseBody`); the actor is the body's `actor`, else `{holder, via: 'api'}`. No holder check and no confirmation. 200 `ReservationForceRelease`.
+export function forceReleaseReservationRoute(ctx, { body, params }) {
+  const input = checkReservationForceReleaseBody(body);
+  const actor = input.actor ?? { holder: input.holder, via: 'api' };
+  return forceReleaseReservation(params.run_key, { why: input.why, actor, name: input.name }, serviceContext(ctx));
+}
+
 // `shape` names the `### <Shape>` section of the contract document that lists the response's fields.
 export const ROUTES = Object.freeze([
   Object.freeze({ method: 'GET', path: '/health', shape: 'Health', handler: health }),
@@ -337,6 +346,7 @@ export const ROUTES = Object.freeze([
   Object.freeze({ method: 'POST', path: '/leases/{id}/release', shape: 'Release', handler: releaseLeaseRoute }),
   Object.freeze({ method: 'POST', path: '/leases/{id}/force-release', shape: 'ForceRelease', handler: forceReleaseLeaseRoute }),
   Object.freeze({ method: 'POST', path: '/requests/{id}/cancel', shape: 'Cancel', handler: cancelRequestRoute }),
+  Object.freeze({ method: 'POST', path: '/reservations/{run_key}/force-release', shape: 'ReservationForceRelease', handler: forceReleaseReservationRoute }),
 ]);
 
 // ---- dispatch ----

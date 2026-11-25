@@ -127,3 +127,24 @@ test('a clean fixture passes, a test file or an unscanned directory is not an en
     assert.equal(violations(root, { deployPath: ['tools/device'] }).length, 1, 'a directory added to DEPLOY_PATH is scanned');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+// Story 7.7 (AD-25): a deploy job ends its own Reservation with a plain `release` and never calls a service, Claims or the force-release route
+// for it. Nothing the deploy path runs passes an actor (the one thing that turns `releaseReservation` into a force-release), names the
+// `/reservations/` route or the `force-release` verb.
+// A `releaseReservation(` call whose argument list carries `actor`.
+const ACTOR_RELEASE = /\breleaseReservation\s*\([^)]*\bactor\b/;
+
+test('no deploy path file force-releases a Reservation or names its route', () => {
+  const files = DEPLOY_PATH.flatMap(dir => entriesOf(repoRoot, dir));
+  assert.ok(files.length > 5, 'the scan sees the deploy commands');
+  for (const file of files) {
+    const source = readFileSync(file, 'utf8');
+    const name = relative(repoRoot, file);
+    assert.doesNotMatch(source, ACTOR_RELEASE, `${name} passes no actor to releaseReservation (an actor makes a release a force-release)`);
+    assert.doesNotMatch(source, /\/reservations\/|force-release/, `${name} names neither the force-release route nor its verb`);
+  }
+  // The check can fail: the narrowed pattern catches a call with an actor and passes one without.
+  assert.match("releaseReservation('adb', { key, actor, why })", ACTOR_RELEASE);
+  assert.doesNotMatch("releaseReservation('adb', { env, reason })", ACTOR_RELEASE);
+  assert.doesNotMatch('// an actor is who force-releases', ACTOR_RELEASE);
+});
