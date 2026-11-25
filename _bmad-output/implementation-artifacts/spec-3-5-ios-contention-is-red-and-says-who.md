@@ -2,7 +2,7 @@
 title: 'Story 3.5: iOS contention is red, and says who'
 type: 'feature'
 created: '2026-11-24'
-status: 'awaiting-operator'
+status: done
 baseline_revision: 'd1ee6d6ac309dfded5dda884dadfde7e56193303'
 review_loop_iteration: 0
 followup_review_recommended: false
@@ -159,3 +159,12 @@ Status: awaiting-operator
 - The `storeTake` call site inside `ios()` runs in no test, though `storeTake` itself is tested.
 - Lanes that record no contention can still leak lock-holder text to public copies. This is deferred and predates the story.
 - The change reaches the apps only after the hub release and the install on both hosts (`operator_actions`).
+
+## Operator Confirmation
+
+Confirmed 2026-11-24: the external actions this story owed were carried out.
+
+- After the orchestrator merges this story branch to main, cut the hub release from a fresh clean clone of main: `mise run release -- 1.2.49`. The `## v1.2.49` section of docs/hub-releases.md is already written.
+- Run `mise run hosts:install` from a clean checkout at tag v1.2.49 on big-chungus and on the Mac. Then check that both hosts' `current` is v1.2.49 and that the catch-up candybars still fire.
+
+_Appended by the bmad-loop orchestrator (`bmad-loop confirm`, #335): a human confirmed these external actions out of band, and the story was advanced from `awaiting-operator` to `done`._

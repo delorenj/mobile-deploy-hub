@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 11-24-2026 08:06
-last_updated: 11-24-2026 09:00
+last_updated: 2026-11-24
 project: Mobile Deploy Hub
 project_key: MOBI
 tracking_system: file-system
@@ -59,7 +59,7 @@ development_status:
   3-2-a-blocked-android-delivery-goes-pending: done
   3-3-the-catch-up-delivers-contention-pending-builds-in-its-turn: done
   3-4-a-newer-installed-build-is-refused-with-a-name: done
-  3-5-ios-contention-is-red-and-says-who: awaiting-operator
+  3-5-ios-contention-is-red-and-says-who: done
   epic-3-retrospective: optional
 
   epic-4: done
