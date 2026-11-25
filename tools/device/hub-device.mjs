@@ -48,6 +48,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { formatEta } from '../ci/lib/eta.mjs';
 import { sleep as realSleep } from '../ci/lib/pause.mjs';
+import { NO_ANSWER, NO_DEVICECTL, NO_SERVER } from '../registry/reachability.mjs';
 import * as claims from './claims.mjs';
 
 // This tool's own parse and usage refusals; the library's carry the same code, so both exit 2 through the table.
@@ -387,7 +388,7 @@ async function discover(parsed, context) {
   if (parsed.words.length > 1) throw usage('discover takes no argument');
   const key = (context.hostKey ?? claims.hostKey)({ env: context.env });
   const result = await claims.discover(key, context);
-  const code = result.note === 'adb did not answer' || result.note === 'devicectl did not answer' ? 1 : 0;
+  const code = result.note === NO_ANSWER || result.note === NO_DEVICECTL ? 1 : 0;
   if (parsed.flags.json) { stdout(JSON.stringify(result, null, 2)); return code; }
   const lines = result.devices.map(device => `  ${device.serial ?? '-'}  ${device.model ?? '-'}  id ${device.id ?? '-'}  ${device.state ?? '-'}`);
   if (result.host === 'mac') {
@@ -400,7 +401,7 @@ async function discover(parsed, context) {
     for (const line of lines) stdout(line);
     if (result.note === null && lines.length === 0) stdout('  none unregistered');
   }
-  if (result.note !== null) stdout(`  ${result.note === 'no adb server' ? 'no adb server (nothing was started)' : result.note}`);
+  if (result.note !== null) stdout(`  ${result.note === NO_SERVER ? `${NO_SERVER} (nothing was started)` : result.note}`);
   return code;
 }
 

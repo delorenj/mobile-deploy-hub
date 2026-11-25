@@ -14,7 +14,7 @@ import * as claims from '../device/claims.mjs';
 import { main } from '../device/hub-device.mjs';
 import { fakeHub, fakeWire } from '../device/wire-fixtures.mjs';
 import { discover, queryAdb } from './reachability.mjs';
-import { seed } from './seed.mjs';
+import { loadQaDevices, seed } from './seed.mjs';
 
 hermetic();
 
@@ -198,6 +198,37 @@ test('hub-device discover --json is the document, two-space indented, with the p
     const text = await s.cli(['discover']);
     assert.match(text.out[0], /adb server port 15037/);
   } finally { s.cleanup(); }
+});
+
+test('claims.discover and hub-device discover never read the QA file: a sentinel or broken one changes nothing', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'discover-qa-'));
+  const keep = process.env.HUB_QA_DEVICES;
+  const s = side({ wire: fakeWire({ listed: [...seeded, { id: 'SENTINEL9', state: 'device', model: 'Pixel_8' }] }) });
+  try {
+    const point = file => { process.env.HUB_QA_DEVICES = file; s.env.HUB_QA_DEVICES = file; };
+    const ctx = claims.createContext({ env: s.env, adbWire: s.wire, inventory: serverUp, sleep: quickSleep() });
+    const observe = async () => ({ document: JSON.stringify(await claims.discover('linux', ctx)), cli: await s.cli(['discover', '--json']) });
+    point(keep);
+    const base = await observe();
+    assert.deepEqual(JSON.parse(base.document).devices.map(device => device.serial), ['SENTINEL9'], 'the sentinel serial is listed over USB, unregistered');
+    const sentinel = join(dir, 'sentinel.json');
+    writeFileSync(sentinel, JSON.stringify({ schema: 1, devices: [{ name: 'Sentinel', serial: 'SENTINEL9', allowed_users: [3] }, { name: 'S24', serial: S24 }] }));
+    point(sentinel);
+    assert.ok(seed(loadDevices(s.env), { qaDevices: () => loadQaDevices({ env: s.env }) }).resources.some(resource => resource.id === 'res-sentinel'), 'the sentinel file is a valid QA file');
+    const marked = await observe();
+    assert.deepEqual(marked, base);
+    for (const text of [marked.document, marked.cli.out.join('\n')]) assert.ok(!/res-sentinel|dedicated_qa/.test(text));
+    const broken = join(dir, 'broken.json');
+    writeFileSync(broken, '{ not json');
+    point(broken);
+    const after = await observe();
+    assert.equal(after.cli.code, 0);
+    assert.deepEqual(after, base);
+  } finally {
+    if (keep === undefined) delete process.env.HUB_QA_DEVICES; else process.env.HUB_QA_DEVICES = keep;
+    s.cleanup();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('hub-device discover with only seeded phones says none unregistered', async () => {
