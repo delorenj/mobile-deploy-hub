@@ -4,6 +4,7 @@
 // (`present`), and its staleness is derived when a view is built and never stored.
 //
 // The deploy path never imports this directory (tools/deploy-path.test.mjs).
+import { idMatchesSerial } from '../ci/lib/adb.mjs';
 import { inspectIpad } from '../ci/lib/devicectl.mjs';
 
 export const REACHABILITY = Object.freeze({
@@ -54,6 +55,95 @@ export async function readIpad({ list, udid, model }) {
   let document;
   try { document = await list(); } catch { return REACHABILITY.unknown; }
   try { return ipadReachability({ result: inspectIpad(document, { udid, model }) }); } catch (error) { return ipadReachability({ error }); }
+}
+
+// ---- the adb wire query (the one read-only question every consumer asks of the hub's adb server) ----
+
+export const NO_SERVER = 'no adb server';
+export const NO_ANSWER = 'adb did not answer';
+const PROBE_MS = 5000;
+const SERIAL_READ_MS = 1500;
+
+// What is on the hub's adb server, read over the wire and never through the adb client: `host:version`, then `host:devices-l`, plus one
+// `host:transport:<id>` + `shell:getprop ro.serialno` for each `host:port` id in `device` state, which is how a bare endpoint (what a
+// manual `adb connect` leaves) is tied back to its phone. An id that cannot be read (unauthorized, offline, a read that fails or hangs)
+// has no serial. `running` is the caller's own proof that the hub's server is already up (its inventory shows it): false opens no wire
+// at all, so this can never start a server. `wire` is the `adbWire(port, {signal})` factory, always injected. Each serial read is
+// bounded at 1.5 s, the whole query at 5 s, and its abort closes every socket at once. Returns `{port, note, listed, serials}`:
+// `note` is null, `no adb server` or `adb did not answer` (a wedged or foreign server is an answer, never a failure); `listed` is the
+// `devices-l` entries; `serials` maps a `host:port` id to the serial read from it.
+async function readWire(wire, { sleep, signal }) {
+  await wire.version();
+  const listed = await wire.devicesLong();
+  const serials = new Map();
+  await Promise.all(listed.filter(entry => entry.state === 'device' && /^[^:\s]+:\d+$/.test(entry.id)).map(async entry => {
+    const read = Promise.resolve().then(() => wire.shell(entry.id, 'getprop ro.serialno')).then(text => String(text).trim(), () => null);
+    const serial = await Promise.race([read, sleep(SERIAL_READ_MS, signal).then(() => null)]);
+    if (serial) serials.set(entry.id, serial);
+  }));
+  return { listed, serials };
+}
+
+export async function queryAdb({ port, running, wire, sleep }) {
+  if (!running) return { port, note: NO_SERVER, listed: [], serials: new Map() };
+  const unanswered = () => ({ port, note: NO_ANSWER, listed: [], serials: new Map() });
+  const stopQuery = new AbortController();   // closes the wire's sockets the moment the query is done with them
+  const giveUp = new AbortController();      // clears the race's timer once it settles
+  try {
+    const asked = readWire(wire(port, { signal: stopQuery.signal }), { sleep, signal: giveUp.signal });
+    asked.catch(() => {});   // the race below may stop waiting first
+    const answer = await Promise.race([asked.then(read => read, () => null), sleep(PROBE_MS, giveUp.signal).then(() => null)]);
+    return answer === null ? unanswered() : { port, note: null, listed: answer.listed, serials: answer.serials };
+  } catch {
+    return unanswered();
+  } finally {
+    giveUp.abort();
+    stopQuery.abort();
+  }
+}
+
+// ---- discovery (FR-4): what the host can see that no Resource names ----
+
+export const NO_DEVICECTL = 'devicectl did not answer';
+const EMULATOR_ID = /^emulator-\d+$/;
+const WIRELESS_ID = /^adb-(.+)-[^-]+\._adb-tls-connect\._tcp\.?$/;
+const ENDPOINT_ID = /^[^:\s]+:\d+$/;
+
+// The serial a listed id stands for: the `ro.serialno` read for a `host:port` id (null when unreadable or not read), the serial inside
+// an mDNS id, else the id itself (over USB the id is the serial).
+function serialOf(entry, serials) {
+  if (ENDPOINT_ID.test(entry.id)) return serials.get(entry.id) || null;
+  return WIRELESS_ID.exec(entry.id)?.[1] ?? entry.id;
+}
+
+// The devices the host can see that a seeded Resource does not name. Pure over its inputs: `seed` is a `seed()` result or a resources
+// array, `host` is `linux` (adb: the `queryAdb` result) or `mac` (ipads: `{document}`, devicectl's `list devices` result, or `{error}`).
+// Returns `{format: 1, port, devices, host, via, note}`, each device `{serial, model, id, state}`. Linux skips `emulator-<n>` ids (the
+// emulator Pool names emulators) and every device a phone Resource names; the Mac lists every devicectl record whose UDID is not seeded.
+export function discover({ seed, host, adb, ipads } = {}) {
+  const resources = Array.isArray(seed) ? seed : seed?.resources ?? [];
+  if (host === 'mac') {
+    const udids = new Set(resources.map(resource => resource?.identity?.udid).filter(udid => typeof udid === 'string'));
+    const records = ipads?.document?.result?.devices;
+    const answered = ipads?.error === undefined && ipads?.document !== undefined && ipads?.document !== null && (records === undefined || Array.isArray(records));
+    const devices = answered ? (records ?? []).filter(record => !udids.has(record?.hardwareProperties?.udid)).map(record => ({
+      serial: record?.hardwareProperties?.udid ?? null,
+      model: record?.hardwareProperties?.productType ?? null,
+      id: record?.identifier ?? null,
+      state: record?.connectionProperties?.pairingState ?? null,
+    })) : [];
+    return { format: 1, port: null, devices, host: 'mac', via: 'devicectl', note: answered ? null : NO_DEVICECTL };
+  }
+  const serials = resources.filter(resource => resource?.kind === 'phone' && typeof resource.identity?.serial === 'string').map(resource => resource.identity.serial);
+  const read = adb.serials ?? new Map();
+  const devices = [];
+  for (const entry of adb.listed ?? []) {
+    if (EMULATOR_ID.test(entry.id)) continue;
+    const serial = serialOf(entry, read);
+    if (serials.some(known => idMatchesSerial(entry.id, known) || (Boolean(read.get(entry.id)) && read.get(entry.id) === known))) continue;
+    devices.push({ serial, model: entry.model ?? null, id: entry.id, state: entry.state });
+  }
+  return { format: 1, port: adb.port, devices, host: 'linux', via: 'adb', note: adb.note ?? null };
 }
 
 // ---- readings ----

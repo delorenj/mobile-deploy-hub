@@ -22,6 +22,9 @@
 //   hub-device status [--json]   (read only: locks, every waiter with its position and live ETA, the Reservations, the inventory; --json
 //                    gives every row its `resource` and its `reachability` {state, checked_at, age_ms, stale}, read over the adb wire on the
 //                    Linux host and through devicectl on the Mac, and none at all on a host that does not know its key)
+//   hub-device discover [--json]   (read only: the devices this host can see that no Resource names, with model, serial and adb id; the hub's
+//                    adb server over its wire on the Linux host (never started or connected), devicectl on the Mac; exits 1 when the transport
+//                    did not answer, 0 for an empty list or no adb server)
 //   hub-device run s24|s26|phone [--for 1h] [--why TEXT] [--wait 2m] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...>
 //   hub-device lease emulator [--profile default|playstore] --for 30m --why TEXT [--wait 2m] [--id ID] [--pid N] [--holder WHO]
 //                    [--env-serial NAME]... [--json]
@@ -45,6 +48,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { formatEta } from '../ci/lib/eta.mjs';
 import { sleep as realSleep } from '../ci/lib/pause.mjs';
+import { NO_ANSWER, NO_DEVICECTL, NO_SERVER } from '../registry/reachability.mjs';
 import * as claims from './claims.mjs';
 
 // This tool's own parse and usage refusals; the library's carry the same code, so both exit 2 through the table.
@@ -84,7 +88,7 @@ export function parseArgs(argv) {
 
 const shellQuote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 
-const USAGE = 'usage: hub-device lease s24|s26|phone --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | lease emulator [--profile NAME] --for <dur> --why <text> [--wait <dur>] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] | release [emulator] [<lease_id>|--any] | status [--json] | reservation release --run <key> [--name adb|mac-ios] [--json] | run s24|s26|phone|emulator [--profile NAME] [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...>';
+const USAGE = 'usage: hub-device lease s24|s26|phone --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | lease emulator [--profile NAME] --for <dur> --why <text> [--wait <dur>] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] | release [emulator] [<lease_id>|--any] | status [--json] | discover [--json] | reservation release --run <key> [--name adb|mac-ios] [--json] | run s24|s26|phone|emulator [--profile NAME] [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...>';
 
 // Leases are honoured only by a hub whose lock.mjs knows them. The catch-up runs from the installed release, and an
 // older one sees a lease's short-lived pid as a dead job and reclaims the lock at once, so lease and run say so.
@@ -377,6 +381,30 @@ async function status(parsed, context) {
   return 0;
 }
 
+// The devices this host can see that no Resource names (FR-4). The host key picks the transport and an unknown one fails (exit 1, the
+// hostKey message): which host this is is its identity, never a guess (AD-47). Exit 1 only when the transport did not answer.
+async function discover(parsed, context) {
+  const { stdout } = context;
+  if (parsed.words.length > 1) throw usage('discover takes no argument');
+  const key = (context.hostKey ?? claims.hostKey)({ env: context.env });
+  const result = await claims.discover(key, context);
+  const code = result.note === NO_ANSWER || result.note === NO_DEVICECTL ? 1 : 0;
+  if (parsed.flags.json) { stdout(JSON.stringify(result, null, 2)); return code; }
+  const lines = result.devices.map(device => `  ${device.serial ?? '-'}  ${device.model ?? '-'}  id ${device.id ?? '-'}  ${device.state ?? '-'}`);
+  if (result.host === 'mac') {
+    stdout('DISCOVER (read only; devicectl on this Mac)');
+    stdout('  discovery of the iPad is by devicectl; the Mac\'s adb is not the hub\'s, so no Android device is listed');
+    for (const line of lines) stdout(line);
+    if (result.note === null && lines.length === 0) stdout('  none unregistered');
+  } else {
+    stdout(`DISCOVER (read only; adb server port ${result.port}, never started or connected)`);
+    for (const line of lines) stdout(line);
+    if (result.note === null && lines.length === 0) stdout('  none unregistered');
+  }
+  if (result.note !== null) stdout(`  ${result.note === NO_SERVER ? `${NO_SERVER} (nothing was started)` : result.note}`);
+  return code;
+}
+
 // Runs the command with a throwaway emulator, and tears it down on every way out: success, failure, SIGINT, SIGTERM, SIGHUP.
 async function runEmulator(parsed, context) {
   const { env, stderr, signals } = context;
@@ -507,6 +535,7 @@ export async function main(argv, {
       case 'lease': return await lease(parsed, context);
       case 'release': return await release(parsed, context);
       case 'status': return await status(parsed, context);
+      case 'discover': return await discover(parsed, context);
       case 'reservation': return reservationCommand(parsed, context);
       case 'run': return await runCommand(parsed, context);
       default: throw usage(USAGE);
