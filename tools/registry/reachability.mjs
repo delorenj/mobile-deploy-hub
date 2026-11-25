@@ -176,3 +176,28 @@ export function present(stored, { now, maxAgeS } = {}) {
   const limited = Number.isSafeInteger(maxAgeS) && maxAgeS > 0;
   return { state: stored.state, checked_at: stored.checked_at ?? null, age_ms: age, stale: !limited || age > maxAgeS * 1000 };
 }
+
+// ---- crossing a boundary: serve and receive ----
+
+// The served form of "nobody checked": every field of a reading, null but the state.
+export const NO_READING = Object.freeze({ state: REACHABILITY.unknown, checked_at: null, age_ms_at_receipt: null, received_at: null, source: null });
+
+const isReading = stored => Boolean(stored) && isReachability(stored.state) && Number.isFinite(stored.received_at) && Number.isFinite(stored.age_ms_at_receipt);
+
+// A stored reading as a service answers a request for it, on the service's clock `now` (ms): the age it has AS OF THIS RESPONSE
+// (`age_ms_at_receipt` plus the time since the service stored it) and `received_at` the service's own `now`. A reader on the same
+// host computes `age_ms_at_receipt + now - received_at` exactly; a reader on another host re-stamps with `receive` first, so neither
+// clock can make the reading look fresher than it is. `stale` is never served (a reader derives it); no reading is `NO_READING`.
+export function serve(stored, { now } = {}) {
+  if (!isReading(stored)) return { ...NO_READING };
+  const age = Math.max(0, stored.age_ms_at_receipt + now - stored.received_at);
+  return { state: stored.state, checked_at: stored.checked_at ?? null, age_ms_at_receipt: age, received_at: now, source: stored.source ?? 'probe' };
+}
+
+// A served reading as the reader stores it: the age it was served with stays, `received_at` becomes the READER's clock `now` (ms), so
+// `present(receive(x, {now: t}), {now: t + d})` has `age_ms = x.age_ms_at_receipt + d` whatever either clock says. An unknown or empty
+// reading (nobody checked, or nobody could say) is null: a reader shows it as the missing reading.
+export function receive(served, { now } = {}) {
+  if (!isReading(served) || served.state === REACHABILITY.unknown) return null;
+  return { state: served.state, checked_at: served.checked_at ?? null, age_ms_at_receipt: served.age_ms_at_receipt, received_at: now, source: served.source ?? 'probe' };
+}
