@@ -460,3 +460,42 @@ test('the process entry, run directly and through a symlink, refuses before any 
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('startHubApi hands its devices and qaDevices to the routes: an injected QA phone is served with a null serial', async () => {
+  const s = scratch();
+  const SERIAL = 'QAMADEUP4242';
+  try {
+    const running = await s.start({ qaDevices: () => [{ name: 'Pixel-QA', model: 'Pixel 7', serial: SERIAL }] });
+    const listener = s.servers[0].listener;
+    // The start wrote the file; with it gone the routes answer from the in-memory seed, which only the injected seams can supply.
+    rmSync(registryPath(s.env));
+    const ask = async url => { const e = exchange('GET', url); await listener(e.req, e.res); return e; };
+    const list = await ask('/resources');
+    assert.equal(list.res.head.status, 200);
+    const listed = list.json().resources.find(resource => resource.id === 'res-pixel-qa');
+    assert.equal(list.json().source, 'seed');
+    assert.equal(listed?.identity.serial, null);
+    const one = await ask('/resources/s26');
+    assert.equal(one.res.head.status, 200);
+    assert.equal(one.json().resource.id, 's26');
+    assert.equal(list.res.text.includes(SERIAL) || one.res.text.includes(SERIAL), false);
+    await running.stop();
+  } finally { s.cleanup(); }
+});
+
+test('Registry routes with no file and a QA seed that cannot be built answer 500 HUB_API_ERROR, one line, and log each request', async () => {
+  const s = scratch();
+  try {
+    const errors = [];
+    const ctx = s.ctx({ qaDevices: () => { throw Object.assign(new Error('qa file\nis broken'), { code: 'HUB_QA_DEVICES' }); }, devices: structuredClone(loadDevices({})), log: { out: () => {}, err: line => errors.push(line) } });
+    for (const url of ['/resources', '/resources/s26', '/pools']) {
+      const answer = await handle({ method: 'GET', url }, ctx);
+      assert.equal(answer.status, 500, url);
+      assert.equal(answer.headers['Content-Type'], 'application/problem+json');
+      assert.deepEqual([answer.body.code, answer.body.exit], ['HUB_API_ERROR', 1], url);
+      assert.doesNotMatch(answer.body.detail, /\n/);
+    }
+    assert.equal(errors.length, 3);
+    assert.ok(errors.every(line => line.startsWith('HUB_API_ERROR GET /')));
+  } finally { s.cleanup(); }
+});

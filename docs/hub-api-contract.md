@@ -13,7 +13,8 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 - Every response carries `Cache-Control: no-store`.
 - Keys are `snake_case`.
 - A success is `application/json; charset=utf-8`. An error is `application/problem+json` with exactly the `Problem` fields below.
-- Paths match exactly: no trailing-slash folding, and the query string is ignored for routing.
+- Paths match exactly: no trailing-slash folding, and the query string is ignored for routing. A `{name}` segment in a path below is a parameter: one non-empty segment, URI-decoded (a bad escape is no route). A literal path wins over a parameterised one, and the literal routes are then the whole answer for a path they match: a method none of them has is 405 with an `Allow` naming only the literal routes' methods, even when a parameterised route would have taken it.
+- In a shape's field list, `a.b` is a key of the object `a`; `a[].b` is a key of the objects in the array `a`; `a.*` is an open object whose keys this document does not list (a client reads what it knows and ignores the rest). An array of plain values is listed as the array itself.
 - The contract is additive only: a later release adds routes and fields, never removes or renames one, and never changes what a field means. A client ignores fields it does not know. `contract` in `/health` is the version, and rises only on a change that cannot be additive.
 - `exit` in an error is the exit code a CLI front door uses for the same error, so `hub-device` and a Holocene button agree.
 
@@ -22,6 +23,9 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 | Method | Path | Shape | Added |
 |--------|------|-------|-------|
 | GET | `/health` | Health | 6.4 |
+| GET | `/resources` | ResourceList | 6.5 |
+| GET | `/resources/{id}` | Resource | 6.5 |
+| GET | `/pools` | PoolList | 6.5 |
 
 ## Shapes
 
@@ -34,6 +38,57 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 - `ports.hub_api` the Hub API's port
 - `ports.host_agent` the Host Agent's port
 - `registry` `ok`, or `unreadable` when `registry.json` exists and cannot be read; a missing file is `ok` (the in-memory seed answers). Read fresh on every call.
+
+### ResourceList
+
+`GET /resources`: every Resource a reader shows (`visible`, or `retiring`), in the Registry's order. A retired or seed-missing Resource that is neither held nor waited on is left out. The Registry is read fresh on every call.
+
+- `rev` the Registry's revision (`0` when the in-memory seed answers)
+- `source` `file` (the Registry file), or `seed` (no readable file: the in-memory seed of `devices.json`)
+- `resources[].id` the Resource's id, never reused
+- `resources[].lock` the lock a Hold takes
+- `resources[].name` the word a Claimant says
+- `resources[].kind` `phone`, `ios-lane` or `emulator-pool`
+- `resources[].host` the host key the Resource lives on (`linux` or `mac`)
+- `resources[].identity.*` what names the hardware (`serial`, `udid`, `adb_id`, `model`), or `null`. For a `dedicated_qa` Resource `serial`, `udid` and `adb_id`, where the record has them, are `null` (the key stays); `allowed_users` is never served.
+- `resources[].capabilities.*` the Resource's Capabilities (`{}` when none); `allowed_users` is never served
+- `resources[].deploy_target` `true` for a Resource deploys install to
+- `resources[].seeded` `true` for a Resource `devices.json` derives, `false` for a runtime Resource
+- `resources[].seed_missing` `true` when a seeded Resource is no longer in `devices.json`; always a boolean
+- `resources[].created_at` an ISO time, or `null` (the in-memory seed has none)
+- `resources[].retired_at` an ISO time, or `null`
+- `resources[].visibility` `visible`, or `retiring` (retired or seed-missing but still held or waited on)
+
+### Resource
+
+`GET /resources/{id}`: one Resource, found by `id` only. An unknown id is 404 `HUB_RESOURCE_NOT_FOUND` with `reason: unknown`; a retired or seed-missing Resource that is idle is 404 with `reason: retired`.
+
+- `rev` the Registry's revision
+- `source` `file` or `seed`
+- `resource.id` as in `ResourceList`
+- `resource.lock` as in `ResourceList`
+- `resource.name` as in `ResourceList`
+- `resource.kind` as in `ResourceList`
+- `resource.host` as in `ResourceList`
+- `resource.identity.*` as in `ResourceList`
+- `resource.capabilities.*` as in `ResourceList`
+- `resource.deploy_target` as in `ResourceList`
+- `resource.seeded` as in `ResourceList`
+- `resource.seed_missing` as in `ResourceList`
+- `resource.created_at` as in `ResourceList`
+- `resource.retired_at` as in `ResourceList`
+- `resource.visibility` as in `ResourceList`
+
+### PoolList
+
+`GET /pools`: every Pool of the Registry, in its stored order.
+
+- `rev` the Registry's revision
+- `source` `file` or `seed`
+- `pools[].name` the Pool's name (`phone`, `emulator`)
+- `pools[].kind` `named` (a list of Resources) or `gate` (one lock, no list)
+- `pools[].members` for a `named` Pool the ids a lease of it would try, in order (`[]` when none can serve it); always `[]` for a `gate`
+- `pools[].gate` the gate's lock name, or `null`
 
 ### Problem
 
@@ -50,6 +105,7 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 | Code | Status | Exit | Meaning |
 |------|--------|------|---------|
 | `HUB_NO_ROUTE` | 404, 405 | 2 | No such path (`reason: no-route`), or the path exists and the method is not allowed (`reason: method`, with an `Allow` header). |
+| `HUB_RESOURCE_NOT_FOUND` | 404 | 2 | No Resource has this id (`reason: unknown`), or it is retired and idle (`reason: retired`). |
 | `HUB_USAGE` | 400, 413 | 2 | The request body is not valid JSON (`bad-json`) or is over 1 MiB (`too-large`). |
 | `HUB_API_ERROR` | 500 | 1 | A bug in the service. The detail is one line; the journal has the same line. |
 | `HUB_API_ALREADY_RUNNING` | none | 1 | Start only: the port is taken. Never an HTTP answer. |

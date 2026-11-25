@@ -148,7 +148,7 @@ export async function startHubApi({ policy, env = process.env, log = defaultLog(
       log.err(`HUB_API_SEED_FAILED ${error?.code ?? 'ERROR'} ${oneLine(error)}`);
     }
   };
-  return startService({ ...seams, service: SERVICE, port: resolved.api.hub_api_port, routes, ctx: { policy: resolved, now }, afterBind, env, log });
+  return startService({ ...seams, service: SERVICE, port: resolved.api.hub_api_port, routes, ctx: { policy: resolved, now, devices, qaDevices }, afterBind, env, log });
 }
 
 // The process entry: starts the service and ends 0 after a stop. An error prints `<CODE> <message>` on stderr and exits with its `exit`.
