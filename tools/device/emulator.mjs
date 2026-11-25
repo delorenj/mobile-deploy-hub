@@ -22,7 +22,7 @@ import { basename, dirname, join, resolve, sep } from 'node:path';
 import { adbEnv, adbPath } from '../ci/lib/adb.mjs';
 import { androidSdk, javaHome } from '../ci/lib/android.mjs';
 import { inHeavy } from '../ci/lib/heavy.mjs';
-import { MAX_LEASE_MS, acquireLease, isLease, lockDir, localHost, poolRequest, processStart, queueView, readOwner, releaseLease, sameHost, updateLease, withLock } from '../ci/lib/lock.mjs';
+import { MAX_LEASE_MS, acquireLease, forceRelease, isLease, lockDir, localHost, poolRequest, processStart, queueView, readOwner, releaseLease, sameHost, updateLease, withLock } from '../ci/lib/lock.mjs';
 import { pause, sleep as realSleep } from '../ci/lib/pause.mjs';
 import { createAdbWire } from './adb-wire.mjs';
 import { inventory } from './inventory.mjs';
@@ -30,6 +30,8 @@ import { inventory } from './inventory.mjs';
 export const GATE = 'emulator';
 export const slotName = k => `emulator-${k}`;
 export const isEmulatorLock = name => name === GATE || /^emulator-\d+$/.test(name);
+// A slot of the pool a host can have (Story 7.8): `emulator-<n>`, n from 1 to MAX_POOL, spelled plainly (no `emulator-01`).
+export const isEmulatorSlot = name => typeof name === 'string' && /^emulator-[1-9]\d*$/.test(name) && Number(name.slice('emulator-'.length)) <= MAX_POOL;
 export const DEFAULT_POOL = 2;
 export const MAX_POOL = 8;
 const REAPER = 'emulator-reaper';
@@ -357,8 +359,16 @@ async function underReaper(id, fn, env) {
 // Returns {outcome: released|cancelled|none|stuck, slot, record, result}. Only a lease id is accepted: lock.mjs reads an
 // empty id as "whichever lease", which is never what releasing one emulator means.
 // `reason` (optional) is the slot release's `reason` (a service's undelivered grant says `undelivered`), else `by-id`.
-export async function releaseEmulator(id, { env = process.env, log = () => {}, graceMs, sleep, now, reason = null } = {}) {
+// `alreadyReleased` (Story 7.8: a force-release, which ended the slot itself and holds the reaper lock) skips the gate and slot releases
+// and the reaper lock (it is not re-entrant) and only tears the record down: no hold-ending event is written here.
+export async function releaseEmulator(id, { env = process.env, log = () => {}, graceMs, sleep, now, reason = null, alreadyReleased = false } = {}) {
   if (typeof id !== 'string' || !LEASE_ID.test(id)) throw failure('HUB_EMULATOR_USAGE', `release emulator needs a lease id (lowercase letters, digits and dashes), not "${id ?? ''}"`);
+  if (alreadyReleased) {
+    const record = readRecord(env, id);
+    if (!record) return { outcome: 'released', slot: null, record: null, result: { ok: true, signalled: [], survivors: [] } };
+    const result = await teardown(record, { env, log, graceMs, sleep, now });
+    return { outcome: result.ok ? 'released' : 'stuck', slot: record.slot, record, result };
+  }
   const queued = releaseLease(GATE, id, { env });
   const record = readRecord(env, id);
   const slot = record?.slot ?? slotHolding(env, id);
@@ -370,6 +380,27 @@ export async function releaseEmulator(id, { env = process.env, log = () => {}, g
   if (record) result = await underReaper(id, () => teardown(record, { env, log, graceMs, sleep, now }), env);
   if (!result.ok) return { outcome: 'stuck', slot, record, result };
   return { outcome: 'released', slot, record, result };
+}
+
+// Force-releases the emulator slot `slot` held by `lease_id` (Story 7.8, AD-38), from the point where the owner has been read: under the
+// reaper lock, the one `force-release` event (lock.mjs `forceRelease`: the rename decides), then the emulator torn down and its record
+// removed (`releaseEmulator` with `alreadyReleased`), then the reaper lock goes. A crash after the force leaves an ownerless record that
+// the next reap tears down as `orphaned`, writing nothing (the slot lock is gone); the record keeps the slot out of the pool meanwhile.
+// Returns {released, reason, owner, outcome, survivors}: `released` false (`reason` none|unknown-holder|other-lease|changed) tore nothing
+// down; `outcome` `released` or `stuck` (a recorded process outlived SIGKILL: the force stands, the record stays for the next reap).
+// A reaper lock still busy after `reaperWaitMs` is HUB_LOCK_TIMEOUT with nothing written. `afterStep` is the crash seam of the tests
+// (called with `force-release`, then `teardown`); `beforeRetire` the rename's.
+export async function forceReleaseSlot(slot, { lease_id, actor, why, env = process.env, log = () => {}, graceMs, sleep, now, afterStep = () => {}, beforeRetire, reaperWaitMs = 120_000 } = {}) {
+  if (!isEmulatorSlot(slot)) throw failure('HUB_EMULATOR_USAGE', `force-release emulator needs a slot (emulator-1 to emulator-${MAX_POOL}), not "${slot ?? ''}"`);
+  if (typeof lease_id !== 'string' || !LEASE_ID.test(lease_id)) throw failure('HUB_EMULATOR_USAGE', `force-release emulator needs the lease id that holds ${slot}`);
+  return withLock(REAPER, async () => {
+    const forced = forceRelease(slot, { actor, why, lease_id, env, ...(now ? { now } : {}), log, ...(beforeRetire ? { beforeRetire } : {}) });
+    if (!forced.released) return { released: false, reason: forced.reason, owner: forced.owner ?? null, outcome: null, survivors: [] };
+    await afterStep('force-release');
+    const torn = await releaseEmulator(lease_id, { env, log, graceMs, sleep, now, alreadyReleased: true });
+    await afterStep('teardown');
+    return { released: true, reason: null, owner: forced.owner, outcome: torn.outcome, survivors: torn.result?.survivors ?? [] };
+  }, { env, log: () => {}, timeoutMs: reaperWaitMs, pollMs: 200 });
 }
 
 // The pool as status shows it: each record with whether each of its processes is still alive.

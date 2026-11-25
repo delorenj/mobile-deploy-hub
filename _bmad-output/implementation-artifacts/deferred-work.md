@@ -180,3 +180,11 @@ source_spec: `spec-7-6-force-release-a-lease.md`
 severity: low
 reason: eta.mjs ENDS already includes force-release (tools/ci/lib/eta.mjs:8, :22; README "The enqueue ETA"), a design that predates Story 7.6; this story is the first writer of lease force-release events, so the data now reaches it. Whether abandoned holds should count is an ETA design decision (the hold did block waiters that long), not a force-release defect.
 status: open
+
+### DW-13: A slot whose owner or emulator record belongs to another host would be force-released and its record deleted.
+origin: spec-deferred 61c0f756a3a8
+location: tools/device/claims.mjs forceReleaseEmulator; tools/device/emulator.mjs forceReleaseSlot
+source_spec: `spec-7-8-force-release-an-emulator-slot.md`
+severity: medium
+reason: Unverified (maybe-false). forceReleaseEmulator and forceReleaseSlot do not check sameHost on the owner or the record, while doomed() does. Settle by confirming whether any supported topology lets a host other than the one running the emulators take an emulator-<n> lock in this lock dir (today emulators run and are served only on big-chungus); if one does, refuse a foreign owner before the force and skip a foreign record in the teardown. (declared severity: medium (unverified))
+status: open

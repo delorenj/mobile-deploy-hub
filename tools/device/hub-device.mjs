@@ -62,8 +62,12 @@
 //                    The waiter's own wait ends HUB_DEVICE_CANCELLED naming the canceller; prints `HUB_DEVICE_CANCELLED <resource> <id>`)
 //   hub-device force-release <lease_id> --why TEXT [--holder WHO] [--json]   (ends a Lease by force, whoever holds it, on any lock of this host (a phone, a registered
 //                    phone, the iOS lane); --why is required and, with the actor, recorded on the one `force-release` event; no holder check, no confirmation. A
-//                    deploy job's Hold is never ended from outside its run: HUB_FORCE_RELEASE_JOB (exit 2) names `gh run cancel`. An emulator lease is refused (exit 2):
-//                    force-release its slot (Story 7.8). A waiter is `cancel`'s. Prints `HUB_DEVICE_FORCE_RELEASED <device|lock> <id> holder=<holder>`)
+//                    deploy job's Hold is never ended from outside its run: HUB_FORCE_RELEASE_JOB (exit 2) names `gh run cancel`. An emulator lease id is refused (exit 2):
+//                    force-release its slot (`force-release emulator-<n>`, below). A waiter is `cancel`'s. Prints `HUB_DEVICE_FORCE_RELEASED <device|lock> <id> holder=<holder>`)
+//   hub-device force-release emulator-<n> --why TEXT [--holder WHO] [--json]   (ends the Lease holding an emulator slot of this host (emulator-1 to emulator-8) and tears its emulator
+//                    down (Story 7.8): under the emulator-reaper lock the one `force-release` event, then the teardown and the record's removal. A crash in between leaves an
+//                    ownerless record the next emulator acquire reaps as an orphan, with no second event. Processes that will not die: HUB_EMULATOR_FAILED (exit 1), the force
+//                    stands. Same stdout line as above: `HUB_DEVICE_FORCE_RELEASED emulator-<n> <lease_id> holder=<holder>`)
 //   hub-device force-release --reservation <run_key> --why TEXT [--name adb|mac-ios] [--holder WHO] [--json]   (ends a deploy run's Reservation by force: a dead run's
 //                    Reservation is first in line on adb or mac-ios until its 3 h ceiling. --why is required and, with the actor, recorded on the one `force-release`
 //                    event (`hold_kind: reservation`); no holder check, no confirmation. Without --name every reservable lock of this host is tried (`adb` from big-chungus; a `mac-ios` Reservation is on the Mac's disk and is ended there once its Host Agent serves the same call, Epic 9). Already released or
@@ -129,7 +133,7 @@ export function parseArgs(argv) {
 
 const shellQuote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 
-const USAGE = 'usage: hub-device lease s24|s26|phone --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | lease emulator [--profile NAME] --for <dur> --why <text> [--wait <dur>] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] | release [emulator] [<lease_id>|--any] [--holder WHO] | extend [<lease_id>] --for <dur> [--override <why>] [--holder WHO] [--json] | cancel <request_id> [--resource R] [--pool P] [--why <text>] [--holder WHO] [--json] | force-release <lease_id> --why <text> [--holder WHO] [--json] | force-release --reservation <run_key> --why <text> [--name adb|mac-ios] [--holder WHO] [--json] | status [--json] | discover [--json] | reservation release --run <key> [--name adb|mac-ios] [--json] | run s24|s26|phone|emulator [--profile NAME] [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...> | lease --match <query> --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | run --match <query> [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...> | registry add --kind K --name N [--model M] [--serial S] [--udid U] [--profile P] [--host H] [--cap k=v]... [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry edit <id> [--name N] [--cap k=v]... [--uncap k]... [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry retire <id> [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry list [--json]';
+const USAGE = 'usage: hub-device lease s24|s26|phone --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | lease emulator [--profile NAME] --for <dur> --why <text> [--wait <dur>] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] | release [emulator] [<lease_id>|--any] [--holder WHO] | extend [<lease_id>] --for <dur> [--override <why>] [--holder WHO] [--json] | cancel <request_id> [--resource R] [--pool P] [--why <text>] [--holder WHO] [--json] | force-release <lease_id> --why <text> [--holder WHO] [--json] | force-release emulator-<n> --why <text> [--holder WHO] [--json] | force-release --reservation <run_key> --why <text> [--name adb|mac-ios] [--holder WHO] [--json] | status [--json] | discover [--json] | reservation release --run <key> [--name adb|mac-ios] [--json] | run s24|s26|phone|emulator [--profile NAME] [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...> | lease --match <query> --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | run --match <query> [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...> | registry add --kind K --name N [--model M] [--serial S] [--udid U] [--profile P] [--host H] [--cap k=v]... [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry edit <id> [--name N] [--cap k=v]... [--uncap k]... [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry retire <id> [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry list [--json]';
 
 // Leases are honoured only by a hub whose lock.mjs knows them. The catch-up runs from the installed release, and an
 // older one sees a lease's short-lived pid as a dead job and reclaims the lock at once, so lease and run say so.
@@ -374,15 +378,19 @@ function cancel(parsed, context) {
 
 // `force-release <id> --why <text>`: the library's `forceReleaseLease` (the Hub API's `POST /leases/{id}/force-release` is the same call). Ends the Lease `id` holds on
 // this host by force and records who and why on the `force-release` event. A deploy job's Hold, an emulator lease and an id that holds nothing exit 2.
-function forceRelease(parsed, context) {
+// `emulator-<n>` is a slot (Story 7.8): the library's `forceReleaseEmulator` ends its Lease and tears the emulator down (the Hub API's
+// `POST /leases/emulator-<n>/force-release` is the same call); the same stdout line and `--json` answer.
+async function forceRelease(parsed, context) {
   const { env, stdout } = context;
   if (parsed.flags.reservation !== undefined) return forceReleaseReservation(parsed, context);
   if (parsed.flags.name !== undefined) throw usage('force-release --name goes with --reservation');
   if (parsed.words.length !== 2) throw usage('force-release takes one lease id');
   const id = parsed.words[1];
-  const answer = claims.forceReleaseLease(id, { why: parsed.flags.why ?? null, actor: cliActor(parsed, env) }, context);
+  const input = { why: parsed.flags.why ?? null, actor: cliActor(parsed, env) };
+  const slot = claims.namesEmulatorSlot(id);
+  const answer = slot ? await claims.forceReleaseEmulator(id, input, context) : claims.forceReleaseLease(id, input, context);
   if (parsed.flags.json) stdout(JSON.stringify(answer));
-  else stdout(`HUB_DEVICE_FORCE_RELEASED ${answer.device ?? answer.lock} ${id} holder=${answer.holder ?? '-'}`);
+  else stdout(`HUB_DEVICE_FORCE_RELEASED ${slot ? answer.lock : answer.device ?? answer.lock} ${answer.lease_id} holder=${answer.holder ?? '-'}`);
   return claims.EXIT_OK;
 }
 
@@ -811,7 +819,7 @@ export async function main(argv, {
       case 'release': return await release(parsed, context);
       case 'extend': return extend(parsed, context);
       case 'cancel': return cancel(parsed, context);
-      case 'force-release': return forceRelease(parsed, context);
+      case 'force-release': return await forceRelease(parsed, context);
       case 'status': return await status(parsed, context);
       case 'discover': return await discover(parsed, context);
       case 'reservation': return reservationCommand(parsed, context);

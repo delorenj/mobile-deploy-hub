@@ -5,7 +5,9 @@
 //
 // `op` is `provision` (the lazy reap, then `provision`: args are provision's own plain options: id, holder, why, forMs, waitMs,
 // holderPid, profileName, pool, claimantKind, actor, pollMs, graceMs, bootTimeoutMs, bootPollMs) or `release` (`releaseEmulator`: id,
-// graceMs, reason). `process.pid` is the same in a worker, so a slot taken during the boot is tied to the service's pid: a service that
+// graceMs, reason) or `force-release` (Story 7.8, AD-44: `forceReleaseSlot`, the reaper lock, the one `force-release` event and the
+// teardown, all in the worker: args `slot`, `lease_id`, `actor`, `why`, `graceMs`, `reaperWaitMs`; the answer is its own, `{released,
+// reason, owner, outcome, survivors}`). `process.pid` is the same in a worker, so a slot taken during the boot is tied to the service's pid: a service that
 // dies mid-boot leaves an orphan the next `reap` tears down (`holder gone`).
 //
 // Worker messages: `log` (a line for the service log), `done` (the operation's result), `error` ({message, code, reason, retry,
@@ -14,9 +16,9 @@
 // without answering, is HUB_EMULATOR_FAILED.
 import { Worker, isMainThread, parentPort, threadId, workerData } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
-import { provision, reap, releaseEmulator } from './emulator.mjs';
+import { forceReleaseSlot, provision, reap, releaseEmulator } from './emulator.mjs';
 
-export const THREAD_OPS = Object.freeze(['provision', 'release']);
+export const THREAD_OPS = Object.freeze(['provision', 'release', 'force-release']);
 
 const failed = (message, extra = {}) => Object.assign(new Error(message), { code: 'HUB_EMULATOR_FAILED', ...extra });
 const oneLine = value => String(value?.message ?? value).replace(/\s+/g, ' ').trim();
@@ -42,7 +44,7 @@ export function offThread(op, args, { env = process.env, log = () => {}, signal 
     if (signal?.aborted) { reject(signal.reason); return; }
     const clean = plain(env);
     const worker = new Worker(fileURLToPath(import.meta.url), { workerData: { op, args, env: clean }, env: clean, execArgv: [] });
-    say(`HUB_EMULATOR_THREAD ${op} ${args?.id ?? '-'} thread=${worker.threadId}`);
+    say(`HUB_EMULATOR_THREAD ${op} ${args?.id ?? args?.slot ?? '-'} thread=${worker.threadId}`);
     let settled = false;
     const onAbort = () => {
       const reason = signal.reason;
@@ -85,6 +87,8 @@ async function work() {
       // The lazy reaper first, as every emulator acquire does: a failure of it is a warning, never a failed acquire.
       try { await reap({ env, log, graceMs: args.graceMs, wait: false }); } catch (error) { log(`hub-device: the emulator reaper failed: ${oneLine(error)}`); }
       result = await provision({ ...args, env, log, signal: controller.signal });
+    } else if (op === 'force-release') {
+      result = await forceReleaseSlot(args.slot, { lease_id: args.lease_id, actor: args.actor, why: args.why, env, log, graceMs: args.graceMs, ...(args.reaperWaitMs ? { reaperWaitMs: args.reaperWaitMs } : {}) });
     } else {
       result = await releaseEmulator(args.id, { env, log, graceMs: args.graceMs, reason: args.reason ?? null });
     }

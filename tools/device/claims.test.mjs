@@ -50,7 +50,7 @@ async function startWaiter(s, id, lock = 's24') {
 const emptyAdb = () => ({ startServer: async () => {}, devices: async () => [], prop: async () => '' });
 
 test('the library exports the whole action surface and the exit table as frozen data', () => {
-  for (const name of ['resolve', 'take', 'release', 'extend', 'newLeaseId', 'checkBounds', 'checkLeaseId', 'usableFleet', 'emulatorBounds', 'emulatorPool', 'serviceLease', 'statusView', 'leaseExports', 'jobTicket', 'releaseEmulatorNow', 'releaseReservations', 'extendHeld', 'serviceExtend', 'cancel', 'checkCancelBody', 'requestLocks', 'forceReleaseLease', 'checkForceReleaseBody', 'forceReleaseReservation', 'checkReservationForceReleaseBody', 'serviceRelease', 'checkExtendBody', 'checkReleaseBody', 'exitCodeOf', 'fleetOf', 'loadFleet', 'matchTarget', 'hostKey', 'isLocal', 'hostKeyPath']) {
+  for (const name of ['resolve', 'take', 'release', 'extend', 'newLeaseId', 'checkBounds', 'checkLeaseId', 'usableFleet', 'emulatorBounds', 'emulatorPool', 'serviceLease', 'statusView', 'leaseExports', 'jobTicket', 'releaseEmulatorNow', 'releaseReservations', 'extendHeld', 'serviceExtend', 'cancel', 'checkCancelBody', 'requestLocks', 'forceReleaseLease', 'forceReleaseEmulator', 'checkForceReleaseBody', 'forceReleaseReservation', 'checkReservationForceReleaseBody', 'serviceRelease', 'checkExtendBody', 'checkReleaseBody', 'exitCodeOf', 'fleetOf', 'loadFleet', 'matchTarget', 'hostKey', 'isLocal', 'hostKeyPath']) {
     assert.equal(typeof claims[name], 'function', name);
   }
   assert.equal(claims.PHONE, 'phone');
