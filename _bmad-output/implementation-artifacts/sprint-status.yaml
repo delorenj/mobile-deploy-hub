@@ -54,7 +54,7 @@ development_status:
   2-8-ship-the-freeze-set: done
   epic-2-retrospective: optional  # skipped: Jarad, 2026-11-24
 
-  epic-3: in-progress
+  epic-3: done
   3-1-peek-at-the-s26-without-disturbing-a-lease: done
   3-2-a-blocked-android-delivery-goes-pending: done
   3-3-the-catch-up-delivers-contention-pending-builds-in-its-turn: done
