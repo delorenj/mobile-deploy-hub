@@ -11,6 +11,10 @@
 // retired or seed_missing, before anything is queued or written; the file only is read (`readRegistryFile`), so a missing or unreadable
 // one refuses nothing and the QA file is never opened.
 //
+// A service (the Hub API now, the Host Agent in Epic 9) reaches an emulator through the same calls as a phone (Story 7.4): `serviceLease`,
+// `findLease`, `serviceExtend` and `serviceRelease` take, find, extend and give back one, and its reap, boot and teardown run in a worker
+// thread (`emulator-thread.mjs`; the seams `provisionOffThread` and `releaseOffThread` replace it in a test), never on a request path.
+//
 // Everything that writes the lock directory goes through lock.mjs and emulator.mjs (AD-1); reads may look at it directly. Errors carry a `code`; a usage
 // refusal is `code: 'HUB_USAGE'`. The context every action takes is the one `createContext` builds: `env`, `log`, `warn`,
 // `timing`, `emulator`, `adbFactory`, `adbWire`, `devicectl`, `hostKey`, `inventory`, `policy`, `fleet`, `qaDevices` and `registry` (the last two are the seams `matchTarget` reads), plus `fetchImpl` and `timeout` (the seams of the Hub API client, `registryWrite`).
@@ -27,7 +31,8 @@ import { sleep as realSleep } from '../ci/lib/pause.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { createAdbWire } from './adb-wire.mjs';
 import { createAsyncAdb } from './async-adb.mjs';
-import { GATE, LEASE_ID, MAX_POOL, PROFILES, emulatorStatus, exportsOf as emulatorExports, hostPool, isEmulatorLease, isEmulatorLock, provision, readRecord, reap, releaseEmulator as releaseEmulatorLease, teardownNow } from './emulator.mjs';
+import { GATE, LEASE_ID, MAX_POOL, PROFILES, doomed, emulatorStatus, exportsOf as emulatorExports, hostPool, isEmulatorLease, isEmulatorLock, provision, readRecord, reap, releaseEmulator as releaseEmulatorLease, resolveImage, slotHolding, teardownNow } from './emulator.mjs';
+import { offThread } from './emulator-thread.mjs';
 import { REACHABILITY, discover as discoverDevices, phoneReachability, present, queryAdb, readIpad, stamp } from '../registry/reachability.mjs';
 import { match, canonical, parseQuery, retirement, visibility } from '../registry/match.mjs';
 import { readRegistry, readRegistryFile } from '../registry/store.mjs';
@@ -60,6 +65,8 @@ export const EXIT_CODES = Object.freeze({
   HUB_LEASE_NOT_FOUND: 2,
   HUB_LEASE_SUPERSEDED: 1,
   HUB_API_RESTARTING: 1,
+  // Story 7.4: an emulator that would not boot (or whose teardown would not finish) through a service: the host's trouble, the busy exit's opposite.
+  HUB_EMULATOR_FAILED: 1,
   HUB_HOST_UNKNOWN: 1,
   HUB_NO_MATCH: 2,
   HUB_POOL_CROSS_HOST: 2,
@@ -107,6 +114,7 @@ export const HTTP_ANSWERS = Object.freeze({
   HUB_PHONE_AWAY: Object.freeze({ status: 503, reason: 'away' }),
   HUB_DEVICE_AWAY: Object.freeze({ status: 503, reason: 'away' }),
   HUB_HOST_UNKNOWN: Object.freeze({ status: 503, reason: 'host-unknown' }),
+  HUB_EMULATOR_FAILED: Object.freeze({ status: 503, reason: 'emulator-failed' }),
 });
 export const httpAnswerOf = error => (Object.hasOwn(HTTP_ANSWERS, error?.code) ? HTTP_ANSWERS[error.code] : null);
 
@@ -270,11 +278,32 @@ function phoneMembers(fleet, env) {
 // is dropped with its reason: a member that is not a phone, or a phone `ctx.fleet` does not know. Returns the Pool target `take` tries
 // in order: `{kind: 'pool', by: 'match', pool: 'match:<canonical query>', members}`. Throws HUB_USAGE for a bad query, HUB_NO_MATCH
 // (with `reason`, `excluded`) when nothing can serve it and HUB_POOL_CROSS_HOST when the members span hosts. Reads, never writes.
-export function matchTarget(text, { forMs } = {}, ctx) {
+//
+// A service (Story 7.4: `emulators: true`; the CLI's `--match` never passes it and keeps refusing the emulator Pool) also serves the
+// emulator: a `profile=<name>` clause (one, with `=`; HUB_USAGE otherwise) names the emulator Pool and its profile, and a query whose
+// every member is the emulator Pool (`kind=emulator-pool`) names it with the default profile. Both return `{kind: 'emulator', by:
+// 'match', profile}` (`profile` null for the default). With a `profile` clause any other clause must still hold for the emulator Pool's
+// own Resource (else HUB_NO_MATCH, naming what excluded it). Whether the profile's image is installed is the caller's check.
+export function matchTarget(text, { forMs, emulators = false } = {}, ctx) {
   const clauses = parseQuery(text);
   const registry = ctx.registry?.() ?? readRegistry({ env: ctx.env, qaDevices: ctx.qaDevices ?? (() => loadQaDevices({ env: ctx.env })), warn: ctx.warn });
   const policy = ctx.policy ?? loadPolicy().policy;
+  if (emulators) {
+    const profiles = clauses.filter(clause => clause.key === 'profile');
+    if (profiles.length > 1) throw usage(`match "${text}": name one profile clause at most`);
+    if (profiles.length === 1) {
+      const [{ op, value }] = profiles;
+      if (op !== '=') throw usage(`match clause "profile${op}${value}": a profile is named with = (profile=${Object.keys(PROFILES).join(', profile=')})`);
+      const rest = clauses.filter(clause => clause.key !== 'profile');
+      if (rest.length > 0) {
+        const pool = registry.resources.filter(record => record.kind === 'emulator-pool');
+        match({ ...registry, resources: pool }, { query: rest, for_ms: forMs }, policy);
+      }
+      return { kind: EMULATOR, by: 'match', profile: value };
+    }
+  }
   const found = match(registry, { query: clauses, for_ms: forMs }, policy);
+  if (emulators && found.members.every(record => record.kind === 'emulator-pool')) return { kind: EMULATOR, by: 'match', profile: null };
   const members = [];
   const excluded = [...found.excluded];
   for (const record of found.members) {
@@ -397,12 +426,21 @@ export function checkPid(value) {
   return pid;
 }
 
-// --profile and --pool belong to the emulator. The pool's size is the host's (hostPool); --pool may only ask for fewer.
-export function emulatorBounds({ noConnect = false, profile: asked, pool: askedPool } = {}, env = process.env) {
+// The emulator Pool's size on this host, one function for every front door: `HUB_EMULATOR_POOL` (the CLI only: a `service` never reads
+// it), else `<lock dir>/emulator-pool`, else the Registry file's `pools.emulator.size`, else 2, each 1 to 8 (emulator.mjs `hostPool`).
+// The Registry is read as the file only (a missing or unreadable one has no size); slots stay derived locks, never Registry records.
+export function emulatorPool(env = process.env, { service = false } = {}) {
+  const size = readRegistryFile(env)?.pools?.emulator?.size;
+  return hostPool(env, { useEnv: !service, registrySize: size });
+}
+
+// --profile and --pool belong to the emulator. The pool's size is the host's (emulatorPool); --pool may only ask for fewer. A `service`
+// (Story 7.4) never reads the CLI's environment variable for the size.
+export function emulatorBounds({ noConnect = false, profile: asked, pool: askedPool, service = false } = {}, env = process.env) {
   if (noConnect) throw usage('--no-connect is for a phone; an emulator is always made and connected');
   const profile = asked ?? 'default';
   if (!PROFILES[profile]) throw usage(`unknown emulator profile "${profile}" (known: ${Object.keys(PROFILES).join(', ')})`);
-  const host = hostPool(env);
+  const host = emulatorPool(env, { service });
   if (askedPool === undefined) return { profile, pool: host };
   const pool = Number(askedPool);
   if (!Number.isSafeInteger(pool) || pool < 1) throw usage(`--pool takes a whole number of emulators, not "${askedPool}"`);
@@ -525,9 +563,33 @@ export async function reapBeforeAcquire(ctx) {
   try { await reap({ env: ctx.env, log: ctx.log, graceMs: ctx.emulator.graceMs, wait: false }); } catch (error) { ctx.warn?.(`the emulator reaper failed: ${error.message}`); }
 }
 
+// An error out of the worker, as a service answers it: an abort keeps the signal's reason, an error the HTTP table knows (a full pool,
+// a released request) keeps its code, and anything else is HUB_EMULATOR_FAILED with the worker's message.
+const emulatorFailure = (error, signal) => {
+  if (signal?.aborted && error === signal.reason) return error;
+  if (httpAnswerOf(error) !== null || Number.isInteger(error?.status)) return error;
+  return Object.assign(failure('HUB_EMULATOR_FAILED', String(error?.message ?? error)), { cause: error });
+};
+
+// An emulator take. `options.offThread` (a service: AD-44) runs the reap and the boot in a worker thread (`emulator-thread.mjs`; the main
+// thread never calls `provision` or `reap`), the slot tied to the service's pid while it boots and to nobody once it is ready; the CLI
+// runs them in its own process, as it always did. `ctx.provisionOffThread(args, {env, log, signal})` replaces the worker (a test seam).
 async function takeEmulator(options, ctx) {
   const { env, timing } = ctx;
   const id = options.id ?? newLeaseId('emulator');
+  if (options.offThread) {
+    const args = {
+      id, holder: options.holder, why: options.why, forMs: options.forMs, waitMs: options.waitMs, holderPid: options.holderPid ?? null, profileName: options.profile, pool: options.pool,
+      claimantKind: options.claimantKind ?? 'agent', actor: options.actor ?? null, pollMs: timing.leasePollMs, ...ctx.emulator,
+    };
+    const run = ctx.provisionOffThread ?? ((given, seams) => offThread('provision', given, seams));
+    try {
+      const { lease, record } = await run(args, { env, log: ctx.log, signal: options.signal });
+      return { kind: EMULATOR, id, lease, record };
+    } catch (error) {
+      throw emulatorFailure(error, options.signal);
+    }
+  }
   await reapBeforeAcquire(ctx);
   const { lease, record } = await provision({ id, holder: options.holder, why: options.why, forMs: options.forMs, waitMs: options.waitMs, holderPid: options.holderPid, profileName: options.profile, pool: options.pool, env, log: ctx.log, signal: options.signal, sleep: timing.sleep, now: timing.now, pollMs: timing.leasePollMs, ...ctx.emulator });
   return { kind: EMULATOR, id, lease, record };
@@ -564,7 +626,8 @@ async function reachableMembers(members, ctx, statesOf = null) {
 // --for's bounds (the Pool is narrowed to the phones whose cap allows it), --why, --wait, --pid, and an emulator's profile and
 // pool. The CLI checks the same rules earlier, for its message order.
 // options: holder, why, forMs, waitMs, id, holderPid, noConnect, phoneWaitMs, signal (and profile, pool for an emulator), claimantKind
-// (`agent`, or `person`), actor ({holder, via}, recorded on the take's events) and readingsOf (a `--match` Pool's away filter over a
+// (`agent`, or `person`), actor ({holder, via}, recorded on the take's events; an emulator's go on its Pool request and acquires too),
+// `service` and `offThread` (a service's emulator take: the Pool size ignores $HUB_EMULATOR_POOL, and the boot runs in a worker) and readingsOf (a `--match` Pool's away filter over a
 // service's cached states, run even for a noConnect take; see reachableMembers) and flag (what the duration is called in a bounds
 // message: `--for` by default).
 export async function take(resolved, options, ctx) {
@@ -578,7 +641,7 @@ export async function take(resolved, options, ctx) {
   switch (target.kind) {
     case 'phone': return takePhone(target.entry, options, ctx);
     case 'pool': return takeAnyPhone(target.by === 'match' && (!options.noConnect || options.readingsOf) ? await reachableMembers(target.members, ctx, options.readingsOf ?? null) : target.members, options, ctx, target.pool ?? PHONE);
-    case EMULATOR: return takeEmulator({ ...options, ...emulatorBounds(options, ctx.env) }, ctx);
+    case EMULATOR: return takeEmulator({ ...options, ...emulatorBounds({ ...options, service: options.service === true }, ctx.env) }, ctx);
     default: throw usage(`cannot take a ${target.kind}`);
   }
 }
@@ -636,24 +699,56 @@ export function checkLeaseBody(body) {
   return { resource: hasResource ? body.resource : null, match: hasMatch ? body.match : null, forMs: body.for_ms, waitMs: body.wait_ms ?? 0, holder: body.holder, why: body.why, claimantKind, id: body.id ?? null, actor };
 }
 
-// A taken phone Lease as a service answers it: the Lease, the Resource and device it is on, and what the Claimant exports to use it
-// (the CLI's `lease --json` env). One view for every service route that answers with a Lease.
+// A taken Lease as a service answers it: the Lease, the Resource and device it is on, and what the Claimant exports to use it (the CLI's
+// `lease --json` env). One view for every service route that answers with a Lease. A phone's carries `emulator: null`; an emulator's
+// (Story 7.4: `taken` is `{kind: 'emulator', lease, record, slot?}`) is the slot it holds, `device: 'emulator'`, the emulator's own
+// exports (`HUB_LEASE_ID`, `ANDROID_ADB_SERVER_PORT`, `ANDROID_SERIAL`) and `emulator: {slot, serial, profile, console_port, adb_server_port}`.
 export function leaseView(taken) {
+  if (taken.kind === EMULATOR) return emulatorLeaseView(taken);
   const { lease, phone } = taken;
   return {
     lease_id: lease.lease_id, resource: resourceOf(phone.lock), lock: phone.lock, device: phone.device, holder: lease.holder, why: lease.why,
-    claimant_kind: lease.claimant_kind ?? 'agent', started_at: lease.started_at, expires_at: lease.expires_at, env: leaseExports(taken),
+    claimant_kind: lease.claimant_kind ?? 'agent', started_at: lease.started_at, expires_at: lease.expires_at, env: leaseExports(taken), emulator: null,
   };
 }
 
-// The Lease a held id names, for a service: the phone whose lock holds a Lease by this id, as a `taken` (`leaseView`'s input), or null.
-// The device is the one the record carries (a Lease taken with a connect has an adb id), else the lock-only shape a `--no-connect`
-// Lease has. Read only. `ctx`: env, fleet (loaded when absent), warn.
+// The `Lease` of a held emulator: the owner record of its slot and the emulator's record (the slot's owner carries the same facts as a
+// summary when the record is gone).
+function emulatorLeaseView({ lease, record = null, slot = null }) {
+  const info = record ?? lease.emulator ?? {};
+  const lock = record?.slot ?? slot;
+  return {
+    lease_id: lease.lease_id, resource: resourceOf(lock), lock, device: EMULATOR, holder: lease.holder, why: lease.why,
+    claimant_kind: lease.claimant_kind ?? 'agent', started_at: lease.started_at, expires_at: lease.expires_at,
+    env: emulatorExports({ lease_id: lease.lease_id, adb_server_port: info.adb_server_port, serial: info.serial }),
+    emulator: { slot: lock, serial: info.serial ?? null, profile: info.profile ?? null, console_port: info.console_port ?? null, adb_server_port: info.adb_server_port ?? null },
+  };
+}
+
+// The emulator Lease a held id names, for a service, as a `taken`, or null: the slot that holds a Lease by this id, with its record. A
+// slot a service is still booting (its owner is tied to this very process until the emulator is ready) holds no usable emulator yet: null,
+// and so does an orphan the reaper would tear down (`doomed`: a service that died mid-boot left it tied to its dead pid). An expired one
+// is still the Lease it was, as a phone's is: GET answers it and an extend refuses it as `expired`.
+function heldEmulator(id, env) {
+  if (typeof id !== 'string' || !LEASE_ID.test(id)) return null;
+  const record = readRecord(env, id);
+  const slot = record?.slot ?? slotHolding(env, id);
+  if (!slot) return null;
+  const lease = readOwnerOf(slot, env);
+  if (!isLease(lease) || lease.lease_id !== id || lease.holder_pid === process.pid) return null;
+  const why = record ? doomed(record, lease) : null;
+  if (why !== null && why !== 'expired') return null;
+  return { kind: EMULATOR, id, slot, lease, record };
+}
+
+// The Lease a held id names, for a service: the phone whose lock holds a Lease by this id, else the emulator slot that does, as a `taken`
+// (`leaseView`'s input), or null. The device is the one the record carries (a Lease taken with a connect has an adb id), else the
+// lock-only shape a `--no-connect` Lease has. Read only. `ctx`: env, fleet (loaded when absent), warn.
 export function heldLease(id, ctx) {
   const env = ctx.env ?? process.env;
   const fleet = ctx.fleet ?? loadFleet(env, { warn: ctx.warn });
   const phone = typeof id === 'string' && id !== '' ? phoneOwning(fleet, env, id) : null;
-  if (!phone) return null;
+  if (!phone) return heldEmulator(id, env);
   const lease = readOwnerOf(phone.lock, env);
   if (!isLease(lease) || lease.lease_id !== id) return null;
   return { kind: 'phone', phone, lease, device: leaseDevice(lease, phone, env) };
@@ -662,8 +757,9 @@ export function heldLease(id, ctx) {
 // The device a held Lease is on: the one its record carries (a Lease taken with a connect has an adb id), else the lock-only shape.
 const leaseDevice = (lease, phone, env) => lease.device ?? { phone: phone.device, serial: null, adb_id: null, adb_port: Number(String(env.HUB_ADB_SERVER_PORT || '5037')) };
 
-// `GET /leases/{id}`: the Lease an id names, as `leaseView`. A Lease that is still waiting for its lock is 404 `waiting` and an id
-// nothing knows is 404 `unknown`: both HUB_LEASE_NOT_FOUND (exit 2), so a client that lost an answer can tell "not yet" from "never".
+// `GET /leases/{id}`: the Lease an id names, as `leaseView`. A Lease that is still waiting for its lock (or its emulator still booting)
+// is 404 `waiting` and an id nothing knows is 404 `unknown`: both HUB_LEASE_NOT_FOUND (exit 2), so a client that lost an answer can tell
+// "not yet" from "never".
 export function findLease(id, ctx) {
   const env = ctx.env ?? process.env;
   const fleet = ctx.fleet ?? loadFleet(env, { warn: ctx.warn });
@@ -672,10 +768,12 @@ export function findLease(id, ctx) {
   throw leaseNotFound(id, fleet, env);
 }
 
-// The refusal for an id that holds nothing: HUB_LEASE_NOT_FOUND, `reason: waiting` when a waiter has it (it holds nothing yet), else `unknown`.
+// The refusal for an id that holds nothing: HUB_LEASE_NOT_FOUND, `reason: waiting` when a waiter has it (it holds nothing yet; an emulator
+// request counts from its first place in line until it is ready), else `unknown`.
 function leaseNotFound(id, fleet, env) {
   const waiting = typeof id === 'string' && id !== '' ? phoneWaiting(fleet, env, id) : null;
   if (waiting) return Object.assign(failure('HUB_LEASE_NOT_FOUND', `lease ${id} is waiting for ${waiting.device}; it holds nothing yet`), { reason: 'waiting' });
+  if (isEmulatorLease(env, id)) return Object.assign(failure('HUB_LEASE_NOT_FOUND', `lease ${id} is waiting for ${EMULATOR}; it holds nothing yet`), { reason: 'waiting' });
   return Object.assign(failure('HUB_LEASE_NOT_FOUND', `no lease or waiter has the id "${id}"`), { reason: 'unknown' });
 }
 
@@ -690,13 +788,19 @@ export const leaseRequestId = (body, view) => {
 // `findPhone`, no adb on the request path, `holderPid` null (the Lease lives until `expires_at` or its release; it is never reclaimed
 // for a dead process), and an environment with no `GITHUB_*` key. `input` is `checkLeaseBody`'s result (its actor already defaulted by
 // the caller). A `resource` is a word or a Resource id (a lease id is never a target); a `match` Pool drops the members `ctx.readingsOf`
-// (a function of the members, returning Map(device -> state)) already knows are away. An emulator is refused here.
+// (a function of the members, returning Map(device -> state)) already knows are away.
+//
+// An emulator (Story 7.4: the word `emulator`, or a `match` with a `profile=` clause or that only the emulator Pool satisfies) is the
+// same Claims path as `hub-device lease emulator`: `take` to `provision({holderPid: null})`, run off the main thread (AD-44) in a worker
+// (`emulator-thread.mjs`), the Lease answered once the emulator is booted, with `emulator: {slot, serial, profile, console_port,
+// adb_server_port}`. A profile that is unknown or whose image is not installed is HUB_NO_MATCH at once, before any ticket, lock or event.
 //
 // A wait (`input.waitMs` > 0, Story 7.2) is the same take with a place in line: `ctx.signal` ends it (the ticket leaves with a `cancel`,
-// reason `aborted`) and `ctx.processStart` is the service's one cached process-start reader (AD-44). A Hold granted to a request whose
-// signal had already aborted is given back at once (a `release`, reason `undelivered`: nobody received it) and the signal's reason is
-// thrown. An id this holder already holds answers its existing Lease: no second take, no event (a client asking again after a lost answer).
-// Returns `leaseView`. Throws what `resolve`, `matchTarget` and `take` throw (the HTTP table gives them their status).
+// reason `aborted`; an emulator mid-boot is torn down) and `ctx.processStart` is the service's one cached process-start reader (AD-44). A
+// Hold granted to a request whose signal had already aborted is given back at once (a `release`, reason `undelivered`: nobody received
+// it; an emulator is torn down in a worker) and the signal's reason is thrown. An id this holder already holds answers its existing
+// Lease: no second take, no event (a client asking again after a lost answer). Returns `leaseView`. Throws what `resolve`,
+// `matchTarget` and `take` throw (the HTTP table gives them their status).
 export async function serviceLease(input, ctx) {
   const env = withoutDeployIdentity(ctx.env ?? process.env);
   const fleet = ctx.fleet ?? loadFleet(env, { warn: ctx.warn });
@@ -706,9 +810,9 @@ export async function serviceLease(input, ctx) {
     const held = heldLease(input.id, local);
     if (held && held.lease.holder === input.holder) return leaseView(held);
   }
-  const resolved = input.match !== null ? matchTarget(input.match, { forMs: input.forMs }, local) : resolve(input.resource, { fleet, env, ids: false });
-  if (resolved.kind === EMULATOR) throw usage('an emulator is not leased through this route yet; lease a phone');
+  const resolved = input.match !== null ? matchTarget(input.match, { forMs: input.forMs, emulators: true }, local) : resolve(input.resource, { fleet, env, ids: false });
   const signal = ctx.signal ?? null;
+  if (resolved.kind === EMULATOR) return serviceEmulator(input, resolved, local, signal);
   const taken = await take(resolved, {
     holder: input.holder, why: input.why, forMs: input.forMs, waitMs: input.waitMs ?? 0, id: input.id, holderPid: null, noConnect: true,
     claimantKind: input.claimantKind, actor: input.actor, readingsOf: ctx.readingsOf, flag: 'for_ms',
@@ -719,6 +823,39 @@ export async function serviceLease(input, ctx) {
     throw signal.reason;
   }
   return leaseView(taken);
+}
+
+// The profile's image must be there before anything is queued: an unknown profile or a missing image is HUB_NO_MATCH (404, exit 2) naming it.
+function checkProfile(profile, env) {
+  try { resolveImage(profile, { env }); } catch (error) {
+    if (error?.code !== 'HUB_EMULATOR_USAGE' && error?.code !== 'HUB_EMULATOR_NO_IMAGE') throw error;
+    const reason = `emulator ${error.message}`;
+    throw Object.assign(failure('HUB_NO_MATCH', `no Resource matches: ${reason}`), { reason, excluded: [{ id: EMULATOR, why: error.message }] });
+  }
+}
+
+// An emulator Lease through a service (the emulator half of `serviceLease`).
+async function serviceEmulator(input, resolved, local, signal) {
+  const { env } = local;
+  const profile = resolved.profile ?? 'default';
+  checkProfile(profile, env);
+  const taken = await take(resolved, {
+    holder: input.holder, why: input.why, forMs: input.forMs, waitMs: input.waitMs ?? 0, id: input.id, holderPid: null,
+    claimantKind: input.claimantKind, actor: input.actor, flag: 'for_ms', profile, service: true, offThread: true,
+    ...(signal ? { signal } : {}),
+  }, local);
+  if (signal?.aborted) {
+    // Nobody received it: given back at once, its processes and files torn down in a worker too.
+    const give = local.releaseOffThread ?? ((given, seams) => offThread('release', given, seams));
+    // Its outcome goes to the service log: a teardown that fails or would not finish leaves the record for the next reap.
+    const say = line => { try { local.log?.(line); } catch { /* a broken log seam never changes the outcome */ } };
+    try {
+      const given = await give({ id: taken.id, reason: 'undelivered', graceMs: local.emulator.graceMs }, { env, log: local.log });
+      if (given?.outcome === 'stuck') say(`HUB_EMULATOR_UNDELIVERED_STUCK ${taken.id}: pids ${(given.result?.survivors ?? []).join(',')} would not stop; the next reap tries again`);
+    } catch (error) { say(`HUB_EMULATOR_UNDELIVERED_FAILED ${taken.id}: ${error.message}`); }
+    throw signal.reason;
+  }
+  return leaseView({ ...taken, slot: taken.record?.slot ?? null });
 }
 
 // ---- waits bound to the connection (Story 7.2; AD-37, AD-48) ----
@@ -736,11 +873,14 @@ const disconnectedError = id => Object.assign(failure('HUB_LEASE_CANCELLED', `th
 //     and deadline (its place in line, no event), the new connection gets its outcome, and the old one gets HUB_LEASE_SUPERSEDED. Another
 //     holder's repeat is refused as a taken id.
 //   - A repeat of an id already held by the same holder answers the Lease (`serviceLease`).
-//   - `shutdown()` ends every open wait with HUB_API_RESTARTING (`retry: 'requeue'`) and refuses every later request the same way.
+//   - `shutdown()` ends every open wait with HUB_API_RESTARTING (`retry: 'requeue'`) and refuses every later request the same way. So
+//     does it every request that is still being served with no wait (Story 7.4: an emulator boots for minutes, and a stop must not
+//     leave one booting): each is aborted, and what it had made is torn down before `shutdown()` resolves.
 // One cached process-start reader (AD-44) is shared by every wait of the registry. `now` and `startOf` are test seams.
 export function createLeaseWaits({ now = Date.now, startOf } = {}) {
   const processStart = cachedProcessStart({ now: () => now(), ...(startOf ? { startOf } : {}) });
   const open = new Map();
+  const serving = new Set();   // the requests being served with no wait: {controller, work}
   let closed = false;
 
   // The new request becomes the one that receives the wait's outcome; the one before it is superseded.
@@ -775,7 +915,16 @@ export function createLeaseWaits({ now = Date.now, startOf } = {}) {
       // Another holder's open wait names this id: refused as any taken id (never registered over it).
       if (entry) throw usage(`id ${input.id} already names a lease or a waiter; a lease id names one lease`);
       const served = { ...ctx, processStart: ctx.processStart ?? processStart };
-      if (!(input.waitMs > 0)) return serviceLease(input, { ...served, signal: signal ?? null });
+      if (!(input.waitMs > 0)) {
+        // Its own controller, so a stop can end it: it follows the connection's signal, and `shutdown()` aborts it with its own reason.
+        const controller = new AbortController();
+        const follow = () => controller.abort(signal.reason);
+        if (signal?.aborted) follow(); else signal?.addEventListener?.('abort', follow, { once: true });
+        const one = { controller, work: null };
+        serving.add(one);
+        one.work = serviceLease(input, { ...served, signal: controller.signal }).finally(() => { signal?.removeEventListener?.('abort', follow); serving.delete(one); });
+        return one.work;
+      }
       const created = { id: input.id, holder: input.holder, controller: new AbortController(), subscriber: null, work: null };
       open.set(input.id, created);
       const outcome = attach(created, signal);
@@ -788,8 +937,10 @@ export function createLeaseWaits({ now = Date.now, startOf } = {}) {
     async shutdown() {
       closed = true;
       const entries = [...open.values()];
+      const requests = [...serving];
       for (const entry of entries) entry.controller.abort(restartingError());
-      await Promise.all(entries.map(entry => entry.work));
+      for (const request of requests) request.controller.abort(restartingError());
+      await Promise.all([...entries.map(entry => entry.work), ...requests.map(request => request.work.catch(() => {}))]);
     },
   };
   return registry;
@@ -980,9 +1131,8 @@ export function checkReleaseBody(body) {
   return { holder: body.holder ?? null, actor };
 }
 
-// What a service extend and release both do first: the environment without `GITHUB_*` (as a take), the context, a deploy job's ticket
-// id refused (HUB_DEVICE_JOB_ID, which names the run to cancel) and an emulator lease id refused (HUB_USAGE, `reason: emulator`: an
-// emulator is not extended or released through a service yet).
+// What a service extend and release both do first: the environment without `GITHUB_*` (as a take), the context, and a deploy job's ticket
+// id refused (HUB_DEVICE_JOB_ID, which names the run to cancel). An emulator lease id is served like a phone's (Story 7.4).
 function serviceHold(id, ctx) {
   const env = withoutDeployIdentity(ctx.env ?? process.env);
   const fleet = ctx.fleet ?? loadFleet(env, { warn: ctx.warn });
@@ -990,18 +1140,21 @@ function serviceHold(id, ctx) {
   const local = { ...ctx, env, fleet, log: base.log, warn: base.warn, policy: base.policy, timing: ctx.timing ?? base.timing, emulator: ctx.emulator ?? base.emulator };
   const job = jobTicket(id);
   if (job) throw failure(job.code, job.message);
-  if (isEmulatorLease(env, id)) throw bodyUsage('emulator', 'an emulator lease is not extended or released through this route yet');
   return local;
 }
 
 // `POST /leases/{id}/extend` (and the Host Agent's): exactly `hub-device extend <id> --for ...`. `input` is `checkExtendBody`'s result
-// with the actor defaulted by the caller (`actor`; `override.actor` too, defaulting to it). Returns `leaseView` of the extended Lease.
+// with the actor defaulted by the caller (`actor`; `override.actor` too, defaulting to it). Returns `leaseView` of the extended Lease (a
+// phone's or an emulator's, Story 7.4).
 // Throws what `extendHeld` throws (HUB_LEASE_EXTEND_REFUSED with its `reason`, HUB_LEASE_NOT_FOUND, HUB_DEVICE_JOB_ID, HUB_LEASE_LOST).
 export function serviceExtend(id, input, ctx) {
   const local = serviceHold(id, ctx);
+  // An emulator still booting holds nothing yet (GET says `waiting` too): its expiry is set when it is ready, so an extension now would be lost.
+  if (isEmulatorLease(local.env, id) && phoneOwning(local.fleet, local.env, id) === null && heldEmulator(id, local.env) === null) throw leaseNotFound(id, local.fleet, local.env);
   const override = input.override ? { why: input.override.why, actor: input.override.actor ?? input.actor } : null;
   const { lock, record } = extendHeld(id, { forMs: input.forMs, actor: input.actor, override }, local);
   // Built from what the extension wrote: no second read, so a committed extension is never answered as lost.
+  if (isEmulatorLock(lock)) return leaseView({ kind: EMULATOR, id, lease: record, record: readRecord(local.env, id), slot: lock });
   const phone = local.fleet.find(entry => entry.lock === lock);
   return leaseView({ kind: 'phone', phone, lease: record, device: leaseDevice(record, phone, local.env) });
 }
@@ -1010,13 +1163,23 @@ export function serviceExtend(id, input, ctx) {
 // that holds and waits for nothing is `none`. Returns `{lease_id, outcome, resource, lock, device}`, `outcome` `released` (the Lease was
 // given back), `cancelled` (it was only a waiter) or `none`; the last three keys are null for `none`. A lock that is being taken or
 // changed hands is HUB_LEASE_LOST (`being-taken`, `changed-hands`): left alone.
+//
+// An emulator lease id (Story 7.4) is released the way `hub-device release <id>` does, with the teardown (a `/proc` scan and the signals to
+// its processes) run in a worker thread, not on this one: `released` (its slot freed, its processes and files gone), `cancelled` (it was
+// still waiting its turn) or `none`. Processes that would not stop are HUB_EMULATOR_FAILED. `ctx.releaseOffThread(args, {env, log})` replaces
+// the worker (a test seam).
 export async function serviceRelease(id, input, ctx) {
   const local = serviceHold(id, ctx);
-  return releaseAnswer(id, await release({ id, actor: input.actor }, local));
+  if (!isEmulatorLease(local.env, id)) return releaseAnswer(id, await release({ id, actor: input.actor }, local));
+  const give = local.releaseOffThread ?? ((given, seams) => offThread('release', given, seams));
+  let result;
+  try { result = await give({ id, graceMs: local.emulator.graceMs }, { env: local.env, log: local.log }); } catch (error) { throw emulatorFailure(error, null); }
+  return releaseAnswer(id, { kind: EMULATOR, id, ...result });
 }
 
 // The `Release` a service answers with for what `release` found (a pure mapping, so each outcome is testable on its own).
 export function releaseAnswer(id, result) {
+  if (result.kind === EMULATOR) return emulatorReleaseAnswer(id, result);
   switch (result.outcome) {
     case 'released':
     case 'cancelled': return { lease_id: id, outcome: result.outcome, resource: resourceOf(result.lock), lock: result.lock, device: result.device };
@@ -1026,6 +1189,17 @@ export function releaseAnswer(id, result) {
   }
 }
 
+
+// The `Release` for what releasing an emulator lease id did (`releaseEmulator`'s result): the slot it held (`released`), the gate it waited
+// on (`cancelled`) or nothing (`none`). `stuck` (processes that would not stop: the slot stays out of the pool) is HUB_EMULATOR_FAILED.
+function emulatorReleaseAnswer(id, result) {
+  switch (result.outcome) {
+    case 'released': { const lock = result.record?.slot ?? result.slot ?? GATE; return { lease_id: id, outcome: 'released', resource: resourceOf(lock), lock, device: EMULATOR }; }
+    case 'cancelled': return { lease_id: id, outcome: 'cancelled', resource: resourceOf(GATE), lock: GATE, device: EMULATOR };
+    case 'stuck': throw failure('HUB_EMULATOR_FAILED', `emulator ${id}: pids ${(result.result?.survivors ?? []).join(',')} would not stop; ${result.slot} stays out of the pool until they do`);
+    default: return { lease_id: id, outcome: 'none', resource: null, lock: null, device: null };
+  }
+}
 
 // ---- status ----
 
