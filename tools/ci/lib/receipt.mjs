@@ -6,6 +6,7 @@ import { createReadStream } from 'node:fs';
 import { appendFile, mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { busyReason } from './latest.mjs';
 import { loadPolicy } from './policy.mjs';
 
 export async function sha256File(path) {
@@ -61,6 +62,18 @@ export function buildReceipt({ lane, config, env = process.env, version, android
     ...extra,
     created_at: new Date().toISOString(),
   };
+}
+
+// The one public wording of a lane receipt's `reason` (AD-22). A lane whose failure was a device wait that ran out keeps the
+// lock's own message (it names the holder and the waiters ahead) in its receipt, the job summary and the log; every public copy
+// (the bucket receipts, the Bloodbank event) says only which lock was busy. Keyed on the AD-5 message prefix, so a lane that
+// recorded `contention` and then failed for another reason keeps that reason.
+export function publicReason(receipt) {
+  const lock = receipt?.contention?.lock;
+  if (typeof lock === 'string' && lock !== '' && typeof receipt.reason === 'string' && receipt.reason.startsWith(`host lock ${lock} is held`)) {
+    return `${busyReason(lock)}: the wait for it ran out (HUB_LOCK_TIMEOUT); the run summary names who held it`;
+  }
+  return receipt?.reason;
 }
 
 export function summaryMarkdown(receipt) {

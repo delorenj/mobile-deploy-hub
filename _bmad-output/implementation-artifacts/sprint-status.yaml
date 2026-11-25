@@ -59,7 +59,7 @@ development_status:
   3-2-a-blocked-android-delivery-goes-pending: done
   3-3-the-catch-up-delivers-contention-pending-builds-in-its-turn: done
   3-4-a-newer-installed-build-is-refused-with-a-name: done
-  3-5-ios-contention-is-red-and-says-who: backlog
+  3-5-ios-contention-is-red-and-says-who: awaiting-operator
   epic-3-retrospective: optional
 
   epic-4: done

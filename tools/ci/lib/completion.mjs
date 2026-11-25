@@ -16,6 +16,7 @@
 // whose lane would not run is `skipped` (INCOMPLETE: a real run would leave it owed, so `ship` stops before spending a
 // version). The announce job writes the verdict as the completion-out artifact; `deploy.mjs ship` reads it.
 import { defaultGroups, groupsLabel, requiredTargets } from './policy.mjs';
+import { publicReason } from './receipt.mjs';
 
 export const verdicts = Object.freeze(['COMPLETE', 'INCOMPLETE', 'RED']);
 export const targetStatuses = Object.freeze(['installed', 'pending', 'assigned', 'uploaded', 'checked', 'skipped', 'missing', 'failed']);
@@ -52,14 +53,14 @@ export function testflightOf({ testflight, iosLane = 'run', needs = {}, receipts
       const review = typeof store.review?.state === 'string' ? ` (beta review: ${store.review.state})` : '';
       return { status: 'assigned', reason: `${store.uploaded === 'earlier' ? 'already in App Store Connect; assigned to' : 'uploaded and assigned to'} ${to}${review}`, build: store.build ?? null };
     }
-    if (store.status === 'failed') return { status: 'failed', reason: store.reason ?? ios.reason ?? 'the TestFlight step failed', build: store.build ?? null };
+    if (store.status === 'failed') return { status: 'failed', reason: store.reason ?? publicReason(ios) ?? 'the TestFlight step failed', build: store.build ?? null };
     if (store.status === 'checked' && dryRun) return { status: 'checked', reason: ios.testflight ?? 'dry run: upload and assign were not called', build: store.build ?? null };
   }
   if (typeof ios.testflight === 'string') {
     if (/uploaded and assigned|; assigned to /.test(ios.testflight)) return { status: 'assigned', reason: ios.testflight };
     if (/^dry run/.test(ios.testflight) && dryRun) return { status: 'checked', reason: ios.testflight };
   }
-  if (ios.outcome === 'failure') return { status: 'failed', reason: ios.stage === 'deliver' ? (ios.reason ?? 'the TestFlight step failed') : `the ios lane stopped at ${ios.stage ?? 'an unknown stage'} before TestFlight (${ios.reason ?? 'no reason'})` };
+  if (ios.outcome === 'failure') return { status: 'failed', reason: ios.stage === 'deliver' ? (publicReason(ios) ?? 'the TestFlight step failed') : `the ios lane stopped at ${ios.stage ?? 'an unknown stage'} before TestFlight (${publicReason(ios) ?? 'no reason'})` };
   return { status: 'missing', reason: 'the ios lane did not record TestFlight' };
 }
 
