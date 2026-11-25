@@ -123,6 +123,58 @@ export function newRuns(runs, { after, sha }) {
 
 export const newestId = runs => runs.reduce((newest, run) => Math.max(newest, run.databaseId), 0);
 
+// GitHub now and then answers a workflow dispatch with a 5xx or drops the connection, and usually nothing ran: on
+// 2026-11-25 one HTTP 500 on Tower's dispatch turned hub v1.2.53 red before any lane started. A DRY dispatch that failed
+// that way is sent again, at most `dispatchRetries` more times, each only after looking for the run it may still have
+// started. A real dispatch is never sent twice: a run GitHub creates late would be a second real run and a second bump,
+// so the caller passes `retries: 0` for it and a failure throws as before. A 4xx (bad input, no such workflow) is never
+// retried.
+export const dispatchRetries = 2;
+export const transientDispatchError = error =>
+  /HTTP 5\d\d\b|\b50[234] (Bad Gateway|Service Unavailable|Gateway Timeout)|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|connection reset|unexpected EOF|TLS handshake timeout|i\/o timeout/i
+    .test(String(error?.message ?? error));
+
+// Dispatch, then the runs it started (newer than `after`, on `sha`), polling every `pollMs` for at most `timeoutMs`.
+// `onSent` runs once the dispatch was accepted. Retries are for dry dispatches only (see above), so a run recovered
+// after a failed attempt must be a dry one: a REAL run on the same sha is someone else's and is never adopted.
+export async function dispatchRun({ gh, args, listRuns, after, sha, sleep, log, pollMs, timeoutMs, prefix = 'DEPLOY', retries = 0, settleMs = Math.min(30_000, timeoutMs), onSent = () => {} }) {
+  const poll = async ms => {
+    let started = [];
+    for (let tries = Math.max(1, Math.ceil(ms / Math.max(pollMs, 1))); tries > 0 && started.length === 0; tries -= 1) {
+      await sleep(pollMs);
+      started = newRuns(listRuns(), { after, sha });
+    }
+    return started;
+  };
+  // While GitHub is failing, the run list can fail too: that reads as "nothing seen yet", never as the end of the retry.
+  const settle = async () => {
+    let started = [];
+    for (let tries = Math.max(1, Math.ceil(settleMs / Math.max(pollMs, 1))); tries > 0 && started.length === 0; tries -= 1) {
+      await sleep(pollMs);
+      try { started = newRuns(listRuns(), { after, sha }).filter(run => !/\bREAL\b/.test(run.displayTitle ?? '')); } catch { /* next try */ }
+    }
+    return started;
+  };
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      gh(args);
+    } catch (error) {
+      if (attempt > retries || !transientDispatchError(error)) throw error;
+      const why = error.message.split('\n')[0];
+      const started = await settle();
+      if (started.length > 0) {
+        log(`${prefix}_DISPATCH_RECOVERED attempt ${attempt} failed (${why}) but started run ${started.map(run => run.databaseId).join(', ')}; not sending it again`);
+        onSent();
+        return started;
+      }
+      log(`${prefix}_DISPATCH_RETRY attempt ${attempt + 1} of ${retries + 1}: attempt ${attempt} failed (${why}) and no run appeared within ${Math.round(settleMs / 1000)}s`);
+      continue;
+    }
+    onSent();
+    return poll(timeoutMs);
+  }
+}
+
 // The lanes the app declares (its manifest, at the path deploy.yml passes). Unreadable means assume both.
 export function lanesFrom(workflowText, read) {
   const path = /^\s+manifest:\s*(\S+)\s*$/m.exec(workflowText ?? '')?.[1] ?? 'mobile-deploy.json';
@@ -299,14 +351,7 @@ export async function deploy(options, {
 
   const after = newestId(before);
   log(`DEPLOY_DISPATCH ${repo} ${options.dryRun ? 'dry run' : 'REAL run'} bump=${options.bump} platform=${options.platform}${options.testflight ? ' testflight' : ''}${options.play ? ' play' : ''}${options.dryHandoff ? ' dry_handoff' : ''} metered=${options.metered} main=${sha.slice(0, 8)} hub=${options.hubRef || hubRefFrom(workflowText) || '?'} (newest earlier run: ${after || 'none'})`);
-  gh(dispatch);
-
-  const deadline = Date.now() + timeoutMs;
-  let started = [];
-  while (started.length === 0 && Date.now() < deadline) {
-    await sleep(pollMs);
-    started = newRuns(runs(), { after, sha });
-  }
+  const started = await dispatchRun({ gh, args: dispatch, listRuns: runs, after, sha, sleep, log, pollMs, timeoutMs, retries: options.dryRun ? dispatchRetries : 0 });
   if (started.length === 0) throw new Error(`no new ${options.workflow} run appeared within ${timeoutMs / 1000}s of the dispatch; look at the Actions tab, do not trust an older run`);
   if (started.length > 1) throw new Error(`more than one new run started (${started.map(run => run.url).join(', ')}); another dispatch raced this one, watch the right one by hand: gh run watch <id> --interval 30 --exit-status`);
 
@@ -572,13 +617,11 @@ export async function ship(options, {
   const dispatchAndWatch = async ({ dryRun, sha }) => {
     const after = newestId(listRuns());
     log(`SHIP_DISPATCH ${repo} ${dryRun ? 'dry run (dry_handoff)' : 'REAL run'} bump=${options.bump} metered=${options.metered} main=${short(sha)} hub=${hubRef} (TestFlight: caller opt-in or explicit completion policy)`);
-    gh(dispatchArguments({ workflow: options.workflow, dryRun, bump: options.bump, platform: 'both', testflight: false, play: false, dryHandoff: dryRun, metered: options.metered, repo }));
-    if (!dryRun) state.realDispatched = true;
-    let started = [];
-    for (let tries = Math.max(1, Math.ceil(timeoutMs / Math.max(pollMs, 1))); tries > 0 && started.length === 0; tries -= 1) {
-      await sleep(pollMs);
-      started = newRuns(listRuns(), { after, sha });
-    }
+    const started = await dispatchRun({
+      gh, listRuns, after, sha, sleep, log, pollMs, timeoutMs, prefix: 'SHIP', retries: dryRun ? dispatchRetries : 0,
+      args: dispatchArguments({ workflow: options.workflow, dryRun, bump: options.bump, platform: 'both', testflight: false, play: false, dryHandoff: dryRun, metered: options.metered, repo }),
+      onSent: () => { if (!dryRun) state.realDispatched = true; },
+    });
     if (started.length === 0) throw new Error(`no new ${options.workflow} run on ${short(sha)} appeared within ${Math.round(timeoutMs / 1000)}s of the ${dryRun ? 'dry' : 'real'} dispatch (did main move?); look at the Actions tab`);
     if (started.length > 1) throw new Error(`more than one new run started (${started.map(run => run.url).join(', ')}); another dispatch raced this one`);
     const [run] = started;

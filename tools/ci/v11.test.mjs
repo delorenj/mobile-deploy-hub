@@ -606,6 +606,107 @@ test('a red last real run earns an offer of the rerun, never a refusal; an offli
   assert.ok(calls.some(call => /^workflow run deploy\.yml --ref main --repo delorenj\/gruvato .*-f metered=auto$/.test(call)), calls.join('\n'));
 }, { timeout: 60_000 });
 
+// A dispatch fake for dispatchRun: `answers` says what each `gh workflow run` does (an Error throws; 'ghost' throws
+// HTTP 500 yet starts a run), and `runs` is what `gh run list` would show.
+function flakyDispatch(answers) {
+  const sha = 'a'.repeat(40);
+  const runs = [{ databaseId: 5, headSha: sha, event: 'workflow_dispatch', status: 'completed', url: 'https://x/5' }];
+  let sent = 0;
+  const gh = () => {
+    const answer = answers[sent];
+    sent += 1;
+    const start = () => runs.push({ databaseId: 10 + sent, headSha: sha, event: 'workflow_dispatch', status: 'queued', url: `https://x/${10 + sent}` });
+    if (answer === 'ghost') { start(); throw new Error('gh workflow failed: could not create workflow dispatch event: HTTP 500 (https://api.github.com/...)'); }
+    if (answer instanceof Error) throw answer;
+    start();
+    return '';
+  };
+  const logs = [];
+  let listFails = 0;
+  const listRuns = () => { if (listFails > 0) { listFails -= 1; throw new Error('gh run failed: HTTP 502'); } return runs; };
+  const base = { gh, listRuns, retries: frontDoor.dispatchRetries, after: 5, sha, sleep: async () => {}, log: line => logs.push(line), pollMs: 1, timeoutMs: 50, args: ['workflow', 'run', 'deploy.yml'] };
+  return { base, logs, sent: () => sent, failList: n => { listFails = n; } };
+}
+
+const http500 = new Error('gh workflow failed: could not create workflow dispatch event: HTTP 500 (https://api.github.com/repos/delorenj/tower-of-lost-things/actions/workflows/379324587/dispatches)');
+
+test('a dispatch GitHub answers with a 5xx is sent again once no run appeared, and never when one did', async () => {
+  assert.equal(frontDoor.transientDispatchError(http500), true);
+  assert.equal(frontDoor.transientDispatchError(new Error('gh workflow failed: HTTP 502: Bad Gateway')), true);
+  assert.equal(frontDoor.transientDispatchError(new Error('gh workflow failed: read tcp: connection reset by peer')), true);
+  assert.equal(frontDoor.transientDispatchError(new Error('gh workflow failed: HTTP 422: Unexpected inputs provided')), false);
+  assert.equal(frontDoor.transientDispatchError(new Error('gh workflow failed: HTTP 404: Not Found')), false);
+
+  // 500, nothing ran: the second attempt starts the run.
+  const retry = flakyDispatch([http500, 'ok']);
+  let sent = 0;
+  const started = await frontDoor.dispatchRun({ ...retry.base, onSent: () => { sent += 1; } });
+  assert.deepEqual(started.map(run => run.databaseId), [12]);
+  assert.equal(retry.sent(), 2);
+  assert.equal(sent, 1, 'onSent marks the accepted dispatch');
+  assert.match(retry.logs.join('\n'), /^DEPLOY_DISPATCH_RETRY attempt 2 of 3: attempt 1 failed \(gh workflow failed: could not create workflow dispatch event: HTTP 500/m);
+
+  // 500, but the run started anyway: that run is used, the dispatch is not sent again.
+  const ghost = flakyDispatch(['ghost', 'ok']);
+  const found = await frontDoor.dispatchRun({ ...ghost.base, prefix: 'SHIP' });
+  assert.deepEqual(found.map(run => run.databaseId), [11]);
+  assert.equal(ghost.sent(), 1, 'a run that appeared after a 5xx is never dispatched a second time');
+  assert.match(ghost.logs.join('\n'), /^SHIP_DISPATCH_RECOVERED attempt 1 failed .* but started run 11; not sending it again$/m);
+
+  // The run list failing too while GitHub is down reads as "nothing seen yet", not as the end of the retry.
+  const listing = flakyDispatch([http500, 'ok']);
+  listing.failList(3);
+  assert.deepEqual((await frontDoor.dispatchRun(listing.base)).map(run => run.databaseId), [12]);
+
+  // A REAL run on the sha after a failed dry attempt is someone else's: never adopted, the dry dispatch goes again.
+  const foreign = flakyDispatch([http500, 'ok']);
+  const realRuns = foreign.base.listRuns();
+  realRuns.push({ databaseId: 9, headSha: 'a'.repeat(40), event: 'workflow_dispatch', status: 'queued', url: 'https://x/9', displayTitle: 'Deploy REAL both bump=patch' });
+  const mine = await frontDoor.dispatchRun(foreign.base);
+  assert.equal(foreign.sent(), 2);
+  assert.ok(mine.some(run => run.databaseId === 12));
+
+  // A real dispatch (retries 0) is never sent twice: a late run would be a second real run and a second bump.
+  const real = flakyDispatch([http500, 'ok']);
+  await assert.rejects(frontDoor.dispatchRun({ ...real.base, retries: 0 }), /HTTP 500/);
+  assert.equal(real.sent(), 1);
+
+  // A 4xx is the caller's fault: thrown at once, never retried.
+  const bad = flakyDispatch([new Error('gh workflow failed: HTTP 422: Unexpected inputs provided'), 'ok']);
+  await assert.rejects(frontDoor.dispatchRun(bad.base), /HTTP 422/);
+  assert.equal(bad.sent(), 1);
+
+  // A 5xx every time: three attempts, then the error, as before.
+  const down = flakyDispatch([http500, http500, http500, 'ok']);
+  await assert.rejects(frontDoor.dispatchRun(down.base), /HTTP 500/);
+  assert.equal(down.sent(), 3);
+  assert.equal(down.logs.filter(line => line.startsWith('DEPLOY_DISPATCH_RETRY')).length, 2);
+});
+
+test('the front door and the release dry runs ride out one HTTP 500 on the dispatch', async () => {
+  const { gh: inner, calls } = fakeGh();
+  let failed = false;
+  const gh = (args, options) => {
+    if (args[0] === 'workflow' && args[1] === 'run' && !failed) { failed = true; calls.push(args.join(' ')); throw http500; }
+    return inner(args, options);
+  };
+  const logs = [];
+  const result = await frontDoor.deploy(parseArguments(['--dry-run', 'true', '--repo', 'delorenj/gruvato']), { gh, git: () => 'main\n', log: line => logs.push(line), sleep: async () => {}, timeoutMs: 50, pollMs: 1 });
+  assert.equal(result.status, 0, logs.join('\n'));
+  assert.equal(calls.filter(call => /^workflow run deploy\.yml/.test(call)).length, 2);
+  assert.ok(logs.some(line => /^DEPLOY_DISPATCH_RETRY attempt 2 of 3/.test(line)), logs.join('\n'));
+  assert.ok(logs.some(line => /^DEPLOY_RUN 21 /.test(line)), logs.join('\n'));
+
+  // The same HTTP 500 on a REAL deploy is thrown, as before: it is never sent a second time.
+  const realCalls = [];
+  const realGh = (args, options) => {
+    if (args[0] === 'workflow' && args[1] === 'run') { realCalls.push(args.join(' ')); throw http500; }
+    return fakeGh().gh(args, options);
+  };
+  await assert.rejects(frontDoor.deploy(parseArguments(['--dry-run', 'false', '--repo', 'delorenj/gruvato']), { gh: realGh, git: () => 'main\n', log: () => {}, sleep: async () => {}, timeoutMs: 50, pollMs: 1 }), /HTTP 500/);
+  assert.equal(realCalls.length, 1);
+});
+
 test('the train dispatches Tower, then Green In Between, then Gruvato, and stops at the first red run', async () => {
   const seen = [];
   const { gh } = fakeGh({ conclusion: () => (seen.length === 2 ? 1 : 0) });

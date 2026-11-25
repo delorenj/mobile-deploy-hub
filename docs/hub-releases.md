@@ -4,6 +4,18 @@ One section per hub release, headed `## vX.Y.Z`. `mise run release -- X.Y.Z` (`t
 
 A section is plain text read in a terminal: everything after its heading up to the next `## ` heading. Use `###` for sub-headings and `-` lists; do not start a section line with `## `.
 
+## v1.2.54
+
+v1.2.53 (Epic 6: the Registry and the Hub API) plus a dispatch retry. v1.2.53 was tagged and rolled back, never on `v1`: no lane ran. GitHub answered the dispatch of Tower's release dry run with `HTTP 500` (`could not create workflow dispatch event`), and the release took the failed dispatch as a red dry run. Everything in the v1.2.53 section below ships in this pin, including its install steps and its rollback to `v1.2.52` with the `systemctl --user disable --now mobile-deploy-hub-api.service` step; install it on both hosts (`mise run hosts:install` on big-chungus), then run `mise run hosts:smoke`.
+
+### What changed
+
+- `dispatchRun` (`tools/deploy.mjs`), the one dispatch path for `mise run deploy`, the release dry runs and `ship`, sends a DRY dispatch again when GitHub answers it with a 5xx or drops the connection: at most twice more, each only after waiting up to 30 s for the dry run the failed attempt may have started anyway (a failing run list during that wait counts as nothing seen yet). If that run appears it is used (`DEPLOY_DISPATCH_RECOVERED` / `SHIP_DISPATCH_RECOVERED`) and nothing is sent again; otherwise it logs `DEPLOY_DISPATCH_RETRY attempt <n> of 3: ...` and sends again. A REAL dispatch is never sent twice (a run GitHub created late would be a second real run and a second bump): it fails as before. A 4xx (bad inputs, no such workflow) is thrown at once, as before.
+
+### Test changes you will see
+
+- `tools/ci/v11.test.mjs`: two new tests for the retry (5xx with and without a run started, a failing run list, a foreign REAL run never adopted, a real dispatch never resent, 4xx, three 5xx) and for the front door riding out one `HTTP 500` on a dry run. No existing assertion changed.
+
 ## v1.2.53
 
 Epic 6 (Jarad registers a device and every agent can use it), on top of v1.2.52: the Registry and the Hub API. This release installs a service on big-chungus: `mobile-deploy-hub-api`, a systemd user service on `127.0.0.1:8794`, the Registry's only writer. The Mac gets no service: only the `hub-device` and `host-key` changes (its Host Agent is Epic 9); `mise run hosts:install` on big-chungus installs both hosts as before.
