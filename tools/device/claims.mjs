@@ -19,7 +19,7 @@ import { loadPolicy } from '../ci/lib/policy.mjs';
 import { createAdbWire } from './adb-wire.mjs';
 import { createAsyncAdb } from './async-adb.mjs';
 import { GATE, LEASE_ID, MAX_POOL, PROFILES, emulatorStatus, exportsOf as emulatorExports, hostPool, isEmulatorLease, isEmulatorLock, provision, readRecord, reap, releaseEmulator as releaseEmulatorLease, teardownNow } from './emulator.mjs';
-import { REACHABILITY, phoneReachability, present, readIpad, stamp } from '../registry/reachability.mjs';
+import { REACHABILITY, discover as discoverDevices, phoneReachability, present, queryAdb, readIpad, stamp } from '../registry/reachability.mjs';
 import { deployTargetIds, seed } from '../registry/seed.mjs';
 import { inventory as realInventory } from './inventory.mjs';
 
@@ -459,52 +459,19 @@ export function extend(id, { forMs }, ctx) {
 
 // ---- status ----
 
-const NO_SERVER = 'no adb server';
-const NO_ANSWER = 'adb did not answer';
-const PROBE_MS = 5000;
-const SERIAL_READ_MS = 1500;
-
-// Which phones are on the hub's adb server, read over the wire and never through the adb client: `host:version`, then
-// `host:devices-l`, plus one `host:transport:<id>` + `shell:getprop ro.serialno` for each `host:port` id in `device` state, which is
-// how a bare endpoint (what a manual `adb connect` leaves) is tied back to its phone. An id that cannot be read (unauthorized,
-// offline) is not matched, so that phone reads absent. Returns each fleet phone's observation: the state adb lists it in, null
-// when the server does not list it, or a note saying why nobody could look. Only asked when the inventory shows the hub's server
-// already running, so status can never start one (and a Mac, with no /proc, asks nothing). The whole probe is bounded: it is
-// settled within 5s and its abort closes every socket at once, so status never lingers on a wedged server.
-async function readWire(wire, fleet, { sleep, signal }) {
-  await wire.version();
-  const listed = await wire.devicesLong();
-  const serials = new Map();
-  // Each serial read is bounded on its own: one wedged `host:port` phone is unmatched, and never costs the rest their listed states.
-  await Promise.all(listed.filter(entry => entry.state === 'device' && /^[^:\s]+:\d+$/.test(entry.id)).map(async entry => {
-    const read = Promise.resolve().then(() => wire.shell(entry.id, 'getprop ro.serialno')).then(text => String(text).trim(), () => null);
-    const serial = await Promise.race([read, sleep(SERIAL_READ_MS, signal).then(() => null)]);
-    if (serial) serials.set(entry.id, serial);
-  }));
+// Which fleet phones the hub's adb server lists, from the one read-only query (`reachability.queryAdb`: the wire only, never the adb
+// client). Returns each fleet phone's observation: the state adb lists it in, null when the server does not list it, or a note saying
+// why nobody could look. Only asked when the inventory shows the hub's server already running, so status can never start one (and a
+// Mac, with no /proc, asks nothing). An id that cannot be read (unauthorized, offline) is not matched, so that phone reads absent.
+async function phoneObservations(fleet, ctx, found) {
+  const { env, adbWire, timing } = ctx;
+  const hubPort = Number(env.HUB_ADB_SERVER_PORT) || 5037;
+  const { note, listed, serials } = await queryAdb({ port: hubPort, running: found.adb_servers.some(server => server.port === hubPort), wire: adbWire ?? createAdbWire, sleep: timing.sleep });
+  if (note !== null) return new Map(fleet.map(phone => [phone.device, note]));
   return new Map(fleet.map(phone => {
     const entry = listed.find(device => idMatchesSerial(device.id, phone.serial) || (Boolean(serials.get(device.id)) && serials.get(device.id) === phone.serial));
     return [phone.device, entry ? entry.state : null];
   }));
-}
-
-async function phoneObservations(fleet, ctx, found) {
-  const { env, adbWire, timing } = ctx;
-  const hubPort = Number(env.HUB_ADB_SERVER_PORT) || 5037;
-  if (!found.adb_servers.some(server => server.port === hubPort)) return new Map(fleet.map(phone => [phone.device, NO_SERVER]));
-  const unanswered = () => new Map(fleet.map(phone => [phone.device, NO_ANSWER]));
-  const stopQuery = new AbortController();   // closes the wire's sockets the moment the probe is done with them
-  const giveUp = new AbortController();      // clears the race's timer once it settles
-  try {
-    const asked = readWire((adbWire ?? createAdbWire)(hubPort, { signal: stopQuery.signal }), fleet, { sleep: timing.sleep, signal: giveUp.signal });
-    asked.catch(() => {});   // the race below may stop waiting first
-    // A query that fails (a wedged or foreign server) is an answer, not a failure: status never fails on it.
-    return await Promise.race([asked.then(observed => observed, () => null), timing.sleep(PROBE_MS, giveUp.signal).then(() => null)]) ?? unanswered();
-  } catch {
-    return unanswered();
-  } finally {
-    giveUp.abort();
-    stopQuery.abort();
-  }
 }
 
 // What `presence` has always said for an observation: adb's own word for a state, `reachable` for `device`, `absent` for none.
@@ -661,4 +628,26 @@ export async function statusView(key, options, ctx) {
     for (const [rows] of rowsOf) for (const row of rows) if (row.resource !== null && qa.has(row.resource)) redact(row);
   }
   return { phones, locks, waiters, reservations, inventory: found, emulators };
+}
+
+// ---- discover (FR-4) ----
+
+// The devices this host can see that no seeded Resource names, from the read-only queries only: the hub's adb server over the wire on
+// the Linux host (never started, connected or asked through the adb client; no server answers `no adb server`), `devicectl list
+// devices` on the Mac. The host key picks the transport (AD-47): a host that does not know its key throws HUB_HOST_UNKNOWN, because
+// guessing from the platform would list the Mac's adb devices, which are not the hub's. The seed is devices.json's alone: the QA file
+// is never read. Returns `reachability.discover`'s document. Writes nothing.
+export async function discover(key, ctx) {
+  if (key !== 'linux' && key !== 'mac') throw failure('HUB_HOST_UNKNOWN', `this host does not know which host it is${key ? ` ("${key}" is neither linux nor mac)` : ''}, so it cannot choose how to discover devices; run \`mise run hosts:install\` on it`);
+  const { env, timing } = ctx;
+  const registry = seed(loadDevices(env), { qaDevices: () => [] });
+  if (key === 'mac') {
+    let ipads;
+    try { ipads = { document: await (ctx.devicectl ?? createDevicectl({ env }))(['list', 'devices'], 10) }; } catch (error) { ipads = { error }; }
+    return discoverDevices({ seed: registry, host: 'mac', ipads });
+  }
+  const hubPort = Number(env.HUB_ADB_SERVER_PORT) || 5037;
+  const found = (ctx.inventory ?? realInventory)({ lockRoot: lockDir(env), hubAdbPort: hubPort });
+  const adb = await queryAdb({ port: hubPort, running: found.adb_servers.some(server => server.port === hubPort), wire: ctx.adbWire ?? createAdbWire, sleep: timing.sleep });
+  return discoverDevices({ seed: registry, host: 'linux', adb });
 }

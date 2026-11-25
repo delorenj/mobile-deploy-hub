@@ -40,7 +40,7 @@ What it is: one shared deploy pipeline (a reusable GitHub workflow, a composite 
 
 ## Shared phones and emulators
 
-- **`hub-device`:** FIFO leases on the shared S26 and S24 (`lease`, `release`, `run`, `status`), plus a throwaway emulator pool with identity-checked teardown. A waiting `lease` prints the wait line (`HUB_LOCK_WAIT ... position=<n> eta=<lo>-<hi>`) on stderr; `status` shows every waiter (Lease, deploy job, catch-up) with its position and live ETA, and a RESERVATIONS section for the runs holding a place; `release job:...` is refused with the run to cancel.
+- **`hub-device`:** FIFO leases on the shared S26 and S24 (`lease`, `release`, `run`, `status`), plus a throwaway emulator pool with identity-checked teardown. A waiting `lease` prints the wait line (`HUB_LOCK_WAIT ... position=<n> eta=<lo>-<hi>`) on stderr; `status` shows every waiter (Lease, deploy job, catch-up) with its position and live ETA, and a RESERVATIONS section for the runs holding a place; `release job:...` is refused with the run to cancel. `discover [--json]` lists the devices the host can see that no Resource names (the hub's adb server over its read-only wire on Linux, never started or connected; `devicectl` on the Mac).
 
 ## Implemented but not activated by the current policy (hub `main`)
 
