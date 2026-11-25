@@ -320,3 +320,18 @@ test('the route is POST only: GET and DELETE on the path are 405 with Allow: POS
     }
   } finally { s.cleanup(); }
 });
+
+test('the refusal order with several faults: body, then name shape, then stale rev, then taken, then duplicate identity', async () => {
+  const s = scratch();
+  try {
+    await s.seedFile();
+    await s.post(PIXEL);
+    const before = s.bytes();
+    const dup = { serial: S24_SERIAL, model: 'x' };
+    assert.deepEqual(problemOf(await s.post({ ...PIXEL, name: 'Bad Name', host: 'nowhere' })), [400, 'HUB_USAGE', 2, 'bad-host']);
+    const stale = await s.post({ ...PIXEL, identity: dup, if_rev: 0 });
+    assert.deepEqual([stale.status, stale.body.code], [409, 'HUB_REGISTRY_CONFLICT']);
+    assert.deepEqual(problemOf(await s.post({ ...PIXEL, identity: dup })), [409, 'HUB_REGISTRY_NAME', 2, 'taken']);
+    assert.equal(s.bytes(), before);
+  } finally { s.cleanup(); }
+});

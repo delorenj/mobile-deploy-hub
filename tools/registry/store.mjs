@@ -253,8 +253,8 @@ export async function updateRegistry({ env = process.env, if_rev, change, reason
 // results and errors, and a bad shape is a TypeError before anything is read.
 export async function writeRegistry({ env = process.env, if_rev, resources, pools, ...rest } = {}) {
   if (!wholeNumber(if_rev)) throw new TypeError('if_rev must be a whole number (0 when there is no file yet)');
-  normalise(resources, pools);
-  return updateRegistry({ ...rest, env, if_rev, change: () => ({ resources, pools }) });
+  const { next, nextPools } = normalise(resources, pools);
+  return updateRegistry({ ...rest, env, if_rev, change: () => ({ resources: next, pools: nextPools }) });
 }
 
 // ---- seed ----

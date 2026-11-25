@@ -67,15 +67,13 @@ function checkWho(body) {
 
 // Checks a register body into the normalised input `{kind, name, host, identity, capabilities, if_rev, actor, why}` (`if_rev` and `why`
 // undefined when absent; `identity` null for an `ios-lane` with none), or throws a coded error: HUB_USAGE 400 with the reason
-// (bad-body, bad-kind, bad-host, bad-identity, no-model, bad-capabilities, bad-if-rev, bad-why, bad-actor, no-holder), or
-// HUB_REGISTRY_NAME 400 (`not-slug`, `too-long`). `hosts` is claims.mjs's HOST_PLATFORMS (host key to platform): an `ios-lane`
+// (bad-body, bad-kind, bad-host, bad-identity, no-model, bad-capabilities, bad-if-rev, bad-why, bad-actor, no-holder; all checked
+// before the name), or HUB_REGISTRY_NAME 400 (`not-slug`, `too-long`). `hosts` is claims.mjs's HOST_PLATFORMS (host key to platform): an `ios-lane`
 // must be on a `darwin` one. Stateless: the checks that need the Registry are `planRegister`'s.
 export function checkRegisterBody(body, { hosts } = {}) {
   if (!isObject(body)) throw usage('bad-body', 'the body must be a JSON object');
   for (const key of Object.keys(body)) if (!BODY_KEYS.includes(key)) throw usage('bad-body', `the body has no key "${key}" (${BODY_KEYS.join(', ')})`);
   if (!REGISTER_KINDS.includes(body.kind)) throw usage('bad-kind', `kind must be one of ${REGISTER_KINDS.join(', ')}`);
-  if (!isSlug(body.name)) throw nameError(400, 'not-slug', 'name must be a slug: lowercase letters and digits, single dashes between');
-  if (body.name.length > NAME_MAX) throw nameError(400, 'too-long', `name is longer than ${NAME_MAX} characters`);
   if (typeof body.host !== 'string' || !isObject(hosts) || !Object.hasOwn(hosts, body.host)) throw usage('bad-host', `host must be one of ${Object.keys(hosts ?? {}).join(', ')}`);
   if (body.kind === 'ios-lane' && hosts[body.host] !== 'darwin') throw usage('bad-host', `an ios-lane lives on a mac host, not "${body.host}"`);
   const identity = checkIdentity(body.identity, body.kind);
@@ -83,6 +81,8 @@ export function checkRegisterBody(body, { hosts } = {}) {
   if (body.if_rev !== undefined && !(Number.isSafeInteger(body.if_rev) && body.if_rev >= 0)) throw usage('bad-if-rev', 'if_rev must be a whole number');
   if (body.why !== undefined && typeof body.why !== 'string') throw usage('bad-why', 'why must be a string');
   const actor = checkWho(body);
+  if (!isSlug(body.name)) throw nameError(400, 'not-slug', 'name must be a slug: lowercase letters and digits, single dashes between');
+  if (body.name.length > NAME_MAX) throw nameError(400, 'too-long', `name is longer than ${NAME_MAX} characters`);
   return { kind: body.kind, name: body.name, host: body.host, identity, capabilities, if_rev: body.if_rev, actor, why: body.why };
 }
 
