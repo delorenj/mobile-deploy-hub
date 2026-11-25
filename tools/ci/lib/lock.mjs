@@ -184,6 +184,95 @@ function note(name, body, { env, at, hostId }) {
   return isQueued(name) ? appendEvent(body, { env, now: () => at, hostId }) : false;
 }
 
+// Who did it (AD-36): {holder, via}, set once by the first front door. Optional on every event the functions below write.
+export const ACTOR_VIA = Object.freeze(['cli', 'api', 'host-agent', 'control-surface']);
+
+// The actor as it is written, or null for none. A malformed actor is a caller bug: TypeError.
+export function checkActor(actor) {
+  if (actor === undefined || actor === null) return null;
+  const plain = typeof actor === 'object' && !Array.isArray(actor) && Object.getPrototypeOf(actor) === Object.prototype;
+  if (!plain || Object.keys(actor).sort().join(',') !== 'holder,via' || typeof actor.holder !== 'string' || actor.holder === '' || !ACTOR_VIA.includes(actor.via)) {
+    throw new TypeError(`bad actor ${JSON.stringify(actor)} ({holder: non-empty string, via: ${ACTOR_VIA.join('|')}})`);
+  }
+  return { holder: actor.holder, via: actor.via };
+}
+
+// The ones every non-hold event may carry: actor (checked) and why (a string).
+function actorFields(fields) {
+  const out = {};
+  const actor = checkActor(fields.actor);
+  if (actor) out.actor = actor;
+  if (fields.why !== undefined && fields.why !== null) {
+    if (typeof fields.why !== 'string') throw new TypeError('why must be a string');
+    out.why = fields.why;
+  }
+  return out;
+}
+
+const nonEmpty = (value, key) => { if (typeof value !== 'string' || value === '') throw new TypeError(`${key} must be a non-empty string`); return value; };
+
+export const REGISTRY_EVENTS = Object.freeze(['add', 'edit', 'retire']);
+
+// Appends one `registry-add|edit|retire` event (AD-39). The body is an allowlist: resource, lock, changed (the key paths that
+// changed, strings only), rev, reason, actor, why. Anything else passed in (an identity, a serial, a udid, an adb id, allowed_users)
+// is dropped, never written. No Queued gate (a Resource's name is not a lock's hold). A caller bug (bad kind, missing resource or
+// lock, a bad changed, rev or actor) is a TypeError; a failed write is false, logged HUB_EVENT_LOG_FAILED, never thrown.
+export function noteRegistry(kind, fields, { env = process.env, now = Date.now, hostId = machineId(), log = console.error } = {}) {
+  if (!REGISTRY_EVENTS.includes(kind)) throw new TypeError(`bad registry event kind "${kind}" (${REGISTRY_EVENTS.join(', ')})`);
+  if (!fields || typeof fields !== 'object') throw new TypeError('registry event fields are an object');
+  const body = { event: `registry-${kind}`, resource: nonEmpty(fields.resource, 'resource'), lock: nonEmpty(fields.lock, 'lock') };
+  if (fields.changed !== undefined && fields.changed !== null) {
+    if (!Array.isArray(fields.changed) || fields.changed.some(key => typeof key !== 'string')) throw new TypeError('changed is an array of key strings');
+    body.changed = [...fields.changed];
+  }
+  if (fields.rev !== undefined && fields.rev !== null) {
+    if (!Number.isSafeInteger(fields.rev) || fields.rev < 0) throw new TypeError('rev must be a whole number');
+    body.rev = fields.rev;
+  }
+  if (fields.reason !== undefined && fields.reason !== null) {
+    if (typeof fields.reason !== 'string') throw new TypeError('reason must be a string');
+    body.reason = fields.reason;
+  }
+  return appendEvent({ ...body, ...actorFields(fields) }, { env, now, hostId, log });
+}
+
+// A Reachability state is a short lowercase word, or null for a first reading. Not checked against the Registry's enum: this module
+// never imports tools/registry (it is imported by it).
+const STATE_WORD = /^[a-z][a-z-]{0,23}$/;
+const HOST_KEY = /^[a-z0-9][a-z0-9._-]{0,62}$/;
+const stateOf = (value, key, nullable) => {
+  if (value === null || value === undefined) { if (nullable) return null; throw new TypeError(`${key} must be a state word`); }
+  if (typeof value !== 'string' || !STATE_WORD.test(value)) throw new TypeError(`${key} must be a short lowercase word${nullable ? ' or null' : ''}`);
+  return value;
+};
+
+// Appends one `reachability` (a Resource: `resource`) or `host-reachability` (a peer host: `host`) event (AD-39). Exactly one of
+// host and resource: both or neither is a TypeError. `from` is the state before (null for a first reading), `to` the state now,
+// `checked_at` when the reading was taken (a date, ISO text or ms; null when unknown), `reason` why it changed. On a
+// host-reachability line `host` is the peer the event is about (the one place the envelope's host is not the writer; the writer
+// is `host_id`) and `resource` is null. No Queued gate. A failed write is false and logged, never thrown.
+export function noteReachability(fields, { env = process.env, now = Date.now, hostId = machineId(), log = console.error } = {}) {
+  if (!fields || typeof fields !== 'object') throw new TypeError('reachability fields are an object');
+  const hasHost = fields.host !== undefined && fields.host !== null;
+  const hasResource = fields.resource !== undefined && fields.resource !== null;
+  if (hasHost === hasResource) throw new TypeError('a reachability event names exactly one of host and resource');
+  const peer = hasHost ? nonEmpty(fields.host, 'host') : null;
+  if (peer !== null && !HOST_KEY.test(peer)) throw new TypeError(`bad host key "${peer}"`);
+  const checked = fields.checked_at === undefined || fields.checked_at === null ? null : iso(fields.checked_at instanceof Date ? fields.checked_at.getTime() : typeof fields.checked_at === 'number' ? fields.checked_at : Date.parse(fields.checked_at));
+  if (checked === null && fields.checked_at !== undefined && fields.checked_at !== null) throw new TypeError('checked_at must be a date');
+  if (fields.reason !== undefined && fields.reason !== null && typeof fields.reason !== 'string') throw new TypeError('reason must be a string');
+  const body = {
+    event: hasHost ? 'host-reachability' : 'reachability',
+    resource: hasHost ? null : nonEmpty(fields.resource, 'resource'),
+    from: stateOf(fields.from, 'from', true), to: stateOf(fields.to, 'to', false),
+    checked_at: checked, reason: fields.reason ?? null,
+    ...actorFields(fields),
+  };
+  return appendEvent(body, { env, now, hostId, log, ...(hasHost ? { host: peer } : {}) });
+}
+
+export const PRUNE_EVENTS_MAX = 20;
+
 let lastTomb = 0;
 const VANISHED_RETRIES = 3;
 
@@ -552,33 +641,72 @@ export function ticketStaleness(ticket, { now = Date.now, host = hostname(), hos
   return Number.isFinite(since) && now() - since < TICKET_ABSENT_MS ? null : 'abandoned';
 }
 
-// The waiters for a lock, oldest first. Observers only report stale tickets; acquire prunes them.
+// The waiters for a lock, oldest first. Observers only report stale tickets; acquire prunes them. A prune is unlink-decided (AD-9):
+// the unlink that succeeds is the one removal, and only its winner writes a `prune` event (ENOENT: another pruner got there first,
+// no event). A call writes at most PRUNE_EVENTS_MAX events however many tickets it removes: the first PRUNE_EVENTS_MAX - 1 each
+// (`count` 1) and one more for the rest (`reason: folded`, the sum in `count`), so a reader adds `count`. The removals never wait on
+// the log: a failed write is logged and the removal stands.
 export function listWaiters(name, { env = process.env, prune = false, now = Date.now, host, hostId, processStart: startOf, isAlive } = {}) {
   const dir = queuePath(name, env);
   let files = [];
   try { files = readdirSync(dir).filter(file => file.endsWith('.json')).sort(); } catch { return []; }
   const seams = { now, ...(host === undefined ? {} : { host }), ...(hostId === undefined ? {} : { hostId }), ...(startOf ? { processStart: startOf } : {}), ...(isAlive ? { isAlive } : {}) };
   const waiters = [];
-  for (const file of files) {
-    let ticket = null;
-    try { ticket = JSON.parse(readFileSync(join(dir, file), 'utf8')); } catch { /* being written, or junk */ }
-    if (ticket && typeof ticket === 'object' && !Array.isArray(ticket)) {
-      let mtimeMs = null;
-      if (!Number.isFinite(Date.parse(ticket.enqueued_at))) { try { mtimeMs = statSync(join(dir, file)).mtimeMs; } catch { continue; } }
-      const why = ticketStaleness(ticket, { ...seams, mtimeMs });
-      if (why) {
-        if (prune) rmSync(join(dir, file), { force: true });
-        else waiters.push({ ...ticket, file, stale: true });
+  const pruned = [];
+  // Unlinks one ticket; true for the process whose unlink removed it.
+  const remove = (file, ticket, why, at) => {
+    try { unlinkSync(join(dir, file)); } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+    pruned.push({ ticket, why, at });
+    return true;
+  };
+  try {
+    for (const file of files) {
+      let ticket = null;
+      try { ticket = JSON.parse(readFileSync(join(dir, file), 'utf8')); } catch { /* being written, or junk */ }
+      if (ticket && typeof ticket === 'object' && !Array.isArray(ticket)) {
+        let mtimeMs = null;
+        if (!Number.isFinite(Date.parse(ticket.enqueued_at))) { try { mtimeMs = statSync(join(dir, file)).mtimeMs; } catch { continue; } }
+        const why = ticketStaleness(ticket, { ...seams, mtimeMs });
+        if (why) {
+          if (prune) remove(file, ticket, why, now());
+          else waiters.push({ ...ticket, file, stale: true });
+          continue;
+        }
+        waiters.push({ ...ticket, file, stale: false });
         continue;
       }
-      waiters.push({ ...ticket, file, stale: false });
-      continue;
+      let age = 0;
+      try { age = now() - statSync(join(dir, file)).mtimeMs; } catch { continue; }
+      if (prune && age > 60_000) remove(file, null, 'unreadable', now());
     }
-    let age = 0;
-    try { age = now() - statSync(join(dir, file)).mtimeMs; } catch { continue; }
-    if (prune && age > 60_000) rmSync(join(dir, file), { force: true });
+  } finally {
+    if (pruned.length > 0) notePruned(name, pruned, { env, hostId });
   }
   return waiters;
+}
+
+// The `prune` events for the tickets one call removed (see listWaiters). A ticket's claimant is the one its `request` named (the
+// subject releaseLease cancels as); an unreadable one has none.
+function notePruned(name, pruned, { env, hostId }) {
+  const individual = pruned.length > PRUNE_EVENTS_MAX ? PRUNE_EVENTS_MAX - 1 : pruned.length;
+  for (const { ticket, why, at } of pruned.slice(0, individual)) {
+    let subject = null;
+    let waited = null;
+    if (ticket) {
+      const enqueued = Date.parse(ticket.enqueued_at);
+      waited = Number.isFinite(enqueued) ? Math.max(0, at - enqueued) : null;
+      const kind = ticketKind(ticket);
+      subject = kind === 'job' || kind === 'hub-job'
+        ? { kind, repo: ticket.repo ?? null, run: ticket.run ?? null, attempt: ticket.attempt ?? null, job: ticket.job ?? null }
+        : { kind: 'lease', lease_id: ticket.lease_id ?? null, holder: ticket.holder ?? null };
+    }
+    const pool = typeof ticket?.pool === 'string' && typeof ticket?.request === 'string' ? { pool: ticket.pool, request: ticket.request } : {};
+    note(name, eventOf('prune', name, subject, { count: 1, reason: why, waited_ms: waited, ...pool }), { env, at, hostId });
+  }
+  if (individual < pruned.length) {
+    const at = pruned[pruned.length - 1].at;
+    note(name, eventOf('prune', name, null, { count: pruned.length - individual, reason: 'folded' }), { env, at, hostId });
+  }
 }
 
 // ---- Reservations (AD-7) ----
@@ -730,7 +858,13 @@ export function reserve(name, { env = process.env, now = Date.now, policy = null
       // set a record that never became readable aside.
       let age = 0;
       try { age = now() - statSync(join(dir, 'reservation.json')).mtimeMs; } catch { /* gone: round again */ }
-      if (age > RESERVATION_ABSENT_MS) retireReservation(name, { key, record: null }, { env, now, hostId }); else wait(25);
+      if (age > RESERVATION_ABSENT_MS) {
+        // Only the process whose rename won writes the one `prune`: an unreadable record has no claimant to name.
+        if (retireReservation(name, { key, record: null }, { env, now, hostId })) {
+          const pruned = now();
+          note(name, eventOf('prune', name, null, { hold_kind: 'reservation', run_key: key, count: 1, reason: 'unreadable' }), { env, at: pruned, hostId });
+        }
+      } else wait(25);
       continue;
     }
     const found = readReservation(dir, key);
