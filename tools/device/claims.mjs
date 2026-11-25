@@ -22,7 +22,7 @@ import { findPhone, idMatchesSerial } from '../ci/lib/adb.mjs';
 import { createDevicectl } from '../ci/lib/devicectl.mjs';
 import { earliest } from '../ci/lib/eta.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
-import { MAX_LEASE_MS, RESERVABLE, SEED_RESOURCES, acquireLease, acquirePool, capText, deployTargetCapMs, etaHistory, extendLease, isLease, listLocks, lockDir, newLeaseId as newLockLeaseId, queueView, readOwner, releaseLease, releaseReservation, resourceOf, updateLease, waiterEtas } from '../ci/lib/lock.mjs';
+import { CLAIMANT_KINDS, MAX_LEASE_MS, RESERVABLE, SEED_RESOURCES, acquireLease, acquirePool, capText, checkActor, deployTargetCapMs, etaHistory, extendLease, isLease, listLocks, lockDir, newLeaseId as newLockLeaseId, queueView, readOwner, releaseLease, releaseReservation, resourceOf, updateLease, waiterEtas } from '../ci/lib/lock.mjs';
 import { sleep as realSleep } from '../ci/lib/pause.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { createAdbWire } from './adb-wire.mjs';
@@ -79,6 +79,26 @@ export const EXIT_CODES = Object.freeze({
   HUB_API_UNKNOWN: 1,
 });
 export const exitCodeOf = error => (Object.hasOwn(EXIT_CODES, error?.code) ? EXIT_CODES[error.code] : EXIT_FAILURE);
+
+// The HTTP answer of a library error (Story 7.1): the status a service gives an error that carries none, and the `reason` it is
+// answered with (data, so the Hub API and the Host Agent cannot answer one error two ways). A code not in the table has no answer
+// here (`httpAnswerOf` is null): it is a bug of the service. An error that carries its own `status` keeps it.
+export const HTTP_ANSWERS = Object.freeze({
+  HUB_USAGE: Object.freeze({ status: 400 }),
+  HUB_EMULATOR_USAGE: Object.freeze({ status: 400 }),
+  HUB_LEASE_TOO_LONG: Object.freeze({ status: 400 }),
+  HUB_DEVICE_JOB_ID: Object.freeze({ status: 400 }),
+  HUB_NO_MATCH: Object.freeze({ status: 404, reason: 'no-match' }),
+  HUB_LOCK_TIMEOUT: Object.freeze({ status: 409, reason: 'busy' }),
+  HUB_DEVICE_BUSY: Object.freeze({ status: 409, reason: 'busy' }),
+  HUB_POOL_CROSS_HOST: Object.freeze({ status: 409 }),
+  HUB_RESOURCE_RETIRED: Object.freeze({ status: 409 }),
+  HUB_LEASE_CANCELLED: Object.freeze({ status: 409 }),
+  HUB_PHONE_AWAY: Object.freeze({ status: 503, reason: 'away' }),
+  HUB_DEVICE_AWAY: Object.freeze({ status: 503, reason: 'away' }),
+  HUB_HOST_UNKNOWN: Object.freeze({ status: 503, reason: 'host-unknown' }),
+});
+export const httpAnswerOf = error => (Object.hasOwn(HTTP_ANSWERS, error?.code) ? HTTP_ANSWERS[error.code] : null);
 
 const usage = message => Object.assign(new Error(message), { code: 'HUB_USAGE' });
 const failure = (code, message) => Object.assign(new Error(message), { code });
@@ -348,13 +368,14 @@ export const usableFleet = (fleet, forMs, policy = null) => fleet.filter(phone =
 
 // --for must be more than 0 and at most 48 h; a deploy phone's cap is a usage error that names the cap. `phone` (whichever is free)
 // skips the deploy phone when --for is over the cap, and is refused when that leaves none. Returns the resolved target with
-// the Pool narrowed to the phones that can take it.
-export function checkBounds(resolved, { forMs, forText = forMs, fleet = resolved.members ?? [], policy = null }) {
-  if (!Number.isFinite(forMs) || forMs <= 0 || forMs > MAX_LEASE_MS) throw usage(`--for must be more than 0 and at most ${MAX_LEASE_MS / 3_600_000}h`);
-  if (resolved.kind === 'phone' && overCap(resolved.entry, forMs, policy)) throw usage(`--for ${forText}: ${capText(resolved.entry.lock, deployTargetCapMs(resolved.entry.lock, { policy }))}`);
+// the Pool narrowed to the phones that can take it. `flag` is what the caller calls the duration in its messages (`--for`, or
+// `for_ms` in a request body).
+export function checkBounds(resolved, { forMs, forText = forMs, fleet = resolved.members ?? [], policy = null, flag = '--for' }) {
+  if (!Number.isFinite(forMs) || forMs <= 0 || forMs > MAX_LEASE_MS) throw usage(`${flag} must be more than 0 and at most ${MAX_LEASE_MS / 3_600_000}h`);
+  if (resolved.kind === 'phone' && overCap(resolved.entry, forMs, policy)) throw usage(`${flag} ${forText}: ${capText(resolved.entry.lock, deployTargetCapMs(resolved.entry.lock, { policy }))}`);
   if (resolved.kind !== 'pool') return resolved;
   const members = usableFleet(fleet, forMs, policy);
-  if (members.length === 0) throw usage(`--for ${forText}: no phone can take it; ${capText('adb', deployTargetCapMs('adb', { policy }))}`);
+  if (members.length === 0) throw usage(`${flag} ${forText}: no phone can take it; ${capText('adb', deployTargetCapMs('adb', { policy }))}`);
   return { ...resolved, members };
 }
 
@@ -470,6 +491,7 @@ async function takeAnyPhone(members, options, ctx, poolName = PHONE) {
   const deadline = timing.now() + options.waitMs;
   const taken = await acquirePool(poolName, fleet.map(phone => phone.lock), {
     holder: options.holder, why: options.why, forMs: options.forMs, waitMs: options.waitMs, id: options.id ?? null, holderPid: options.holderPid ?? null,
+    claimantKind: options.claimantKind, actor: options.actor,
     env, log: ctx.log, pollMs: timing.leasePollMs, sleep: timing.sleep, now: timing.now, signal: options.signal, policy: ctx.policy,
     accept: async (lock, record) => {
       const phone = fleet.find(entry => entry.lock === lock);
@@ -503,14 +525,22 @@ async function takeEmulator(options, ctx) {
 // The members of a `--match` Pool that are not definitively away, read over the same read-only wire query status uses (nothing is
 // started or connected). A member reading absent, offline or unauthorized is dropped; every one dropped is HUB_DEVICE_AWAY (75) naming
 // each, before any event is written. `unknown` (no adb server, a wedged one, no host key, a host that is not `linux`) drops nothing, so
-// the ordered try decides as it always has. `--no-connect` skips it: that lease is the lock only, phone away or not.
-async function reachableMembers(members, ctx) {
-  let key = null;
-  try { key = (ctx.hostKey ?? hostKey)({ env: ctx.env }); } catch (error) { if (error?.code !== 'HUB_HOST_UNKNOWN') throw error; }
-  if (key !== 'linux') return members;
-  const found = (ctx.inventory ?? realInventory)({ lockRoot: lockDir(ctx.env), hubAdbPort: Number(ctx.env.HUB_ADB_SERVER_PORT) || 5037 });
-  const observed = await phoneObservations(members, ctx, found);
-  const states = new Map(members.map(phone => [phone.device, phoneReachability(observed.get(phone.device) ?? null)]));
+// the ordered try decides as it always has. `--no-connect` skips it: that lease is the lock only, phone away or not. A service
+// (Story 7.1) has no adb on its request path (AD-44): it passes `statesOf(members)`, its own cache's states (a Map of device to state,
+// a missing one `unknown`), and the same filter runs over them with nothing read.
+async function reachableMembers(members, ctx, statesOf = null) {
+  let states;
+  if (statesOf) {
+    const known = await statesOf(members);
+    states = new Map(members.map(phone => [phone.device, known?.get?.(phone.device) ?? REACHABILITY.unknown]));
+  } else {
+    let key = null;
+    try { key = (ctx.hostKey ?? hostKey)({ env: ctx.env }); } catch (error) { if (error?.code !== 'HUB_HOST_UNKNOWN') throw error; }
+    if (key !== 'linux') return members;
+    const found = (ctx.inventory ?? realInventory)({ lockRoot: lockDir(ctx.env), hubAdbPort: Number(ctx.env.HUB_ADB_SERVER_PORT) || 5037 });
+    const observed = await phoneObservations(members, ctx, found);
+    states = new Map(members.map(phone => [phone.device, phoneReachability(observed.get(phone.device) ?? null)]));
+  }
   const gone = new Set([REACHABILITY.absent, REACHABILITY.offline, REACHABILITY.unauthorized]);
   const left = members.filter(phone => !gone.has(states.get(phone.device)));
   if (left.length > 0) return left;
@@ -522,18 +552,21 @@ async function reachableMembers(members, ctx) {
 // A library caller gets the refusals the CLI makes, in the CLI's order: an unknown target, an id that is already taken,
 // --for's bounds (the Pool is narrowed to the phones whose cap allows it), --why, --wait, --pid, and an emulator's profile and
 // pool. The CLI checks the same rules earlier, for its message order.
-// options: holder, why, forMs, waitMs, id, holderPid, noConnect, phoneWaitMs, signal (and profile, pool for an emulator).
+// options: holder, why, forMs, waitMs, id, holderPid, noConnect, phoneWaitMs, signal (and profile, pool for an emulator), claimantKind
+// (`agent`, or `person`), actor ({holder, via}, recorded on the take's events) and readingsOf (a `--match` Pool's away filter over a
+// service's cached states, run even for a noConnect take; see reachableMembers) and flag (what the duration is called in a bounds
+// message: `--for` by default).
 export async function take(resolved, options, ctx) {
   if (!resolved || typeof resolved !== 'object') throw usage('take needs a resolved target (resolve a device word first)');
   checkLeaseId(options.id, { fleet: ctx.fleet, env: ctx.env });
-  const bounded = checkBounds(resolved, { forMs: options.forMs, fleet: resolved.members, policy: ctx.policy });
+  const bounded = checkBounds(resolved, { forMs: options.forMs, fleet: resolved.members, policy: ctx.policy, ...(options.flag ? { flag: options.flag } : {}) });
   if (!options.why) throw usage('--why <text> is required');
   if (!Number.isFinite(options.waitMs) || options.waitMs < 0) throw usage('--wait must be a duration of 0 or more');
   checkPid(options.holderPid);
   const target = withoutRetired(bounded, ctx.env);
   switch (target.kind) {
     case 'phone': return takePhone(target.entry, options, ctx);
-    case 'pool': return takeAnyPhone(target.by === 'match' && !options.noConnect ? await reachableMembers(target.members, ctx) : target.members, options, ctx, target.pool ?? PHONE);
+    case 'pool': return takeAnyPhone(target.by === 'match' && (!options.noConnect || options.readingsOf) ? await reachableMembers(target.members, ctx, options.readingsOf ?? null) : target.members, options, ctx, target.pool ?? PHONE);
     case EMULATOR: return takeEmulator({ ...options, ...emulatorBounds(options, ctx.env) }, ctx);
     default: throw usage(`cannot take a ${target.kind}`);
   }
@@ -550,6 +583,73 @@ export function leaseExports(taken, envSerial = []) {
     for (const name of envSerial) vars[name] = device.adb_id;
   }
   return vars;
+}
+
+// ---- take a Lease through a service (Story 7.1) ----
+
+// The environment a service takes a Lease with: no `GITHUB_*` key. A Lease records the identity of the run that takes it (repo, run,
+// attempt, job) from its environment, and a service belongs to no run; whatever deploy identity leaked into its environment is dropped.
+export const withoutDeployIdentity = env => Object.fromEntries(Object.entries(env ?? {}).filter(([key]) => !key.startsWith('GITHUB_')));
+
+const LEASE_BODY_KEYS = Object.freeze(['resource', 'match', 'for_ms', 'holder', 'why', 'claimant_kind', 'id', 'actor']);
+const bodyUsage = (reason, message) => Object.assign(usage(message), { reason });
+const isText = value => typeof value === 'string' && value.trim() !== '';
+
+// Checks the body of a service's take into `{resource, match, forMs, holder, why, claimantKind, id, actor}` (`resource`, `match`, `id`
+// and `actor` null when absent; `actor` as `checkActor` writes it, the caller defaults it). HUB_USAGE with a `reason`, checked in this
+// order and before anything is read: bad-body (not an object, or a key outside the list), bad-target (exactly one of `resource` and
+// `match`, a non-empty string), bad-for (`for_ms` a whole number of ms, more than 0), bad-claimant-kind, bad-id (a lease id: lowercase
+// letters, digits and dashes), bad-actor, no-holder, bad-why. The caps (48 h, and 60 min on a deploy target) are `take`'s own.
+// A wait (`wait_ms`) is not a key: it is refused as any unknown one.
+export function checkLeaseBody(body) {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) throw bodyUsage('bad-body', 'the body must be a JSON object');
+  for (const key of Object.keys(body)) if (!LEASE_BODY_KEYS.includes(key)) throw bodyUsage('bad-body', `the body has no key "${key}" (${LEASE_BODY_KEYS.join(', ')})`);
+  const hasResource = body.resource !== undefined;
+  const hasMatch = body.match !== undefined;
+  if (hasResource === hasMatch) throw bodyUsage('bad-target', 'name exactly one of resource (a device word or Resource id) and match (a Capability query)');
+  if (!isText(hasResource ? body.resource : body.match)) throw bodyUsage('bad-target', `${hasResource ? 'resource' : 'match'} must be a non-empty string`);
+  if (!Number.isSafeInteger(body.for_ms) || body.for_ms <= 0) throw bodyUsage('bad-for', 'for_ms must be a whole number of milliseconds, more than 0');
+  const claimantKind = body.claimant_kind ?? 'agent';
+  if (!CLAIMANT_KINDS.includes(claimantKind)) throw bodyUsage('bad-claimant-kind', `claimant_kind is one of ${CLAIMANT_KINDS.join(', ')}`);
+  if (body.id !== undefined && (typeof body.id !== 'string' || !LEASE_ID.test(body.id))) throw bodyUsage('bad-id', 'id must be a lease id (lowercase letters, digits and dashes, at most 64)');
+  let actor = null;
+  if (body.actor !== undefined) {
+    try { actor = checkActor(body.actor); } catch (error) { throw bodyUsage('bad-actor', error.message); }
+    if (actor === null) throw bodyUsage('bad-actor', 'actor must be {holder, via}');
+  }
+  if (!isText(body.holder)) throw bodyUsage('no-holder', 'say who holds the lease: a holder');
+  if (!isText(body.why)) throw bodyUsage('bad-why', 'why is required: say what the lease is for');
+  return { resource: hasResource ? body.resource : null, match: hasMatch ? body.match : null, forMs: body.for_ms, holder: body.holder, why: body.why, claimantKind, id: body.id ?? null, actor };
+}
+
+// A taken phone Lease as a service answers it: the Lease, the Resource and device it is on, and what the Claimant exports to use it
+// (the CLI's `lease --json` env). One view for every service route that answers with a Lease.
+export function leaseView(taken) {
+  const { lease, phone } = taken;
+  return {
+    lease_id: lease.lease_id, resource: resourceOf(phone.lock), lock: phone.lock, device: phone.device, holder: lease.holder, why: lease.why,
+    claimant_kind: lease.claimant_kind ?? 'agent', started_at: lease.started_at, expires_at: lease.expires_at, env: leaseExports(taken),
+  };
+}
+
+// The Lease a service takes (`POST /leases`, and the Host Agent's): exactly `hub-device lease <word> --no-connect`: the lock only, no
+// `findPhone`, no adb on the request path, `holderPid` null (the Lease lives until `expires_at` or its release; it is never reclaimed
+// for a dead process), no wait, and an environment with no `GITHUB_*` key. `input` is `checkLeaseBody`'s result (its actor already
+// defaulted by the caller). A `resource` is a word or a Resource id (a lease id is never a target); a `match` Pool drops the members
+// `ctx.readingsOf` (a function of the members, returning Map(device -> state)) already knows are away. An emulator is refused here.
+// Returns `leaseView`. Throws what `resolve`, `matchTarget` and `take` throw (the HTTP table gives them their status).
+export async function serviceLease(input, ctx) {
+  const env = withoutDeployIdentity(ctx.env ?? process.env);
+  const fleet = ctx.fleet ?? loadFleet(env, { warn: ctx.warn });
+  const base = createContext({ env, log: ctx.log, warn: ctx.warn, policy: ctx.policy, now: ctx.timing?.now ?? ctx.now, sleep: ctx.timing?.sleep ?? ctx.sleep, fleet, qaDevices: ctx.qaDevices, registry: ctx.registry });
+  const local = { ...ctx, env, fleet, log: base.log, warn: base.warn, timing: ctx.timing ?? base.timing, emulator: ctx.emulator ?? base.emulator };
+  const resolved = input.match !== null ? matchTarget(input.match, { forMs: input.forMs }, local) : resolve(input.resource, { fleet, env, ids: false });
+  if (resolved.kind === EMULATOR) throw usage('an emulator is not leased through this route yet; lease a phone');
+  const taken = await take(resolved, {
+    holder: input.holder, why: input.why, forMs: input.forMs, waitMs: 0, id: input.id, holderPid: null, noConnect: true,
+    claimantKind: input.claimantKind, actor: input.actor, readingsOf: ctx.readingsOf, flag: 'for_ms',
+  }, local);
+  return leaseView(taken);
 }
 
 // ---- release ----
@@ -759,7 +859,7 @@ export async function statusView(key, options, ctx) {
     return {
       lock: entry.name, device: nameOf(fleet, entry.name), kind: entry.kind, stale: entry.stale,
       lease_id: lease ? owner.lease_id : null, holder: lease ? owner.holder : null, why: lease ? owner.why : null,
-      repo: owner.repo ?? null, run: owner.run ?? null, pid: owner.pid ?? null, holder_pid: owner.holder_pid ?? null,
+      repo: owner.repo ?? null, run: owner.run ?? null, pid: lease ? null : owner.pid ?? null, holder_pid: owner.holder_pid ?? null,
       started_at: owner.started_at ?? null, expires_at: lease ? owner.expires_at : null, phone: owner.device ?? null,
       emulator: owner.emulator ?? null,
     };

@@ -17,6 +17,7 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 - In a shape's field list, `a.b` is a key of the object `a`; `a[].b` is a key of the objects in the array `a`; `a.*` is an open object whose keys this document does not list (a client reads what it knows and ignores the rest). An array of plain values is listed as the array itself.
 - The contract is additive only: a later release adds routes and fields, never removes or renames one, and never changes what a field means. A client ignores fields it does not know. `contract` in `/health` is the version, and rises only on a change that cannot be additive.
 - `exit` in an error is the exit code a CLI front door uses for the same error, so `hub-device` and a Holocene button agree.
+- An error the Claims library throws has no HTTP status of its own: it takes its `status` (and, for busy, away, no-match and host-unknown, its `reason`) from the library's one table (`HTTP_ANSWERS` in `tools/device/claims.mjs`), so every service answers the same error the same way. An error code the table does not know is a bug of the service: 500 `HUB_API_ERROR`.
 
 ## Routes
 
@@ -30,6 +31,7 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 | POST | `/registry/resources` | Resource | 6.6 |
 | POST | `/registry/resources/{id}` | Resource | 6.7 |
 | POST | `/registry/resources/{id}/retire` | Retirement | 6.7 |
+| POST | `/leases` | Lease | 7.1 |
 
 ## Shapes
 
@@ -131,6 +133,21 @@ The age rule: a reader on the service's host computes `age_ms = age_ms_at_receip
 - `devices[].id` the adb id: the serial over USB, the mDNS service name, or `host:port`
 - `devices[].state` the state adb lists it in (`device`, `unauthorized`, `offline`, ...)
 
+### Lease
+
+`POST /leases`: status 200, the Lease that was taken. It is the Lease `hub-device lease <word> --no-connect --json` would take, and the one view every service route that answers with a Lease uses (`leaseView` in `tools/device/claims.mjs`).
+
+- `lease_id` the Lease's id (the body's `id`, else one the lock layer minted)
+- `resource` the Resource id the lock stands for
+- `lock` the lock the Lease holds
+- `device` the word a Claimant says for the phone (what `hub-device lease --json` calls `device`)
+- `holder` the body's `holder`
+- `why` the body's `why`
+- `claimant_kind` `agent` or `person`
+- `started_at` an ISO time, when the Lease was taken
+- `expires_at` an ISO time. An API Lease lives until then or until it is released: it is tied to no process, so a restart of the service never reclaims it
+- `env.*` what a Claimant exports to use it (`HUB_LEASE_ID`, `HUB_DEVICE`, `ANDROID_ADB_SERVER_PORT`): the same keys `hub-device lease --json` prints under `env`. No `ANDROID_SERIAL`: a Lease taken here never finds the phone on adb
+
 ### Problem
 
 - `type` `urn:mobile-deploy-hub:problem:<code>`
@@ -186,6 +203,20 @@ Refusals, in the order they are checked: `HUB_USAGE` 400 for the body (`bad-body
 
 Refusals, in the order they are checked: `HUB_USAGE` 400 for the body (`bad-body`, `bad-if-rev`, `bad-why`, `bad-actor`, `no-holder`); `HUB_REGISTRY_CONFLICT` 409 for a stale `if_rev`; `HUB_RESOURCE_NOT_FOUND` 404 (`unknown`); `HUB_REGISTRY_SEEDED` 409 (`reason: retire`) for a seeded Resource. A retire is never undone: `retired_at` is not cleared.
 
+**`POST /leases`** takes a Lease on a phone, with no wait. The body is a JSON object with only these keys:
+
+- `resource` or `match` (exactly one): `resource` is a device word (`s24`, `s26`, a registered phone's name, or the Pool word `phone`) or a Resource id (`res-…`); `match` is a Capability query (`kind=phone`). `emulator` is refused (`HUB_USAGE`): an emulator lease is a later route. A lease id is never a target.
+- `for_ms` (required): a whole number of milliseconds, more than 0. At most 48 h for any Lease and at most 60 min on a deploy target (the S26); the `phone` Pool is narrowed to the phones that allow it, so over 60 min it is the S24.
+- `holder` (required): who holds the Lease, recorded as given.
+- `why` (required): a non-empty string, what the Lease is for.
+- `claimant_kind`: `agent` (the default) or `person`. Recorded on the owner record and on every event of the Lease.
+- `id`: the Lease's id: lowercase letters, digits and dashes, at most 64. An id that already names a Lease or a waiter on any phone is refused. When absent one is minted.
+- `actor`: `{holder, via}`, recorded as given on the take's events. When absent the actor is `{holder: <holder>, via: 'api'}`.
+
+There is no `wait_ms`: a key not listed is `bad-body`, so a wait is refused until the route that has one (a later story). The take is `hub-device lease <word> --no-connect`: the lock only (the owner record has `holder_pid: null` and no `device.adb_id`), `findPhone` never runs and adb is never asked. The service's environment is stripped of every `GITHUB_*` key before it is used, so no Lease or event of the API names a repo or a run. For a `match` the members whose reading in the service's own cache is `absent`, `offline` or `unauthorized` are dropped (an `unknown` or missing reading drops nothing); a word is never away, as for `--no-connect` on the CLI.
+
+Refusals, in the order they are checked: `HUB_USAGE` 400 for the body (`bad-body`, `bad-target`, `bad-for`, `bad-claimant-kind`, `bad-id`, `bad-actor`, `no-holder`, `bad-why`), all before anything is read; `HUB_USAGE` 400 for an unknown device word, `emulator`, an `id` that is already taken, and a `for_ms` over 48 h or over a deploy target's cap (the message names the cap; the deploy-target one ends `lease s24 or an emulator for longer`), with nothing written; `HUB_RESOURCE_RETIRED` 409 (`retired`, `seed-missing`) for a Resource the Registry marks retired or seed-missing; `HUB_NO_MATCH` 404 (`no-match`) when a `match` finds nothing; `HUB_POOL_CROSS_HOST` 409 when its members span hosts; `HUB_DEVICE_AWAY` 503 (`away`) when every member of a `match` is known away; `HUB_LOCK_TIMEOUT` 409 (`busy`) when the lock is held or anyone waits: `detail` keeps `host lock <name> is held …`, and no event is written.
+
 For every write route the actor is `actor` as given, else `{holder, via: 'api'}`, else `no-holder`; the body is checked before the name's shape, which is checked before anything is read from the Registry.
 
 ## Error codes
@@ -194,9 +225,13 @@ For every write route the actor is `actor` as given, else `{holder, via: 'api'}`
 |------|--------|------|---------|
 | `HUB_NO_ROUTE` | 404, 405 | 2 | No such path (`reason: no-route`), or the path exists and the method is not allowed (`reason: method`, with an `Allow` header). |
 | `HUB_RESOURCE_NOT_FOUND` | 404 | 2 | No Resource has this id (`reason: unknown`), or on a read it is retired and idle (`reason: retired`). The write routes (`/registry/resources/{id}` and `/retire`) answer only `unknown`. |
-| `HUB_RESOURCE_RETIRED` | 409 | 2 | An edit of a Resource that is retired (`reason: retired`) or no longer in `devices.json` (`reason: seed-missing`). Also what a take of one is refused with. |
+| `HUB_RESOURCE_RETIRED` | 409 | 2 | An edit of a Resource that is retired (`reason: retired`) or no longer in `devices.json` (`reason: seed-missing`). Also what `POST /leases` refuses a take of one with, with the same reasons. |
 | `HUB_REGISTRY_SEEDED` | 409 | 2 | A retire (`reason: retire`), an edit of `id`, `lock`, `kind`, `host` or `identity` (`reason` is that key) or a different name (`reason: name`) of a seeded Resource: a hub release changes those. |
-| `HUB_USAGE` | 400, 413 | 2 | The request body is not valid JSON (`bad-json`) or is over 1 MiB (`too-large`), or a write body is wrong (`bad-body`, `bad-kind`, `bad-host`, `bad-identity`, `no-model`, `bad-capabilities`, `bad-if-rev`, `no-if-rev`, `bad-why`, `bad-actor`, `no-holder`, `no-change`), or an edit names a key a runtime Resource keeps for good (`immutable`). |
+| `HUB_USAGE` | 400, 413 | 2 | The request body is not valid JSON (`bad-json`) or is over 1 MiB (`too-large`), or a write body is wrong (`bad-body`, `bad-kind`, `bad-host`, `bad-identity`, `no-model`, `bad-capabilities`, `bad-if-rev`, `no-if-rev`, `bad-why`, `bad-actor`, `no-holder`, `no-change`), or an edit names a key a runtime Resource keeps for good (`immutable`). A lease body is wrong with `bad-body`, `bad-target`, `bad-for`, `bad-claimant-kind`, `bad-id`, `bad-actor`, `no-holder` or `bad-why`; a lease request the library refuses (an unknown word, `emulator`, a taken `id`, a `for_ms` over a cap) has `reason: hub_usage` and a `detail` that says why. |
+| `HUB_LOCK_TIMEOUT` | 409 | 76 | `POST /leases`: the lock is held or someone waits (`reason: busy`). `detail` keeps the library's wording, `host lock <name> is held …`; nothing is written. |
+| `HUB_DEVICE_AWAY` | 503 | 75 | `POST /leases` with a `match` whose every member the service's cache knows is away: `absent`, `offline` or `unauthorized` (`reason: away`). |
+| `HUB_NO_MATCH` | 404 | 2 | `POST /leases` with a `match` nothing can serve (`reason: no-match`); `detail` says what excluded each Resource. |
+| `HUB_POOL_CROSS_HOST` | 409 | 2 | `POST /leases` with a `match` whose members are on more than one host. |
 | `HUB_REGISTRY_NAME` | 400, 409 | 2 | A register's or edit's name is not a slug (`not-slug`) or is too long (`too-long`) with 400; reserved (`reserved`), already used (`taken`) or out of `-<n>` suffixes (`exhausted`) with 409. |
 | `HUB_REGISTRY_DUPLICATE` | 409 | 2 | A live Resource already has the serial (`reason: serial`) or UDID (`reason: udid`); `holder` names it. |
 | `HUB_REGISTRY_CONFLICT` | 409 | 1 | `if_rev` is not the Registry's revision; `rev` is the current one. |

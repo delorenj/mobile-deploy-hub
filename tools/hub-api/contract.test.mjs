@@ -118,6 +118,7 @@ const POST_SAMPLES = Object.freeze({
   // After the seed (rev 1) and the setup register (rev 2), the edit is based on rev 2.
   '/registry/resources/{id}': { status: 200, params: { id: 'res-pixel' }, setup: ['/registry/resources'], body: { if_rev: 2, name: 'pixel-9', capabilities: { api_level: 36 }, holder: 'contract-test' } },
   '/registry/resources/{id}/retire': { status: 200, params: { id: 'res-pixel' }, setup: ['/registry/resources'], body: { holder: 'contract-test' } },
+  '/leases': { status: 200, body: { resource: 's24', for_ms: 1_800_000, holder: 'contract-test', why: 'contract' } },
 });
 const sampleOf = (route, samples = POST_SAMPLES) => {
   if (!Object.hasOwn(samples, route.path)) throw new Error(`no request body sample for ${route.method} ${route.path}: add it to POST_SAMPLES`);

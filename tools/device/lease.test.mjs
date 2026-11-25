@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ALIVE_MS, QUEUED, TICKET_ABSENT_MS, acquireLease, buildTicket, isQueued, jobLeaseId, listLocks, listWaiters, poolRequest, processStart as processStartOf, queueView, releaseLease, sameHost, ticketKind, ticketStaleness, updateLease, withLock } from '../ci/lib/lock.mjs';
+import { ALIVE_MS, QUEUED, TICKET_ABSENT_MS, acquireLease, acquirePool, buildTicket, isQueued, jobLeaseId, listLocks, listWaiters, poolRequest, processStart as processStartOf, queueView, releaseLease, sameHost, ticketKind, ticketStaleness, updateLease, withLock } from '../ci/lib/lock.mjs';
 import { hostId, readEvents } from '../ci/lib/events.mjs';
 import { pause } from '../ci/lib/pause.mjs';
 
@@ -1206,5 +1206,70 @@ test('a Queued withLock whose ticket is released while it waits is cancelled, no
     await assert.rejects(failing, /boom/);
     assert.deepEqual(queueOf(f), []);
     assert.deepEqual(events(f).filter(event => event.claimant.job === 'ios').map(event => [event.event, event.reason]), [['request', null], ['cancel', 'error']]);
+  } finally { f.cleanup(); }
+});
+
+// Story 7.1: a Lease records who it is for (`claimantKind`) and who took it (`actor`).
+test('claimantKind and actor: written to the owner record and the acquire event, and the kind survives into the release', async () => {
+  const f = fixture();
+  try {
+    const actor = { holder: 'agent-a', via: 'api' };
+    const record = await lease(f, { id: 'who-1', claimantKind: 'person', actor });
+    assert.equal(record.claimant_kind, 'person');
+    assert.equal(owner(f).claimant_kind, 'person');
+    const [acquire] = events(f);
+    assert.deepEqual([acquire.event, acquire.claimant.kind, acquire.actor], ['acquire', 'person', actor]);
+    assert.equal(releaseLease('adb', 'who-1', { env: f.env }).released, true);
+    const release = events(f).find(event => event.event === 'release');
+    assert.equal(release.claimant.kind, 'person', 'the owner record carries the kind into the release');
+    assert.equal(Object.hasOwn(release, 'actor'), false, 'a release this call did not take names no actor');
+  } finally { f.cleanup(); }
+});
+
+test('with neither option a lease is an agent\'s with no actor, as before; a waiting request carries both on request and acquire', async () => {
+  const f = fixture();
+  try {
+    const plain = await lease(f, { id: 'plain-1' });
+    assert.equal(plain.claimant_kind, 'agent');
+    const [first] = events(f);
+    assert.deepEqual([first.claimant.kind, Object.hasOwn(first, 'actor')], ['agent', false]);
+    releaseLease('adb', 'plain-1', { env: f.env });
+    const actor = { holder: 'holocene', via: 'control-surface' };
+    await lease(f, { id: 'wait-1', waitMs: 1000, claimantKind: 'person', actor });
+    const mine = events(f).filter(event => event.lease_id === 'wait-1');
+    assert.deepEqual(mine.map(event => [event.event, event.claimant.kind, event.actor]), [['request', 'person', actor], ['acquire', 'person', actor]]);
+  } finally { f.cleanup(); }
+});
+
+test('a bad claimantKind or actor is a TypeError and nothing is written', async () => {
+  const f = fixture();
+  try {
+    await assert.rejects(lease(f, { claimantKind: 'robot' }), { name: 'TypeError', message: /bad claimantKind "robot"/ });
+    await assert.rejects(lease(f, { claimantKind: null }), TypeError);
+    await assert.rejects(lease(f, { actor: { holder: 'a', via: 'smoke-signal' } }), { name: 'TypeError', message: /bad actor/ });
+    await assert.rejects(lease(f, { actor: 'a' }), TypeError);
+    await assert.rejects(acquirePool('phone', ['s24', 'adb'], { holder: 'a', why: 'b', forMs: 1000, env: f.env, claimantKind: 'robot' }), TypeError);
+    await assert.rejects(acquirePool('phone', ['s24', 'adb'], { holder: 'a', why: 'b', forMs: 1000, env: f.env, actor: { holder: '', via: 'api' } }), TypeError);
+    assert.deepEqual(events(f), []);
+    assert.ok(!existsSync(f.lock));
+  } finally { f.cleanup(); }
+});
+
+test('acquirePool: claimantKind and actor reach the owner record, the Pool-level request and acquire and the member acquire', async () => {
+  const f = fixture();
+  try {
+    const actor = { holder: 'agent-a', via: 'api' };
+    const taken = await acquirePool('phone', ['s24', 'adb'], { holder: 'agent-a', why: 'any', forMs: 60_000, id: 'pool-1', env: f.env, log: f.log, pollMs: 5, claimantKind: 'person', actor });
+    assert.equal(taken.name, 's24');
+    assert.equal(taken.record.claimant_kind, 'person');
+    assert.equal(JSON.parse(readFileSync(join(f.root, 'locks/s24.lock/owner.json'), 'utf8')).claimant_kind, 'person');
+    const mine = events(f).filter(event => event.lease_id === 'pool-1');
+    assert.ok(mine.length >= 2);
+    for (const event of mine) assert.deepEqual([event.claimant.kind, event.actor], ['person', actor], event.event);
+    // A failed try writes the Pool-level timeout with the same actor.
+    const lost = await acquirePool('phone', ['s24'], { holder: 'agent-b', why: 'any', forMs: 60_000, id: 'pool-2', env: f.env, log: f.log, pollMs: 5, actor }).catch(error => error);
+    assert.equal(lost.code, 'HUB_LOCK_TIMEOUT');
+    const ended = events(f).filter(event => event.lease_id === 'pool-2');
+    assert.deepEqual(ended.map(event => [event.event, event.actor]), [['request', actor], ['timeout', actor]]);
   } finally { f.cleanup(); }
 });
