@@ -395,6 +395,37 @@ test('findPhone waits for the phone to reconnect, refuses a wrong model, and nam
   await assert.rejects(findPhone(other, { serial: 'R5GL43A7PCH', model: 'SM-S948U', waitMs: 10_000, pollMs: 1000, ...timing }), /SM-S948U \(serial R5GL43A7PCH\) is not on this host's adb server after 10s \(devices: adb-R5CX31AEJDA-x \(device\)\)\. Turn on Wireless debugging/);
 });
 
+test('findPhone rides out an adb server that dies mid-start, and an adb that never lists stays red', async () => {
+  // Tower's v1.2.50 release dry run: `daemon started successfully` then `daemon still not running` failed the plan job
+  // on its first `adb devices`, when the next poll would have found a running server.
+  let clock = 0;
+  const logs = [];
+  const timing = { sleep: async ms => { clock += ms; }, now: () => clock, log: line => logs.push(line) };
+  let lists = 0;
+  const flaky = {
+    started: 0,
+    startServer() { this.started += 1; },
+    devices() { lists += 1; if (lists <= 2) throw new Error('adb devices failed (exit 1): * daemon still not running'); return [{ id: 'p', state: 'device' }]; },
+    prop: (_id, name) => ({ 'ro.serialno': 'R5GL43A7PCH', 'ro.product.model': 'SM-S948U' })[name],
+  };
+  assert.equal(await findPhone(flaky, { serial: 'R5GL43A7PCH', model: 'SM-S948U', waitMs: 60_000, pollMs: 1000, ...timing }), 'p');
+  assert.equal(flaky.started, 3, 'every failed listing gets a fresh start-server on the next poll');
+  assert.equal(logs.filter(line => line.startsWith('HUB_S26_ADB_RETRY')).length, 2);
+
+  clock = 0;
+  const startFails = { startServer() { throw new Error('adb start-server failed (exit 1)'); }, devices: () => [], prop() {} };
+  await assert.rejects(findPhone(startFails, { serial: 'R5GL43A7PCH', model: 'SM-S948U', waitMs: 10_000, pollMs: 1000, ...timing }), /adb start-server failed/, 'an adb that never lists is an error, not an away phone');
+
+  clock = 0;
+  let calls = 0;
+  const diesLater = {
+    startServer() {},
+    devices() { calls += 1; if (calls > 1) throw new Error('adb devices failed (exit 1)'); return []; },
+    prop() {},
+  };
+  await assert.rejects(findPhone(diesLater, { serial: 'R5GL43A7PCH', model: 'SM-S948U', waitMs: 10_000, pollMs: 1000, ...timing }), error => error.code === 'HUB_PHONE_AWAY', 'a server that listed once and then died is the phone away, as before');
+});
+
 test('a slow mDNS auto-connect is nudged: the phone is looked up in adb mdns services and connected', async () => {
   assert.equal(parseMdnsEndpoint('List of discovered mdns services\nadb-R5CX31AEJDA-YYVl71\t_adb-tls-connect._tcp\t192.168.1.34:34995\nadb-R5GL43A7PCH-NGdiLU\t_adb-tls-connect._tcp\t192.168.1.50:41234\n', 'R5GL43A7PCH'), '192.168.1.50:41234');
   assert.equal(parseMdnsEndpoint('adb-R5GL43A7PCH-x\t_adb-tls-pairing._tcp\t192.168.1.50:5555\n', 'R5GL43A7PCH'), null, 'a pairing endpoint is not a connect endpoint');

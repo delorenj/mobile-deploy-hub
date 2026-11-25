@@ -4,6 +4,14 @@ One section per hub release, headed `## vX.Y.Z`. `mise run release -- X.Y.Z` (`t
 
 A section is plain text read in a terminal: everything after its heading up to the next `## ` heading. Use `###` for sub-headings and `-` lists; do not start a section line with `## `.
 
+## v1.2.51
+
+v1.2.49 (story 3.5) plus an adb fix; install it on both hosts (`mise run hosts:install`). v1.2.50 was tagged and rolled back, never on `v1`: Tower's release dry run (45523879648) went red in `plan` because big-chungus's adb server died while it was starting (`daemon started successfully`, then `daemon still not running`), and the first `adb devices` failure killed the job.
+
+### What changed
+
+- `findPhone` (`lib/adb.mjs`), which the plan, the android lane, the gate, the catch-up and `hub-device` all use, retries a server that will not start or list: it logs `HUB_S26_ADB_RETRY poll <n>: <error>`, runs `adb start-server` again on the next poll and keeps waiting until the usual deadline. An adb that never lists once in the whole wait still fails with its own error (a broken adb is red, never "the phone is away"); a server that listed and then died ends as `HUB_PHONE_AWAY`, as before.
+
 ## v1.2.50
 
 v1.2.49 re-released; no hub code changed. v1.2.49 was tagged and rolled back, never on `v1`: green-in-between's release dry run (45520180065) went red in the `ios` job when the Mac's network dropped. The app's `ios-build.py` timed out after 90 s reading its godot-tests status from big-chungus over ssh, and GitHub's artifact service timed out on the same job. Tower's dry run on v1.2.49 was green. Everything in the v1.2.49 section below ships in this pin; install it on both hosts (`mise run hosts:install`).

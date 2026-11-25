@@ -133,14 +133,29 @@ export function createAdb({ env: given = process.env, home = homedir(), runner =
 // that never comes throws code HUB_PHONE_AWAY with a `reason` ('unauthorized' or 'offline' when adb lists it unusable,
 // 'absent' when it is not listed at all). `signal` (hub-device's interactive runs) stops the wait between calls;
 // deploys pass none and see no change. `label` names the log lines (deploys keep the default HUB_S26).
+// A server that will not start or list (`daemon started successfully` then `daemon still not running`, when another
+// client kills or replaces the server mid-start) is retried every poll until the deadline, with a fresh start-server;
+// only an adb that never lists once in the whole wait throws its last error (a broken adb stays red, never AWAY).
 export async function findPhone(adb, { serial, model, waitMs = 180_000, pollMs = 3000, nudgeEvery = 5, label = 'HUB_S26', sleep = realSleep, now = Date.now, log = console.log, signal } = {}) {
   signal?.throwIfAborted();
-  await adb.startServer();
   const deadline = now() + waitMs;
   let seen = [];
+  let listedOnce = false;
+  let serverError = null;
   for (let poll = 1; ; poll += 1) {
     signal?.throwIfAborted();
-    seen = await adb.devices();
+    try {
+      if (poll === 1 || serverError) await adb.startServer();
+      seen = await adb.devices();
+      listedOnce = true;
+      serverError = null;
+    } catch (error) {
+      serverError = error;
+      log(`${label}_ADB_RETRY poll ${poll}: ${String(error?.message ?? error).split('\n')[0].slice(0, 200)}`);
+      if (now() >= deadline) { if (!listedOnce) throw error; break; }
+      await pause(pollMs, { signal, sleep });
+      continue;
+    }
     for (const device of seen.filter(entry => entry.state === 'device')) {
       signal?.throwIfAborted();
       let found;
