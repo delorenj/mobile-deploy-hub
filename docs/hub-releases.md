@@ -4,6 +4,10 @@ One section per hub release, headed `## vX.Y.Z`. `mise run release -- X.Y.Z` (`t
 
 A section is plain text read in a terminal: everything after its heading up to the next `## ` heading. Use `###` for sub-headings and `-` lists; do not start a section line with `## `.
 
+## v1.2.50
+
+v1.2.49 re-released; no hub code changed. v1.2.49 was tagged and rolled back, never on `v1`: green-in-between's release dry run (45520180065) went red in the `ios` job when the Mac's network dropped. The app's `ios-build.py` timed out after 90 s reading its godot-tests status from big-chungus over ssh, and GitHub's artifact service timed out on the same job. Tower's dry run on v1.2.49 was green. Everything in the v1.2.49 section below ships in this pin; install it on both hosts (`mise run hosts:install`).
+
 ## v1.2.49
 
 Story 3.5 (AD-22): iOS contention is red, and says who. Nothing here changes the Queue protocol, the policy, the deadline or `latest.json`; install it on both hosts (`mise run hosts:install`).
