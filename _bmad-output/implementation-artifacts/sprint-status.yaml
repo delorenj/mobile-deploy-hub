@@ -74,7 +74,7 @@ development_status:
   5-3-a-host-knows-its-own-key: done
   5-4-status-through-one-builder-with-reachability: done
   5-5-deploy-targets-are-marked-from-the-committed-declarations: done
-  5-6-discover-unregistered-devices-from-the-cli: backlog
+  5-6-discover-unregistered-devices-from-the-cli: done
   5-7-ask-for-a-phone-by-capability: backlog
   5-8-phone-holds-a-place-in-line: backlog
   5-9-no-extension-while-a-pool-or-gate-waiter-sits-behind: backlog
