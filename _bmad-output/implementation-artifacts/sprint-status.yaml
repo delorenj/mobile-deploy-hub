@@ -97,7 +97,7 @@ development_status:
   epic-6-retrospective: optional
 
   epic-7: backlog
-  7-1-take-a-lease-through-the-api: backlog
+  7-1-take-a-lease-through-the-api: done
   7-2-wait-for-a-lease-through-the-api: backlog
   7-3-extend-and-release-a-lease-with-a-recorded-override: backlog
   7-4-lease-an-emulator-through-the-api: backlog

@@ -153,8 +153,8 @@ const sameOwner = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const iso = ms => (Number.isFinite(ms) ? new Date(ms).toISOString() : null);
 
 // The AD-9 event body for a hold or a request. `subject` is an owner record, or the would-be owner of a request (a Lease:
-// kind 'lease', lease_id, holder; a job: its owner without started_at). A Lease is taken by an agent (v1a has no person
-// surface), a withLock job by a deploy run unless it says `hub-job` (the catch-up). An owner from before v1a (no kind) is a
+// kind 'lease', lease_id, holder, and claimant_kind `agent` or `person`, `agent` when it has none; a job: its owner without
+// started_at). A withLock job is taken by a deploy run unless it says `hub-job` (the catch-up). An owner from before v1a (no kind) is a
 // deploy job. for_ms and expires_at describe a Lease; `fields` fills or overrides the rest. `resource` is the Resource the lock
 // stands for (resourceOf, by name alone), null on a Pool-level event; old readers ignore it (AD-2).
 function eventOf(event, name, subject, fields = {}) {
@@ -163,7 +163,7 @@ function eventOf(event, name, subject, fields = {}) {
   return {
     event, lock: name, resource: resourceOf(name), hold_kind: subject ? (lease ? 'lease' : 'job') : null,
     claimant: {
-      kind: subject ? (lease ? 'agent' : subject.kind === 'hub-job' ? 'hub-job' : 'deploy') : null,
+      kind: subject ? (lease ? subject.claimant_kind ?? 'agent' : subject.kind === 'hub-job' ? 'hub-job' : 'deploy') : null,
       holder: subject?.holder ?? null, repo: subject?.repo ?? null, run: subject?.run ?? null, attempt: subject?.attempt ?? null, job: subject?.job ?? null,
     },
     lease_id: lease ? subject.lease_id ?? null : null,
@@ -473,6 +473,13 @@ const leaseId = id => { if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(id)) throw new Err
 const lockPath = (name, env) => join(lockDir(env), `${leaseName(name)}.lock`);
 const queuePath = (name, env) => join(lockDir(env), `${leaseName(name)}.queue`);
 const failure = (code, message) => Object.assign(new Error(message), { code });
+
+// Who a Lease is for: an agent (the default) or a person (Holocene's page, a person's own tool). Anything else is a caller bug.
+export const CLAIMANT_KINDS = Object.freeze(['agent', 'person']);
+function checkClaimantKind(kind) {
+  if (!CLAIMANT_KINDS.includes(kind)) throw new TypeError(`bad claimantKind ${JSON.stringify(kind)} (${CLAIMANT_KINDS.join('|')})`);
+  return kind;
+}
 
 // The Holds that kept a wait from the lock, as plain data for a receipt or an event (never public): the holder first, then each
 // blocker ahead of the waiter in the Queue with its place. A holder is a Lease's `holder` or a job's `<repo>#<run>`. Never throws.
@@ -1134,14 +1141,16 @@ export const newLeaseId = () => `l-${randomBytes(6).toString('hex')}`;
 // Returns {id, tag, settle(error, {signal})}; settle writes the one ending, once, and is never fatal. No event for a name
 // outside the Queued pools (AD-4 names only phone and emulator).
 // `eta` (a waiting request's combined ETA, or null) goes on the `request` event; a try passes none and its event has no `eta` key.
-export function poolRequest(pool, { id = newLeaseId(), holder, why, forMs = null, waitMs = 0, env = process.env, now = Date.now, hostId = machineId(), eta: told } = {}) {
+export function poolRequest(pool, { id = newLeaseId(), holder, why, forMs = null, waitMs = 0, env = process.env, now = Date.now, hostId = machineId(), eta: told, claimantKind = 'agent', actor = null } = {}) {
+  checkClaimantKind(claimantKind);
+  const who = checkActor(actor);
   const since = now();
   const deadline = since + waitMs;
   const tag = { name: pool, request: id, since, deadline };
-  const subject = { kind: 'lease', lease_id: id, holder: holder ?? null, repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null, attempt: env.GITHUB_RUN_ATTEMPT ?? null, job: env.GITHUB_JOB ?? null };
+  const subject = { kind: 'lease', lease_id: id, holder: holder ?? null, claimant_kind: claimantKind, repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null, attempt: env.GITHUB_RUN_ATTEMPT ?? null, job: env.GITHUB_JOB ?? null };
   const write = (event, fields = {}) => {
     const at = now();
-    appendEvent(eventOf(event, null, subject, { pool, request: id, for_ms: forMs, deadline_at: iso(deadline), ...fields }), { env, now: () => at, hostId });
+    appendEvent(eventOf(event, null, subject, { pool, request: id, for_ms: forMs, deadline_at: iso(deadline), ...(who ? { actor: who } : {}), ...fields }), { env, now: () => at, hostId });
     return at;
   };
   write('request', told === undefined ? {} : { eta: told });
@@ -1203,8 +1212,12 @@ export async function acquirePool(pool, members, {
   giveUp = null,
   afterTake = () => {},
   beforeWithdraw = () => {},
+  claimantKind = 'agent',
+  actor = null,
 } = {}) {
   if (typeof pool !== 'string' || pool === '') throw new Error('a Pool request names its pool');
+  checkClaimantKind(claimantKind);
+  const who = checkActor(actor);
   if (!Array.isArray(members) || members.length === 0) throw new Error(`Pool ${pool} has no members`);
   const names = members.map(leaseName);
   if (new Set(names).size !== names.length) throw new Error(`Pool ${pool} lists a member twice`);
@@ -1256,7 +1269,7 @@ export async function acquirePool(pool, members, {
         placed.add(name);
       }
     }
-    request = poolRequest(pool, { id: lease_id, holder, why, forMs, waitMs, env, now, hostId, ...(tryOnly ? {} : { eta: estimate }) });
+    request = poolRequest(pool, { id: lease_id, holder, why, forMs, waitMs, env, now, hostId, claimantKind, actor: who, ...(tryOnly ? {} : { eta: estimate }) });
     const cancelled = text => failure('HUB_LEASE_CANCELLED', `lease ${lease_id} ${text} ${pool}`);
     const view = name => queueView(name, { env, prune: true, now, host, hostId, processStart: startOf });
     const report = tryOnly ? () => {} : waitReporter(pool, {
@@ -1281,7 +1294,7 @@ export async function acquirePool(pool, members, {
             pid: process.pid, host, repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null, started_at: new Date(started).toISOString(),
             kind: 'lease', lease_id, holder, why, expires_at: new Date(started + forMs).toISOString(),
             holder_pid: holderPid, holder_process_start: Number.isSafeInteger(holderPid) ? startOf(holderPid) : null,
-            format: OWNER_FORMAT, attempt, job, host_id: hostId,
+            format: OWNER_FORMAT, attempt, job, host_id: hostId, claimant_kind: claimantKind,
           };
           let taken = false;
           try {
@@ -1311,7 +1324,7 @@ export async function acquirePool(pool, members, {
               }
               claimed.add(name);
             }
-            note(name, eventOf('acquire', name, record, { deadline_at: iso(request.tag.deadline), waited_ms: Math.max(0, started - request.tag.since), pool, request: lease_id }), { env, hostId, at: started });
+            note(name, eventOf('acquire', name, record, { deadline_at: iso(request.tag.deadline), waited_ms: Math.max(0, started - request.tag.since), pool, request: lease_id, ...(who ? { actor: who } : {}) }), { env, hostId, at: started });
             log(`HUB_LEASE ${name} ${lease_id} until ${record.expires_at}`);
             return record;
           }
@@ -1583,8 +1596,13 @@ export async function acquireLease(name, {
   pool = null,
   policy = null,
   afterEta = () => {},
+  claimantKind = 'agent',
+  actor = null,
 } = {}) {
   const path = lockPath(name, env);
+  checkClaimantKind(claimantKind);
+  const who = checkActor(actor);
+  const by = who ? { actor: who } : {};
   if (!(forMs > 0) || forMs > MAX_LEASE_MS) throw new Error(`a lease runs for more than 0 and at most ${MAX_LEASE_MS / 3600_000}h`);
   // A Lease on a deploy target may not outlast the Queue's patience (AD-16): refused before it takes a place in line.
   const cap = deployTargetCapMs(name, { policy });
@@ -1607,10 +1625,10 @@ export async function acquireLease(name, {
   }
   const attempt = env.GITHUB_RUN_ATTEMPT ?? null;
   const job = env.GITHUB_JOB ?? null;
-  const asked = { kind: 'lease', lease_id, holder, repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null, attempt, job };
+  const asked = { kind: 'lease', lease_id, holder, claimant_kind: claimantKind, repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null, attempt, job };
   const seams = { env, hostId };
   const waitedTo = at => ({ for_ms: forMs, deadline_at: iso(deadline), waited_ms: Math.max(0, at - requested) });
-  if (!tryOnly) note(name, eventOf('request', name, asked, { for_ms: forMs, deadline_at: iso(deadline), eta: estimate }), { ...seams, at: requested });
+  if (!tryOnly) note(name, eventOf('request', name, asked, { for_ms: forMs, deadline_at: iso(deadline), eta: estimate, ...by }), { ...seams, at: requested });
   // Leaves the queue by unlinking its own ticket. True when this waiter's unlink decided it (and recorded `as`); false
   // when the ticket was already gone, which means a release cancelled it and wrote that event.
   let left = false;
@@ -1618,7 +1636,7 @@ export async function acquireLease(name, {
     try { unlinkSync(ticketFile); } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
     left = true;
     const at = now();
-    note(name, eventOf(as, name, asked, { ...waitedTo(at), ...fields }), { ...seams, at });
+    note(name, eventOf(as, name, asked, { ...waitedTo(at), ...by, ...fields }), { ...seams, at });
     return true;
   };
   const timedOut = (message, owner) => {
@@ -1644,7 +1662,7 @@ export async function acquireLease(name, {
           pid: process.pid, host, repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null, started_at: new Date(started).toISOString(),
           kind: 'lease', lease_id, holder, why, expires_at: new Date(started + forMs).toISOString(),
           holder_pid: holderPid, holder_process_start: Number.isSafeInteger(holderPid) ? startOf(holderPid) : null,
-          format: OWNER_FORMAT, attempt, job, host_id: hostId,
+          format: OWNER_FORMAT, attempt, job, host_id: hostId, claimant_kind: claimantKind,
         };
         let taken = false;
         try {
@@ -1680,7 +1698,7 @@ export async function acquireLease(name, {
           left = true;
           const tag = pool ? { pool: pool.name, request: pool.request } : {};
           const waitedMs = Math.max(0, started - (pool?.since ?? requested));
-          note(name, eventOf('acquire', name, record, { deadline_at: iso(pool?.deadline ?? deadline), waited_ms: waitedMs, ...tag }), { ...seams, at: started });
+          note(name, eventOf('acquire', name, record, { deadline_at: iso(pool?.deadline ?? deadline), waited_ms: waitedMs, ...tag, ...by }), { ...seams, at: started });
           log(`HUB_LEASE ${name} ${lease_id} until ${record.expires_at}`);
           failed = false;
           return record;

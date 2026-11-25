@@ -15,7 +15,7 @@ import { createServer as nodeCreateServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
 import { onPath } from '../ci/lib/heavy.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
-import { exitCodeOf } from '../device/claims.mjs';
+import { exitCodeOf, withoutDeployIdentity } from '../device/claims.mjs';
 import { recoverRegistry, applySeed } from '../registry/store.mjs';
 import { createReadings } from './readings.mjs';
 import { ROUTES, SERVICE, handle } from './routes.mjs';
@@ -84,8 +84,10 @@ export function requestListener(ctx) {
 // a lost bind throws a coded error (HUB_API_NODE, HUB_API_NO_HEAVY, HUB_API_ALREADY_RUNNING) with nothing bound or written.
 export async function startService({
   service = SERVICE, port, routes = ROUTES, ctx = {}, afterBind,
-  env = process.env, log = defaultLog(), versions = process.versions, onPath: hasOnPath = onPath, createServer = nodeCreateServer, signals = process,
+  env: given = process.env, log = defaultLog(), versions = process.versions, onPath: hasOnPath = onPath, createServer = nodeCreateServer, signals = process,
 } = {}) {
+  // A service belongs to no deploy run: whatever GITHUB_* identity its environment carries never reaches a Lease or an event.
+  const env = withoutDeployIdentity(given);
   if (!nodeAtLeast(versions?.node, MIN_NODE)) throw coded('HUB_API_NODE', `${service} needs Node >= ${MIN_NODE}, this is ${versions?.node ?? 'unknown'}; run it from the release's node/24.x path`);
   if (!hasOnPath('heavy', env)) throw coded('HUB_API_NO_HEAVY', `${service} needs \`heavy\` on PATH: emulators boot through it`);
 
@@ -132,7 +134,8 @@ export async function startService({
 // and the service keeps serving; `/health` says `registry: unreadable` when the file is the problem. The device seams (`adbWire`,
 // `inventory`, `hostKey`, `sleep`, `devicectl`) go into the request context and into the one readings cache (Story 6.10); a refresh of
 // it is started by a read, never by a timer.
-export async function startHubApi({ policy, env = process.env, log = defaultLog(), now, hostId, devices, qaDevices, routes = ROUTES, adbWire, inventory, hostKey, sleep, devicectl, ...seams } = {}) {
+export async function startHubApi({ policy, env: given = process.env, log = defaultLog(), now, hostId, devices, qaDevices, routes = ROUTES, adbWire, inventory, hostKey, sleep, devicectl, ...seams } = {}) {
+  const env = withoutDeployIdentity(given);
   const resolved = policy ?? loadPolicy().policy;
   const afterBind = async () => {
     try {

@@ -14,7 +14,7 @@
 // handler as `request.params`; a literal route wins over a parameterised one.
 import { STATUS_CODES } from 'node:http';
 import { idMatchesSerial } from '../ci/lib/adb.mjs';
-import { HOST_PLATFORMS, discover as discoverHost, exitCodeOf, hostKey as realHostKey, lockActivity } from '../device/claims.mjs';
+import { HOST_PLATFORMS, checkLeaseBody, discover as discoverHost, exitCodeOf, hostKey as realHostKey, httpAnswerOf, lockActivity, serviceLease } from '../device/claims.mjs';
 import { hubRef } from '../ci/lib/receipt.mjs';
 import { NO_READING } from '../registry/reachability.mjs';
 import { loadQaDevices } from '../registry/seed.mjs';
@@ -39,9 +39,12 @@ export const reply = (status, body) => ({ [REPLY]: true, status, body });
 
 const respond = (status, body, extra = {}) => ({ status, headers: { ...BASE_HEADERS, 'Content-Type': JSON_TYPE, ...extra }, body });
 
-// The problem+json response for an error. An error with a `status` (the library's and the API's own coded errors) keeps its code and
-// exit; anything else is a bug in a handler: 500 HUB_API_ERROR.
+// The problem+json response for an error. An error with a `status` (the API's own coded errors) keeps its code and exit; an error
+// without one whose code the Claims library's HTTP table knows (`httpAnswerOf`) takes that status, and its reason from the table, else
+// from the error, else its lower-cased code; anything else is a bug in a handler: 500 HUB_API_ERROR.
 const hasStatus = error => Number.isInteger(error?.status) && error.status >= 400 && error.status <= 599;
+// The table's answer for an error that carries no `status` of its own (one that carries a bad one is a bug: 500).
+const tableAnswer = error => (error?.status === undefined ? httpAnswerOf(error) : null);
 const oneLine = value => String(value).replace(/\s+/g, ' ').trim();
 
 // The members a code adds to the base Problem fields (`rev` of a conflict, `holder` of a duplicate). `problem()` merges the ones an error
@@ -52,8 +55,9 @@ export const PROBLEM_EXTENSIONS = Object.freeze({
 });
 
 export function problem(error, extra = {}) {
-  const known = hasStatus(error);
-  const status = known ? error.status : 500;
+  const answer = tableAnswer(error);
+  const known = hasStatus(error) || answer !== null;
+  const status = answer?.status ?? (known ? error.status : 500);
   const code = known && typeof error.code === 'string' && error.code !== '' ? error.code : 'HUB_API_ERROR';
   const detail = oneLine(typeof error?.message === 'string' && error.message !== '' ? error.message : error);
   const body = {
@@ -63,7 +67,7 @@ export function problem(error, extra = {}) {
     detail,
     code,
     exit: known ? (Number.isInteger(error.exit) ? error.exit : exitCodeOf(error)) : 1,
-    reason: known && typeof error.reason === 'string' && error.reason !== '' ? error.reason : (known ? code.toLowerCase() : 'internal'),
+    reason: answer?.reason ?? (known && typeof error.reason === 'string' && error.reason !== '' ? error.reason : (known ? code.toLowerCase() : 'internal')),
   };
   if (known) {
     for (const field of PROBLEM_EXTENSIONS[code] ?? []) {
@@ -237,6 +241,30 @@ export async function retireResource(ctx, { body, params }) {
   return { rev: written.rev, source: 'file', id: record.id, retired_at: record.retired_at, visibility: visibility(record, { held: activity.held === true, queued: activity.queued === true }) };
 }
 
+// POST /leases: takes a Lease on a phone, by word, Resource id or `match`, with no wait (Story 7.1). The body is checked first
+// (`checkLeaseBody`), then the Claims library takes it exactly as `hub-device lease <word> --no-connect` would: `serviceLease` is the one
+// function every service front door calls, and the status of a refusal comes from its HTTP table. The actor is the body's `actor`, else
+// `{holder, via: 'api'}`. A `match` drops the members this service's own cache knows are away (no adb is asked on a request: AD-44).
+// 200 `Lease`.
+function readingsOf(ctx) {
+  return members => {
+    const registry = readIt(ctx);
+    const records = new Map(members.map(member => [member.device, registry.resources.find(record => record.lock === member.lock)]));
+    const served = ctx.readings?.read([...records.values()].filter(Boolean)) ?? new Map();
+    return new Map(members.map(member => [member.device, served.get(records.get(member.device)?.id)?.state ?? 'unknown']));
+  };
+}
+
+export async function takeLease(ctx, { body }) {
+  const input = checkLeaseBody(body);
+  const actor = input.actor ?? { holder: input.holder, via: 'api' };
+  const out = line => { try { ctx.log?.out?.(line); } catch { /* a broken log seam never changes the answer */ } };
+  return serviceLease({ ...input, actor }, {
+    env: ctx.env ?? process.env, policy: ctx.policy, now: ctx.now, sleep: ctx.sleep, qaDevices: ctx.qaDevices,
+    log: out, warn: () => {}, readingsOf: readingsOf(ctx),
+  });
+}
+
 // `shape` names the `### <Shape>` section of the contract document that lists the response's fields.
 export const ROUTES = Object.freeze([
   Object.freeze({ method: 'GET', path: '/health', shape: 'Health', handler: health }),
@@ -247,6 +275,7 @@ export const ROUTES = Object.freeze([
   Object.freeze({ method: 'POST', path: '/registry/resources', shape: 'Resource', handler: registerResource }),
   Object.freeze({ method: 'POST', path: '/registry/resources/{id}', shape: 'Resource', handler: editResource }),
   Object.freeze({ method: 'POST', path: '/registry/resources/{id}/retire', shape: 'Retirement', handler: retireResource }),
+  Object.freeze({ method: 'POST', path: '/leases', shape: 'Lease', handler: takeLease }),
 ]);
 
 // ---- dispatch ----
@@ -302,7 +331,7 @@ export async function handle({ method, url, body, bodyError } = {}, ctx = {}) {
     if (result === null || typeof result !== 'object') throw new TypeError(`the handler for ${verb} ${path} returned ${result === null ? 'null' : typeof result}, not an object`);
     return respond(200, result);
   } catch (error) {
-    if (!hasStatus(error)) {
+    if (!hasStatus(error) && tableAnswer(error) === null) {
       try { ctx.log?.err?.(`HUB_API_ERROR ${verb} ${path} ${oneLine(error?.message ?? error)}`); } catch { /* a broken log seam never changes the answer */ }
     }
     return problem(error);
