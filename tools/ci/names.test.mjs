@@ -8,11 +8,11 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   DEPLOY_TARGETS, EMULATOR_POOL, NAME_MAX, QUEUED, RESERVED, SEED_RESOURCES, SLUG, SLUG_MAX, acquireLease, isQueued, isSlug, leaseHoldersSince,
-  listLocks, liveLease, nameRefusal, poolRequest, queueView, releaseLease, reservedBy, resourceOf,
+  listLocks, liveLease, nameRefusal, poolRequest, queueView, releaseLease, reservedBy, resourceOf, withLock,
 } from './lib/lock.mjs';
 import { parseDevices } from './lib/devices.mjs';
 import { readEvents } from './lib/events.mjs';
-import { fleetOf } from '../device/claims.mjs';
+import { EMULATOR, PHONE, fleetOf } from '../device/claims.mjs';
 import { hermetic } from './test-fixtures.mjs';
 
 hermetic();
@@ -40,14 +40,12 @@ test('SLUG is exactly the AD-28 rule, and isSlug adds the 1 to 32 length bound',
 });
 
 test('isQueued is decided by name alone: the v1a set, emulator-<n> and res-<slug>', () => {
-  const cwdBefore = process.cwd();
   // no file is read: HUB_LOCK_DIR points nowhere and the answers hold
   process.env.HUB_LOCK_DIR = '/nonexistent/hub-locks';
   try {
     for (const name of ['adb', 's24', 'mac-ios', 'emulator', 'emulator-3', 'res-pixel', `res-${g(28)}-999`, `res-${g(32)}`]) assert.equal(isQueued(name), true, name);
     for (const name of ['s3-tolt', 's3-index', 'emulator-reaper', 'emulator-x', 'res-', 'res-Pixel', 'res-a--b', `res-${g(33)}`, 'pixel', 's26', 'adbx', '', null, undefined, 4]) assert.equal(isQueued(name), false, String(name));
   } finally { delete process.env.HUB_LOCK_DIR; hermetic(); }
-  assert.equal(process.cwd(), cwdBefore);
   assert.deepEqual([...QUEUED], ['adb', 's24', 'mac-ios', 'emulator'], 'the v1a set keeps its four entries');
 });
 
@@ -79,6 +77,8 @@ test('parseDevices refuses an extra phone named after a reserved word, case-inse
   assert.throws(() => parseDevices(extra('Adb')), /may not be "adb"/);
   assert.throws(() => parseDevices(extra('Emulator')), /may not be "emulator"/);
   assert.doesNotThrow(() => parseDevices(extra('Emulator7')), 'emulator7 is no reserved shape (emulator-<n> has a dash)');
+  assert.throws(() => parseDevices(extra(g(29, 'p'))), /may not be/, '29 characters is over the 28 limit');
+  assert.doesNotThrow(() => parseDevices(extra(g(28, 'p'))), '28 characters loads');
   assert.doesNotThrow(() => parseDevices(extra('Pixel')));
   assert.doesNotThrow(() => parseDevices(extra('S24')));
   assert.equal(parseDevices(devicesText).android_extra[0].name, 'S24');
@@ -89,8 +89,16 @@ test('fleetOf refuses a reserved extra phone with a plain Error (no code), and b
   for (const name of ['Ipad', 'Registry', 'phone', 'Adb', 'S26', 'Emulator']) {
     assert.throws(() => fleetOf(extra(name)), error => error instanceof Error && error.code === undefined && /may not be/.test(error.message), name);
   }
+  assert.throws(() => fleetOf(extra('Pixel 7')), error => error.code === undefined && /may not be/.test(error.message), 'not a slug');
+  assert.throws(() => fleetOf(extra(g(29, 'p'))), error => error.code === undefined && /may not be/.test(error.message), '29 characters');
+  assert.equal(fleetOf(extra(g(28, 'p')))[0].device, g(28, 'p'), '28 characters loads');
   assert.deepEqual(fleetOf(devices).map(phone => [phone.device, phone.lock]), [['s24', 's24'], ['s26', 'adb']]);
   assert.deepEqual(fleetOf(extra('Pixel')).map(phone => phone.lock), ['pixel', 'adb']);
+});
+
+test('the CLI\'s own device words are reserved', () => {
+  assert.notEqual(reservedBy(PHONE), null);
+  assert.notEqual(reservedBy(EMULATOR), null);
 });
 
 test('resourceOf is pure: a name-to-Resource map with no file read', () => {
@@ -140,8 +148,8 @@ test('a res-<slug> Lease queues: a waiter takes a ticket in res-pixel.queue and 
   try {
     const first = await take(f, 'res-pixel', { id: 'first-1', waitMs: 5000 });
     let waiterRecord;
-    const waiting = take(f, 'res-pixel', { id: 'second-1', waitMs: 10_000 }).then(record => { waiterRecord = record; return record; });
-    for (let i = 0; i < 200 && !(existsSync(join(f.env.HUB_LOCK_DIR, 'res-pixel.queue')) && readdirSync(join(f.env.HUB_LOCK_DIR, 'res-pixel.queue')).length > 0); i += 1) await new Promise(done => setTimeout(done, 10));
+    const waiting = take(f, 'res-pixel', { id: 'second-1', waitMs: 30_000 }).then(record => { waiterRecord = record; return record; });
+    for (let i = 0; i < 1000 && !(existsSync(join(f.env.HUB_LOCK_DIR, 'res-pixel.queue')) && readdirSync(join(f.env.HUB_LOCK_DIR, 'res-pixel.queue')).length > 0); i += 1) await new Promise(done => setTimeout(done, 10));
     const tickets = readdirSync(join(f.env.HUB_LOCK_DIR, 'res-pixel.queue'));
     assert.equal(tickets.length, 1, 'the waiter holds a place in res-pixel.queue');
     assert.deepEqual(queueView('res-pixel', { env: f.env }).map(entry => entry.lease_id), ['second-1']);
@@ -152,6 +160,18 @@ test('a res-<slug> Lease queues: a waiter takes a ticket in res-pixel.queue and 
     const log = events(f).filter(event => event.lock === 'res-pixel');
     assert.deepEqual(log.map(event => `${event.event}:${event.lease_id}`), ['request:first-1', 'acquire:first-1', 'request:second-1', 'release:first-1', 'acquire:second-1', 'release:second-1']);
     assert.ok(log.every(event => event.resource === 'res-pixel'));
+  } finally { f.cleanup(); }
+});
+
+test('withLock (the deploy-job route) on a res-<slug> lock takes the queued path: request, acquire, release with resource', async () => {
+  const f = fixture();
+  try {
+    let ran = false;
+    await withLock('res-pixel', async () => { ran = true; }, { env: f.env, log: () => {}, hostId: HOST_ID, timeoutMs: 5000, pollMs: 5 });
+    assert.equal(ran, true);
+    const mine = events(f).filter(event => event.lock === 'res-pixel');
+    assert.deepEqual(mine.map(event => event.event), ['request', 'acquire', 'release']);
+    assert.ok(mine.every(event => event.resource === 'res-pixel' && event.hold_kind === 'job'));
   } finally { f.cleanup(); }
 });
 

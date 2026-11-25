@@ -25,9 +25,10 @@ import { eta, etaMoved, formatEta } from './eta.mjs';
 
 export const lockDir = (env = process.env, home = homedir()) => env.HUB_LOCK_DIR || join(home, '.cache/mobile-deploy-hub/locks');
 
-// Names (AD-28, AD-29): this module is the one owner of what a lock, a Resource word or a Lease id may be called. A slug is
-// lowercase letters and digits in runs split by single dashes; a slug is 1 to 32 characters and a Resource name at most 28, so
-// `res-<name>-999` (a Registry-minted lock with a numeric suffix) is still a slug of at most 32.
+// Names (AD-28, AD-29): this module is the one owner of what a lock or a Resource word may be called, and of the id shapes no word
+// may take (Lease ids keep their own rules). A slug is lowercase letters and digits in runs split by single dashes, 1 to 32
+// characters; a Resource name is at most 28, so the part after `res-` of a Registry-minted lock (`<name>-999`, a numeric
+// suffix) is still a slug of at most 32 (the whole lock is at most 36).
 export const SLUG = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 export const SLUG_MAX = 32;
 export const NAME_MAX = 28;
