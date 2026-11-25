@@ -173,7 +173,7 @@ The age rule: a reader on the service's host computes `age_ms = age_ms_at_receip
 
 - `request_id` the id that was cancelled
 - `outcome` always `cancelled`
-- `resource` the Resource id of the first lock the request was taken out of
+- `resource` the Pool word for a Pool request (`phone`, `emulator`, `match:<query>`, as `pool`), else the Resource id of the lock the request was taken out of
 - `pool` the Pool of a Pool request (`phone`, `emulator`, `match:<query>`), or `null` for a request on one lock
 - `queues[].lock` a lock the request was taken out of (one for a request on one lock, one per member for a Pool request)
 - `queues[].resource` the Resource id the lock stands for
@@ -311,11 +311,12 @@ For every write route the actor is `actor` as given, else `{holder, via: 'api'}`
 | `HUB_POOL_CROSS_HOST` | 409 | 2 | `POST /leases` with a `match` whose members are on more than one host. |
 | `HUB_LEASE_NOT_FOUND` | 404 | 2 | `GET /leases/{id}`, and an extend (the release answers `none`): no Lease holds this id. `reason: waiting` when a waiter has it (it holds nothing yet), `reason: unknown` otherwise. |
 | `HUB_LEASE_EXTEND_REFUSED` | 409 | 76 | `POST /leases/{id}/extend`: the extension is refused and nothing was written. `reason` is `waiters`, `expired`, `cap` or `too-long`. |
+| `HUB_LEASE_CANCELLED` | 409 | 1 | `POST /leases`: a wait ended without a Hold: its place was released while it waited, or it was taken out of the line by `POST /requests/{id}/cancel` (`reason: cancelled`; `detail` says `cancelled by <holder>` and the `why` given). |
 | `HUB_LEASE_LOST` | 409 | 1 | `POST /leases/{id}/extend` or `/release`: the lock changed hands between the read and the write (`reason` is `hub_lease_lost` on an extend, `being-taken` or `changed-hands` on a release). Nothing of this request's was written. |
 | `HUB_REQUEST_NOT_FOUND` | 404 | 2 | `POST /requests/{id}/cancel`: no waiting request has this id on the Resource (`reason: unknown`), or the request already holds its lock and is a Lease to release (`reason: held`). |
 | `HUB_CANCEL_RESERVATION` | 409 | 2 | `POST /requests/{id}/cancel` with the key of a deploy run's Reservation (`reason: reservation`): a cancel never takes one; `detail` says to force-release it (a Reservation is released by its own run key: `hub-device reservation release --run <key>`). |
 | `HUB_WRONG_HOST` | 409 | 2 | `POST /requests/{id}/cancel` whose `host` is not this host's key (`reason: wrong-host`): a cancel never reaches another host. |
-| `HUB_DEVICE_JOB_ID` | 400 | 2 | `POST /leases/{id}/extend`, `/release` or `POST /requests/{id}/cancel` with a `job:` id (or, for a cancel, the id of a deploy job's ticket): a deploy job's place in line is not a lease, and the hub never extends or releases it; `detail` names the run to cancel (`gh run cancel`). |
+| `HUB_DEVICE_JOB_ID` | 400 | 2 | `POST /leases/{id}/extend`, `/release` or `POST /requests/{id}/cancel` with a `job:` id (or, for a cancel, the id of a deploy job's ticket): a deploy job's place in line is not a lease, and the hub never extends, releases or cancels it; `detail` names the run to cancel (`gh run cancel`). |
 | `HUB_LEASE_SUPERSEDED` | 409 | 1 | `POST /leases`: a newer request with the same `id` and `holder` took over this wait (`reason: superseded`). The wait itself goes on. |
 | `HUB_API_RESTARTING` | 503 | 1 | The service is stopping (`reason: restarting`; member `retry: requeue`). Every open wait gets it, and so does a lease request that arrives while it stops. |
 | `HUB_REGISTRY_NAME` | 400, 409 | 2 | A register's or edit's name is not a slug (`not-slug`) or is too long (`too-long`) with 400; reserved (`reserved`), already used (`taken`) or out of `-<n>` suffixes (`exhausted`) with 409. |

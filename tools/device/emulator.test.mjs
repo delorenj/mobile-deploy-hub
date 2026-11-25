@@ -810,6 +810,10 @@ test('cancel takes an emulator request off the gate: one gate cancel and one Poo
     assert.deepEqual(readdirSync(queue), [], 'no ticket and no note is left');
     assert.equal((await f.run(['release', HOLDER])).code, 0);
     assert.ok(await waitFor(() => ownerOf('emulator-1')?.lease_id === NEXT, 15_000), 'the request holding the gate still gets the emulator');
+    // Now it holds a slot, not the gate: still a Hold, still "release it".
+    const slotHeld = await f.run(['cancel', NEXT, '--resource', 'emulator', '--holder', 'ops']);
+    assert.equal(slotHeld.code, 2);
+    assert.match(slotHeld.err.join('\n'), /^HUB_REQUEST_NOT_FOUND .*release it/m);
     assert.equal((await f.run(['release', 'emulator', NEXT])).code, 0);
     next.child.kill('SIGTERM');
     await next.exit;

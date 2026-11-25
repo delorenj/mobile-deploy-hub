@@ -1249,10 +1249,10 @@ export function requestLocks(resource, ctx) {
   throw requestNotFound('unknown', `no Resource "${resource}" is known here, so no request of it can be cancelled`);
 }
 
-// Every lock on this host that has a queue: where `hub-device cancel <id>` looks when it is not told the Resource (a CLI looks on its own host; a
+// Every lock on this host that has a queue, a lock or Reservations: where `hub-device cancel <id>` looks when it is not told the Resource (a CLI looks on its own host; a
 // service never does).
 const queuedLocks = env => {
-  try { return readdirSync(lockDir(env)).filter(entry => /^[a-z0-9-]+\.queue$/.test(entry)).map(entry => entry.slice(0, -'.queue'.length)).sort(); } catch { return []; }
+  try { return [...new Set(readdirSync(lockDir(env)).filter(entry => /^[a-z0-9-]+\.(queue|lock|reservations)$/.test(entry)).map(entry => entry.replace(/\.(queue|lock|reservations)$/, '')))].sort(); } catch { return []; }
 };
 
 // One lock's waiters after the cancel, as a `Cancel` carries them (the tickets only: a Reservation is not a request). Read only.
@@ -1266,13 +1266,13 @@ function queueAnswer(lock, ctx) {
   return { lock, resource: resourceOf(lock), waiters };
 }
 
-// `POST /requests/{id}/cancel` (and `hub-device cancel <id>`, and the Host Agent's): takes the waiting request `id` out of the line, in every member's
+// `POST /requests/{id}/cancel` (and `hub-device cancel <id>`): takes the waiting request `id` out of the line, in every member's
 // queue for a Pool request, and touches no Hold. `input` is `checkCancelBody`'s result with the actor defaulted by the caller (a cancel always has
 // an actor, recorded on the one ending event; the waiter's own wait ends HUB_LEASE_CANCELLED naming it). `input.resource` null (the CLI only) looks
 // on this host for the request; a given one names the Resource it waits on, and `input.pool` the Pool of a Pool request (a Pool request cancelled
 // without its `pool`, or with another, is not found). `input.host`, when given, must be this host's key.
 //
-// Answers `{request_id, outcome: 'cancelled', resource, pool, queues: [{lock, resource, waiters}]}`: the resulting queue of every lock the request was
+// Answers `{request_id, outcome: 'cancelled', resource, pool, queues: [{lock, resource, waiters}]}` (`resource` the Pool word for a Pool request, else the lock's Resource): the resulting queue of every lock the request was
 // taken out of. Throws HUB_DEVICE_JOB_ID (a job's id or ticket), HUB_CANCEL_RESERVATION, HUB_WRONG_HOST, HUB_HOST_UNKNOWN (this host's key is
 // unreadable) and HUB_REQUEST_NOT_FOUND with `reason` `unknown` (nothing waits under the id, or it was granted or withdrew as the cancel ran) or
 // `held` (it already holds its lock: release it), all before or instead of any write.
@@ -1289,14 +1289,15 @@ export function cancel(id, input, ctx) {
   const locks = named ? requestLocks(input.resource, local) : queuedLocks(local.env);
   // A Pool request is found only by its Pool; with a Resource named, a request on one lock only by none (the CLI's lookup takes whatever it finds).
   // The emulator request is a Pool request whose one queue is the gate's (a plain ticket): `emulator` is its Pool, and naming it is not a mismatch.
-  const gate = named && locks.length === 1 && locks[0] === GATE;
-  const pool = gate && (input.pool ?? EMULATOR) === EMULATOR ? undefined : input.pool ?? (named ? null : undefined);
+  const poolOf = lock => (lock === GATE && (input.pool ?? EMULATOR) === EMULATOR ? undefined : input.pool ?? (named ? null : undefined));
   let held = false;
   for (const lock of locks) {
-    const result = cancelRequest(lock, id, { actor, why: input.why ?? null, pool, env: local.env, now: local.timing.now });
+    const result = cancelRequest(lock, id, { actor, why: input.why ?? null, pool: poolOf(lock), env: local.env, now: local.timing.now });
     if (result.cancelled) {
       const queues = result.locks.slice().sort().map(name => queueAnswer(name, local));
-      return { request_id: id, outcome: 'cancelled', resource: queues[0].resource, pool: result.pool ?? (gate ? EMULATOR : null), queues };
+      const pool = result.pool ?? (lock === GATE ? EMULATOR : null);
+      // A Pool request is answered under its Pool word; a request on one lock under that lock's Resource.
+      return { request_id: id, outcome: 'cancelled', resource: pool ?? queues[0].resource, pool, queues };
     }
     held ||= result.reason === 'held';
   }

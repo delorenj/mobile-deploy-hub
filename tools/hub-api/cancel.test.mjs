@@ -117,7 +117,7 @@ test('a phone Pool request: found only by its pool, taken out of every member qu
     assert.equal(s.queue('s24').length + s.queue('adb').length, 2, 'nothing was removed');
     const answer = await s.api('p-1', { resource: 'phone', pool: 'phone', holder: 'ops', why: 'not needed' });
     assert.equal(answer.status, 200, JSON.stringify(answer.body));
-    assert.deepEqual([answer.body.pool, answer.body.queues.map(queue => queue.lock), answer.body.queues.map(queue => queue.waiters)], ['phone', ['adb', 's24'], [[], []]]);
+    assert.deepEqual([answer.body.pool, answer.body.resource, answer.body.queues.map(queue => queue.lock), answer.body.queues.map(queue => queue.waiters)], ['phone', 'phone', ['adb', 's24'], [[], []]]);
     await settled;
     assert.deepEqual([s.queue('s24'), s.queue('adb')], [[], []]);
     const ending = s.events().filter(event => event.request === 'p-1' && event.event !== 'request');
@@ -134,7 +134,7 @@ test('an emulator request waiting on the gate: the gate ticket goes, the answer 
     assert.deepEqual(problemOf(await s.api('e-1', { resource: 'emulator', pool: 'phone', holder: 'ops' })), [404, 'HUB_REQUEST_NOT_FOUND', 2, 'unknown']);
     const answer = await s.api('e-1', { resource: 'emulator', pool: 'emulator', holder: 'ops' });
     assert.equal(answer.status, 200, JSON.stringify(answer.body));
-    assert.deepEqual([answer.body.resource, answer.body.pool, answer.body.queues.map(queue => [queue.lock, queue.waiters.map(waiter => waiter.lease_id)])], [resourceOf('emulator'), 'emulator', [['emulator', ['e-2']]]]);
+    assert.deepEqual([answer.body.resource, answer.body.pool, answer.body.queues.map(queue => [queue.lock, queue.waiters.map(waiter => waiter.lease_id)])], ['emulator', 'emulator', [['emulator', ['e-2']]]]);
     assert.deepEqual(cancels(s).map(event => [event.lock, event.lease_id, event.actor.holder]), [['emulator', 'e-1', 'ops']]);
     assert.equal((await s.api('e-2', { resource: 'emulator', holder: 'ops' })).status, 200, 'no pool needed for the gate');
   } finally { s.cleanup(); }
@@ -239,6 +239,23 @@ test('the CLI: finds the request on this host without --resource, takes --pool a
     assert.equal(pooled.code, 0);
     assert.deepEqual([JSON.parse(pooled.out[0]).pool, JSON.parse(pooled.out[0]).queues.map(queue => queue.lock)], ['phone', ['adb', 's24']]);
     assert.deepEqual([s.queue('s24'), s.queue('adb')], [[], []]);
+    // A Pool request is also found by its id alone, with neither --resource nor --pool; its answer is under the Pool word.
+    const file2 = `${String(T0).padStart(15, '0')}-000006-00000009.json`;
+    s.wait('s24', 'p-2', { pool: 'phone', file: file2 });
+    s.wait('adb', 'p-2', { pool: 'phone', file: file2 });
+    const located = await s.cli(['cancel', 'p-2', '--json']);
+    assert.equal(located.code, 0, located.err.join('\n'));
+    assert.deepEqual([JSON.parse(located.out[0]).pool, JSON.parse(located.out[0]).resource, [s.queue('s24'), s.queue('adb')]], ['phone', 'phone', [[], []]]);
+    // The emulator gate's ticket, by `--pool emulator` alone.
+    s.wait('emulator', 'e-1', { why: 'next for an emulator: tests' });
+    const gate = await s.cli(['cancel', 'e-1', '--pool', 'emulator', '--json']);
+    assert.equal(gate.code, 0, gate.err.join('\n'));
+    assert.deepEqual([JSON.parse(gate.out[0]).pool, JSON.parse(gate.out[0]).resource, s.queue('emulator')], ['emulator', 'emulator', []]);
+    // A lease that holds a lock with no queue, and a Reservation key, are found without --resource too.
+    const held = await s.cli(['cancel', 'a-1']);
+    assert.deepEqual([held.code, held.err[0].startsWith('HUB_REQUEST_NOT_FOUND request a-1 already holds')], [2, true]);
+    assert.equal(reserve('adb', { env: { ...s.env, GITHUB_REPOSITORY: 'acme/app', GITHUB_RUN_ID: '78' }, now: () => T0, log: () => {} }).status, 'claimed');
+    assert.deepEqual([(await s.cli(['cancel', 'acme--app--78'])).code, (await s.cli(['cancel', 'acme--app--78'])).err[0].startsWith('HUB_CANCEL_RESERVATION')], [2, true]);
     assert.equal((await s.cli(['cancel'])).code, 2);
     assert.equal((await s.cli(['cancel', 'a', 'b'])).code, 2);
     assert.equal((await s.cli(['cancel', 'b-1', '--why', ' '])).code, 2);
