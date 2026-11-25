@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DEPLOY_TARGETS, acquireLease, deployTargetCapMs, extendLease, releaseLease, reserve, updateLease } from './lib/lock.mjs';
+import { DEPLOY_TARGETS, acquireLease, acquirePool, deployTargetCapMs, extendLease, queueView, releaseLease, reserve, updateLease } from './lib/lock.mjs';
 import { readEvents } from './lib/events.mjs';
 import { loadPolicy } from './lib/policy.mjs';
 import { hermetic } from './test-fixtures.mjs';
@@ -250,5 +250,146 @@ test('an extension that cannot start (a bad forMs, a bad name) throws before tou
     for (const forMs of [0, -1, NaN, Infinity, undefined]) assert.throws(() => extend(f, forMs), /an extension is for more than 0 ms/, String(forMs));
     assert.throws(() => extend(f, MIN, 'Bad Name'), /bad lock name/);
     assert.equal(f.owner('adb').expires_at, at(T0 + 20 * MIN));
+  } finally { f.cleanup(); }
+});
+
+// ---- Story 5.9 (AD-34): Pool tickets, the extender's own ticket and the emulator gate ----
+
+// The ticket of a Pool request `req` for the phone Pool, as acquirePool writes it into each member's queue.
+const poolTicket = (f, ms, name, request = 'req', extra = {}) => putTicket(f, ms, { lease_id: request, holder: 'pooler', why: 'any phone', pool: 'phone', request, ...extra }, name);
+const hold = (f, name, id, extra = {}) => acquireLease(name, { holder: `holder-${id}`, why: 'holding', forMs: 30 * MIN, id, env: f.env, log: () => {}, now: f.now, policy, ...extra });
+const extendEvents = f => f.events().filter(event => event.event === 'extend').length;
+
+test('queueView lists a Pool request\'s identical ticket once in each member queue, with its pool and request keys', async () => {
+  const f = fixture();
+  try {
+    await take(f, 's24');
+    poolTicket(f, T0 + MIN, 's24');
+    poolTicket(f, T0 + MIN, 'adb');
+    for (const name of ['s24', 'adb']) {
+      const view = queueView(name, { env: f.env, now: f.now });
+      assert.equal(view.length, 1, `listed once in ${name}`);
+      assert.deepEqual([view[0].pool, view[0].request, view[0].lease_id, view[0].blocking], ['phone', 'req', 'req', true]);
+    }
+  } finally { f.cleanup(); }
+});
+
+test('a Pool request that waits blocks an extension; once it holds another member it no longer does', async () => {
+  const f = fixture();
+  try {
+    await take(f, 's24');
+    await hold(f, 'adb', 'other');
+    poolTicket(f, T0 + MIN, 's24');
+    poolTicket(f, T0 + MIN, 'adb');
+    f.clock.at = T0 + 2 * MIN;
+    const before = JSON.stringify(f.owner('s24'));
+    assert.throws(() => extend(f, 5 * MIN, 's24'), refused('HUB_LEASE_EXTEND_REFUSED', /^lease mine on s24 cannot be extended while 1 waiter waits: 1\. pooler \(any phone\)$/));
+    assert.equal(JSON.stringify(f.owner('s24')), before, 'nothing was written');
+    assert.equal(extendEvents(f), 0);
+    // The request takes adb (its own lease id now owns that lock): it is served, its s24 ticket is a leftover.
+    releaseLease('adb', 'other', { env: f.env, now: f.now });
+    rmSync(join(f.root, 'locks', 'adb.queue'), { recursive: true, force: true });   // the winner withdrew its adb ticket
+    await hold(f, 'adb', 'req');
+    assert.equal(extend(f, 5 * MIN, 's24').expires_at, at(T0 + 25 * MIN));
+    assert.equal(extendEvents(f), 1);
+  } finally { f.cleanup(); }
+});
+
+test('a Pool request\'s member Lease that expired but was not reaped is not held: the request still waits', async () => {
+  const f = fixture();
+  try {
+    await take(f, 's24', { forMs: 60 * MIN });
+    await hold(f, 'adb', 'req', { forMs: 5 * MIN });
+    poolTicket(f, T0 + MIN, 's24');
+    poolTicket(f, T0 + MIN, 'adb');
+    f.clock.at = T0 + 6 * MIN;   // past req's expiry on adb, inside mine's on s24
+    assert.throws(() => extend(f, MIN, 's24'), refused('HUB_LEASE_EXTEND_REFUSED', /cannot be extended while 1 waiter waits: 1\. pooler \(any phone\)$/));
+    assert.equal(extendEvents(f), 0);
+  } finally { f.cleanup(); }
+});
+
+test('through a real acquirePool: the extension in the window before the winner withdraws its s24 ticket succeeds, the request already holds adb', async () => {
+  const f = fixture();
+  try {
+    await take(f, 's24', { forMs: 60 * MIN });
+    let outcome = null;
+    let called = 0;
+    const won = await acquirePool('phone', ['s24', 'adb'], {
+      holder: 'pooler', why: 'any phone', forMs: 5 * MIN, id: 'req', waitMs: 5 * MIN, env: f.env, log: () => {}, now: f.now, policy,
+      pollMs: 1000, sleep: async ms => { f.clock.at += ms; },
+      beforeWithdraw: name => {
+        called += 1;
+        try { outcome = { name, record: extend(f, 5 * MIN, 's24') }; } catch (error) { outcome = { name, error }; }
+      },
+    });
+    assert.equal(won.name, 'adb', 'the pool won adb');
+    assert.equal(called, 1, 'the s24 ticket was withdrawn after the take');
+    assert.equal(outcome?.error, undefined, outcome?.error?.message);
+    assert.equal(outcome.name, 's24');
+    assert.equal(outcome.record.expires_at, at(T0 + 65 * MIN));
+    assert.equal(extendEvents(f), 1);
+  } finally { f.cleanup(); }
+});
+
+test('the extender\'s own ticket in its queue is not a waiter', async () => {
+  const f = fixture();
+  try {
+    await take(f, 's24');
+    putTicket(f, T0 + MIN, { lease_id: 'mine', holder: 'agent-a' }, 's24');
+    assert.equal(extend(f, MIN, 's24').expires_at, at(T0 + 21 * MIN));
+    assert.equal(extendEvents(f), 1);
+  } finally { f.cleanup(); }
+});
+
+test('an emulator slot cannot be extended while the emulator gate is held by a waiting request, or has a queue', async () => {
+  const f = fixture();
+  try {
+    await take(f, 'emulator-1');
+    await hold(f, 'emulator', 'e-next', { holder: 'agent-e', why: 'next for an emulator: tests' });
+    f.clock.at = T0 + MIN;
+    const before = JSON.stringify(f.owner('emulator-1'));
+    assert.throws(() => extend(f, MIN, 'emulator-1'), refused('HUB_LEASE_EXTEND_REFUSED', /^lease mine on emulator-1 cannot be extended while 1 waiter waits: in the emulator line 1\. agent-e \(next for an emulator: tests\)$/));
+    assert.equal(JSON.stringify(f.owner('emulator-1')), before);
+    assert.equal(extendEvents(f), 0);
+    putTicket(f, T0 + MIN, { lease_id: 'e-second', holder: 'agent-f', why: 'next for an emulator: more' }, 'emulator');
+    assert.throws(() => extend(f, MIN, 'emulator-1'), refused('HUB_LEASE_EXTEND_REFUSED', /^lease mine on emulator-1 cannot be extended while 2 waiters wait: in the emulator line 1\. agent-e \(next for an emulator: tests\), 2\. agent-f \(next for an emulator: more\)$/));
+    // An own-queue waiter comes first, joined with `; `.
+    putTicket(f, T0 + MIN, { lease_id: 'slot-waiter', holder: 'agent-g', why: 'slot' }, 'emulator-1');
+    assert.throws(() => extend(f, MIN, 'emulator-1'), refused('HUB_LEASE_EXTEND_REFUSED', /while 3 waiters wait: 1\. agent-g \(slot\); in the emulator line 1\. agent-e .*, 2\. agent-f /));
+    assert.equal(extendEvents(f), 0);
+  } finally { f.cleanup(); }
+});
+
+test('a gate holder that already holds a slot, or a gate queue with no holder, is read as the gate says', async () => {
+  const f = fixture();
+  try {
+    await take(f, 'emulator-1');
+    await hold(f, 'emulator', 'e-next');
+    await hold(f, 'emulator-2', 'e-next');
+    f.clock.at = T0 + MIN;
+    assert.equal(extend(f, MIN, 'emulator-1').expires_at, at(T0 + 21 * MIN), 'the gate holder is served: it holds emulator-2');
+    // No live gate holder: a queued ticket stands at its own place.
+    releaseLease('emulator', 'e-next', { env: f.env, now: f.now });
+    putTicket(f, T0 + MIN, { lease_id: 'e-queued', holder: 'agent-q', why: 'queued' }, 'emulator');
+    assert.throws(() => extend(f, MIN, 'emulator-1'), refused('HUB_LEASE_EXTEND_REFUSED', /in the emulator line 1\. agent-q \(queued\)$/));
+  } finally { f.cleanup(); }
+});
+
+test('a lock that is not an emulator slot never reads the gate', async () => {
+  const f = fixture();
+  try {
+    await take(f, 's24');
+    await hold(f, 'emulator', 'e-next');
+    assert.equal(extend(f, MIN, 's24').expires_at, at(T0 + 21 * MIN));
+  } finally { f.cleanup(); }
+});
+
+test('an expired gate holder is not a waiter', async () => {
+  const f = fixture();
+  try {
+    await take(f, 'emulator-1', { forMs: 60 * MIN });
+    await hold(f, 'emulator', 'e-next', { forMs: 5 * MIN });
+    f.clock.at = T0 + 6 * MIN;
+    assert.equal(extend(f, MIN, 'emulator-1').expires_at, at(T0 + 61 * MIN));
   } finally { f.cleanup(); }
 });

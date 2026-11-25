@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { acquireLease } from '../ci/lib/lock.mjs';
+import { acquireLease, acquirePool } from '../ci/lib/lock.mjs';
 import { readEvents } from '../ci/lib/events.mjs';
 import * as claims from './claims.mjs';
 import { main } from './hub-device.mjs';
@@ -274,6 +274,32 @@ test('extend: a live Lease with no waiter gets the new expiry and one extend eve
     assert.equal(claims.exitCodeOf(lost), 1);
     assert.equal(refusal('l-aaaaaaaaaaaa', 0).code, 'HUB_USAGE');
   } finally { await waiter?.stop(); s.cleanup(); }
+});
+
+test('extend: a real Pool waiter in the s24 and adb queues refuses an extension of the s24 Lease, naming it', async () => {
+  const s = side();
+  let settled = null;
+  const abort = new AbortController();
+  try {
+    const { fleet } = s.ctx;
+    await claims.take(claims.resolve('s24', { fleet, env: s.env, ids: false }), options({ id: 'l-aaaaaaaaaaaa' }), s.ctx);
+    await claims.take(claims.resolve('s26', { fleet, env: s.env, ids: false }), options({ id: 'l-bbbbbbbbbbbb' }), s.ctx);
+    settled = acquirePool('phone', ['s24', 'adb'], { id: 'l-pppppppppppp', holder: 'pooler', why: 'any phone', forMs: 60_000, waitMs: 5000, env: s.env, log: () => {}, pollMs: 5, now: () => T0, signal: abort.signal }).catch(error => error);
+    const queued = lock => { try { return readdirSync(join(s.root, `locks/${lock}.queue`)).length > 0; } catch { return false; } };
+    for (let tries = 0; tries < 200 && !(queued('s24') && queued('adb')); tries += 1) await new Promise(done => setTimeout(done, 10));
+    assert.ok(queued('s24') && queued('adb'), 'the request waits in both member queues');
+    const before = s.events().length;
+    assert.throws(() => claims.extend('l-aaaaaaaaaaaa', { forMs: 600_000 }, s.ctx), error => {
+      assert.equal(error.code, 'HUB_LEASE_EXTEND_REFUSED');
+      assert.match(error.message, /cannot be extended while 1 waiter waits: 1\. pooler \(any phone\)$/);
+      return true;
+    });
+    assert.equal(s.events().length, before, 'the refusal writes nothing');
+  } finally {
+    abort.abort();
+    if (settled) await settled;
+    s.cleanup();
+  }
 });
 
 test('take refuses what the CLI refuses: no target, a taken id, and a Pool over the deploy cap is narrowed to the S24', async () => {

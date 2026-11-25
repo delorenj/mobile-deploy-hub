@@ -1621,6 +1621,30 @@ export function updateLease(name, id, fields, { env = process.env, ino = null } 
   return readOwner(path)?.lease_id === id;
 }
 
+// The Claimants waiting behind the Lease `id` holds on `name`, read only (AD-34): `own` is the lock's own queue (Pool tickets
+// included), `gate` the `emulator` gate for an `emulator-<n>` slot (its live holder is next, then its queue). The extender's own
+// ticket and a Pool ticket whose request already holds a member are served, so they do not count. Writes nothing: no prune, no
+// grace, no event.
+export function waitersBehind(name, id, { env = process.env, now = Date.now, hostId, host, processStart: startOf } = {}) {
+  let holding = null;   // lease ids that hold a lock other than the gate, read once and only when a Pool request is seen
+  const holdsMember = request => {
+    holding ??= new Set(listLocks({ env, now, host, hostId })
+      .filter(lock => lock.name !== EMULATOR_POOL && lock.kind === 'lease' && !lock.stale)
+      .map(lock => lock.owner.lease_id));
+    return holding.has(request);
+  };
+  const served = entry => entry.lease_id === id || (typeof entry.pool === 'string' && typeof entry.request === 'string' && holdsMember(entry.request));
+  const view = lock => queueView(lock, { env, now, hostId, host, processStart: startOf }).filter(entry => entry.blocking && !served(entry));
+  const own = view(name);
+  if (!/^emulator-\d+$/.test(name)) return { own, gate: [] };
+  const holder = liveLease(EMULATOR_POOL, { env, now, host, hostId });
+  const shift = holder ? 1 : 0;
+  const gate = [];
+  if (holder && holder.lease_id !== id && !holdsMember(holder.lease_id)) gate.push({ place: 1, holder: holder.holder, lease_id: holder.lease_id, why: holder.why });
+  for (const entry of view(EMULATOR_POOL)) gate.push({ ...entry, place: entry.place + shift });
+  return { own, gate };
+}
+
 // Extends the Lease `id` holds on `name` by `forMs` past its current expiry (AD-16), the only path that moves expires_at later.
 // Refused with HUB_LEASE_EXTEND_REFUSED, writing nothing:
 //   - at or after its expiry (a Lease that ran out is over, take a new one);
@@ -1638,9 +1662,11 @@ export function extendLease(name, id, { forMs, env = process.env, now = Date.now
   const at = now();
   const expiry = expiresAt(current);
   if (!(expiry > at)) throw failure('HUB_LEASE_EXTEND_REFUSED', `lease ${id} on ${name} ${Number.isFinite(expiry) ? `ran out at ${current.expires_at}` : 'has no expiry'}; an expired lease cannot be extended, take a new one`);
-  const waiting = queueView(name, { env, now, hostId, host, processStart: startOf }).filter(entry => entry.blocking);
-  if (waiting.length > 0) {
-    throw failure('HUB_LEASE_EXTEND_REFUSED', `lease ${id} on ${name} cannot be extended while ${waiting.length} waiter${waiting.length === 1 ? '' : 's'} wait${waiting.length === 1 ? 's' : ''}: ${waiting.map(waiterText).join(', ')}`);
+  const { own, gate } = waitersBehind(name, id, { env, now, hostId, host, processStart: startOf });
+  const count = own.length + gate.length;
+  if (count > 0) {
+    const groups = [...(own.length > 0 ? [own.map(waiterText).join(', ')] : []), ...(gate.length > 0 ? [`in the emulator line ${gate.map(waiterText).join(', ')}`] : [])];
+    throw failure('HUB_LEASE_EXTEND_REFUSED', `lease ${id} on ${name} cannot be extended while ${count} waiter${count === 1 ? '' : 's'} wait${count === 1 ? 's' : ''}: ${groups.join('; ')}`);
   }
   const started = Date.parse(current.started_at);
   const next = expiry + forMs;
