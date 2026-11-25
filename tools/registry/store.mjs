@@ -176,22 +176,10 @@ function serialised(path, task) {
   return run;
 }
 
-// Writes the Registry: `resources` (an array of records) and `pools` become the new content when they differ from the file, at
-// `rev + 1`, only if the file is at `if_rev` (0 for no file yet). Returns `{rev, changed, events}`: a no-op write commits nothing,
-// logs nothing and returns the current rev with `changed: false`; otherwise `events` lists each `registry-*` event derived, with its
-// `logged` flag (a failed log write never fails a committed write). The caller's `reason`, `actor` ({holder, via}) and `why` ride on
-// every event.
-//   HUB_REGISTRY_CONFLICT  (409, `rev` = the current one)  the file is not at `if_rev`
-//   HUB_REGISTRY_FORMAT    (409, `reason`)                 the file is unreadable or of another format; it is left as it is
-//   TypeError                                              a caller bug: a bad shape, a duplicate id, a record dropped, a changed id or lock
-// `afterRead` is a test seam, awaited between the read and the commit.
-export async function writeRegistry({ env = process.env, if_rev, resources, pools, reason, actor, why, afterRead, now, hostId, log } = {}) {
-  if (!wholeNumber(if_rev)) throw new TypeError('if_rev must be a whole number (0 when there is no file yet)');
+// The checked shape of a write's content: a JSON copy (compared and written as JSON, so what is diffed is what is stored) of the
+// records and Pools, each with an id and a lock, or a name. A caller bug is a TypeError.
+function normalise(resources, pools) {
   if (!Array.isArray(resources)) throw new TypeError('resources must be an array of records');
-  if (reason !== undefined && reason !== null && typeof reason !== 'string') throw new TypeError('reason must be a string');
-  if (why !== undefined && why !== null && typeof why !== 'string') throw new TypeError('why must be a string');
-  checkActor(actor);
-  // Compared and written as JSON, so what is diffed is what is stored.
   const next = JSON.parse(JSON.stringify(resources));
   const nextPools = JSON.parse(JSON.stringify(poolList(pools)));
   const ids = new Set();
@@ -206,15 +194,41 @@ export async function writeRegistry({ env = process.env, if_rev, resources, pool
     if (names.has(pool.name)) throw new TypeError(`pools[${index}] repeats the name "${pool.name}"`);
     names.add(pool.name);
   }
+  return { next, nextPools };
+}
+
+// The one transactional write (AD-27): reads the file, checks `if_rev`, runs `change` and commits, all inside the per-path queue, so
+// `change` sees the file as it will be replaced (what an earlier queued write committed included). `change({rev, resources, pools,
+// state})` gets copies of the current records and Pools (an array) and `state` `'file'` or `'missing'` (no file yet: no records, rev 0);
+// it returns `{resources, pools}` (the same shapes `writeRegistry` takes) or throws, and a throw commits nothing and reaches the caller
+// as it is. It may be async. `if_rev`, when given, must equal the file's rev (0 for no file yet); when it is absent there is no rev
+// check (a writer whose own checks run in `change`, such as register, cannot lose an update).
+// The content becomes the new file when it differs, at `rev + 1`. Returns `{rev, changed, events}`: a no-op write commits nothing,
+// logs nothing and returns the current rev with `changed: false`; otherwise `events` lists each `registry-*` event derived, with its
+// `logged` flag (a failed log write never fails a committed write). The caller's `reason`, `actor` ({holder, via}) and `why` ride on
+// every event.
+//   HUB_REGISTRY_CONFLICT  (409, `rev` = the current one)  `if_rev` is given and the file is not at it
+//   HUB_REGISTRY_FORMAT    (409, `reason`)                 the file is unreadable or of another format; it is left as it is
+//   TypeError                                              a caller bug: a bad shape, a duplicate id, a record dropped, a changed id or lock
+// `afterRead` is a test seam, awaited between the read and the commit.
+export async function updateRegistry({ env = process.env, if_rev, change, reason, actor, why, afterRead, now, hostId, log } = {}) {
+  if (if_rev !== undefined && !wholeNumber(if_rev)) throw new TypeError('if_rev must be a whole number (0 when there is no file yet), or absent');
+  if (typeof change !== 'function') throw new TypeError('change must be a function');
+  if (reason !== undefined && reason !== null && typeof reason !== 'string') throw new TypeError('reason must be a string');
+  if (why !== undefined && why !== null && typeof why !== 'string') throw new TypeError('why must be a string');
+  checkActor(actor);
   const path = registryPath(env);
   return serialised(path, async () => {
     const file = loadFile(path);
     if (file.state === 'unreadable') throw formatError(file.reason, path);
     const current = file.state === 'ok' ? file.rev : 0;
     if (afterRead) await afterRead({ rev: current });
-    if (if_rev !== current) throw registryError('HUB_REGISTRY_CONFLICT', `${path} is at rev ${current}, not ${if_rev}`, { rev: current });
+    if (if_rev !== undefined && if_rev !== current) throw registryError('HUB_REGISTRY_CONFLICT', `${path} is at rev ${current}, not ${if_rev}`, { rev: current });
     const was = file.state === 'ok' ? file.resources : [];
     const wasPools = file.state === 'ok' ? file.pools : [];
+    const changed = await change({ rev: current, resources: structuredClone(was), pools: structuredClone(wasPools), state: file.state === 'ok' ? 'file' : 'missing' });
+    if (!isObject(changed)) throw new TypeError('change returns {resources, pools}');
+    const { next, nextPools } = normalise(changed.resources, changed.pools);
     for (const record of was) {
       const kept = next.find(entry => entry.id === record.id);
       if (!kept) throw new TypeError(`a write may not drop the record "${record.id}" (retire it)`);
@@ -232,6 +246,15 @@ export async function writeRegistry({ env = process.env, if_rev, resources, pool
     });
     return { rev, changed: true, events };
   });
+}
+
+// Writes the Registry: `resources` (an array of records) and `pools` become the new content when they differ from the file, at
+// `rev + 1`, only if the file is at `if_rev` (0 for no file yet; required). `updateRegistry` with a constant change: the same
+// results and errors, and a bad shape is a TypeError before anything is read.
+export async function writeRegistry({ env = process.env, if_rev, resources, pools, ...rest } = {}) {
+  if (!wholeNumber(if_rev)) throw new TypeError('if_rev must be a whole number (0 when there is no file yet)');
+  normalise(resources, pools);
+  return updateRegistry({ ...rest, env, if_rev, change: () => ({ resources, pools }) });
 }
 
 // ---- seed ----
