@@ -3,6 +3,10 @@
 // here, so `hub-device` (and later the Hub API and the Host Agent) can only parse, call and print: none of them can take,
 // refuse or report one action differently. The deploy path never imports this file (tools/deploy-path.test.mjs).
 //
+// The fleet is a projection of the Registry (Story 6.9): `loadFleet` reads `<lock dir>/registry.json` fresh on every call, so a phone
+// registered through the Hub API is leasable by name or id on the next call, from every caller of this library (the CLI now, the
+// Hub API and the Host Agent later); with no readable file it is the in-memory seed of devices.json, as it always was.
+//
 // A take is refused (HUB_RESOURCE_RETIRED, exit 2, `reason` retired|seed-missing, `resource`) for a Resource the Registry file marks
 // retired or seed_missing, before anything is queued or written; the file only is read (`readRegistryFile`), so a missing or unreadable
 // one refuses nothing and the QA file is never opened.
@@ -25,7 +29,7 @@ import { createAdbWire } from './adb-wire.mjs';
 import { createAsyncAdb } from './async-adb.mjs';
 import { GATE, LEASE_ID, MAX_POOL, PROFILES, emulatorStatus, exportsOf as emulatorExports, hostPool, isEmulatorLease, isEmulatorLock, provision, readRecord, reap, releaseEmulator as releaseEmulatorLease, teardownNow } from './emulator.mjs';
 import { REACHABILITY, discover as discoverDevices, phoneReachability, present, queryAdb, readIpad, stamp } from '../registry/reachability.mjs';
-import { match, canonical, parseQuery, retirement } from '../registry/match.mjs';
+import { match, canonical, parseQuery, retirement, visibility } from '../registry/match.mjs';
 import { readRegistry, readRegistryFile } from '../registry/store.mjs';
 import { deployTargetIds, loadQaDevices, seed } from '../registry/seed.mjs';
 import { viewPools, viewRecord } from '../registry/view.mjs';
@@ -134,18 +138,26 @@ export function createContext({ env = process.env, sleep = realSleep, now = Date
 
 // ---- the fleet and ids ----
 
+// A phone this CLI cannot lease: it lives on a host that is not `linux`. (Destructured, so claims.mjs keeps its one record-host comparison, `isLocal`.)
+const isOtherHost = ({ host }) => host !== 'linux';
+
+// The fleet entries of a list of Registry records: every phone on the `linux` host, in the list's order (retired and seed-missing ones
+// included: release, `withoutRetired` and status still need them). `device` is the record's `name` (the word a caller types), `deploy`
+// whether deploys install to it, `name` its display name and `serial` and `model` its identity (null when it has none).
+export const phonesOf = resources => resources
+  .filter(({ kind, host }) => kind === 'phone' && host === 'linux')
+  .map(resource => ({ device: resource.name, lock: resource.lock, deploy: resource.deploy_target === true, name: resource.display_name ?? resource.name, serial: resource.identity?.serial ?? null, model: resource.identity?.model ?? null }));
+
 // The phones this tool can lease, in the order `phone` prefers them: a projection of the Registry seed (tools/registry/seed.mjs),
 // which is the one derivation from devices.json. The S26 is the deploy phone (devices.android): it sits under the `adb` host
 // lock deploys take, so its lock name can never change, and every further phone (devices.android_extra) gets a lock of its own
 // lowercased name. Nothing but the seed reads android_extra. The QA file is never read here (`qaDevices: () => []`).
-export function fleetOf(devices) {
-  return seed(devices, { qaDevices: () => [] }).resources
-    .filter(resource => resource.kind === 'phone')
-    .map(resource => ({ device: resource.id, lock: resource.lock, deploy: resource.deploy_target, name: resource.display_name, serial: resource.identity.serial, model: resource.identity.model }));
-}
+export const fleetOf = devices => phonesOf(seed(devices, { qaDevices: () => [] }).resources);
 
-// The phones this checkout's devices.json names; a broken one is a tool failure, named like any other.
-export const loadFleet = env => fleetOf(loadDevices(env));
+// The phones this checkout can lease: the Registry file's phones (`registry.json` in the lock dir, read fresh, no cache), or, when it is
+// missing or unreadable (one HUB_REGISTRY_FORMAT warning through `warn`), `fleetOf` of devices.json, which is a broken one's tool
+// failure, named like any other. The QA file is never read.
+export const loadFleet = (env, { warn } = {}) => phonesOf(readRegistry({ env, qaDevices: () => [], warn }).resources);
 
 export const nameOf = (fleet, lock) => (isEmulatorLock(lock) ? EMULATOR : fleet.find(phone => phone.lock === lock)?.device ?? null);
 
@@ -212,10 +224,13 @@ function withoutRetired(target, env) {
 const phoneOwning = (fleet, env, id) => fleet.find(phone => { const owner = readOwnerOf(phone.lock, env); return isLease(owner) && owner.lease_id === id; }) ?? null;
 const phoneWaiting = (fleet, env, id) => fleet.find(phone => queueView(phone.lock, { env, includeStale: true }).some(waiter => waiter.lease_id === id)) ?? null;
 
-// The `phone` word's members, in order: the matcher's named list over the committed devices.json (no QA file), as fleet entries. For the
-// committed devices.json that is the S24, then the S26.
+// The `phone` word's members, in order: the matcher's named list over the Registry (the file, else the seed of devices.json; never the QA
+// file, no warning), as fleet entries: the S24, then the S26, then every runtime `linux` phone that is not dedicated_qa, by created_at.
+// The retirement marks are stripped so a retired member stays in the list: `withoutRetired` narrows it and says why when none is left.
 function phoneMembers(fleet, env) {
-  const named = match(seed(loadDevices(env), { qaDevices: () => [] }), { pool: PHONE }, null);
+  const registry = readRegistry({ env, qaDevices: () => [] });
+  const live = registry.resources.map(({ retired_at: _retired, seed_missing: _missing, ...rest }) => rest);
+  const named = match({ ...registry, resources: live }, { pool: PHONE }, null);
   return named.members.map(member => fleet.find(phone => phone.lock === member.lock)).filter(Boolean);
 }
 
@@ -235,7 +250,7 @@ export function matchTarget(text, { forMs } = {}, ctx) {
   for (const record of found.members) {
     const phone = record.kind === 'phone' ? ctx.fleet.find(entry => entry.lock === record.lock) : null;
     if (phone) members.push(phone);
-    else excluded.push({ id: record.id, why: record.kind === 'phone' ? 'is known only from the QA file; hub-device cannot lease it yet' : `is ${/^[aeiou]/.test(record.kind) ? 'an' : 'a'} ${record.kind}; --match takes a phone` });
+    else excluded.push({ id: record.id, why: record.kind === 'phone' ? (isOtherHost(record) ? `is a phone on ${record.host}; hub-device leases a phone on linux` : 'is known only from the QA file; hub-device cannot lease it yet') : `is ${/^[aeiou]/.test(record.kind) ? 'an' : 'a'} ${record.kind}; --match takes a phone` });
   }
   if (members.length === 0) {
     const reason = excluded.map(({ id, why }) => `${id} ${why}`).join('; ');
@@ -294,7 +309,8 @@ export function resolve(target, { fleet, env = process.env, words = true, ids = 
   if (target === EMULATOR) return { kind: EMULATOR, by: 'word' };
   if (target === PHONE) return { kind: 'pool', by: 'word', pool: PHONE, members: phoneMembers(fleet, env) };
   refuseRetired(target, { env });
-  const entry = fleet.find(phone => phone.device === target);
+  // A Resource id first, then the device word (a name is never reused, so the two cannot name different phones).
+  const entry = fleet.find(phone => resourceOf(phone.lock) === target) ?? fleet.find(phone => phone.device === target);
   if (!entry) throw usage(`unknown device "${target ?? ''}" (known: ${[...fleet.map(phone => phone.device), PHONE, EMULATOR].join(', ')})`);
   return { kind: 'phone', by: 'word', entry };
 }
@@ -393,10 +409,15 @@ async function connectPhone(phone, lease, options, ctx) {
   return device;
 }
 
+// A phone registered with a model alone cannot be found on adb: refused before any lock is taken or queued for, unless the lease is
+// --no-connect (the lock only).
+const noSerialAway = phone => Object.assign(failure('HUB_PHONE_AWAY', `${phone?.device ?? 'a phone'} has no serial registered, so adb cannot find it (lease it --no-connect)`), { reason: 'no serial registered (lease it --no-connect)' });
+
 // Takes the lease on one phone, then (unless noConnect) connects it. A phone that does not come gives the lease back;
 // a lease released or reclaimed while the phone was being found ends as HUB_LEASE_CANCELLED holding nothing.
 async function takePhone(phone, options, ctx) {
   const { env, log, timing } = ctx;
+  if (!phone.serial && !options.noConnect) throw noSerialAway(phone);
   const lease = await acquireLease(phone.lock, { ...options, env, log, pollMs: timing.leasePollMs, sleep: timing.sleep, now: timing.now });
   try {
     const device = await connectPhone(phone, lease, options, ctx);
@@ -427,8 +448,11 @@ function noPhoneError(fleet, states, waitMs, ctx) {
 // taken and its phone is given a slice of what is left to appear (HUB_DEVICE_PHONE_SLICE_MS, default 10s); a phone that does not
 // come is given back and the request falls through to the next member, keeping its place, so a phone that frees or appears
 // mid-wait is picked up. The winner takes its member and withdraws the rest; later takers queue behind it like any Lease.
-async function takeAnyPhone(fleet, options, ctx, poolName = PHONE) {
+async function takeAnyPhone(members, options, ctx, poolName = PHONE) {
   const { env, timing } = ctx;
+  // A member with no serial can never be connected: it is dropped before any lock is taken, and none left is AWAY.
+  const fleet = options.noConnect ? members : members.filter(phone => phone.serial);
+  if (fleet.length === 0) throw noSerialAway(members[0]);
   const sliceMs = Number(env.HUB_DEVICE_PHONE_SLICE_MS) || 10_000;
   const deadline = timing.now() + options.waitMs;
   const taken = await acquirePool(poolName, fleet.map(phone => phone.lock), {
@@ -777,7 +801,13 @@ export async function statusView(key, options, ctx) {
   for (const { row, etas } of pooled.values()) row.eta = row.stale ? null : earliest(etas);
   const found = (ctx.inventory ?? realInventory)({ lockRoot: lockDir(env), hubAdbPort: Number(env.HUB_ADB_SERVER_PORT) || 5037 });
   const observed = await phoneObservations(fleet, ctx, found);
-  const phones = fleet.map(phone => {
+  // A retired or seed-missing phone that nobody holds or waits on is gone from the list; a retiring one stays (AD-31).
+  const records = readRegistryFile(env)?.resources ?? [];
+  const shown = fleet.filter(phone => {
+    const record = records.find(entry => entry.lock === phone.lock);
+    return !record || visibility(record, lockActivity(phone.lock, { env, now: timing.now })) !== 'hidden';
+  });
+  const phones = shown.map(phone => {
     const lock = locks.find(entry => entry.lock === phone.lock) ?? null;
     const owner = lock?.kind === 'lease' ? { lease_id: lock.lease_id, holder: lock.holder, why: lock.why, expires_at: lock.expires_at, adb_id: lock.phone?.adb_id ?? null } : null;
     return {

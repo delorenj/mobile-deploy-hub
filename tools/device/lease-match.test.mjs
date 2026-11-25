@@ -398,7 +398,7 @@ test('the USAGE text names --match', async () => {
 // ---- the library ----
 
 test('resolve("phone") takes its members from the matcher and equals [s24, s26] for the committed devices.json', () => {
-  const env = {};
+  const env = { HUB_LOCK_DIR: process.env.HUB_LOCK_DIR };
   const fleet = claims.loadFleet(env);
   const target = claims.resolve('phone', { fleet, env, ids: false });
   assert.deepEqual(target.members.map(phone => phone.device), ['s24', 's26']);
@@ -408,8 +408,9 @@ test('resolve("phone") takes its members from the matcher and equals [s24, s26] 
 });
 
 test('matchTarget returns the Pool target with the canonical label, and the same policy the cap uses', () => {
-  const fleet = claims.loadFleet({});
-  const ctx = { env: {}, fleet, qaDevices: qaS24, policy: loadPolicy().policy };
+  const env = { HUB_LOCK_DIR: process.env.HUB_LOCK_DIR };
+  const fleet = claims.loadFleet(env);
+  const ctx = { env, fleet, qaDevices: qaS24, policy: loadPolicy().policy };
   const target = claims.matchTarget('kind=phone,deploy_target=true', { forMs: 1_800_000 }, ctx);
   assert.deepEqual({ kind: target.kind, by: target.by, pool: target.pool, members: target.members.map(phone => phone.device) }, { kind: 'pool', by: 'match', pool: 'match:kind=phone,deploy_target=true', members: ['s26'] });
   assert.throws(() => claims.matchTarget('kind=phone', { forMs: 7_200_000 }, ctx), error => error.code === 'HUB_NO_MATCH' && /capped at 60 min/.test(error.reason));

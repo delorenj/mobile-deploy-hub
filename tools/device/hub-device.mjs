@@ -12,6 +12,12 @@
 // the first that serves it, so no later taker jumps it (lock.mjs acquirePool; see claims.mjs). `HUB_DEVICE` in the exports and
 // the JSON says which one a `phone` lease took.
 //
+// A phone registered through the Hub API (`registry add`, Story 6.8) is leasable the same way, by its name (`lease pixel`) or its
+// Resource id (`lease res-pixel`), and is a `phone` member after the S24 and the S26: the fleet is read from registry.json in the lock
+// dir on every invocation (claims.loadFleet), so there is no install and no wait, and devices.json is the fleet only while that file
+// is missing or unreadable. A retired phone is refused (HUB_RESOURCE_RETIRED); one registered without a serial leases only
+// with --no-connect (adb cannot find it: HUB_DEVICE_AWAY).
+//
 // `emulator` is a throwaway emulator from a small pool instead (emulator.mjs): made for the lease, with its own AVD and adb
 // server, and torn down at release or expiry. Acquiring an emulator (lease or run) first reaps the pool's expired and abandoned
 // leases; `status` reaps nothing and writes nothing (FR-13).
@@ -360,7 +366,7 @@ async function status(parsed, context) {
           return `LEASE ${phone.lease_id}  holder=${phone.holder}  ${left > 0 ? `expires in ${age(left)}` : `EXPIRED ${age(-left)} ago`}${phone.adb_id ? `  adb=${phone.adb_id}` : ''}`;
         })()
         : `JOB LOCK  ${phone.repo ?? 'a local run'} run ${phone.run ?? '-'}`;
-    stdout(`  ${phone.device}  ${held}  ${phone.presence}  ${phone.model}  serial ${phone.serial}  lock ${phone.lock}${phone.deploy ? '  (the deploy phone)' : ''}`);
+    stdout(`  ${phone.device}  ${held}  ${phone.presence}  ${phone.model ?? '-'}  serial ${phone.serial ?? '-'}  lock ${phone.lock}${phone.deploy ? '  (the deploy phone)' : ''}`);
   }
   stdout('LOCKS');
   if (locks.length === 0) stdout('  none held');
@@ -696,15 +702,24 @@ export async function main(argv, {
   timeout,
 } = {}) {
   let parsed = { flags: {}, words: [], envSerial: [], cap: [], uncap: [], command: null };
+  // Each distinct warning prints once per invocation: the fleet, `--match` and `registry list` each read the Registry, and an unreadable
+  // file warns every time.
+  const warned = new Set();
+  const warn = message => {
+    if (warned.has(message)) return;
+    warned.add(message);
+    stderr(`hub-device: warning: ${message}`);
+  };
   const context = {
-    ...claims.createContext({ env, sleep, now, log: line => stderr(line), warn: message => stderr(`hub-device: warning: ${message}`), adbFactory, adbWire, devicectl, hostKey, inventory: inventoryImpl, policy, qaDevices, registry, fetchImpl, timeout }),
+    ...claims.createContext({ env, sleep, now, log: line => stderr(line), warn, adbFactory, adbWire, devicectl, hostKey, inventory: inventoryImpl, policy, qaDevices, registry, fetchImpl, timeout }),
     stdout, stderr, signals, killGraceMs: Number(env.HUB_DEVICE_KILL_GRACE_MS) || 10_000,
   };
   try {
     parsed = parseArgs(argv);
     checkFlagOwners(parsed);
-    // The phones this checkout's devices.json names; a broken one is a tool failure, named like any other.
-    context.fleet = claims.loadFleet(env);
+    // The phones the Registry names (registry.json in the lock dir, read fresh), else the ones this checkout's devices.json names; a
+    // broken devices.json is a tool failure, named like any other.
+    context.fleet = claims.loadFleet(env, { warn: context.warn });
     switch (parsed.words[0]) {
       case 'lease': return await lease(parsed, context);
       case 'release': return await release(parsed, context);
