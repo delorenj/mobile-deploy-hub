@@ -4,6 +4,31 @@ One section per hub release, headed `## vX.Y.Z`. `mise run release -- X.Y.Z` (`t
 
 A section is plain text read in a terminal: everything after its heading up to the next `## ` heading. Use `###` for sub-headings and `-` lists; do not start a section line with `## `.
 
+## v1.2.52
+
+Epic 5 (agents can tell which phone is free, and wait in line for one), on top of v1.2.51. Nothing in this release is a service: everything runs inside `hub-device` and `lock.mjs` on the host that runs it, and nothing listens, polls or starts at boot. The deploy path (the workflow, `actions/hub`, `tools/ci/commands/*`, `tools/catchup/*`), `policy.json`'s rules, the Queue protocol, the Event Log format and every `HUB_DEVICE_*` line, exit code (75 away, 76 busy, 2 usage) and existing `--json` key are unchanged. Install it on both hosts (`mise run hosts:install`); that also writes each host's key.
+
+Rolling back is `hosts:install` of `v1.2.51`: move `v1` back to `v1.2.51` and run `mise run hosts:install` on big-chungus from a clean checkout at `v1.2.51` (it installs the Mac through hub-mac). The tag's own annotation carries the computed `Roll back:` line, from where `v1` pointed before this release. An older pin keeps working against what this release writes (new fields and files are additive): `v1.2.51`'s `lock.mjs` reads the lock directory and Event Log of this release, sees a `phone` Pool ticket as an ordinary waiter ahead of it (and so waits behind it and refuses an extension while it waits), and ignores the `resource` field.
+
+### What changed
+
+- One Claims library (`tools/device/claims.mjs`). `hub-device` keeps only argument parsing and output; resolving a name, taking a Lease or a phone, releasing, extending, the 48 h and 60 min bounds and the code-to-exit table live in the library, so the CLI and the later services refuse and report the same action the same way. The deploy path never imports it (a conformance table in `tools/deploy-path.test.mjs` checks).
+- Names. `lock.mjs` has one `RESERVED` list and one `SLUG` rule (`devices.mjs`'s own list is gone); a `res-<slug>` lock is a Queued lock like `adb`. Every Hold event gains an additive `resource` field (the Resource the lock belongs to).
+- `host-key`. `hosts:install` writes `~/.config/mobile-deploy-hub/host-key` (`linux` on big-chungus, `mac` on the Mac) and reads it back. A command that must know which host it is on, with no file or a file that disagrees with the OS, fails with `HUB_HOST_UNKNOWN` (exit 1). Until `hosts:install` has run after this release, `hub-device status` on that host shows every reading as `unknown` (and stale), and `hub-device discover` fails with `HUB_HOST_UNKNOWN`.
+- `hub-device status`: every row of `phones`, `locks`, `waiters`, `reservations` and `emulators` has a `resource`, a `deploy_target` and a `reachability` `{state, checked_at, age_ms, stale}` beside the unchanged `presence`. `state` is `reachable`, `unauthorized`, `offline`, `absent` or `unknown`; `unknown` is never shown as `reachable`. The text view gets a `DEPLOY TARGET <resource> ...` line for each deploy target that is held, waited on or reserved. `stale` follows the new strict `policy.json` key `registry.reachability_max_age_s` (60).
+- Status reads the phones on the adb wire only (`host:version`, `host:devices-l`): it never runs the adb binary, starts a server or connects. `deploy_target` is true for `s26` and `ios-lane`, false for `s24`, the emulators and `res-<slug>`.
+- `hub-device discover` lists the devices adb sees that no declaration names, from the same read-only query, and says `no adb server` when there is none.
+- `hub-device lease --match key=value[,key>=n]` asks for a phone by Capability (equality, `>=`, `<=`). No match is `HUB_NO_MATCH` and candidates on two hosts are `HUB_POOL_CROSS_HOST`, both exit 2; every match offline, absent or unauthorized is `HUB_DEVICE_AWAY` (75). A dedicated-QA phone is served only to a request that names it or asks for `dedicated_qa`; a deploy target whose cap the request exceeds is dropped.
+- `phone` holds a place in line. `lease phone` and `run phone` write one identical ticket in every member's queue (the S24 and the S26, then Resources of kind `phone` on `linux`) and take the first member that serves them; the Event Log gets one Pool-level `request` and one `acquire`, `timeout` or `cancel`. It fails at once with `HUB_DEVICE_AWAY` only when every member is away. A request that ends up holding two members releases the later one (`reason: pool-duplicate`). `status` lists a Pool request once, with `pool` and `positions` in `--json`.
+- No extension while anyone waits. The library's `extend` (`lock.mjs` `extendLease`; `hub-device` has no extend command) refuses with `HUB_LEASE_EXTEND_REFUSED`, naming every waiter with its position, while a Pool request waits in the Resource's queue or a waiter sits in the `emulator` gate behind an emulator slot; the extender's own ticket and a Pool request that already holds a member do not count.
+
+### Test changes you will see
+
+- `tools/device/hub-device.test.mjs`: the status fixtures answer on the adb wire (`wire-fixtures.mjs`) instead of through the adb binary, and the tests assert the binary never ran (Story 5.4).
+- `tools/device/lease.test.mjs`: `body()` strips the additive `resource` field (Story 5.2).
+- `tools/device/emulator.test.mjs`: unchanged. No `phone` ordering assertion changed (Story 5.8).
+- New suites: `claims`, `lease-match`, `phone-queue`, `status-view`, `hostkey`, `names`, `pool-request`, `deploy-path`, and `tools/registry/*`; `extend`, `eta` and `policy` grew by this epic's cases.
+
 ## v1.2.51
 
 v1.2.49 (story 3.5) plus an adb fix; install it on both hosts (`mise run hosts:install`). v1.2.50 was tagged and rolled back, never on `v1`: Tower's release dry run (45523879648) went red in `plan` because big-chungus's adb server died while it was starting (`daemon started successfully`, then `daemon still not running`), and the first `adb devices` failure killed the job.

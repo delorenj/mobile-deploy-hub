@@ -78,7 +78,7 @@ development_status:
   5-7-ask-for-a-phone-by-capability: done
   5-8-phone-holds-a-place-in-line: done
   5-9-no-extension-while-a-pool-or-gate-waiter-sits-behind: done
-  5-10-ship-the-cli-release: backlog
+  5-10-ship-the-cli-release: awaiting-operator
   epic-5-retrospective: optional
 
   epic-6: backlog
