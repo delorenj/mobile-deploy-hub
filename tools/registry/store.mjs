@@ -15,7 +15,7 @@ import { join, resolve } from 'node:path';
 import { loadDevices } from '../ci/lib/devices.mjs';
 import { readEvents } from '../ci/lib/events.mjs';
 import { checkActor, lockDir, noteRegistry, writeFileAtomic } from '../ci/lib/lock.mjs';
-import { loadQaDevices, seed } from './seed.mjs';
+import { loadQaDevices, reseed, seed } from './seed.mjs';
 
 export const REGISTRY_FILE = 'registry.json';
 export const REGISTRY_FORMAT = 1;
@@ -99,6 +99,17 @@ export function readRegistry({ env = process.env, devices, qaDevices, warn = () 
     try { warn(message); } catch { /* a broken warn seam is not a reason to fail a read */ }
   }
   return out;
+}
+
+// The file as the matcher reads it (`{format, rev, resources, pools: {<name>: {...}}}`), or null when it is missing or unreadable. Only
+// the file: no seed fallback, no QA read, no warning, and it never throws. A reader that must not invent a Resource (the Claims
+// library's take refusal) uses this instead of `readRegistry`.
+export function readRegistryFile(env = process.env) {
+  try {
+    const file = loadFile(registryPath(env));
+    if (file.state !== 'ok') return null;
+    return { format: REGISTRY_FORMAT, rev: file.rev, resources: file.resources, pools: poolsByName(file.pools) };
+  } catch { return null; }
 }
 
 // ---- diff ----
@@ -215,6 +226,25 @@ export async function writeRegistry({ env = process.env, if_rev, resources, pool
     });
     return { rev, changed: true, events };
   });
+}
+
+// ---- seed ----
+
+// The seed at start (AD-30, FR-3): derives the Registry from `devices` (default this checkout's) and writes it with one `writeRegistry`
+// at the file's rev (0 for no file yet), reason `seed`, and only when something differs, so an unchanged seed writes and logs nothing.
+// Seeded identity, lock, name and deploy_target follow devices.json; Capabilities, retirements and runtime Resources stay (see
+// `reseed`). `qaDevices` (default the private QA file) is read only when the file is first created, and a broken one fails the seed
+// before anything is written, so the one import is retried at the next start. An unreadable file is HUB_REGISTRY_FORMAT before any
+// QA read and is left as it is. Returns `{first, rev, changed, events, warnings}`.
+export async function applySeed({ env = process.env, devices, qaDevices, now, hostId, log, actor, why } = {}) {
+  const path = registryPath(env);
+  const file = loadFile(path);
+  if (file.state === 'unreadable') throw formatError(file.reason, path);
+  const first = file.state === 'missing';
+  const source = devices ?? loadDevices(env);
+  const next = reseed(first ? null : { resources: file.resources, pools: file.pools }, source, { qaDevices: qaDevices ?? (() => loadQaDevices({ env })), now });
+  const written = await writeRegistry({ env, if_rev: first ? 0 : file.rev, resources: next.resources, pools: next.pools, reason: 'seed', actor, why, now, hostId, log });
+  return { first, rev: written.rev, changed: written.changed, events: written.events, warnings: next.warnings };
 }
 
 // ---- recovery ----

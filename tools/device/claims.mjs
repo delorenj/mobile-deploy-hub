@@ -3,6 +3,10 @@
 // here, so `hub-device` (and later the Hub API and the Host Agent) can only parse, call and print: none of them can take,
 // refuse or report one action differently. The deploy path never imports this file (tools/deploy-path.test.mjs).
 //
+// A take is refused (HUB_RESOURCE_RETIRED, exit 2, `reason` retired|seed-missing, `resource`) for a Resource the Registry file marks
+// retired or seed_missing, before anything is queued or written; the file only is read (`readRegistryFile`), so a missing or unreadable
+// one refuses nothing and the QA file is never opened.
+//
 // Everything that writes the lock directory goes through lock.mjs and emulator.mjs (AD-1); reads may look at it directly. Errors carry a `code`; a usage
 // refusal is `code: 'HUB_USAGE'`. The context every action takes is the one `createContext` builds: `env`, `log`, `warn`,
 // `timing`, `emulator`, `adbFactory`, `adbWire`, `devicectl`, `hostKey`, `inventory`, `policy`, `fleet`, `qaDevices` and `registry` (the last two are the seams `matchTarget` reads).
@@ -21,8 +25,8 @@ import { createAdbWire } from './adb-wire.mjs';
 import { createAsyncAdb } from './async-adb.mjs';
 import { GATE, LEASE_ID, MAX_POOL, PROFILES, emulatorStatus, exportsOf as emulatorExports, hostPool, isEmulatorLease, isEmulatorLock, provision, readRecord, reap, releaseEmulator as releaseEmulatorLease, teardownNow } from './emulator.mjs';
 import { REACHABILITY, discover as discoverDevices, phoneReachability, present, queryAdb, readIpad, stamp } from '../registry/reachability.mjs';
-import { match, canonical, parseQuery } from '../registry/match.mjs';
-import { readRegistry } from '../registry/store.mjs';
+import { match, canonical, parseQuery, retirement } from '../registry/match.mjs';
+import { readRegistry, readRegistryFile } from '../registry/store.mjs';
 import { deployTargetIds, loadQaDevices, seed } from '../registry/seed.mjs';
 import { inventory as realInventory } from './inventory.mjs';
 
@@ -48,6 +52,7 @@ export const EXIT_CODES = Object.freeze({
   HUB_HOST_UNKNOWN: 1,
   HUB_NO_MATCH: 2,
   HUB_POOL_CROSS_HOST: 2,
+  HUB_RESOURCE_RETIRED: 2,
   HUB_REGISTRY_CONFLICT: 1,
   HUB_REGISTRY_FORMAT: 1,
 });
@@ -125,6 +130,54 @@ export function newLeaseId(kind = 'lease') {
   }
 }
 
+// ---- retired Resources ----
+
+const retiredError = (record, reason, word = record.id) => Object.assign(
+  new Error(reason === 'retired'
+    ? `${word} is retired (reason: retired): it takes no new lease; a lease it already holds ends as usual`
+    : `${word} is seed-missing (reason: seed-missing): devices.json no longer lists it, so it takes no new lease`),
+  { code: 'HUB_RESOURCE_RETIRED', status: 409, reason, resource: record.id },
+);
+
+// Refuses a device word the Registry file names a retired or seed_missing Resource: found by id, then name, then `words`. A word the
+// file does not know, or no file, passes. Throws HUB_RESOURCE_RETIRED.
+export function refuseRetired(word, { env = process.env } = {}) {
+  if (typeof word !== 'string' || word === '') return;
+  const file = readRegistryFile(env);
+  if (file === null) return;
+  const record = file.resources.find(entry => entry.id === word) ?? file.resources.find(entry => entry.name === word)
+    ?? file.resources.find(entry => Array.isArray(entry.words) && entry.words.includes(word));
+  const reason = record ? retirement(record) : null;
+  if (reason !== null) throw retiredError(record, reason, word);
+}
+
+// A resolved target for `take`: a phone whose Resource is retired or seed_missing is refused, and a word Pool is narrowed to the
+// members that are not (none left is refused, naming the first). Pools by `--match` came out of the matcher already.
+function withoutRetired(target, env) {
+  const file = target.kind === 'phone' || (target.kind === 'pool' && target.by === 'word') ? readRegistryFile(env) : null;
+  if (file === null) return target;
+  const stateOf = phone => {
+    const record = file.resources.find(entry => entry.lock === phone.lock) ?? file.resources.find(entry => entry.id === phone.device);
+    return record ? { record, reason: retirement(record) } : { record: null, reason: null };
+  };
+  if (target.kind === 'phone') {
+    const { record, reason } = stateOf(target.entry);
+    if (reason !== null) throw retiredError(record, reason, target.entry.device);
+    return target;
+  }
+  const left = target.members.filter(phone => stateOf(phone).reason === null);
+  if (left.length === target.members.length) return target;
+  if (left.length === 0) {
+    const { record, reason } = stateOf(target.members[0]);
+    const pool = target.pool ?? PHONE;
+    throw Object.assign(
+      new Error(`every remaining ${pool} member is retired or seed-missing (${target.members.map(phone => `${phone.device} ${stateOf(phone).reason}`).join(', ')}); it takes no new lease`),
+      { code: 'HUB_RESOURCE_RETIRED', status: 409, reason, resource: record.id },
+    );
+  }
+  return { ...target, members: left };
+}
+
 // ---- resolve ----
 
 const phoneOwning = (fleet, env, id) => fleet.find(phone => { const owner = readOwnerOf(phone.lock, env); return isLease(owner) && owner.lease_id === id; }) ?? null;
@@ -176,6 +229,7 @@ export function resolve(target, { fleet, env = process.env, words = true, ids = 
   if (!words) return null;
   if (target === EMULATOR) return { kind: EMULATOR, by: 'word' };
   if (target === PHONE) return { kind: 'pool', by: 'word', pool: PHONE, members: phoneMembers(fleet, env) };
+  refuseRetired(target, { env });
   const entry = fleet.find(phone => phone.device === target);
   if (!entry) throw usage(`unknown device "${target ?? ''}" (known: ${[...fleet.map(phone => phone.device), PHONE, EMULATOR].join(', ')})`);
   return { kind: 'phone', by: 'word', entry };
@@ -371,10 +425,11 @@ async function reachableMembers(members, ctx) {
 export async function take(resolved, options, ctx) {
   if (!resolved || typeof resolved !== 'object') throw usage('take needs a resolved target (resolve a device word first)');
   checkLeaseId(options.id, { fleet: ctx.fleet, env: ctx.env });
-  const target = checkBounds(resolved, { forMs: options.forMs, fleet: resolved.members, policy: ctx.policy });
+  const bounded = checkBounds(resolved, { forMs: options.forMs, fleet: resolved.members, policy: ctx.policy });
   if (!options.why) throw usage('--why <text> is required');
   if (!Number.isFinite(options.waitMs) || options.waitMs < 0) throw usage('--wait must be a duration of 0 or more');
   checkPid(options.holderPid);
+  const target = withoutRetired(bounded, ctx.env);
   switch (target.kind) {
     case 'phone': return takePhone(target.entry, options, ctx);
     case 'pool': return takeAnyPhone(target.by === 'match' && !options.noConnect ? await reachableMembers(target.members, ctx) : target.members, options, ctx, target.pool ?? PHONE);

@@ -101,6 +101,58 @@ export function seed(devices, { qaDevices = loadQaDevices } = {}) {
   };
 }
 
+// ---- re-seed (AD-30) ----
+
+const SEED_FIELDS = ['lock', 'name', 'words', 'display_name', 'kind', 'host', 'identity', 'deploy_target', 'seeded'];
+const poolArray = pools => (Array.isArray(pools) ? pools : Object.entries(pools ?? {}).map(([name, rest]) => ({ name, ...rest })));
+
+// What the seed of `devices` makes of a Registry file's content: `{resources, pools (the file's array form), warnings}`, to be written
+// at the file's `if_rev`. `current` is `{resources, pools}` (pools as an array or keyed by name) or `null` for no file yet.
+//   - null (first creation): the whole seed, with the QA file's phones (`qaDevices`), each record stamped `created_at` (`now()`, ms).
+//   - a file: the QA loader is never called. A seeded record the seed still derives takes every seed field from it and loses
+//     `seed_missing`; Capabilities, `created_at`, `retired_at` and any other key stay. A seeded record the seed no longer derives is
+//     kept with `seed_missing: true`, never deleted. A runtime record is never touched. A new record is appended with `created_at`.
+//     Each derived Pool overwrites its own keys; other keys and other Pools stay. File order is kept.
+// `current` is never mutated. A new seeded record whose name a runtime record already carries adds one warning naming both ids
+// (resolution is id-first, so it is harmless).
+export function reseed(current, devices, { qaDevices = loadQaDevices, now = Date.now } = {}) {
+  const stamp = () => new Date(now()).toISOString();
+  if (current === null || current === undefined) {
+    const first = seed(devices, { qaDevices });
+    const created_at = stamp();
+    return { resources: first.resources.map(entry => ({ ...entry, created_at })), pools: poolArray(first.pools), warnings: first.warnings };
+  }
+  const derived = seed(devices, { qaDevices: () => [] });
+  const wanted = new Map(derived.resources.map(entry => [entry.id, entry]));
+  const resources = structuredClone(current.resources ?? []);
+  const warnings = [];
+  const present = new Set();
+  for (const [index, entry] of resources.entries()) {
+    present.add(entry.id);
+    if (entry.seeded !== true) continue;
+    const from = wanted.get(entry.id);
+    if (from) {
+      const { seed_missing: _gone, ...kept } = entry;
+      resources[index] = { ...kept, ...Object.fromEntries(SEED_FIELDS.map(key => [key, structuredClone(from[key])])) };
+    } else if (entry.seed_missing !== true) {
+      resources[index] = { ...entry, seed_missing: true };
+    }
+  }
+  const created_at = stamp();
+  for (const entry of derived.resources) {
+    if (present.has(entry.id)) continue;
+    const clash = resources.find(other => other.seeded === false && other.name === entry.name);
+    if (clash) warnings.push(`the new seeded Resource "${entry.id}" shares the name "${entry.name}" with the runtime Resource "${clash.id}"; the id wins`);
+    resources.push({ ...entry, created_at });
+  }
+  const pools = structuredClone(poolArray(current.pools));
+  for (const [name, rest] of Object.entries(derived.pools)) {
+    const at = pools.findIndex(pool => pool.name === name);
+    if (at === -1) pools.push({ name, ...rest }); else pools[at] = { ...pools[at], ...rest, name };
+  }
+  return { resources, pools, warnings };
+}
+
 const resourcesOf = seeded => (Array.isArray(seeded) ? seeded : seeded?.resources ?? []);
 
 // The ids a service caller passes as `qa_ids` (AD-41): every Resource marked dedicated_qa.

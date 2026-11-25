@@ -65,7 +65,20 @@ function refusal(facets, { key, op, value }) {
   return (op === '>=' ? actual >= Number(value) : actual <= Number(value)) ? null : `${key} is ${actual}, not ${op}${value}`;
 }
 
-const retired = record => Boolean(record.retired_at) || record.seed_missing === true;
+// The one record-state rule (AD-31): why a record takes no new Claim, or null when it does. `retired_at` wins over `seed_missing`.
+// The matcher, the Claims library's take refusal and every later Registry reader use this and `visibility`, so none can read the
+// two marks differently.
+export const retirement = record => (record?.retired_at ? 'retired' : record?.seed_missing === true ? 'seed-missing' : null);
+
+// Whether a reader shows a record: `visible` (live), `retiring` (retired or seed-missing but still held or queued on: it keeps its
+// Hold and serves its waiters) or `hidden` (retired or seed-missing and idle: it is gone from every list). `held` and `queued` are
+// the caller's reading of the lock; this function reads no lock.
+export function visibility(record, { held = false, queued = false } = {}) {
+  if (retirement(record) === null) return 'visible';
+  return held || queued ? 'retiring' : 'hidden';
+}
+
+const retired = record => retirement(record) !== null;
 const dedicated = record => record.capabilities?.dedicated_qa === true;
 const QA_WHY = 'is dedicated_qa (name it or ask for dedicated_qa)';
 

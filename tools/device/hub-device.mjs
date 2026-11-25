@@ -45,7 +45,7 @@
 // and the Host Agent call too, so no front door can take, refuse or report one action differently.
 //
 // Exit codes: 0 done; 1 the lease was cancelled or the tool failed; 75 the phone is away (stdout is exactly
-// `HUB_DEVICE_AWAY <device>`); 76 the lock (or a pool slot) was not free within --wait (`HUB_DEVICE_BUSY <device> ...` on stderr); 2 usage;
+// `HUB_DEVICE_AWAY <device>`); 76 the lock (or a pool slot) was not free within --wait (`HUB_DEVICE_BUSY <device> ...` on stderr); 2 usage, or a Resource registry.json marks retired or seed-missing (`HUB_RESOURCE_RETIRED <device> ...` on stderr, nothing held);
 // run returns the command's own code (128+N when a signal ended it).
 import { spawn } from 'node:child_process';
 import { readFileSync, realpathSync } from 'node:fs';
@@ -147,7 +147,7 @@ function report(error, parsed, context) {
   const device = labelOf(parsed);
   const code = claims.exitCodeOf(error);
   // These exit 2 like a usage error, but say what they are.
-  if (error.code === 'HUB_NO_MATCH' || error.code === 'HUB_POOL_CROSS_HOST') { stderr(`${error.code} ${device} ${error.message}`); return code; }
+  if (error.code === 'HUB_NO_MATCH' || error.code === 'HUB_POOL_CROSS_HOST' || error.code === 'HUB_RESOURCE_RETIRED') { stderr(`${error.code} ${device} ${error.message}`); return code; }
   if (code === claims.EXIT_CODES.HUB_USAGE) { stderr(`hub-device: ${error.message}`); return code; }
   // A cancelled lease says so even when its last error was the phone not arriving: it never held anything to report.
   if (error.code === 'HUB_LEASE_CANCELLED') { stderr(`HUB_DEVICE_CANCELLED ${device} ${error.message}`); return code; }

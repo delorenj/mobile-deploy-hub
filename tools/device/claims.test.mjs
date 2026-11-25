@@ -62,6 +62,8 @@ test('the library exports the whole action surface and the exit table as frozen 
     HUB_LEASE_CANCELLED: 1, HUB_LEASE_EXTEND_REFUSED: 1, HUB_LEASE_LOST: 1, HUB_HOST_UNKNOWN: 1,
     // Story 5.7 (intended): the matcher's two refusals.
     HUB_NO_MATCH: 2, HUB_POOL_CROSS_HOST: 2, HUB_REGISTRY_CONFLICT: 1, HUB_REGISTRY_FORMAT: 1,
+    // Story 6.3: a take of a retired or seed-missing Resource.
+    HUB_RESOURCE_RETIRED: 2,
   });
 });
 
