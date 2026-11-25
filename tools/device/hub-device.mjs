@@ -7,8 +7,9 @@
 // hub's own.
 //
 // Each phone is leased by name (`s24`, `s26`) under its own lock — the S26's lock is `adb`, the one deploys take,
-// so a lease and a deploy still exclude each other — or as `phone`, whichever phone is free and reachable, tried
-// s24 first (an ordered try with --wait as one overall budget; see claims.mjs). `HUB_DEVICE` in the exports and
+// so a lease and a deploy still exclude each other — or as `phone`, whichever phone is free and reachable, s24 first.
+// `phone` holds a place in line: one request that waits in the queue of every phone with --wait as one overall budget and takes
+// the first that serves it, so no later taker jumps it (lock.mjs acquirePool; see claims.mjs). `HUB_DEVICE` in the exports and
 // the JSON says which one a `phone` lease took.
 //
 // `emulator` is a throwaway emulator from a small pool instead (emulator.mjs): made for the lease, with its own AVD and adb
@@ -19,7 +20,7 @@
 //                    [--env-serial NAME]... [--json] [--verbose]
 //   hub-device lease --match <key=value[,key>=n][,key<=n]> --for 30m --why "device proof" [--wait 2m] ...   (a phone by Capability instead of by name:
 //                    the matcher (registry/match.mjs) picks the phones that fit, a dedicated-QA phone only for a request that names it or asks for
-//                    dedicated_qa, and the first free one is taken as one Pool request; no match is HUB_NO_MATCH (exit 2) with a reason for each
+//                    dedicated_qa, and the first that serves it is taken as one Pool request that holds a place in every match's queue; no match is HUB_NO_MATCH (exit 2) with a reason for each
 //                    Resource left out, every match away is HUB_DEVICE_AWAY (75); report lines say `match:<query>` where a device word goes;
 //                    `run --match <query> ... -- <cmd...>` is the same for run)
 //   hub-device release [<lease_id>|--any]    (no id: $HUB_LEASE_ID; --any: whichever lease holds a phone; a `job:` id is a deploy job's place in
@@ -360,7 +361,9 @@ async function status(parsed, context) {
       ? `${waiter.kind === 'hub-job' ? 'CATCH-UP' : 'JOB'} ${dash(waiter.repo)} run ${dash(waiter.run)} job ${dash(waiter.job)}`
       : `${dash(waiter.lease_id)}  holder=${dash(waiter.holder)}  why="${dash(waiter.why)}"`;
     const estimate = waiter.stale ? '' : `  eta=${formatEta(waiter.eta)}`;
-    stdout(`  ${place}  ${what}  waiting since ${dash(waiter.since)}${estimate}${waiter.stale ? '  [stale]' : ''}`);
+    // A Pool request is listed once, with its place in every member's queue.
+    const pooled = waiter.positions ? `  pool ${waiter.pool} (${Object.entries(waiter.positions).map(([lock, position]) => `${lock} #${position}`).join(', ')})` : '';
+    stdout(`  ${place}  ${what}  waiting since ${dash(waiter.since)}${estimate}${waiter.stale ? '  [stale]' : ''}${pooled}`);
   }
   // A deploy target that is held, waited on or reserved gets one line: deploys install to it, and a lease on it holds them back.
   const targets = new Map();
@@ -369,7 +372,16 @@ async function status(parsed, context) {
     return targets.get(row.resource);
   };
   for (const entry of locks) if (entry.deploy_target === true) targetOf(entry).entry = entry;
-  for (const waiter of waiters) if (waiter.deploy_target === true && !waiter.stale) targetOf(waiter).waiting += 1;
+  for (const waiter of waiters) {
+    if (waiter.stale) continue;
+    // A Pool request waits on every lock it has a place in, so it counts for each of those that is a deploy target.
+    if (waiter.positions) {
+      for (const lock of Object.keys(waiter.positions)) {
+        const phone = phones.find(entry => entry.lock === lock);
+        if (phone?.deploy === true) targetOf({ resource: phone.device, lock }).waiting += 1;
+      }
+    } else if (waiter.deploy_target === true) targetOf(waiter).waiting += 1;
+  }
   for (const entry of reservations) if (entry.deploy_target === true && !entry.stale) targetOf(entry).reserved += 1;
   for (const [resource, target] of targets) {
     const lock = target.entry;

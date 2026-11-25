@@ -76,7 +76,7 @@ development_status:
   5-5-deploy-targets-are-marked-from-the-committed-declarations: done
   5-6-discover-unregistered-devices-from-the-cli: done
   5-7-ask-for-a-phone-by-capability: done
-  5-8-phone-holds-a-place-in-line: backlog
+  5-8-phone-holds-a-place-in-line: done
   5-9-no-extension-while-a-pool-or-gate-waiter-sits-behind: backlog
   5-10-ship-the-cli-release: backlog
   epic-5-retrospective: optional

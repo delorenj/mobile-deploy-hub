@@ -169,6 +169,20 @@ export function formatEta(value) {
   return `${duration(Math.max(0, value.lo_ms))}-${hi}${value.low_data ? ' low-data' : ''}`;
 }
 
+// The earliest of several ETAs (AD-33: a Pool request is served by whichever member serves it first): lo is the least lower bound,
+// hi the least KNOWN upper bound (a member whose hi is null is unknown and bounds nothing; null when none is known), low_data when any
+// member's range is. Entries that are not an ETA (null: that member's computation failed) are ignored; null when none is one.
+export function earliest(values) {
+  const known = (Array.isArray(values) ? values : []).filter(value => value && typeof value === 'object' && Number.isFinite(value.lo_ms));
+  if (known.length === 0) return null;
+  const highs = known.map(value => value.hi_ms).filter(Number.isFinite);
+  return {
+    lo_ms: Math.min(...known.map(value => value.lo_ms)),
+    hi_ms: highs.length > 0 ? Math.min(...highs) : null,
+    low_data: known.some(value => value.low_data === true),
+  };
+}
+
 // Whether `b` differs from `a` by more than a minute: either bound moved by over 60 s, the upper bound turned known or unknown,
 // or exactly one of the two has no ETA. The wait line compares with the last PRINTED range, so small drifts add up until due.
 export function etaMoved(a, b) {

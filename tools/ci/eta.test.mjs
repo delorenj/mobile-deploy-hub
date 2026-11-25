@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { eta, etaMoved, formatEta, percentile } from './lib/eta.mjs';
+import { earliest, eta, etaMoved, formatEta, percentile } from './lib/eta.mjs';
 import { acquireLease, releaseLease, reserve, waiterEtas, withLock } from './lib/lock.mjs';
 import { appendEvent, readEvents } from './lib/events.mjs';
 import { loadPolicy } from './lib/policy.mjs';
@@ -426,4 +426,24 @@ test('waiterEtas: stale tickets and Reservations get no ETA, each live ticket is
   const broken = waiterEtas({ owner, view, events: held, policy: { queue: {} }, now: NOW });
   assert.deepEqual([...broken.entries()], [['001-a', null], ['004-b', null], ['005-c', null]]);
   assert.equal(waiterEtas({ policy, now: NOW }).size, 0);
+});
+
+// Story 5.8 (AD-33): a Pool request's ETA is the earliest member's range.
+test('earliest(): least lo, least known hi, low_data if any, nulls ignored, null when nothing is an ETA', () => {
+  const a = { lo_ms: 5 * MIN, hi_ms: 20 * MIN, low_data: false };
+  const b = { lo_ms: 2 * MIN, hi_ms: 30 * MIN, low_data: true };
+  assert.deepEqual(earliest([a, b]), { lo_ms: 2 * MIN, hi_ms: 20 * MIN, low_data: true });
+  assert.deepEqual(earliest([a]), a, 'one member is its own range');
+  // a member whose upper bound is unknown bounds nothing: the known one decides, and the unknown alone stays unknown
+  assert.deepEqual(earliest([{ lo_ms: 0, hi_ms: null, low_data: true }, a]), { lo_ms: 0, hi_ms: 20 * MIN, low_data: true });
+  assert.deepEqual(earliest([{ lo_ms: 3 * MIN, hi_ms: null, low_data: false }, { lo_ms: 1 * MIN, hi_ms: null, low_data: false }]), { lo_ms: MIN, hi_ms: null, low_data: false });
+  // a member whose computation failed (null) is ignored
+  assert.deepEqual(earliest([null, b]), b);
+  assert.equal(earliest([null, null]), null);
+  assert.equal(earliest([]), null);
+  assert.equal(earliest(undefined), null);
+  const input = [a, b];
+  earliest(input);
+  assert.deepEqual(input, [a, b], 'pure: nothing is mutated');
+  assert.equal(formatEta(earliest([a, b])), '2m-20m low-data');
 });
