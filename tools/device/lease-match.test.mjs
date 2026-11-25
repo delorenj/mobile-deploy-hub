@@ -12,7 +12,7 @@ import { loadDevices } from '../ci/lib/devices.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { hermetic } from '../ci/test-fixtures.mjs';
 import { seed } from '../registry/seed.mjs';
-import { registryPath, writeRegistry } from '../registry/store.mjs';
+import { applySeed, registryPath, writeRegistry } from '../registry/store.mjs';
 import * as claims from './claims.mjs';
 import { main } from './hub-device.mjs';
 import { fakeWire } from './wire-fixtures.mjs';
@@ -471,5 +471,150 @@ test('a garbage registry.json warns HUB_REGISTRY_FORMAT once on stderr, the leas
     const { resources, pools } = seededFile();
     await assert.rejects(writeRegistry({ env: s.env, if_rev: 0, resources, pools, log: () => {} }), error => error.code === 'HUB_REGISTRY_FORMAT');
     assert.equal(readFileSync(registryPath(s.env), 'utf8'), 'not json{');
+  } finally { s.cleanup(); }
+});
+
+// ---- Story 6.3: a take of a retired or seed-missing Resource ----
+
+// Writes registry.json with the committed seed (no QA marks), then lets `change` mark records.
+async function registryFile(s, change = records => records) {
+  const seeded = seed(loadDevices({}), { qaDevices: () => [] });
+  await writeRegistry({ env: s.env, if_rev: 0, resources: change(structuredClone(seeded.resources)), pools: seeded.pools, hostId: 'test-host', log: () => {} });
+}
+// The lock events (registry-* events are the file's own writes, not a take's).
+const lockEvents = s => s.events().filter(event => !event.event.startsWith('registry-'));
+const mark = (id, fields) => records => records.map(record => (record.id === id ? { ...record, ...fields } : record));
+
+test('lease s24 with s24 seed_missing in registry.json: exit 2 with HUB_RESOURCE_RETIRED and seed-missing, nothing held, no event', async () => {
+  const s = side();
+  try {
+    await registryFile(s, mark('s24', { seed_missing: true }));
+    const result = await s.cli(leaseWord('s24'));
+    assert.equal(result.code, 2);
+    assert.deepEqual(result.out, []);
+    assert.equal(result.err.length, 1);
+    assert.match(result.err[0], /^HUB_RESOURCE_RETIRED s24 /);
+    assert.match(result.err[0], /seed-missing/);
+    assert.equal(s.owner('s24'), null);
+    assert.deepEqual(s.locks().filter(name => name !== 'registry.json'), []);
+    assert.deepEqual(lockEvents(s), []);
+    // The same refusal for `run`, and a retired (not seed-missing) Resource says retired.
+    const ran = await s.cli(['run', 's24', '--for', '5m', '--why', 'x', '--', 'true']);
+    assert.equal(ran.code, 2);
+    assert.match(ran.err[0], /^HUB_RESOURCE_RETIRED s24 /);
+  } finally { s.cleanup(); }
+});
+
+test('a retired Resource says retired; the other phone is still taken', async () => {
+  const s = side();
+  try {
+    await registryFile(s, mark('s24', { retired_at: '2026-11-24T00:00:00.000Z' }));
+    const refused = await s.cli(leaseWord('s24'));
+    assert.equal(refused.code, 2);
+    assert.match(refused.err[0], /^HUB_RESOURCE_RETIRED s24 .*retired/);
+    const taken = await s.cli(leaseWord('s26'));
+    assert.equal(taken.code, 0, taken.err.join('\n'));
+  } finally { s.cleanup(); }
+});
+
+test('a word gone from devices.json whose file record is seed_missing is refused, not "unknown device"', async () => {
+  const s = side();
+  try {
+    await registryFile(s, mark('s24', { seed_missing: true }));
+    const devices = loadDevices({});
+    delete devices.android_extra;
+    const file = join(s.root, 'devices.json');
+    writeFileSync(file, JSON.stringify(devices));
+    s.env.HUB_DEVICES = file;
+    const result = await s.cli(leaseWord('s24'));
+    assert.equal(result.code, 2);
+    assert.match(result.err[0], /^HUB_RESOURCE_RETIRED s24 /);
+    assert.doesNotMatch(result.err.join('\n'), /unknown device/);
+    // A word nothing knows is still the usage error.
+    const unknown = await s.cli(leaseWord('s99'));
+    assert.match(unknown.err[0], /unknown device "s99"/);
+  } finally { s.cleanup(); }
+});
+
+test('`lease phone` skips a seed-missing member and takes the next; every member out is HUB_RESOURCE_RETIRED', async () => {
+  const some = side();
+  const none = side();
+  try {
+    await registryFile(some, mark('s24', { seed_missing: true }));
+    const taken = await some.cli(leaseWord('phone'));
+    assert.equal(taken.code, 0, taken.err.join('\n'));
+    assert.equal(taken.out[1], "export HUB_DEVICE='s26'");
+    assert.equal(some.owner('s24'), null);
+
+    await registryFile(none, records => mark('s26', { retired_at: '2026-11-24T00:00:00.000Z' })(mark('s24', { seed_missing: true })(records)));
+    const refused = await none.cli(leaseWord('phone'));
+    assert.equal(refused.code, 2);
+    assert.match(refused.err[0], /^HUB_RESOURCE_RETIRED phone /);
+    assert.deepEqual(lockEvents(none), []);
+    assert.equal(none.owner('s26'), null);
+  } finally { some.cleanup(); none.cleanup(); }
+});
+
+test('with no registry.json every take is as before, and an unreadable one refuses nothing', async () => {
+  const plain = side();
+  const garbled = side();
+  try {
+    const taken = await plain.cli(leaseWord('s24'));
+    assert.equal(taken.code, 0, taken.err.join('\n'));
+    assert.equal(plain.owner('s24').lease_id, 'l-aaaaaaaaaaaa');
+    mkdirSync(garbled.env.HUB_LOCK_DIR, { recursive: true });
+    writeFileSync(registryPath(garbled.env), '{ garbage');
+    assert.equal((await garbled.cli(leaseWord('s24'))).code, 0);
+  } finally { plain.cleanup(); garbled.cleanup(); }
+});
+
+test('refuseRetired finds a record by id, then name, then words; the QA file is never read', async () => {
+  const s = side();
+  try {
+    // A directory where the QA file would be: reading it throws, so any QA read would fail this test.
+    s.env.HUB_QA_DEVICES = s.root;
+    await registryFile(s, mark('ios-lane', { seed_missing: true }));
+    for (const word of ['ios-lane', 'ipad', 'mac']) assert.throws(() => claims.refuseRetired(word, { env: s.env }), error => error.code === 'HUB_RESOURCE_RETIRED' && error.reason === 'seed-missing' && error.resource === 'ios-lane' && error.status === 409, word);
+    assert.doesNotThrow(() => claims.refuseRetired('s24', { env: s.env }));
+    assert.doesNotThrow(() => claims.refuseRetired('phone', { env: s.env }));
+  } finally { s.cleanup(); }
+});
+
+test('claims.take refuses a phone target whose Resource went seed_missing, holding and logging nothing; a lease taken before still releases', async () => {
+  const s = side();
+  try {
+    const before = await s.cli(leaseWord('s24'));
+    assert.equal(before.code, 0, before.err.join('\n'));
+    assert.equal(s.owner('s24').lease_id, 'l-aaaaaaaaaaaa');
+    await registryFile(s, mark('s24', { seed_missing: true }));
+    const logged = lockEvents(s).length;
+    const fleet = claims.loadFleet(s.env);
+    const ctx = claims.createContext({ env: s.env, fleet, policy: loadPolicy().policy, adbFactory: adbWith(S24, S26) });
+    const target = { kind: 'phone', by: 'word', entry: fleet.find(phone => phone.device === 's24') };
+    await assert.rejects(
+      () => claims.take(target, { holder: 'h2', why: 'again', forMs: 60_000, waitMs: 0, id: 'l-bbbbbbbbbbbb' }, ctx),
+      error => error.code === 'HUB_RESOURCE_RETIRED' && error.reason === 'seed-missing' && error.resource === 's24' && error.status === 409,
+    );
+    assert.equal(s.owner('s24').lease_id, 'l-aaaaaaaaaaaa', 'the earlier lease is untouched');
+    assert.equal(lockEvents(s).length, logged, 'no event for the refused take');
+    const released = await s.cli(['release', 'l-aaaaaaaaaaaa']);
+    assert.equal(released.code, 0, released.err.join('\n'));
+    assert.equal(s.owner('s24'), null);
+  } finally { s.cleanup(); }
+});
+
+test('end to end: seed, drop the phone from devices.json, re-seed, then `lease s24` exits 2 with HUB_RESOURCE_RETIRED seed-missing', async () => {
+  const s = side();
+  try {
+    const seeded = devices => applySeed({ env: s.env, devices, qaDevices: () => [], hostId: 'test-host', log: () => {} });
+    assert.equal((await seeded(loadDevices({}))).first, true);
+    const gone = loadDevices({});
+    gone.android_extra = [];
+    assert.equal((await seeded(gone)).changed, true);
+    const result = await s.cli(leaseWord('s24'));
+    assert.equal(result.code, 2);
+    assert.match(result.err[0], /^HUB_RESOURCE_RETIRED s24 .*seed-missing/);
+    assert.equal(s.owner('s24'), null);
+    assert.deepEqual(lockEvents(s), []);
   } finally { s.cleanup(); }
 });
