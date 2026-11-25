@@ -11,7 +11,7 @@ import { readEvents } from '../ci/lib/events.mjs';
 import { writeFileAtomic } from '../ci/lib/lock.mjs';
 import { hermetic } from '../ci/test-fixtures.mjs';
 import { exitCodeOf } from '../device/claims.mjs';
-import { REGISTRY_ERRORS, REGISTRY_FILE, REGISTRY_FORMAT, readRegistry, recoverRegistry, registryPath, writeRegistry } from './store.mjs';
+import { REGISTRY_ERRORS, REGISTRY_FILE, REGISTRY_FORMAT, readRegistry, recoverRegistry, registryPath, registryState, writeRegistry } from './store.mjs';
 import { seed } from './seed.mjs';
 
 hermetic();
@@ -335,5 +335,19 @@ test('a QA serial in an identity never reaches an event line or an event result'
     assert.ok(!text.includes(QA_SERIAL));
     assert.ok(!JSON.stringify(result.events).includes(QA_SERIAL));
     assert.ok(existsSync(registryPath(s.env)));
+  } finally { s.cleanup(); }
+});
+
+test('registryState says missing, ok or unreadable, fresh on each call, and never writes', async () => {
+  const s = scratch();
+  try {
+    assert.equal(registryState(s.env), 'missing');
+    assert.equal(existsSync(registryPath(s.env)), false);
+    const { resources, pools } = s.seeded();
+    await s.write({ if_rev: 0, resources, pools });
+    assert.equal(registryState(s.env), 'ok');
+    writeFileSync(registryPath(s.env), '{"format": 2}');
+    assert.equal(registryState(s.env), 'unreadable');
+    assert.equal(readFileSync(registryPath(s.env), 'utf8'), '{"format": 2}');
   } finally { s.cleanup(); }
 });

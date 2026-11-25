@@ -321,6 +321,8 @@ mise run conformance    # every app still deploys only through the hub (gh api);
 mise run hosts:install  # the bucket index, hub-mac, each host's key (~/.config/mobile-deploy-hub/host-key), the Mac's quickdrop .stignore and handoff cache, the catch-up units and the Mac watchdog
 ```
 
+The Hub API (`node tools/hub-api/server.mjs`, Node >= 24.15 and `heavy` on `PATH`) listens on `127.0.0.1:8794` (`api.hub_api_port` in the policy) and is the Registry's only writer; a second instance is refused on the port bind (`HUB_API_ALREADY_RUNNING`), and a stopped API only disables Registry writes, never a deploy or a hold. `GET /health` says what runs and whether `registry.json` can be read. Its routes, field lists and error codes are in [docs/hub-api-contract.md](docs/hub-api-contract.md), which `tools/hub-api/contract.test.mjs` holds equal to the code.
+
 The catch-up installs only on a host in live mode, and both are live since 2026-10-09 (`catchup.mjs mode` prints it; every gate logs `HUB_CATCHUP_MODE`, and a pending device on a host in watch mode reads "catch-up off" in the event and on the page):
 
 ```sh

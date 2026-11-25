@@ -85,7 +85,7 @@ development_status:
   6-1-event-log-vocabulary-for-registry-reachability-and-prune: done
   6-2-the-registry-store-has-one-writer: done
   6-3-seed-at-start-import-qa-phones-on-first-creation: done
-  6-4-the-hub-api-runs-answers-health-and-has-a-contract: backlog
+  6-4-the-hub-api-runs-answers-health-and-has-a-contract: done
   6-5-read-the-registry-through-the-api: backlog
   6-6-register-a-resource-through-the-api: backlog
   6-7-edit-and-retire-a-resource: backlog

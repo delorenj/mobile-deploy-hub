@@ -254,3 +254,41 @@ test('the registry block is strict: reachability_max_age_s is required, a positi
   copy.registry.reachability_max_age_s = 120;
   assert.doesNotThrow(() => parsePolicy(JSON.stringify(copy)), 'a tuning change is a valid release, not a parse error');
 });
+
+// ---------------------------------------------------------------------------------------------------- Story 6.4 (AD-45, AD-46)
+
+test('the api block is strict: two different ports, a keepalive of 1..30 s, a positive connect timeout, and no other key', () => {
+  const base = JSON.parse(source);
+  const want = { hub_api_port: 8794, host_agent_port: 8795, stream_keepalive_s: 15, peer_connect_timeout_s: 5 };
+  assert.deepEqual(base.api, want);
+  assert.deepEqual(loadPolicy().policy.api, want);
+  const bad = {
+    'no api block': p => { delete p.api; },
+    'api is not an object': p => { p.api = 8794; },
+    'api is a list': p => { p.api = [8794]; },
+    'an unknown api key': p => { p.api.tls = true; },
+    'no hub api port': p => { delete p.api.hub_api_port; },
+    'no host agent port': p => { delete p.api.host_agent_port; },
+    'no keepalive': p => { delete p.api.stream_keepalive_s; },
+    'no connect timeout': p => { delete p.api.peer_connect_timeout_s; },
+    'port zero': p => { p.api.hub_api_port = 0; },
+    'port above 65535': p => { p.api.host_agent_port = 65536; },
+    'a fractional port': p => { p.api.hub_api_port = 8794.5; },
+    'a port as text': p => { p.api.hub_api_port = '8794'; },
+    'the same port twice': p => { p.api.host_agent_port = p.api.hub_api_port; },
+    'keepalive 31': p => { p.api.stream_keepalive_s = 31; },
+    'keepalive zero': p => { p.api.stream_keepalive_s = 0; },
+    'a fractional keepalive': p => { p.api.stream_keepalive_s = 1.5; },
+    'connect timeout zero': p => { p.api.peer_connect_timeout_s = 0; },
+    'a negative connect timeout': p => { p.api.peer_connect_timeout_s = -5; },
+    'connect timeout as text': p => { p.api.peer_connect_timeout_s = '5'; },
+  };
+  for (const [name, change] of Object.entries(bad)) {
+    const copy = structuredClone(base);
+    change(copy);
+    assert.throws(() => parsePolicy(JSON.stringify(copy)), /policy\.json: .*api/, name);
+  }
+  const copy = structuredClone(base);
+  Object.assign(copy.api, { hub_api_port: 9000, host_agent_port: 9001, stream_keepalive_s: 30, peer_connect_timeout_s: 10 });
+  assert.doesNotThrow(() => parsePolicy(JSON.stringify(copy)), 'a tuning change is a valid release, not a parse error');
+});
