@@ -25,7 +25,9 @@ import { viewPools, viewRecord } from '../registry/view.mjs';
 import { deviceCtx } from './readings.mjs';
 
 export const CONTRACT_VERSION = 1;
-export const SERVICE = 'mobile-deploy-hub-api';
+// One name for the service: the server answers with it, and the installer's readback and the smoke check for it.
+import { HUB_API_SERVICE } from '../hub-client.mjs';
+export const SERVICE = HUB_API_SERVICE;
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const PROBLEM_TYPE = 'application/problem+json';

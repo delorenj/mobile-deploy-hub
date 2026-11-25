@@ -13,6 +13,7 @@ import { inHeavy, onPath, which } from '../ci/lib/heavy.mjs';
 import { bootCommand } from '../device/emulator.mjs';
 import { onPath as serverOnPath } from '../hub-api/server.mjs';
 import { HUB_API_UNIT, hostsInstall, installHubApi } from '../hosts.mjs';
+import { HUB_API_SERVICE } from '../hub-client.mjs';
 
 hermetic();
 
@@ -186,7 +187,7 @@ test('units install renders every *.service in its directory (the Host Agent\'s 
 // ---- hosts:install ----
 
 const jsonResponse = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
-const health = (ref, extra = {}) => ({ ok: true, service: 'hub-api', contract: '1', hub_version: ref, ...extra });
+const health = (ref, extra = {}) => ({ ok: true, service: HUB_API_SERVICE, contract: '1', hub_version: ref, ...extra });
 
 function clock() {
   const c = { t: 1_000_000, sleeps: [] };
@@ -247,7 +248,7 @@ test('installHubApi: no answer for 10 s fails, and no attempt starts after the d
   const start = c.t;
   const attempts = [];
   const fetchImpl = async () => { attempts.push(c.t - start); throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } }); };
-  await assert.rejects(installHubApi({ ref: 't1', run: () => ({ ok: true, out: '' }), fetchImpl, sleep: c.sleep, now: c.now, home: HOME, port: 8794 }), /did not report hub-api t1 within 10s.*ECONNREFUSED/);
+  await assert.rejects(installHubApi({ ref: 't1', run: () => ({ ok: true, out: '' }), fetchImpl, sleep: c.sleep, now: c.now, home: HOME, port: 8794 }), /did not report mobile-deploy-hub-api t1 within 10s.*ECONNREFUSED/);
   assert.ok(attempts.length > 1 && attempts.every(at => at <= 10_000), `attempts at ${attempts.join(',')}`);
   assert.ok(c.t - start <= 10_000 + 500, 'the loop stops at the deadline');
 });

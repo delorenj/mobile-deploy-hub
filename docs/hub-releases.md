@@ -4,6 +4,19 @@ One section per hub release, headed `## vX.Y.Z`. `mise run release -- X.Y.Z` (`t
 
 A section is plain text read in a terminal: everything after its heading up to the next `## ` heading. Use `###` for sub-headings and `-` lists; do not start a section line with `## `.
 
+## v1.2.55
+
+v1.2.54 plus an installer readback fix. v1.2.54 is on `v1` with all six dry runs green, but its `mise run hosts:install` reported `HOSTS_FAILED hub api on big-chungus` although the service was up and healthy: the readback waited for `/health` to say `service: hub-api`, while the server answers `mobile-deploy-hub-api` (the name in `docs/hub-api-contract.md`). The tests faked the readback with the same wrong name, so they agreed with it.
+
+### What changed
+
+- `installHubApi` (`tools/hosts.mjs`) checks `/health` for `HUB_API_SERVICE` from `tools/hub-client.mjs`, and the server's `SERVICE` (`tools/hub-api/routes.mjs`) is that same constant, so the server, the installer's readback and `hosts:smoke` share one name. The failure line now reads `did not report mobile-deploy-hub-api <ref> within 10s`.
+- Rolling back is the same as for v1.2.54: the `Roll back:` line names `v1.2.54`.
+
+### Test changes you will see
+
+- `tools/hosts/hosts.test.mjs` and `tools/hostkey.test.mjs`: the `/health` fakes answer with `HUB_API_SERVICE`; the timeout test matches the new wording.
+
 ## v1.2.54
 
 v1.2.53 (Epic 6: the Registry and the Hub API) plus a dispatch retry. v1.2.53 was tagged and rolled back, never on `v1`: no lane ran. GitHub answered the dispatch of Tower's release dry run with `HTTP 500` (`could not create workflow dispatch event`), and the release took the failed dispatch as a red dry run. Everything in the v1.2.53 section below ships in this pin, including its install steps and its rollback to `v1.2.52` with the `systemctl --user disable --now mobile-deploy-hub-api.service` step; install it on both hosts (`mise run hosts:install` on big-chungus), then run `mise run hosts:smoke`.
