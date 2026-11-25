@@ -4,6 +4,7 @@
 //   - the hub-mac ssh alias reaches the Mac (tailscale nc, on and off the LAN);
 //   - the Mac's quickdrop .stignore holds /builds, so APKs never cross its link;
 //   - the Mac's handoff cache is seeded from the newest handoff tarball already there (0 bytes over the link);
+//   - each host's key (AD-47), `linux` on big-chungus and `mac` on the Mac, in ~/.config/mobile-deploy-hub/host-key, read back;
 //   - the catch-up units, CATCHUP's tools/catchup/units/install.sh, on big-chungus and (through hub-mac) on the Mac.
 // Writes to the bucket use the hub writer's keys from 1Password, as deliver does.
 import { spawnSync } from 'node:child_process';
@@ -16,6 +17,7 @@ import { latestKey, parseLatest } from './ci/lib/latest.mjs';
 import { indexData, indexPage } from './ci/lib/pages.mjs';
 import { loadPolicy } from './ci/lib/policy.mjs';
 import { createS3, readObject, writerCredentials } from './ci/lib/s3.mjs';
+import { HOST_KEY_FILE, HOST_PLATFORMS } from './device/claims.mjs';
 
 const hubRoot = fileURLToPath(new URL('..', import.meta.url));
 const ssh = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20'];
@@ -25,10 +27,10 @@ function sh(command, args, { input, timeout = 120_000 } = {}) {
   return { ok: !result.error && result.status === 0, out: `${result.stdout ?? ''}${result.stderr ?? ''}`.trim() };
 }
 
-export function releaseName() {
-  const tag = sh('git', ['describe', '--exact-match', '--tags', '--match', 'v[0-9]*.[0-9]*.[0-9]*', 'HEAD']);
+export function releaseName(run = sh) {
+  const tag = run('git', ['describe', '--exact-match', '--tags', '--match', 'v[0-9]*.[0-9]*.[0-9]*', 'HEAD']);
   if (tag.ok && /^v\d+\.\d+\.\d+$/.test(tag.out)) return tag.out;
-  const head = sh('git', ['rev-parse', '--short=7', 'HEAD']);
+  const head = run('git', ['rev-parse', '--short=7', 'HEAD']);
   return `main-${head.out}`;
 }
 
@@ -55,18 +57,33 @@ for repo in '${base}'/*/; do
 done`;
 }
 
-export async function hostsInstall({ log = console.log } = {}) {
+// The host key's writer (AD-47), run as `sh -s` here and over ssh on the Mac. The key is the host block being installed;
+// `uname` only refuses to write `mac` onto a Linux box. Written through a `.part` rename, then printed back as a `HOST_KEY=<key>` line (ssh may add its own notices around it).
+export function hostKeyScript(key) {
+  if (!Object.hasOwn(HOST_PLATFORMS, key)) throw new Error(`hostKeyScript: unknown host key "${key}" (${Object.keys(HOST_PLATFORMS).join(', ')})`);
+  const file = `$HOME/${HOST_KEY_FILE}`;
+  return `set -e
+platform=$(uname -s | tr 'A-Z' 'a-z')
+[ "$platform" = '${HOST_PLATFORMS[key]}' ] || { echo "host-key: '${key}' is a ${HOST_PLATFORMS[key]} host but this is $platform" >&2; exit 1; }
+mkdir -p "$(dirname "${file}")"
+printf '%s\\n' '${key}' > "${file}.part"
+mv "${file}.part" "${file}"
+printf 'HOST_KEY=%s\\n' "$(cat "${file}")"
+`;
+}
+
+export async function hostsInstall({ log = console.log, run = sh, fetchImpl = fetch } = {}) {
   const { policy } = loadPolicy();
   const devices = loadDevices();
   const failures = [];
   const step = async (name, fn) => {
     try { log(`HOSTS ${name}: ${await fn()}`); } catch (error) { failures.push(name); log(`HOSTS_FAILED ${name}: ${error.message.split('\n')[0]}`); }
   };
-  const ref = releaseName();
+  const ref = releaseName(run);
   const host = devices.mac.host;
 
   await step('build directory', async () => {
-    const health = await fetch(`${policy.delivery.s3.write}/minio/health/live`, { signal: AbortSignal.timeout(10_000) });
+    const health = await fetchImpl(`${policy.delivery.s3.write}/minio/health/live`, { signal: AbortSignal.timeout(10_000) });
     if (!health.ok) throw new Error(`MinIO on ${policy.delivery.s3.write} answered ${health.status}`);
     // MOBI-17: the pointers of a private app are not anonymous, so the hub reads them with the writer's keys.
     const credentials = await writerCredentials();
@@ -85,19 +102,29 @@ export async function hostsInstall({ log = console.log } = {}) {
   });
 
   await step('hub-mac', async () => {
-    const result = sh('ssh', [...ssh, host, 'echo ok']);
+    const result = run('ssh', [...ssh, host, 'echo ok']);
     if (!result.ok || !/\bok\b/.test(result.out)) throw new Error(`ssh ${host} failed: ${result.out.slice(-200)} (add the alias: Host ${host}, ProxyCommand tailscale nc ${devices.mac.peer} %p)`);
     return `ssh ${host} reaches ${devices.mac.peer}`;
   });
 
+  const writeKey = async (where, key, command, args) => {
+    const result = run(command, args, { input: hostKeyScript(key) });
+    if (!result.ok) throw new Error(result.out.slice(-200));
+    const back = result.out.split('\n').map(line => /^HOST_KEY=(.*)$/.exec(line.trim())?.[1]).filter(value => value !== undefined).at(-1);
+    if (back !== key) throw new Error(`read back ${back === undefined ? 'nothing' : `"${back.slice(-40)}"`}, not "${key}"`);
+    return `${where} is "${key}" (${HOST_KEY_FILE})`;
+  };
+  await step('host key on big-chungus', () => writeKey('big-chungus', 'linux', 'sh', ['-s']));
+  await step('host key on the Mac', () => writeKey(host, 'mac', 'ssh', [...ssh, host, 'sh -s']));
+
   await step('quickdrop .stignore', async () => {
-    const result = sh('ssh', [...ssh, host, 'f="$HOME/quickdrop/.stignore"; [ -d "$HOME/quickdrop" ] || { echo "no quickdrop folder"; exit 0; }; touch "$f"; grep -qx "/builds" "$f" || printf "%s\\n" "// mobile-deploy-hub APKs stay off this Mac (often on a metered link)." "/builds" >> "$f"; grep -c "^/builds$" "$f"']);
+    const result = run('ssh', [...ssh, host, 'f="$HOME/quickdrop/.stignore"; [ -d "$HOME/quickdrop" ] || { echo "no quickdrop folder"; exit 0; }; touch "$f"; grep -qx "/builds" "$f" || printf "%s\\n" "// mobile-deploy-hub APKs stay off this Mac (often on a metered link)." "/builds" >> "$f"; grep -c "^/builds$" "$f"']);
     if (!result.ok) throw new Error(result.out.slice(-200));
     return `the Mac's quickdrop ignores /builds (${result.out.split('\n').pop()})`;
   });
 
   await step('handoff cache', async () => {
-    const result = sh('ssh', [...ssh, host, 'bash -s'], { input: seedScript({ base: devices.mac.handoff_dir, cache: devices.mac.handoff_cache }), timeout: 15 * 60_000 });
+    const result = run('ssh', [...ssh, host, 'bash -s'], { input: seedScript({ base: devices.mac.handoff_dir, cache: devices.mac.handoff_cache }), timeout: 15 * 60_000 });
     if (!result.ok) throw new Error(result.out.slice(-300));
     return result.out.split('\n').join('; ') || 'nothing to seed';
   });
@@ -107,18 +134,18 @@ export async function hostsInstall({ log = console.log } = {}) {
     log('HOSTS catch-up: tools/catchup/units/install.sh is not in this checkout yet (CATCHUP); skipped');
   } else {
     await step('catch-up on big-chungus', async () => {
-      const result = sh('bash', [installer, ref], { timeout: 5 * 60_000 });
+      const result = run('bash', [installer, ref], { timeout: 5 * 60_000 });
       if (!result.ok) throw new Error(result.out.slice(-300));
       return `${ref}: ${result.out.split('\n').slice(-2).join('; ')}`;
     });
     await step('catch-up on the Mac', async () => {
       const target = `.local/share/mobile-deploy-hub/releases/${ref}/tools/`;
-      const mk = sh('ssh', [...ssh, host, `mkdir -p '${target}'`]);
+      const mk = run('ssh', [...ssh, host, `mkdir -p '${target}'`]);
       if (!mk.ok) throw new Error(mk.out.slice(-200));
-      const copy = sh('rsync', ['-az', '--delete', '--stats', '-e', `ssh ${ssh.join(' ')}`, `${resolve(hubRoot, 'tools')}/`, `${host}:${target}`], { timeout: 10 * 60_000 });
+      const copy = run('rsync', ['-az', '--delete', '--stats', '-e', `ssh ${ssh.join(' ')}`, `${resolve(hubRoot, 'tools')}/`, `${host}:${target}`], { timeout: 10 * 60_000 });
       if (!copy.ok) throw new Error(copy.out.slice(-300));
       const sent = /Total bytes sent:\s*([\d,]+)/.exec(copy.out)?.[1] ?? '?';
-      const install = sh('ssh', [...ssh, host, `bash '.local/share/mobile-deploy-hub/releases/${ref}/tools/catchup/units/install.sh' '${ref}'`], { timeout: 5 * 60_000 });
+      const install = run('ssh', [...ssh, host, `bash '.local/share/mobile-deploy-hub/releases/${ref}/tools/catchup/units/install.sh' '${ref}'`], { timeout: 5 * 60_000 });
       if (!install.ok) throw new Error(install.out.slice(-300));
       return `${ref} (${sent} bytes sent): ${install.out.split('\n').slice(-2).join('; ')}`;
     });
