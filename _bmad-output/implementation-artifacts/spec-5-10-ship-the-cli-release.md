@@ -2,7 +2,7 @@
 title: 'Story 5.10: Ship the CLI release (pre-release half)'
 type: 'chore'
 created: '2026-11-25'
-status: 'awaiting-operator'
+status: done
 operator_actions:
   - 'Merge this story branch into main and push main to origin (main is 19+ commits past origin/main d148d7e); the release refuses a main that is not origin/main.'
   - 'Before releasing, confirm `git ls-remote origin refs/tags/v1 refs/tags/v1.2.52` shows v1 on v1.2.51 (commit 084568c) and no v1.2.52 tag; if v1 moved or 1.2.52 is taken, retitle or reword the `## v1.2.52` section of docs/hub-releases.md first.'
@@ -148,3 +148,16 @@ Status: awaiting-operator
 - `release()`'s new wiring (reading `previous` before the first tag, passing the line to all four annotations) is exercised only by the first live release.
 - The host-key steps of `hosts:install` have never run over real ssh to the Mac (Story 5.3); until they do, live `status` shows every reading `unknown` and `discover` fails with `HUB_HOST_UNKNOWN`.
 - The operator actions are agent-runnable under the standing release approval once main is pushed; they are listed here only because they must follow the orchestrator's merge.
+
+## Operator Confirmation
+
+Confirmed 2026-11-25: the external actions this story owed were carried out.
+
+- Merge this story branch into main and push main to origin (main is 19+ commits past origin/main d148d7e); the release refuses a main that is not origin/main.
+- Before releasing, confirm `git ls-remote origin refs/tags/v1 refs/tags/v1.2.52` shows v1 on v1.2.51 (commit 084568c) and no v1.2.52 tag; if v1 moved or 1.2.52 is taken, retitle or reword the `## v1.2.52` section of docs/hub-releases.md first.
+- From a fresh clean clone of main on big-chungus, run `mise run release -- 1.2.52`; confirm every app strict dry run is green, v1 moved to v1.2.52, and `git show v1.2.52` carries the notes and a `Roll back:` line naming v1.2.51.
+- After the release runner confirms its runs are finished, run `mise run hosts:install` on big-chungus from a clean checkout at tag v1.2.52 (it installs the Mac through hub-mac); confirm the `HOST_KEY=linux` and `HOST_KEY=mac` readbacks, both hosts current at v1.2.52, no catch-up timer, and the catch-up candybars still firing.
+- After the first real deploy on v1.2.52, confirm in the Event Log that it took `adb` or `mac-ios` as before, then run `hub-device status --json` on big-chungus and on the Mac and confirm every Resource row carries `reachability` (a connected phone reads `reachable`, not `unknown`) and `deploy_target` (true for s26 and ios-lane).
+- If the release is red or anything regresses, run the `Roll back:` line from the v1.2.52 annotation: move v1 back to v1.2.51 and run `mise run hosts:install` on big-chungus from a clean checkout at v1.2.51.
+
+_Appended by the bmad-loop orchestrator (`bmad-loop confirm`, #335): a human confirmed these external actions out of band, and the story was advanced from `awaiting-operator` to `done`._
