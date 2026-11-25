@@ -21,7 +21,7 @@ import { appendEvent, hostId as machineId, readEvents } from './events.mjs';
 import { pause, sleep as realSleep } from './pause.mjs';
 import { jobDeadline, jobTimeoutMs } from './deadline.mjs';
 import { loadPolicy } from './policy.mjs';
-import { eta, etaMoved, formatEta } from './eta.mjs';
+import { earliest, eta, etaMoved, formatEta } from './eta.mjs';
 
 export const lockDir = (env = process.env, home = homedir()) => env.HUB_LOCK_DIR || join(home, '.cache/mobile-deploy-hub/locks');
 
@@ -914,8 +914,10 @@ export const ETA_REFRESH_MS = 300_000;
 // computation). After that the ETA is recomputed only when the position changed since the last computation or ETA_REFRESH_MS has
 // passed, and a line prints only when the position changed or the range moved over a minute from the last PRINTED one (etaMoved).
 // A failed recompute logs one HUB_ETA_FAILED per waiter and goes on with a null ETA (`eta=?`); the wait never fails because of it.
-// `afterEta` is a test seam called once per recompute.
-function waitReporter(name, { ticket, deadline, estimate, requested, env, now, policy, host, hostId, processStart: startOf, log, afterEta = () => {} }) {
+// `afterEta` is a test seam called once per recompute. `name` is the label the line prints (a Pool request prints its Pool's name);
+// `recompute(at, onFail)` replaces the one-lock ETA computation (a Pool request combines its members').
+function waitReporter(name, { ticket, deadline, estimate, requested, env, now, policy, host, hostId, processStart: startOf, log, afterEta = () => {}, recompute = null }) {
+  const again = recompute ?? ((at, onFail) => enqueueEta(name, { file: ticket, deadline, env, now: () => at, policy, host, hostId, processStart: startOf, log: onFail }));
   let computed = estimate;
   let computedAt = requested;
   let computedPosition = null;
@@ -933,7 +935,7 @@ function waitReporter(name, { ticket, deadline, estimate, requested, env, now, p
     if (printed === null) {
       computedPosition = position;
     } else if (position !== computedPosition || at - computedAt >= ETA_REFRESH_MS) {
-      computed = enqueueEta(name, { file: ticket, deadline, env, now: () => at, policy, host, hostId, processStart: startOf, log: once });
+      computed = again(at, once);
       computedAt = at;
       computedPosition = position;
       afterEta();
@@ -969,7 +971,8 @@ export const newLeaseId = () => `l-${randomBytes(6).toString('hex')}`;
 // caller then gave back (a phone that was not there) is an acquire and a release, true history, and the request goes on.
 // Returns {id, tag, settle(error, {signal})}; settle writes the one ending, once, and is never fatal. No event for a name
 // outside the Queued pools (AD-4 names only phone and emulator).
-export function poolRequest(pool, { id = newLeaseId(), holder, why, forMs = null, waitMs = 0, env = process.env, now = Date.now, hostId = machineId() } = {}) {
+// `eta` (a waiting request's combined ETA, or null) goes on the `request` event; a try passes none and its event has no `eta` key.
+export function poolRequest(pool, { id = newLeaseId(), holder, why, forMs = null, waitMs = 0, env = process.env, now = Date.now, hostId = machineId(), eta: told } = {}) {
   const since = now();
   const deadline = since + waitMs;
   const tag = { name: pool, request: id, since, deadline };
@@ -979,7 +982,7 @@ export function poolRequest(pool, { id = newLeaseId(), holder, why, forMs = null
     appendEvent(eventOf(event, null, subject, { pool, request: id, for_ms: forMs, deadline_at: iso(deadline), ...fields }), { env, now: () => at, hostId });
     return at;
   };
-  write('request');
+  write('request', told === undefined ? {} : { eta: told });
   let ended = false;
   return {
     id,
@@ -999,6 +1002,237 @@ export function poolRequest(pool, { id = newLeaseId(), holder, why, forMs = null
       }
     },
   };
+}
+
+// A Pool request that holds a place in line (AD-33, Story 5.8): one request served by whichever of `members` (lock names, in
+// preference order) serves it first. A waiting request (waitMs > 0) mints one ticket file name and writes the identical Lease
+// ticket (carrying `pool` and `request`) into every member's queue, so it stands at the same place everywhere and a taker that
+// arrives later never jumps it; each pass walks the members in order and takes the first it is served on exactly as acquireLease
+// takes a lock (mkdir, owner record, re-check, claim = unlink that member's ticket). A try (waitMs 0) writes no ticket.
+//
+// `accept(name, record)` decides whether the taken member serves the caller (a phone that must also be found): `{ok: true, value}`
+// wins (every other ticket is withdrawn, with no event, and `{name, record, value}` returns); `{ok: false, state}` gives the lock
+// back (a `release`, reason `by-id`), records the state and, for a waiting request, writes the ticket back under the same file name
+// so the place is kept; a throw gives the lock back if this Lease still holds it and ends the request with that error. When no
+// member served and the deadline has passed, `giveUp(states)` (a Map lock -> `held` or the away state) supplies the error; the
+// default is HUB_LOCK_TIMEOUT naming each holder. Every way out but a win withdraws every ticket and settles the one Pool-level
+// request once (poolRequest), so the log holds one `request` and one `acquire`, `timeout` or `cancel`, plus the true acquire and
+// release of a member that was taken and given back. `afterTake` and `beforeWithdraw` are test seams.
+export async function acquirePool(pool, members, {
+  holder,
+  why,
+  forMs,
+  waitMs = 0,
+  id = null,
+  holderPid = null,
+  env = process.env,
+  pollMs = 1000,
+  staleMs = 4 * 3600_000,
+  log = console.log,
+  sleep = realSleep,
+  now = Date.now,
+  signal,
+  hostId = machineId(),
+  host = hostname(),
+  processStart: startOf = processStart,
+  policy = null,
+  afterEta = () => {},
+  accept = async () => ({ ok: true, value: undefined }),
+  giveUp = null,
+  afterTake = () => {},
+  beforeWithdraw = () => {},
+} = {}) {
+  if (typeof pool !== 'string' || pool === '') throw new Error('a Pool request names its pool');
+  if (!Array.isArray(members) || members.length === 0) throw new Error(`Pool ${pool} has no members`);
+  const names = members.map(leaseName);
+  if (new Set(names).size !== names.length) throw new Error(`Pool ${pool} lists a member twice`);
+  if (!(forMs > 0) || forMs > MAX_LEASE_MS) throw new Error(`a lease runs for more than 0 and at most ${MAX_LEASE_MS / 3600_000}h`);
+  for (const name of names) {
+    const cap = deployTargetCapMs(name, { policy });
+    if (cap !== null && forMs > cap) throw failure('HUB_LEASE_TOO_LONG', capText(name, cap));
+  }
+  if (!holder || !why) throw new Error('a lease names its holder and why');
+  const lease_id = id ? leaseId(id) : newLeaseId();
+  mkdirSync(lockDir(env), { recursive: true });
+  const requested = now();
+  const deadline = requested + waitMs;
+  const tryOnly = !(waitMs > 0);
+  const attempt = env.GITHUB_RUN_ATTEMPT ?? null;
+  const job = env.GITHUB_JOB ?? null;
+  const file = tryOnly ? null : ticketName(requested);
+  const ticketPath = name => join(queuePath(name, env), file);
+  // The members whose ticket this request itself unlinked (the claim of a take): withdrawal skips them.
+  const claimed = new Set();
+  const placed = new Set();
+  let body = null;
+  let estimate = null;
+  if (!tryOnly) {
+    estimate = earliest(names.map(name => enqueueEta(name, { file, deadline, env, now: () => requested, policy, host, hostId, processStart: startOf, log })));
+    body = buildTicket('lease', { env, requested, deadline, lease_id, holder, why, host, hostId, processStart: startOf, pool, request: lease_id, eta: estimate });
+  }
+  // Withdrawing a ticket: renamed to <file>.tomb-<ms>-<pid> (never ending in .json, so no reader lists it) and removed; ENOENT means a
+  // release cancelled it first. No event: the request writes its own ending.
+  const withdraw = () => {
+    for (const name of placed) {
+      if (claimed.has(name)) continue;
+      try {
+        beforeWithdraw(name);
+        lastTomb = Math.max(Math.trunc(now()) || 0, lastTomb + 1);
+        const path = ticketPath(name);
+        const tomb = `${path}.tomb-${lastTomb}-${process.pid}`;
+        try { renameSync(path, tomb); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+        rmSync(tomb, { force: true });
+      } catch { try { rmSync(ticketPath(name), { force: true }); } catch { /* a stale ticket is pruned by the next acquirer */ } }
+    }
+    placed.clear();
+  };
+  let request = null;
+  try {
+    if (!tryOnly) {
+      for (const name of names) {
+        writeTicket(name, body, { env, requested, file });
+        placed.add(name);
+      }
+    }
+    request = poolRequest(pool, { id: lease_id, holder, why, forMs, waitMs, env, now, hostId, ...(tryOnly ? {} : { eta: estimate }) });
+    const cancelled = text => failure('HUB_LEASE_CANCELLED', `lease ${lease_id} ${text} ${pool}`);
+    const view = name => queueView(name, { env, prune: true, now, host, hostId, processStart: startOf });
+    const report = tryOnly ? () => {} : waitReporter(pool, {
+      ticket: file, deadline, estimate, requested, env, now, policy, host, hostId, processStart: startOf, log, afterEta,
+      recompute: (at, onFail) => earliest(names.map(name => enqueueEta(name, { file, deadline, env, now: () => at, policy, host, hostId, processStart: startOf, log: onFail }))),
+    });
+    const states = new Map();
+    const holds = new Map();
+    let vanished = 0;
+
+    // One member: take it if it serves this request. Returns the record taken, or null (the member is blocked; states and holds say how).
+    const serve = name => {
+      const path = lockPath(name, env);
+      for (;;) {
+        if (file) { try { statSync(ticketPath(name)); } catch { throw cancelled('was released while it waited for'); } }
+        const current = view(name);
+        if (file && !current.some(entry => entry.file === file)) throw cancelled('lost its place in the queue for');
+        let blockers = blockersAhead(current, file);
+        if (blockers.length === 0) {
+          const started = now();
+          const record = {
+            pid: process.pid, host, repo: env.GITHUB_REPOSITORY ?? null, run: env.GITHUB_RUN_ID ?? null, started_at: new Date(started).toISOString(),
+            kind: 'lease', lease_id, holder, why, expires_at: new Date(started + forMs).toISOString(),
+            holder_pid: holderPid, holder_process_start: Number.isSafeInteger(holderPid) ? startOf(holderPid) : null,
+            format: OWNER_FORMAT, attempt, job, host_id: hostId,
+          };
+          let taken = false;
+          try {
+            mkdirSync(path);
+            record.lock_ino = inodeOf(path);
+            writeOwner(path, record);
+            taken = true;
+          } catch (error) {
+            if (error.code !== 'EEXIST') throw error;
+          }
+          if (taken) {
+            afterTake(name);
+            blockers = blockersAhead(view(name), file);
+            if (blockers.length > 0) {
+              retire(name, path, record, { env, now, log, hostId });
+              taken = false;
+            }
+          }
+          if (taken) {
+            if (file) {
+              try {
+                unlinkSync(ticketPath(name));
+              } catch (error) {
+                if (error.code !== 'ENOENT') throw error;
+                retire(name, path, record, { env, now, log, hostId });
+                throw cancelled('was released while it was being taken for');
+              }
+              claimed.add(name);
+            }
+            note(name, eventOf('acquire', name, record, { deadline_at: iso(request.tag.deadline), waited_ms: Math.max(0, started - request.tag.since), pool, request: lease_id }), { env, hostId, at: started });
+            log(`HUB_LEASE ${name} ${lease_id} until ${record.expires_at}`);
+            return record;
+          }
+          if (blockers.length === 0) {
+            const owner = readOwner(path);
+            const verdict = staleness(path, owner, { now, staleMs, host, hostId });
+            if (verdict && (verdict !== 'gone' || (vanished += 1) <= VANISHED_RETRIES)) {
+              if (verdict !== 'gone' && retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, hostId })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
+              continue;
+            }
+            states.set(name, 'held');
+            holds.set(name, { owner, blockers });
+            return null;
+          }
+        }
+        startGrace(name, current, { env, now, hostId });
+        states.set(name, 'held');
+        holds.set(name, { owner: readOwner(path), blockers });
+        return null;
+      }
+    };
+
+    for (;;) {
+      signal?.throwIfAborted();
+      if (file) for (const name of names) { try { statSync(ticketPath(name)); } catch { throw cancelled('was released while it waited for'); } }
+      states.clear();
+      holds.clear();
+      for (const name of names) {
+        let record = serve(name);
+        if (record === null) continue;
+        let kept = name;
+        // A request that already holds another member keeps that one: the member just taken is the later, and goes back.
+        const other = names.find(candidate => {
+          if (candidate === name) return false;
+          const owner = readOwner(lockPath(candidate, env));
+          return isLease(owner) && owner.lease_id === lease_id;
+        });
+        if (other) {
+          releaseLease(name, lease_id, { env, now, reason: 'pool-duplicate', hostId });
+          kept = other;
+          record = readOwner(lockPath(other, env)) ?? record;
+        }
+        let verdict;
+        try {
+          verdict = await accept(kept, record);
+        } catch (error) {
+          const owner = readOwner(lockPath(kept, env));
+          if (isLease(owner) && owner.lease_id === lease_id) releaseLease(kept, lease_id, { env, now, hostId });
+          throw error;
+        }
+        if (verdict?.ok) {
+          withdraw();
+          return { name: kept, record, value: verdict.value };
+        }
+        if (!releaseLease(kept, lease_id, { env, now, hostId }).released) throw cancelled('was released while it was being taken for');
+        states.set(kept, verdict?.state ?? 'absent');
+        // The place is kept: every ticket this pass claimed goes back under its own file name.
+        for (const member of new Set([name, kept])) {
+          if (file && claimed.has(member)) {
+            writeTicket(member, body, { env, requested, file });
+            claimed.delete(member);
+          }
+        }
+      }
+      if (now() >= deadline) {
+        if (giveUp) throw giveUp(new Map(states));
+        const by = names.map(name => (states.get(name) === 'held' ? `${name} is held by ${describe(holds.get(name)?.owner ?? null)}` : `${name} ${states.get(name) ?? 'absent'}`)).join('; ');
+        throw failure('HUB_LOCK_TIMEOUT', `no member of ${pool} was free: ${by}; gave up after ${Math.round(waitMs / 1000)}s`);
+      }
+      // The held member with the fewest blockers ahead is where this request stands (the first on a tie).
+      let best = null;
+      for (const name of names) {
+        const hold = holds.get(name);
+        if (hold && (best === null || hold.blockers.length < best.blockers.length)) best = hold;
+      }
+      if (best) report(best.owner, best.blockers);
+      await pause(pollMs, { signal, sleep });
+    }
+  } catch (error) {
+    withdraw();
+    request?.settle(error, { signal });
+    throw error;
+  }
 }
 
 // A Queued withLock (AD-4, AD-6): the same wait as a Lease's, for a deploy job or the catch-up. A wait writes a `job` or `hub-job`
@@ -1336,6 +1570,8 @@ export function releaseLease(name, id, { env = process.env, now = Date.now, reas
         if (ticket.lease_id !== id) continue;
         unlinkSync(join(dir, file));
         cancelled += 1;
+        // A Pool request's ticket (`pool` and `request` strings) is one of several; the request writes its own one `cancel`.
+        if (typeof ticket.pool === 'string' && typeof ticket.request === 'string') continue;
         const at = now();
         const enqueued = Date.parse(ticket.enqueued_at);
         // A job's or the catch-up's ticket cancels as that job (the claimant its own `request` named, lease_id null as for every
