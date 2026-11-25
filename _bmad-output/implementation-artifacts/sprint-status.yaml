@@ -72,7 +72,7 @@ development_status:
   5-1-one-claims-library-under-an-unchanged-cli: done
   5-2-one-reserved-word-list-one-slug-rule-res-locks-queue: done
   5-3-a-host-knows-its-own-key: done
-  5-4-status-through-one-builder-with-reachability: backlog
+  5-4-status-through-one-builder-with-reachability: done
   5-5-deploy-targets-are-marked-from-the-committed-declarations: backlog
   5-6-discover-unregistered-devices-from-the-cli: backlog
   5-7-ask-for-a-phone-by-capability: backlog
