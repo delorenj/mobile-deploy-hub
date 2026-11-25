@@ -244,7 +244,13 @@ function reservationCommand(parsed, context) {
 
 function printPhoneRelease(result, { any, id }, context) {
   const { stdout, stderr } = context;
-  for (const note of result.notes) stderr(`hub-device: ${note}`);
+  // The verdict first, then what each phone was doing: the order the two streams always had.
+  const notes = () => { for (const note of result.notes) stderr(`hub-device: ${note}`); };
+  try { return printPhoneVerdict(result, { any, id }, context); } finally { notes(); }
+}
+
+function printPhoneVerdict(result, { any, id }, context) {
+  const { stdout, stderr } = context;
   if (any) {
     if (result.outcome === 'released') { stdout(`HUB_DEVICE_RELEASED ${result.device} ${result.leaseId}`); return claims.EXIT_OK; }
     if (result.outcome === 'refused') { stderr(`hub-device: ${result.refusal}`); return claims.EXIT_FAILURE; }
