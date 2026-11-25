@@ -91,3 +91,19 @@ source_spec: `spec-3-5-ios-contention-is-red-and-says-who.md`
 severity: low
 reason: publicReason (tools/ci/lib/receipt.mjs) redacts only when the receipt carries `contention`, which only the android and ios lanes write. This behaviour predates story 3.5: those lanes' raw lock messages already reached the bucket receipts and announce. One level up would be to have every Queued withLock caller record `contention` on its timeout, or to key publicReason on the AD-5 prefix alone.
 status: open
+
+### DW-2: The repo's agent rules ("Where things are" in AGENTS.md, read through the CLAUDE.md symlink) still name hub-device.mjs as the place to extend device checkout and do not mention
+origin: spec-deferred c104e71be151
+location: AGENTS.md (Where things are)
+source_spec: `spec-5-1-one-claims-library-under-an-unchanged-cli.md`
+severity: low
+reason: After this story every action and rule lives in claims.mjs (AD-24); an agent that follows the "Where things are" line would add new take/release logic to hub-device.mjs, the front door that must stay parsing and output only. The fix edits an agent-context file, so it is out of this build's reach.
+status: open
+
+### DW-3: The emulator reaper-failure warning now reaches stderr through the new ctx.warn seam, and no test makes reap throw and pins the text or the silent default.
+origin: spec-deferred a52b30589b5f
+location: tools/device/claims.mjs reapBeforeAcquire
+source_spec: `spec-5-1-one-claims-library-under-an-unchanged-cli.md`
+severity: low
+reason: claims.reapBeforeAcquire calls ctx.warn?.(...); main supplies warn => stderr('hub-device: warning: ' + message). No test in tools/ has the reaper fail (grep "reaper failed" hits only claims.mjs). The gap predates the move (the old stderr call was untested too), and the path is warning-only.
+status: open
