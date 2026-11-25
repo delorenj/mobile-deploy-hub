@@ -2,7 +2,7 @@
 title: 'Story 6.12: Ship the Registry and the Hub API (pre-release half)'
 type: 'chore'
 created: '2026-11-25'
-status: awaiting-operator
+status: done
 operator_actions:
   - 'Merge this story branch into main and push main to origin (main is 22+ commits past origin/main 2f12f8a); the release refuses a main that is not origin/main.'
   - 'Before releasing, confirm `git ls-remote origin refs/tags/v1 refs/tags/v1.2.53` shows v1 on v1.2.52 and no v1.2.53 tag; if v1 moved or 1.2.53 is taken, retitle the `## v1.2.53` section of docs/hub-releases.md first.'
@@ -215,3 +215,18 @@ Status: awaiting-operator
 - Only the live operator action (`git show v1.2.53`) checks the `release()` wiring.
 - Each `hosts:smoke` run leaves one retired `smoke-<id>` record, because names are never reused (AD-28).
 - DW-7 and every operator step are still unrun.
+
+## Operator Confirmation
+
+Confirmed 2026-11-25: the external actions this story owed were carried out.
+
+- Merge this story branch into main and push main to origin (main is 22+ commits past origin/main 2f12f8a); the release refuses a main that is not origin/main.
+- Before releasing, confirm `git ls-remote origin refs/tags/v1 refs/tags/v1.2.53` shows v1 on v1.2.52 and no v1.2.53 tag; if v1 moved or 1.2.53 is taken, retitle the `## v1.2.53` section of docs/hub-releases.md first.
+- From a fresh clean clone of main on big-chungus, run `mise run release -- 1.2.53`; confirm every app strict dry run is green, v1 moved to v1.2.53, and `git show v1.2.53` carries the notes and a `Roll back:` line that names v1.2.52 and `systemctl --user disable --now mobile-deploy-hub-api.service` before the `hosts:install`.
+- After the release runner confirms its runs are finished, run `mise run hosts:install` on big-chungus from a clean checkout at tag v1.2.53 (it installs the Hub API service and, through hub-mac, the Mac); confirm the HUB_API readback for v1.2.53, `systemctl --user status mobile-deploy-hub-api`, and the `HOST_KEY=linux` and `HOST_KEY=mac` readbacks.
+- Then run `mise run hosts:smoke` on big-chungus and confirm it ends `HUB_SMOKE_OK v1.2.53 <id> leasable after <n> ms`; it leaves one retired smoke-<id> record in registry.json, which is expected.
+- After the first real deploy on v1.2.53, confirm in the Event Log that it took `adb` or `mac-ios` as before, that its events carry `hub_version` `v1.2.53`, and that it never called the API; then confirm with the service stopped (`systemctl --user stop mobile-deploy-hub-api`) that `hub-device lease`, `status` and `registry list` still work and a registry write fails `HUB_API_DOWN`; start it again.
+- DW-7: run the live emulator check owed from Story 6.11: lease an emulator, `systemctl --user restart mobile-deploy-hub-api`, and confirm the emulator and its adb server (in their own heavy scopes) are still running and the lease stands.
+- If the release is red or anything regresses, run the `Roll back:` line from the v1.2.53 annotation: move v1 back to v1.2.52, run `systemctl --user disable --now mobile-deploy-hub-api.service` on big-chungus, then `mise run hosts:install` from a clean checkout at v1.2.52.
+
+_Appended by the bmad-loop orchestrator (`bmad-loop confirm`, #335): a human confirmed these external actions out of band, and the story was advanced from `awaiting-operator` to `done`._
