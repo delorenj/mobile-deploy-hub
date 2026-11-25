@@ -14,7 +14,7 @@
 // handler as `request.params`; a literal route wins over a parameterised one.
 import { STATUS_CODES } from 'node:http';
 import { idMatchesSerial } from '../ci/lib/adb.mjs';
-import { HOST_PLATFORMS, cancel, checkCancelBody, checkExtendBody, checkLeaseBody, checkReleaseBody, discover as discoverHost, exitCodeOf, findLease, hostKey as realHostKey, httpAnswerOf, leaseRequestId, lockActivity, serviceExtend, serviceLease, serviceRelease } from '../device/claims.mjs';
+import { HOST_PLATFORMS, cancel, checkCancelBody, checkExtendBody, checkForceReleaseBody, checkLeaseBody, checkReleaseBody, discover as discoverHost, exitCodeOf, findLease, forceReleaseLease, hostKey as realHostKey, httpAnswerOf, leaseRequestId, lockActivity, serviceExtend, serviceLease, serviceRelease } from '../device/claims.mjs';
 import { hubRef } from '../ci/lib/receipt.mjs';
 import { NO_READING } from '../registry/reachability.mjs';
 import { loadQaDevices } from '../registry/seed.mjs';
@@ -53,6 +53,7 @@ export const PROBLEM_EXTENSIONS = Object.freeze({
   HUB_REGISTRY_CONFLICT: Object.freeze(['rev']),
   HUB_REGISTRY_DUPLICATE: Object.freeze(['holder']),
   HUB_API_RESTARTING: Object.freeze(['retry']),
+  HUB_FORCE_RELEASE_JOB: Object.freeze(['repo', 'run', 'job']),
 });
 
 export function problem(error, extra = {}) {
@@ -310,6 +311,15 @@ export function cancelRequestRoute(ctx, { body, params }) {
   return cancel(params.id, { ...input, actor }, serviceContext(ctx));
 }
 
+// POST /leases/{id}/force-release: ends a Lease by force (Story 7.6), exactly `hub-device force-release <id> --why ...`: `forceReleaseLease` is the one function every
+// front door calls, and the status of a refusal comes from its HTTP table. The body is checked first (`checkForceReleaseBody`); the actor is the body's `actor`, else
+// `{holder, via: 'api'}`. No holder check and no confirmation (that is the page's). 200 `ForceRelease`.
+export function forceReleaseLeaseRoute(ctx, { body, params }) {
+  const input = checkForceReleaseBody(body);
+  const actor = input.actor ?? { holder: input.holder, via: 'api' };
+  return forceReleaseLease(params.id, { why: input.why, actor }, serviceContext(ctx));
+}
+
 // `shape` names the `### <Shape>` section of the contract document that lists the response's fields.
 export const ROUTES = Object.freeze([
   Object.freeze({ method: 'GET', path: '/health', shape: 'Health', handler: health }),
@@ -325,6 +335,7 @@ export const ROUTES = Object.freeze([
   Object.freeze({ method: 'GET', path: '/leases/{id}', shape: 'Lease', handler: getLease }),
   Object.freeze({ method: 'POST', path: '/leases/{id}/extend', shape: 'Lease', handler: extendLeaseRoute }),
   Object.freeze({ method: 'POST', path: '/leases/{id}/release', shape: 'Release', handler: releaseLeaseRoute }),
+  Object.freeze({ method: 'POST', path: '/leases/{id}/force-release', shape: 'ForceRelease', handler: forceReleaseLeaseRoute }),
   Object.freeze({ method: 'POST', path: '/requests/{id}/cancel', shape: 'Cancel', handler: cancelRequestRoute }),
 ]);
 

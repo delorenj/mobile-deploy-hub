@@ -172,3 +172,11 @@ source_spec: `spec-7-4-lease-an-emulator-through-the-api.md`
 severity: low
 reason: `withoutRetired` in claims.take checks only a `phone` target or a word Pool, never the `emulator` kind, so `hub-device lease emulator` has never honoured a retired emulator Pool (pre-existing). The 7.4 `profile=` branch of `matchTarget` with no other clause returns the emulator target without consulting the Registry, inheriting the same gap. The fix belongs in `take`: refuse HUB_RESOURCE_RETIRED for the emulator Pool's Resource when the Registry file marks it retired or seed_missing, so every front door gets it at once.
 status: open
+
+### DW-12: A force-released forgotten Lease's held_ms (up to its 48 h expiry) counts as a past Lease hold in the enqueue ETA, which can widen later waiters' ETAs.
+origin: spec-deferred 596d296365c6
+location: tools/ci/lib/eta.mjs:22
+source_spec: `spec-7-6-force-release-a-lease.md`
+severity: low
+reason: eta.mjs ENDS already includes force-release (tools/ci/lib/eta.mjs:8, :22; README "The enqueue ETA"), a design that predates Story 7.6; this story is the first writer of lease force-release events, so the data now reaches it. Whether abandoned holds should count is an ETA design decision (the hold did block waiters that long), not a force-release defect.
+status: open

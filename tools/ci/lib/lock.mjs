@@ -1834,6 +1834,48 @@ export function releaseLease(name, id, { env = process.env, now = Date.now, reas
   return { released: true, cancelled, reason: 'released', owner };
 }
 
+// The refusal to end a deploy job's (or the catch-up's) Hold from outside its run (Story 7.6): HUB_FORCE_RELEASE_JOB, with the members
+// `repo`, `run` and `job` (null when unknown) a front door answers with. Built from an owner record (forceRelease) or from a `job:` id
+// (claims.mjs), so the text and the members cannot drift. A GitHub run is cancelled with `gh run cancel`; a local run or the catch-up
+// has no run to cancel, so the message says to stop its process.
+export function forceReleaseJobError({ kind = 'job', repo = null, run = null, job = null, pid = null } = {}) {
+  const text = value => (typeof value === 'string' && value !== '' ? value : typeof value === 'number' ? String(value) : null);
+  const where = text(repo);
+  const which = text(run);
+  const github = where !== null && which !== null;
+  const pidText = Number.isSafeInteger(pid) ? ` ${pid}` : '';
+  const what = github
+    ? `cancel the run instead (gh run cancel ${which} --repo ${where})`
+    : kind === 'hub-job' ? `stop the catch-up process${pidText} instead` : `stop the local process${pidText} instead`;
+  return Object.assign(failure('HUB_FORCE_RELEASE_JOB', `a deploy job's Hold is never ended from outside its run; ${what}`), { repo: where, run: which, job: text(job) });
+}
+
+// Ends the Lease holding `name` by force (Story 7.6): the Lease's owner is renamed to a tomb (retire: the rename decides) and one
+// `force-release` event is written with `actor`, `why`, `lease_id`, `hold_kind: lease`, the Lease's `claimant` and `held_ms`. The one
+// protocol writer of it: Claims (the CLI, the Hub API and the Host Agent) calls this and nothing else ends a Lease on someone's behalf.
+// There is no holder check: any actor may do it, and says why. It never ends a Job Hold (`job`, `hub-job`, or an owner from before v1a
+// with no kind): HUB_FORCE_RELEASE_JOB, before anything is written. Returns {released: true, owner}, or {released: false, reason} with
+// `none` (no lock), `unknown-holder` (a lock with no owner record yet: being taken), `other-lease` (`lease_id` was given and another
+// Lease holds the lock; `owner`) or `changed` (the owner changed hands or went between the read and the rename; the new owner is
+// untouched and nothing is written). TypeError without an actor; HUB_USAGE (`reason: bad-why`) for an empty or non-string `why`.
+// `beforeRetire` is the test seam of `retire`.
+export function forceRelease(name, { actor, why, lease_id = null, env = process.env, now = Date.now, hostId = machineId(), log = console.error, beforeRetire } = {}) {
+  const who = checkActor(actor);
+  if (!who) throw new TypeError('a force-release names its actor ({holder, via})');
+  if (typeof why !== 'string' || why.trim() === '') throw Object.assign(failure('HUB_USAGE', 'a force-release says why: a non-empty why'), { reason: 'bad-why' });
+  const path = lockPath(name, env);
+  const owner = readOwner(path);
+  if (!owner) {
+    let exists = true;
+    try { statSync(path); } catch { exists = false; }
+    return { released: false, reason: exists ? 'unknown-holder' : 'none' };
+  }
+  if (!isLease(owner)) throw forceReleaseJobError({ kind: owner.kind ?? 'job', repo: owner.repo, run: owner.run, job: owner.job, pid: owner.pid });
+  if (lease_id !== null && owner.lease_id !== lease_id) return { released: false, reason: 'other-lease', owner };
+  if (!retire(name, path, owner, { as: 'force-release', fields: { actor: who, why }, env, now, log, hostId, beforeRetire })) return { released: false, reason: 'changed' };
+  return { released: true, owner };
+}
+
 // Takes a waiting request out of the line (Story 7.5): `lease_id`'s ticket on `name`, or, for a Pool request (its ticket carries
 // `pool` and `request`), its ticket in every member's queue. The one writer of the other half of a waiter's ending: it leaves the
 // attribution note (see readCancelNote) before it unlinks, so the waiter's own failure names `actor`; a request on a single lock
