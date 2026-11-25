@@ -107,3 +107,11 @@ source_spec: `spec-5-1-one-claims-library-under-an-unchanged-cli.md`
 severity: low
 reason: claims.reapBeforeAcquire calls ctx.warn?.(...); main supplies warn => stderr('hub-device: warning: ' + message). No test in tools/ has the reaper fail (grep "reaper failed" hits only claims.mjs). The gap predates the move (the old stderr call was untested too), and the path is warning-only.
 status: open
+
+### DW-4: An android_extra phone other than s24 (for example "Pixel") passes the name rule but sits on a bare, non-Queued lock whose events are dropped and whose resource is null.
+origin: spec-deferred 953763633f12
+location: tools/ci/lib/devices.mjs android_extra; tools/ci/lib/lock.mjs isQueued
+source_spec: `spec-5-2-one-reserved-word-list-one-slug-rule-res-locks-queue.md`
+severity: medium
+reason: isQueued covers only the frozen v1a QUEUED set, emulator-<n> and res-<slug>, and SEED_RESOURCES maps only adb, s24 and mac-ios, so a lock named "pixel" gets no queue ticket and no events. This predates Story 5.2 (any extra phone but s24 was already bare). names.test.mjs fails when the committed devices.json gains such a phone, but a HUB_DEVICES override file does not run that test. Settling it means choosing whether devices.json may still declare new phones (then seed and queue them) or new phones must be registered as res-<slug> (then refuse unseeded android_extra names).
+status: open

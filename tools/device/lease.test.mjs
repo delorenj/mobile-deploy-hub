@@ -452,7 +452,7 @@ const HOST_ID = 'test-machine-id';
 const T0 = Date.parse('2026-11-23T10:00:00Z');
 const at = ms => new Date(ms).toISOString();
 // The event without its envelope (format, ts, host, host_id, hub_version), which Story 1.1 pins.
-const body = ({ format, ts, host, host_id, hub_version, ...rest }) => rest;
+const body = ({ format, ts, host, host_id, hub_version, resource, ...rest }) => rest; // Story 5.2: `resource` is additive (AD-2); the v1.2.46 body is what these tests pin, names.test.mjs pins `resource`
 const ciEnv = f => ({ ...f.env, GITHUB_RUN_ATTEMPT: '2', GITHUB_JOB: 'android' });
 const fakeTimers = () => {
   const made = [];
