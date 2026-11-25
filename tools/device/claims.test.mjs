@@ -50,7 +50,7 @@ async function startWaiter(s, id, lock = 's24') {
 const emptyAdb = () => ({ startServer: async () => {}, devices: async () => [], prop: async () => '' });
 
 test('the library exports the whole action surface and the exit table as frozen data', () => {
-  for (const name of ['resolve', 'take', 'release', 'extend', 'newLeaseId', 'checkBounds', 'checkLeaseId', 'usableFleet', 'emulatorBounds', 'statusView', 'leaseExports', 'jobTicket', 'releaseEmulatorNow', 'releaseReservations', 'exitCodeOf', 'fleetOf', 'loadFleet', 'hostKey', 'isLocal', 'hostKeyPath']) {
+  for (const name of ['resolve', 'take', 'release', 'extend', 'newLeaseId', 'checkBounds', 'checkLeaseId', 'usableFleet', 'emulatorBounds', 'statusView', 'leaseExports', 'jobTicket', 'releaseEmulatorNow', 'releaseReservations', 'exitCodeOf', 'fleetOf', 'loadFleet', 'matchTarget', 'hostKey', 'isLocal', 'hostKeyPath']) {
     assert.equal(typeof claims[name], 'function', name);
   }
   assert.equal(claims.PHONE, 'phone');
@@ -60,6 +60,8 @@ test('the library exports the whole action surface and the exit table as frozen 
     HUB_USAGE: 2, HUB_EMULATOR_USAGE: 2, HUB_LEASE_TOO_LONG: 2, HUB_DEVICE_JOB_ID: 2,
     HUB_DEVICE_AWAY: 75, HUB_PHONE_AWAY: 75, HUB_DEVICE_BUSY: 76, HUB_LOCK_TIMEOUT: 76,
     HUB_LEASE_CANCELLED: 1, HUB_LEASE_EXTEND_REFUSED: 1, HUB_LEASE_LOST: 1, HUB_HOST_UNKNOWN: 1,
+    // Story 5.7 (intended): the matcher's two refusals.
+    HUB_NO_MATCH: 2, HUB_POOL_CROSS_HOST: 2,
   });
 });
 

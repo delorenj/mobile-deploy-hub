@@ -5,7 +5,7 @@
 //
 // Everything that writes the lock directory goes through lock.mjs and emulator.mjs (AD-1); reads may look at it directly. Errors carry a `code`; a usage
 // refusal is `code: 'HUB_USAGE'`. The context every action takes is the one `createContext` builds: `env`, `log`, `warn`,
-// `timing`, `emulator`, `adbFactory`, `adbWire`, `devicectl`, `hostKey`, `inventory`, `policy` and `fleet`.
+// `timing`, `emulator`, `adbFactory`, `adbWire`, `devicectl`, `hostKey`, `inventory`, `policy`, `fleet`, `qaDevices` and `registry` (the last two are the seams `matchTarget` reads).
 import { randomBytes } from 'node:crypto';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -20,7 +20,8 @@ import { createAdbWire } from './adb-wire.mjs';
 import { createAsyncAdb } from './async-adb.mjs';
 import { GATE, LEASE_ID, MAX_POOL, PROFILES, emulatorStatus, exportsOf as emulatorExports, hostPool, isEmulatorLease, isEmulatorLock, provision, readRecord, reap, releaseEmulator as releaseEmulatorLease, teardownNow } from './emulator.mjs';
 import { REACHABILITY, discover as discoverDevices, phoneReachability, present, queryAdb, readIpad, stamp } from '../registry/reachability.mjs';
-import { deployTargetIds, seed } from '../registry/seed.mjs';
+import { match, canonical, parseQuery } from '../registry/match.mjs';
+import { deployTargetIds, loadQaDevices, seed } from '../registry/seed.mjs';
 import { inventory as realInventory } from './inventory.mjs';
 
 export const PHONE = 'phone';
@@ -43,6 +44,8 @@ export const EXIT_CODES = Object.freeze({
   HUB_LEASE_EXTEND_REFUSED: 1,
   HUB_LEASE_LOST: 1,
   HUB_HOST_UNKNOWN: 1,
+  HUB_NO_MATCH: 2,
+  HUB_POOL_CROSS_HOST: 2,
 });
 export const exitCodeOf = error => (Object.hasOwn(EXIT_CODES, error?.code) ? EXIT_CODES[error.code] : EXIT_FAILURE);
 
@@ -79,9 +82,9 @@ export const isLocal = (record, { hostKey: keyOf = hostKey } = {}) => record?.ho
 // ---- context ----
 
 // Timing and emulator settings from the environment, as the CLI always read them; every key can be overridden by a seam.
-export function createContext({ env = process.env, sleep = realSleep, now = Date.now, log = () => {}, warn = () => {}, adbFactory, adbWire, devicectl, hostKey: hostKeyOf, inventory, policy = null, fleet } = {}) {
+export function createContext({ env = process.env, sleep = realSleep, now = Date.now, log = () => {}, warn = () => {}, adbFactory, adbWire, devicectl, hostKey: hostKeyOf, inventory, policy = null, fleet, qaDevices, registry } = {}) {
   return {
-    env, log, warn, policy, adbFactory, adbWire, devicectl, hostKey: hostKeyOf, inventory, fleet,
+    env, log, warn, policy, adbFactory, adbWire, devicectl, hostKey: hostKeyOf, inventory, fleet, qaDevices, registry,
     timing: { sleep, now, leasePollMs: Number(env.HUB_DEVICE_POLL_MS) || 1000, phonePollMs: Number(env.HUB_DEVICE_POLL_MS) || 3000 },
     emulator: {
       graceMs: Number(env.HUB_EMULATOR_KILL_GRACE_MS) || 15_000,
@@ -123,6 +126,37 @@ export function newLeaseId(kind = 'lease') {
 const phoneOwning = (fleet, env, id) => fleet.find(phone => { const owner = readOwnerOf(phone.lock, env); return isLease(owner) && owner.lease_id === id; }) ?? null;
 const phoneWaiting = (fleet, env, id) => fleet.find(phone => queueView(phone.lock, { env, includeStale: true }).some(waiter => waiter.lease_id === id)) ?? null;
 
+// The `phone` word's members, in order: the matcher's named list over the committed devices.json (no QA file), as fleet entries. For the
+// committed devices.json that is the S24, then the S26.
+function phoneMembers(fleet, env) {
+  const named = match(seed(loadDevices(env), { qaDevices: () => [] }), { pool: PHONE }, null);
+  return named.members.map(member => fleet.find(phone => phone.lock === member.lock)).filter(Boolean);
+}
+
+// `--match <query>`: a Capability query resolved by the matcher against the in-memory seed (the QA marks included: `ctx.qaDevices`, default
+// the private QA file; `ctx.registry()` replaces the whole registry, where Epic 6's `registry.json` plugs in). What the CLI cannot hold
+// is dropped with its reason: a member that is not a phone, or a phone `ctx.fleet` does not know. Returns the Pool target `take` tries
+// in order: `{kind: 'pool', by: 'match', pool: 'match:<canonical query>', members}`. Throws HUB_USAGE for a bad query, HUB_NO_MATCH
+// (with `reason`, `excluded`) when nothing can serve it and HUB_POOL_CROSS_HOST when the members span hosts. Reads, never writes.
+export function matchTarget(text, { forMs } = {}, ctx) {
+  const clauses = parseQuery(text);
+  const registry = ctx.registry?.() ?? seed(loadDevices(ctx.env), { qaDevices: ctx.qaDevices ?? (() => loadQaDevices({ env: ctx.env })) });
+  const policy = ctx.policy ?? loadPolicy().policy;
+  const found = match(registry, { query: clauses, for_ms: forMs }, policy);
+  const members = [];
+  const excluded = [...found.excluded];
+  for (const record of found.members) {
+    const phone = record.kind === 'phone' ? ctx.fleet.find(entry => entry.lock === record.lock) : null;
+    if (phone) members.push(phone);
+    else excluded.push({ id: record.id, why: record.kind === 'phone' ? 'is known only from the QA file; hub-device cannot lease it yet' : `is ${/^[aeiou]/.test(record.kind) ? 'an' : 'a'} ${record.kind}; --match takes a phone` });
+  }
+  if (members.length === 0) {
+    const reason = excluded.map(({ id, why }) => `${id} ${why}`).join('; ');
+    throw Object.assign(failure('HUB_NO_MATCH', `no Resource matches: ${reason}`), { reason, excluded });
+  }
+  return { kind: 'pool', by: 'match', pool: `match:${canonical(clauses)}`, members };
+}
+
 // A target names one lease (an id: an emulator lease, then the phone holding it, then the phone it waits on) or a device word
 // (a fleet phone, the `phone` Pool, `emulator`). An id wins over a word; `words`/`ids` narrow what is tried. An unknown
 // word is HUB_USAGE. An id nothing holds resolves to null with `words: false`; otherwise it is read as a word (and refused).
@@ -136,7 +170,7 @@ export function resolve(target, { fleet, env = process.env, words = true, ids = 
   }
   if (!words) return null;
   if (target === EMULATOR) return { kind: EMULATOR, by: 'word' };
-  if (target === PHONE) return { kind: 'pool', by: 'word', pool: PHONE, members: fleet };
+  if (target === PHONE) return { kind: 'pool', by: 'word', pool: PHONE, members: phoneMembers(fleet, env) };
   const entry = fleet.find(phone => phone.device === target);
   if (!entry) throw usage(`unknown device "${target ?? ''}" (known: ${[...fleet.map(phone => phone.device), PHONE, EMULATOR].join(', ')})`);
   return { kind: 'phone', by: 'word', entry };
@@ -258,12 +292,12 @@ function noPhoneError(fleet, states, waitMs, ctx) {
 // poll tick and tries again, so a phone that frees or appears mid-wait is picked up. It does not queue FIFO behind
 // another `phone` taker (the ordered try wins at the next poll); single-device leases still queue FIFO on their own
 // locks, and a lease that frees is taken by whichever caller's poll sees it first.
-async function takeAnyPhone(fleet, options, ctx) {
+async function takeAnyPhone(fleet, options, ctx, poolName = PHONE) {
   const { env, timing } = ctx;
   const sliceMs = Number(env.HUB_DEVICE_PHONE_SLICE_MS) || 10_000;
   // One Pool-level request for the whole wait (AD-4): each pass below is a try, and the try that takes a phone writes the
   // one `acquire`, with waited_ms from this request. A request that ends without a phone settles as one timeout or cancel.
-  const pool = poolRequest(PHONE, { id: options.id ?? undefined, holder: options.holder, why: options.why, forMs: options.forMs, waitMs: options.waitMs, env, now: timing.now });
+  const pool = poolRequest(poolName, { id: options.id ?? undefined, holder: options.holder, why: options.why, forMs: options.forMs, waitMs: options.waitMs, env, now: timing.now });
   const deadline = timing.now() + options.waitMs;
   const states = new Map();
   try {
@@ -303,6 +337,24 @@ async function takeEmulator(options, ctx) {
   return { kind: EMULATOR, id, lease, record };
 }
 
+// The members of a `--match` Pool that are not definitively away, read over the same read-only wire query status uses (nothing is
+// started or connected). A member reading absent, offline or unauthorized is dropped; every one dropped is HUB_DEVICE_AWAY (75) naming
+// each, before any event is written. `unknown` (no adb server, a wedged one, no host key, a host that is not `linux`) drops nothing, so
+// the ordered try decides as it always has. `--no-connect` skips it: that lease is the lock only, phone away or not.
+async function reachableMembers(members, ctx) {
+  let key = null;
+  try { key = (ctx.hostKey ?? hostKey)({ env: ctx.env }); } catch (error) { if (error?.code !== 'HUB_HOST_UNKNOWN') throw error; }
+  if (key !== 'linux') return members;
+  const found = (ctx.inventory ?? realInventory)({ lockRoot: lockDir(ctx.env), hubAdbPort: Number(ctx.env.HUB_ADB_SERVER_PORT) || 5037 });
+  const observed = await phoneObservations(members, ctx, found);
+  const states = new Map(members.map(phone => [phone.device, phoneReachability(observed.get(phone.device) ?? null)]));
+  const gone = new Set([REACHABILITY.absent, REACHABILITY.offline, REACHABILITY.unauthorized]);
+  const left = members.filter(phone => !gone.has(states.get(phone.device)));
+  if (left.length > 0) return left;
+  const reason = members.map(phone => `${phone.device} ${states.get(phone.device)}`).join(', ');
+  throw Object.assign(failure('HUB_DEVICE_AWAY', `no phone that matches is reachable: ${reason}`), { reason });
+}
+
 // One take for every kind of target: a phone, the `phone` Pool (an ordered try under one Pool request) or an emulator.
 // A library caller gets the refusals the CLI makes, in the CLI's order: an unknown target, an id that is already taken,
 // --for's bounds (the Pool is narrowed to the phones whose cap allows it), --why, --wait, --pid, and an emulator's profile and
@@ -317,7 +369,7 @@ export async function take(resolved, options, ctx) {
   checkPid(options.holderPid);
   switch (target.kind) {
     case 'phone': return takePhone(target.entry, options, ctx);
-    case 'pool': return takeAnyPhone(target.members, options, ctx);
+    case 'pool': return takeAnyPhone(target.by === 'match' && !options.noConnect ? await reachableMembers(target.members, ctx) : target.members, options, ctx, target.pool ?? PHONE);
     case EMULATOR: return takeEmulator({ ...options, ...emulatorBounds(options, ctx.env) }, ctx);
     default: throw usage(`cannot take a ${target.kind}`);
   }
