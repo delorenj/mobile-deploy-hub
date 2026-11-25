@@ -13,13 +13,14 @@ import { join } from 'node:path';
 import { findPhone, idMatchesSerial } from '../ci/lib/adb.mjs';
 import { createDevicectl } from '../ci/lib/devicectl.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
-import { MAX_LEASE_MS, RESERVABLE, SEED_RESOURCES, acquireLease, capText, deployTargetCapMs, etaHistory, extendLease, isLease, listLocks, lockDir, nameRefusal, newLeaseId as newLockLeaseId, poolRequest, queueView, readOwner, releaseLease, releaseReservation, resourceOf, updateLease, waiterEtas } from '../ci/lib/lock.mjs';
+import { MAX_LEASE_MS, RESERVABLE, SEED_RESOURCES, acquireLease, capText, deployTargetCapMs, etaHistory, extendLease, isLease, listLocks, lockDir, newLeaseId as newLockLeaseId, poolRequest, queueView, readOwner, releaseLease, releaseReservation, resourceOf, updateLease, waiterEtas } from '../ci/lib/lock.mjs';
 import { pause, sleep as realSleep } from '../ci/lib/pause.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { createAdbWire } from './adb-wire.mjs';
 import { createAsyncAdb } from './async-adb.mjs';
 import { GATE, LEASE_ID, MAX_POOL, PROFILES, emulatorStatus, exportsOf as emulatorExports, hostPool, isEmulatorLease, isEmulatorLock, provision, readRecord, reap, releaseEmulator as releaseEmulatorLease, teardownNow } from './emulator.mjs';
 import { REACHABILITY, phoneReachability, present, readIpad, stamp } from '../registry/reachability.mjs';
+import { deployTargetIds, seed } from '../registry/seed.mjs';
 import { inventory as realInventory } from './inventory.mjs';
 
 export const PHONE = 'phone';
@@ -92,19 +93,14 @@ export function createContext({ env = process.env, sleep = realSleep, now = Date
 
 // ---- the fleet and ids ----
 
-// The phones this tool can lease, in the order `phone` prefers them. The S26 is the deploy phone (devices.android):
-// it sits under the `adb` host lock deploys take — its lock name can never change — and every further phone
-// (devices.android_extra) gets a lock of its own lowercased name. Nothing but the Claims library reads android_extra.
+// The phones this tool can lease, in the order `phone` prefers them: a projection of the Registry seed (tools/registry/seed.mjs),
+// which is the one derivation from devices.json. The S26 is the deploy phone (devices.android): it sits under the `adb` host
+// lock deploys take, so its lock name can never change, and every further phone (devices.android_extra) gets a lock of its own
+// lowercased name. Nothing but the seed reads android_extra. The QA file is never read here (`qaDevices: () => []`).
 export function fleetOf(devices) {
-  const deploy = { device: 's26', lock: 'adb', deploy: true, name: devices.android.name, serial: devices.android.serial, model: devices.android.model };
-  const extras = (devices.android_extra ?? []).map(entry => {
-    const device = entry.name.toLowerCase();
-    // The same name rule parseDevices applies (lock.mjs), so a fleet built from hand-made devices never carries a reserved word that is not seeded.
-    const refusal = nameRefusal(device);
-    if (refusal) throw new Error(`devices.json: android_extra[].name may not be "${device}" (${refusal})`);
-    return { device, lock: device, deploy: false, name: entry.name, serial: entry.serial, model: entry.model };
-  });
-  return [...extras, deploy];
+  return seed(devices, { qaDevices: () => [] }).resources
+    .filter(resource => resource.kind === 'phone')
+    .map(resource => ({ device: resource.id, lock: resource.lock, deploy: resource.deploy_target, name: resource.display_name, serial: resource.identity.serial, model: resource.identity.model }));
 }
 
 // The phones this checkout's devices.json names; a broken one is a tool failure, named like any other.
@@ -546,8 +542,10 @@ const AUDIENCES = Object.freeze(['local', 'service']);
 
 // Everything `status` shows, as the `--json` object: {phones, locks, waiters, reservations, inventory, emulators}. Read only: it
 // walks the lock dir and the hub's adb server (over the wire), and writes nothing to the lock dir or the Event Log (FR-13).
-// Every row of those lists that names a Resource carries `resource` (resourceOf(lock)) and then `reachability`
-// ({state, checked_at, age_ms, stale}), beside the v1a keys, which keep their values; both are null for a lock that is no Resource.
+// Every row of those lists that names a Resource carries `resource` (resourceOf(lock)), `deploy_target` and then `reachability`
+// ({state, checked_at, age_ms, stale}), beside the v1a keys, which keep their values; `resource` and `reachability` are null for a
+// lock that is no Resource. `deploy_target` is true for a Resource deploys install to (the seed of devices.json, built once with
+// no QA file: local status never reads it), false for any other Resource (a `res-*` lock too) and null when `resource` is null.
 // A reading is taken only on the host that owns the Resource (`hostKey`: the Linux host reads the phones, the Mac the iPad) and
 // only for what a row names; every other row shows the missing reading, unknown and stale, never reachable. A null key (this host
 // does not know which host it is) reads nothing. `audience` is `local` or `service`; a service sees the `qa_ids` Resources' serials,
@@ -628,7 +626,13 @@ export async function statusView(key, options, ctx) {
 
   // Every row gets its Resource; the readings come after, so the iPad is asked only when a row names it.
   const rowsOf = [[phones, phone => phone.lock], [locks, entry => entry.lock], [waiters, waiter => waiter.lock], [reservations, entry => entry.lock], [emulators, entry => entry.slot]];
-  for (const [rows, lockOf] of rowsOf) for (const row of rows) row.resource = resourceOf(lockOf(row));
+  const deployTargets = deployTargetIds(seed(loadDevices(env), { qaDevices: () => [] }));
+  for (const [rows, lockOf] of rowsOf) {
+    for (const row of rows) {
+      row.resource = resourceOf(lockOf(row));
+      row.deploy_target = row.resource === null ? null : deployTargets.has(row.resource);
+    }
+  }
   const readings = new Map();   // Resource id -> stored reading
   if (key === 'linux') {
     const readAt = timing.now();

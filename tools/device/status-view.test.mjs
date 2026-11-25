@@ -13,6 +13,7 @@ import { loadDevices } from '../ci/lib/devices.mjs';
 import { acquireLease, buildTicket, reserve } from '../ci/lib/lock.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { hermetic } from '../ci/test-fixtures.mjs';
+import { dedicatedQaIds, loadQaDevices, seed } from '../registry/seed.mjs';
 import * as claims from './claims.mjs';
 import { main } from './hub-device.mjs';
 import { createAdbWire, parseDevicesLong } from './adb-wire.mjs';
@@ -76,7 +77,7 @@ const wireOnly = requests => requests.every(request => allowed.includes(request)
 
 // ---- the shape ----
 
-test('statusView keeps today\'s root keys and every v1a key in place, then adds resource and reachability to every row', async () => {
+test('statusView keeps today\'s root keys and every v1a key in place, then adds resource, deploy_target and reachability to every row', async () => {
   const s = side();
   try {
     await acquireLease('adb', { holder: 'agent-a', why: 'device proof', forMs: 3_600_000, id: 'held', env: s.env, log: () => {}, now: () => T0 });
@@ -98,9 +99,9 @@ test('statusView keeps today\'s root keys and every v1a key in place, then adds 
     };
     for (const [list, keys] of Object.entries(v1a)) {
       assert.ok(view[list].length > 0, `${list} has a row to check`);
-      for (const row of view[list]) assert.deepEqual(Object.keys(row), [...keys, 'resource', 'reachability'], `${list} row keys`);
+      for (const row of view[list]) assert.deepEqual(Object.keys(row), [...keys, 'resource', 'deploy_target', 'reachability'], `${list} row keys`);
     }
-    const strip = ({ resource, reachability, ...rest }) => rest;
+    const strip = ({ resource, deploy_target, reachability, ...rest }) => rest;
     const [s24, s26] = view.phones;
     assert.deepEqual(strip(s24), { device: 's24', lock: 's24', deploy: false, name: 'S24', model: 'SM-S928U', serial: S24, held: 'free', holder: null, lease_id: null, why: null, expires_at: null, adb_id: null, repo: null, run: null, presence: 'reachable' });
     assert.deepEqual([s26.device, s26.held, s26.holder, s26.lease_id, s26.presence, s26.resource, s26.reachability.state], ['s26', 'lease', 'agent-a', 'held', 'reachable', 's26', 'reachable']);
@@ -580,4 +581,174 @@ test('parseDevicesLong reads host:devices-l, and createAdbWire.devicesLong speak
     assert.equal((await wire.shell('x:1', 'getprop ro.serialno')).trim(), S26);
     assert.deepEqual(server.requests, ['host:version', 'host:devices-l', 'host:transport:x:1', 'shell:getprop ro.serialno']);
   } finally { await server.close(); }
+});
+
+// ---- Story 5.5: deploy targets are marked ----
+
+const jobTicket = (s, name, repo, run, n = 1, extra = {}) => {
+  mkdirSync(join(s.env.HUB_LOCK_DIR, `${name}.queue`), { recursive: true });
+  const job = buildTicket('job', { env: { ...s.env, GITHUB_REPOSITORY: repo, GITHUB_RUN_ID: run, GITHUB_RUN_ATTEMPT: '1', GITHUB_JOB: 'android' }, requested: T0, ...extra });
+  writeFileSync(join(s.env.HUB_LOCK_DIR, `${name}.queue`, `${String(T0).padStart(15, '0')}-00000${n}-0000000${n}.json`), JSON.stringify(job));
+};
+
+test('every row carries deploy_target from the seed: s26 true, s24 and the emulator Pool false, res-* false, no Resource null', async () => {
+  const s = side();
+  try {
+    await acquireLease('adb', { holder: 'agent-a', why: 'device proof', forMs: 3_600_000, id: 'held', env: s.env, log: () => {}, now: () => T0 });
+    jobTicket(s, 'adb', 'delorenj/gruvato', '77');
+    reserve('adb', { env: { ...s.env, GITHUB_REPOSITORY: 'delorenj/earshot', GITHUB_RUN_ID: '9' }, now: () => T0, policy: policy(), log: () => {} });
+    await acquireLease('emulator', { holder: 'agent-e', why: 'emulator proof', forMs: 3_600_000, id: 'emu', env: s.env, log: () => {}, now: () => T0 });
+    mkdirSync(join(s.env.HUB_LOCK_DIR, 'res-foo.queue'), { recursive: true });
+    jobTicket(s, 'res-foo', 'delorenj/gruvato', '78', 2);
+    const dir = join(s.env.HUB_LOCK_DIR, 's3-index.lock');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'owner.json'), JSON.stringify({ pid: process.pid, host: hostname(), repo: 'delorenj/earshot', run: '5', started_at: iso(T0) }));
+    const view = await s.view();
+    const marks = list => view[list].map(row => [row.resource, row.deploy_target]);
+    assert.deepEqual(marks('phones'), [['s24', false], ['s26', true]]);
+    assert.deepEqual(view.locks.map(row => [row.lock, row.resource, row.deploy_target]).sort(), [['adb', 's26', true], ['emulator', 'emulator', false], ['s3-index', null, null]]);
+    assert.ok(view.waiters.some(row => row.resource === 's26' && row.deploy_target === true));
+    assert.deepEqual(view.waiters.filter(row => row.lock === 'res-foo').map(row => [row.resource, row.deploy_target]), [['res-foo', false]]);
+    assert.deepEqual(marks('reservations'), [['s26', true]]);
+    for (const row of [...view.phones, ...view.locks, ...view.waiters, ...view.reservations]) {
+      const keys = Object.keys(row);
+      assert.equal(keys.indexOf('deploy_target'), keys.indexOf('resource') + 1);
+      assert.equal(keys.indexOf('reachability'), keys.indexOf('deploy_target') + 1);
+    }
+  } finally { s.cleanup(); }
+});
+
+test('an emulator row is not a deploy target', async () => {
+  const s = side();
+  try {
+    const records = join(s.env.HUB_LOCK_DIR, 'emulators');
+    mkdirSync(records, { recursive: true });
+    writeFileSync(join(records, 'e-aaaaaaaaaaaa.json'), JSON.stringify({ lease_id: 'e-aaaaaaaaaaaa', slot: 'emulator-1', profile: 'default', serial: 'emulator-5554', console_port: 5554, adb_server_port: 15170, avd: { name: 'hub-a' }, created_at: iso(T0), pids: [] }));
+    assert.deepEqual((await s.view()).emulators.map(row => [row.resource, row.deploy_target]), [['emulator', false]]);
+  } finally { s.cleanup(); }
+});
+
+test('a mac-ios lock row is ios-lane and a deploy target', async () => {
+  const s = side({ inventory: serverDown, devicectl: () => { throw new Error('unreadable'); } });
+  try {
+    await acquireLease('mac-ios', { holder: 'agent-m', why: 'ipad proof', forMs: 60_000, id: 'ipad', env: s.env, log: () => {}, now: () => T0 });
+    const lock = (await s.view('mac')).locks.find(entry => entry.lock === 'mac-ios');
+    assert.deepEqual([lock.resource, lock.deploy_target], ['ios-lane', true]);
+  } finally { s.cleanup(); }
+});
+
+test('local status keeps every value of a dedicated_qa phone; only the service audience redacts it', async () => {
+  const s = side();
+  try {
+    const qa = seed(loadDevices(s.env), { qaDevices: () => [{ name: 'S24', model: 'x', serial: S24, allowed_users: [0] }] });
+    const qaIds = dedicatedQaIds(qa);
+    assert.deepEqual(qaIds, ['s24']);
+    const plain = await s.view('linux', { audience: 'local' });
+    const local = await s.view('linux', { audience: 'local', qa_ids: qaIds });
+    const service = await s.view('linux', { audience: 'service', qa_ids: qaIds });
+    assert.deepEqual(local.phones, plain.phones, 'qa_ids never changes what local shows');
+    assert.equal(local.phones.find(row => row.device === 's24').serial, S24);
+    assert.equal(service.phones.find(row => row.device === 's24').serial, null);
+    assert.equal(service.phones.find(row => row.device === 's24').deploy_target, false, 'a redacted row keeps its mark');
+    assert.ok(!JSON.stringify(local).includes('allowed_users'));
+  } finally { s.cleanup(); }
+});
+
+test('the text status prints one DEPLOY TARGET line between WAITERS and RESERVATIONS for a held, waited-on or reserved deploy target', async () => {
+  const s = side();
+  try {
+    await acquireLease('adb', { holder: 'agent-a', why: 'device proof', forMs: 3_600_000, id: 'held', env: s.env, log: () => {}, now: () => T0 });
+    jobTicket(s, 'adb', 'delorenj/gruvato', '77');
+    reserve('adb', { env: { ...s.env, GITHUB_REPOSITORY: 'delorenj/earshot', GITHUB_RUN_ID: '9' }, now: () => T0, policy: policy(), log: () => {} });
+    const { code, out } = await s.cli(['status']);
+    assert.equal(code, 0);
+    const lines = out.filter(line => line.startsWith('DEPLOY TARGET'));
+    assert.deepEqual(lines, ['DEPLOY TARGET s26 (lock adb)  held by LEASE held holder=agent-a  1 waiting  1 reserved  deploys install here; a lease on it holds deploys back']);
+    const at = out.indexOf(lines[0]);
+    assert.ok(out.findIndex(line => line === 'WAITERS') < at && at < out.indexOf('RESERVATIONS'));
+    assert.ok(out.slice(out.indexOf('WAITERS'), at).every(line => !line.startsWith('INVENTORY')));
+  } finally { s.cleanup(); }
+});
+
+test('a job lock holding a deploy target says so, free with a waiter says free, and a stale job lock is marked', async () => {
+  const s = side();
+  try {
+    jobTicket(s, 'adb', 'delorenj/gruvato', '77');
+    const free = (await s.cli(['status'])).out.filter(line => line.startsWith('DEPLOY TARGET'));
+    assert.deepEqual(free, ['DEPLOY TARGET s26 (lock adb)  free  1 waiting  deploys install here; a lease on it holds deploys back']);
+    const dir = join(s.env.HUB_LOCK_DIR, 'adb.lock');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'owner.json'), JSON.stringify({ pid: 2 ** 22 + 7, host: hostname(), repo: 'delorenj/earshot', run: '5', started_at: iso(T0 - 86_400_000) }));
+    assert.equal((await s.view()).locks.find(entry => entry.lock === 'adb').stale, true, 'the job lock is stale');
+    const held = (await s.cli(['status'])).out.filter(line => line.startsWith('DEPLOY TARGET'));
+    assert.deepEqual(held, ['DEPLOY TARGET s26 (lock adb)  held by JOB LOCK delorenj/earshot run 5  [stale]  1 waiting  deploys install here; a lease on it holds deploys back']);
+  } finally { s.cleanup(); }
+});
+
+test('an expired Lease on a deploy target is marked [stale] on its DEPLOY TARGET line', async () => {
+  const s = side();
+  try {
+    await acquireLease('adb', { holder: 'agent-a', why: 'old', forMs: 60_000, id: 'old', env: s.env, log: () => {}, now: () => T0 - 3_600_000 });
+    assert.equal((await s.view()).locks.find(entry => entry.lock === 'adb').stale, true, 'the lease is stale');
+    const lines = (await s.cli(['status'])).out.filter(line => line.startsWith('DEPLOY TARGET'));
+    assert.deepEqual(lines, ['DEPLOY TARGET s26 (lock adb)  held by LEASE old holder=agent-a  [stale]  0 waiting  deploys install here; a lease on it holds deploys back']);
+  } finally { s.cleanup(); }
+});
+
+test('a deploy target whose only waiter and only Reservation are stale prints no DEPLOY TARGET line', async () => {
+  const s = side();
+  try {
+    jobTicket(s, 'adb', 'delorenj/gruvato', '77', 1, { pid: 2 ** 22 + 7 });
+    reserve('adb', { env: { ...s.env, GITHUB_REPOSITORY: 'delorenj/earshot', GITHUB_RUN_ID: '9' }, now: () => T0 - 100 * 3_600_000, policy: policy(), log: () => {} });
+    const view = await s.view();
+    assert.deepEqual(view.waiters.map(row => [row.lock, row.stale]), [['adb', true]], 'the waiter is stale');
+    assert.deepEqual(view.reservations.map(row => [row.lock, row.stale]), [['adb', true]], 'the Reservation is expired');
+    assert.deepEqual(view.locks, [], 'nothing holds the lock');
+    const { code, out } = await s.cli(['status']);
+    assert.equal(code, 0);
+    assert.ok(out.includes('RESERVATIONS'), 'the stale Reservation is still listed');
+    assert.ok(!out.some(line => line.startsWith('DEPLOY TARGET')));
+  } finally { s.cleanup(); }
+});
+
+test('a lease on s24 only, or nothing held, prints no DEPLOY TARGET line', async () => {
+  const s = side();
+  try {
+    assert.ok(!(await s.cli(['status'])).out.some(line => line.startsWith('DEPLOY TARGET')));
+    await acquireLease('s24', { holder: 'agent-a', why: 'qa', forMs: 60_000, id: 'held', env: s.env, log: () => {}, now: () => T0 });
+    assert.ok(!(await s.cli(['status'])).out.some(line => line.startsWith('DEPLOY TARGET')));
+  } finally { s.cleanup(); }
+});
+
+test('fleetOf, statusView and status --json never read the QA file: a sentinel or broken one changes nothing', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'status-qa-'));
+  const keep = process.env.HUB_QA_DEVICES;
+  const s = side();
+  try {
+    const point = file => { process.env.HUB_QA_DEVICES = file; s.env.HUB_QA_DEVICES = file; };
+    const observe = async () => ({
+      fleet: JSON.stringify(claims.loadFleet(s.env)),
+      view: JSON.stringify(await s.view('linux', { audience: 'local' })),
+      cli: await s.cli(['status', '--json']),
+    });
+    point(keep);
+    const base = await observe();
+    const sentinel = join(dir, 'sentinel.json');
+    writeFileSync(sentinel, JSON.stringify({ schema: 1, devices: [{ name: 'Sentinel', serial: 'SENTINEL9', allowed_users: [3] }, { name: 'S24', serial: S24 }] }));
+    point(sentinel);
+    assert.ok(seed(loadDevices(s.env), { qaDevices: () => loadQaDevices({ env: s.env }) }).resources.some(resource => resource.id === 'res-sentinel'), 'the sentinel file is a valid QA file');
+    const marked = await observe();
+    assert.deepEqual(marked, base);
+    for (const text of [marked.fleet, marked.view, marked.cli.out.join('\n')]) assert.ok(!/res-sentinel|SENTINEL9|dedicated_qa/.test(text));
+    const broken = join(dir, 'broken.json');
+    writeFileSync(broken, '{ not json');
+    point(broken);
+    const after = await observe();
+    assert.equal(after.cli.code, 0);
+    assert.deepEqual(after, base);
+  } finally {
+    if (keep === undefined) delete process.env.HUB_QA_DEVICES; else process.env.HUB_QA_DEVICES = keep;
+    s.cleanup();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

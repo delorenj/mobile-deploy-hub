@@ -339,6 +339,21 @@ async function status(parsed, context) {
     const estimate = waiter.stale ? '' : `  eta=${formatEta(waiter.eta)}`;
     stdout(`  ${place}  ${what}  waiting since ${dash(waiter.since)}${estimate}${waiter.stale ? '  [stale]' : ''}`);
   }
+  // A deploy target that is held, waited on or reserved gets one line: deploys install to it, and a lease on it holds them back.
+  const targets = new Map();
+  const targetOf = row => {
+    if (!targets.has(row.resource)) targets.set(row.resource, { lock: row.lock, entry: null, waiting: 0, reserved: 0 });
+    return targets.get(row.resource);
+  };
+  for (const entry of locks) if (entry.deploy_target === true) targetOf(entry).entry = entry;
+  for (const waiter of waiters) if (waiter.deploy_target === true && !waiter.stale) targetOf(waiter).waiting += 1;
+  for (const entry of reservations) if (entry.deploy_target === true && !entry.stale) targetOf(entry).reserved += 1;
+  for (const [resource, target] of targets) {
+    const lock = target.entry;
+    const held = lock === null ? 'free'
+      : `${lock.kind === 'lease' ? `held by LEASE ${lock.lease_id} holder=${lock.holder}` : `held by JOB LOCK ${lock.repo ?? 'a local run'} run ${lock.run ?? '-'}`}${lock.stale ? '  [stale]' : ''}`;
+    stdout(`DEPLOY TARGET ${resource} (lock ${target.lock})  ${held}  ${target.waiting} waiting${target.reserved > 0 ? `  ${target.reserved} reserved` : ''}  deploys install here; a lease on it holds deploys back`);
+  }
   if (reservations.length > 0) {
     stdout('RESERVATIONS');
     for (const entry of reservations) {

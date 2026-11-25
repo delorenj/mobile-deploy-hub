@@ -123,3 +123,11 @@ source_spec: `spec-5-4-status-through-one-builder-with-reachability.md`
 severity: low
 reason: readWire matches with listed.find(...), first match wins; the v1a phonePresence had the same find-first semantics over `adb devices`, so this predates Story 5.4 (status now also derives reachability from it). Fix would prefer a `device` entry among the matches.
 status: open
+
+### DW-6: An android_extra phone other than the S24 gets resource null, and so deploy_target null, on every status row, because resourceOf's seed map is the fixed {adb, s24, mac-ios}.
+origin: spec-deferred eb1821317a63
+location: tools/ci/lib/lock.mjs:57 (resourceOf); tools/device/claims.mjs statusView rowsOf loop
+source_spec: `spec-5-5-deploy-targets-are-marked-from-the-committed-declarations.md`
+severity: low
+reason: resourceOf (lock.mjs, Story 5.2) maps only the committed seed's locks, and an extra phone such as `Pixel` (lock `pixel`) already read resource null under Story 5.4. Story 5.5 only derives deploy_target from that resource. This is the known pre-existing gap where a non-S24 devices.json phone sits on a bare lock, and fixing it needs the decision on whether new phones are added in devices.json or through the Registry. seed.test.mjs and names.test.mjs fail the moment devices.json changes, so it cannot ship silently.
+status: open
