@@ -227,3 +227,30 @@ test('the queue block is strict: the margin and one allowance per waiting job, n
   copy.queue.eta_low_data_min_holds = 10;
   assert.doesNotThrow(() => parsePolicy(JSON.stringify(copy)), 'a tuning change is a valid release, not a parse error');
 });
+
+// ---------------------------------------------------------------------------------------------------- Story 5.4 (AD-35, AD-46)
+
+test('the registry block is strict: reachability_max_age_s is required, a positive whole number, and the only key', () => {
+  const base = JSON.parse(source);
+  assert.deepEqual(base.registry, { reachability_max_age_s: 60 });
+  assert.deepEqual(loadPolicy().policy.registry, { reachability_max_age_s: 60 });
+  const bad = {
+    'no registry block': p => { delete p.registry; },
+    'registry is not an object': p => { p.registry = 60; },
+    'registry is a list': p => { p.registry = [60]; },
+    'an unknown registry key (a later story adds its own key and its own test)': p => { p.registry.stale_after_s = 5; },
+    'no max age': p => { delete p.registry.reachability_max_age_s; },
+    'max age zero': p => { p.registry.reachability_max_age_s = 0; },
+    'a negative max age': p => { p.registry.reachability_max_age_s = -60; },
+    'a fractional max age': p => { p.registry.reachability_max_age_s = 0.5; },
+    'max age as text': p => { p.registry.reachability_max_age_s = '60'; },
+  };
+  for (const [name, change] of Object.entries(bad)) {
+    const copy = structuredClone(base);
+    change(copy);
+    assert.throws(() => parsePolicy(JSON.stringify(copy)), /policy\.json: .*registry/, name);
+  }
+  const copy = structuredClone(base);
+  copy.registry.reachability_max_age_s = 120;
+  assert.doesNotThrow(() => parsePolicy(JSON.stringify(copy)), 'a tuning change is a valid release, not a parse error');
+});
