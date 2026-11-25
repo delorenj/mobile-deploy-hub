@@ -61,7 +61,7 @@ test('the library exports the whole action surface and the exit table as frozen 
     HUB_DEVICE_AWAY: 75, HUB_PHONE_AWAY: 75, HUB_DEVICE_BUSY: 76, HUB_LOCK_TIMEOUT: 76,
     HUB_LEASE_CANCELLED: 1, HUB_LEASE_EXTEND_REFUSED: 1, HUB_LEASE_LOST: 1, HUB_HOST_UNKNOWN: 1,
     // Story 5.7 (intended): the matcher's two refusals.
-    HUB_NO_MATCH: 2, HUB_POOL_CROSS_HOST: 2,
+    HUB_NO_MATCH: 2, HUB_POOL_CROSS_HOST: 2, HUB_REGISTRY_CONFLICT: 1, HUB_REGISTRY_FORMAT: 1,
   });
 });
 

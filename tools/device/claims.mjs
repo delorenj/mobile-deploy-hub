@@ -22,6 +22,7 @@ import { createAsyncAdb } from './async-adb.mjs';
 import { GATE, LEASE_ID, MAX_POOL, PROFILES, emulatorStatus, exportsOf as emulatorExports, hostPool, isEmulatorLease, isEmulatorLock, provision, readRecord, reap, releaseEmulator as releaseEmulatorLease, teardownNow } from './emulator.mjs';
 import { REACHABILITY, discover as discoverDevices, phoneReachability, present, queryAdb, readIpad, stamp } from '../registry/reachability.mjs';
 import { match, canonical, parseQuery } from '../registry/match.mjs';
+import { readRegistry } from '../registry/store.mjs';
 import { deployTargetIds, loadQaDevices, seed } from '../registry/seed.mjs';
 import { inventory as realInventory } from './inventory.mjs';
 
@@ -47,6 +48,8 @@ export const EXIT_CODES = Object.freeze({
   HUB_HOST_UNKNOWN: 1,
   HUB_NO_MATCH: 2,
   HUB_POOL_CROSS_HOST: 2,
+  HUB_REGISTRY_CONFLICT: 1,
+  HUB_REGISTRY_FORMAT: 1,
 });
 export const exitCodeOf = error => (Object.hasOwn(EXIT_CODES, error?.code) ? EXIT_CODES[error.code] : EXIT_FAILURE);
 
@@ -134,14 +137,15 @@ function phoneMembers(fleet, env) {
   return named.members.map(member => fleet.find(phone => phone.lock === member.lock)).filter(Boolean);
 }
 
-// `--match <query>`: a Capability query resolved by the matcher against the in-memory seed (the QA marks included: `ctx.qaDevices`, default
-// the private QA file; `ctx.registry()` replaces the whole registry, where Epic 6's `registry.json` plugs in). What the CLI cannot hold
+// `--match <query>`: a Capability query resolved by the matcher against the Registry: `<lock dir>/registry.json` read fresh on every call
+// (the store, tools/registry/store.mjs), or the in-memory seed when there is no file or it is unreadable (one HUB_REGISTRY_FORMAT warning
+// through `ctx.warn`). The seed's QA marks come from `ctx.qaDevices` (default the private QA file); `ctx.registry()` replaces the whole registry. What the CLI cannot hold
 // is dropped with its reason: a member that is not a phone, or a phone `ctx.fleet` does not know. Returns the Pool target `take` tries
 // in order: `{kind: 'pool', by: 'match', pool: 'match:<canonical query>', members}`. Throws HUB_USAGE for a bad query, HUB_NO_MATCH
 // (with `reason`, `excluded`) when nothing can serve it and HUB_POOL_CROSS_HOST when the members span hosts. Reads, never writes.
 export function matchTarget(text, { forMs } = {}, ctx) {
   const clauses = parseQuery(text);
-  const registry = ctx.registry?.() ?? seed(loadDevices(ctx.env), { qaDevices: ctx.qaDevices ?? (() => loadQaDevices({ env: ctx.env })) });
+  const registry = ctx.registry?.() ?? readRegistry({ env: ctx.env, qaDevices: ctx.qaDevices ?? (() => loadQaDevices({ env: ctx.env })), warn: ctx.warn });
   const policy = ctx.policy ?? loadPolicy().policy;
   const found = match(registry, { query: clauses, for_ms: forMs }, policy);
   const members = [];

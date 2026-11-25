@@ -83,7 +83,7 @@ development_status:
 
   epic-6: backlog
   6-1-event-log-vocabulary-for-registry-reachability-and-prune: done
-  6-2-the-registry-store-has-one-writer: backlog
+  6-2-the-registry-store-has-one-writer: done
   6-3-seed-at-start-import-qa-phones-on-first-creation: backlog
   6-4-the-hub-api-runs-answers-health-and-has-a-contract: backlog
   6-5-read-the-registry-through-the-api: backlog
