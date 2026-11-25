@@ -1283,3 +1283,27 @@ test('install.sh installs a hub-device wrapper into ~/.local/bin without touchin
     assert.doesNotMatch(leased.stderr, /warning/);
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
+
+// Story 6.8: a stopped Hub API only disables Registry writes. A lease, a status and a release never reach the API client, so with a
+// fetchImpl that fails the test when called they all work, and the Lease is there for the readers the API itself uses.
+test('lease, status and release work with the Hub API down: none of them calls the client', async () => {
+  const f = fixture();
+  try {
+    const noApi = () => assert.fail('a lease, status or release called the Hub API client');
+    const leased = await f.run(['lease', 's24', '--for', '5m', '--why', 'api down', '--no-connect', '--json'], { fetchImpl: noApi });
+    assert.equal(leased.code, 0, leased.err.join('\n'));
+    const { lease_id: leaseId } = JSON.parse(leased.out[0]);
+    const { lockActivity } = await import('./claims.mjs');
+    assert.equal(lockActivity('s24', { env: f.env }).held, true);
+    const status = await f.run(['status', '--json'], { fetchImpl: noApi });
+    assert.equal(status.code, 0, status.err.join('\n'));
+    assert.ok(JSON.parse(status.out.join('\n')).locks.some(entry => entry.lease_id === leaseId && entry.lock === 's24'), 'the Lease is listed');
+    const released = await f.run(['release', leaseId], { fetchImpl: noApi });
+    assert.equal(released.code, 0, released.err.join('\n'));
+    assert.equal(lockActivity('s24', { env: f.env }).held, false);
+    // A registry write in the same breath says plainly that the API is down.
+    const down = await f.run(['registry', 'add', '--kind', 'phone', '--name', 'p', '--model', 'm', '--host', 'linux', '--holder', 'x'], { fetchImpl: async () => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } }); } });
+    assert.equal(down.code, 1);
+    assert.match(down.err[0], /^HUB_API_DOWN /);
+  } finally { f.cleanup(); }
+});

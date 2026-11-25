@@ -9,7 +9,7 @@
 //
 // Everything that writes the lock directory goes through lock.mjs and emulator.mjs (AD-1); reads may look at it directly. Errors carry a `code`; a usage
 // refusal is `code: 'HUB_USAGE'`. The context every action takes is the one `createContext` builds: `env`, `log`, `warn`,
-// `timing`, `emulator`, `adbFactory`, `adbWire`, `devicectl`, `hostKey`, `inventory`, `policy`, `fleet`, `qaDevices` and `registry` (the last two are the seams `matchTarget` reads).
+// `timing`, `emulator`, `adbFactory`, `adbWire`, `devicectl`, `hostKey`, `inventory`, `policy`, `fleet`, `qaDevices` and `registry` (the last two are the seams `matchTarget` reads), plus `fetchImpl` and `timeout` (the seams of the Hub API client, `registryWrite`).
 import { randomBytes } from 'node:crypto';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -28,6 +28,8 @@ import { REACHABILITY, discover as discoverDevices, phoneReachability, present, 
 import { match, canonical, parseQuery, retirement } from '../registry/match.mjs';
 import { readRegistry, readRegistryFile } from '../registry/store.mjs';
 import { deployTargetIds, loadQaDevices, seed } from '../registry/seed.mjs';
+import { viewPools, viewRecord } from '../registry/view.mjs';
+import { call } from '../hub-client.mjs';
 import { inventory as realInventory } from './inventory.mjs';
 
 export const PHONE = 'phone';
@@ -68,6 +70,9 @@ export const EXIT_CODES = Object.freeze({
   HUB_REGISTRY_DUPLICATE: 2,
   // Story 6.7: a retire or an identity or name edit of a seeded Resource (a hub release changes those).
   HUB_REGISTRY_SEEDED: 2,
+  // Story 6.8: the same-host client's two answers (tools/hub-client.mjs): never an HTTP answer. DOWN means nothing was sent; UNKNOWN that the write may have applied.
+  HUB_API_DOWN: 1,
+  HUB_API_UNKNOWN: 1,
 });
 export const exitCodeOf = error => (Object.hasOwn(EXIT_CODES, error?.code) ? EXIT_CODES[error.code] : EXIT_FAILURE);
 
@@ -115,9 +120,9 @@ export const isLocal = (record, { hostKey: keyOf = hostKey } = {}) => record?.ho
 // ---- context ----
 
 // Timing and emulator settings from the environment, as the CLI always read them; every key can be overridden by a seam.
-export function createContext({ env = process.env, sleep = realSleep, now = Date.now, log = () => {}, warn = () => {}, adbFactory, adbWire, devicectl, hostKey: hostKeyOf, inventory, policy = null, fleet, qaDevices, registry } = {}) {
+export function createContext({ env = process.env, sleep = realSleep, now = Date.now, log = () => {}, warn = () => {}, adbFactory, adbWire, devicectl, hostKey: hostKeyOf, inventory, policy = null, fleet, qaDevices, registry, fetchImpl, timeout } = {}) {
   return {
-    env, log, warn, policy, adbFactory, adbWire, devicectl, hostKey: hostKeyOf, inventory, fleet, qaDevices, registry,
+    env, log, warn, policy, adbFactory, adbWire, devicectl, hostKey: hostKeyOf, inventory, fleet, qaDevices, registry, fetchImpl, timeout,
     timing: { sleep, now, leasePollMs: Number(env.HUB_DEVICE_POLL_MS) || 1000, phonePollMs: Number(env.HUB_DEVICE_POLL_MS) || 3000 },
     emulator: {
       graceMs: Number(env.HUB_EMULATOR_KILL_GRACE_MS) || 15_000,
@@ -237,6 +242,41 @@ export function matchTarget(text, { forMs } = {}, ctx) {
     throw Object.assign(failure('HUB_NO_MATCH', `no Resource matches: ${reason}`), { reason, excluded });
   }
   return { kind: 'pool', by: 'match', pool: `match:${canonical(clauses)}`, members };
+}
+
+// ---- the Registry verbs (Story 6.8) ----
+
+// The Hub API route of each Registry write: `add` registers, `edit` and `retire` name a Resource by id (URI-encoded).
+const REGISTRY_ROUTES = Object.freeze({
+  add: () => '/registry/resources',
+  edit: id => `/registry/resources/${encodeURIComponent(id)}`,
+  retire: id => `/registry/resources/${encodeURIComponent(id)}/retire`,
+});
+
+// A Registry write through the Hub API, the Registry's only writer (AD-27): `op` is add, edit or retire, `body` the route's body (the
+// caller sets `actor`). Resolves `{status, body}`; throws what tools/hub-client.mjs throws (HUB_API_DOWN, HUB_API_UNKNOWN, or the
+// problem's own error).
+export async function registryWrite(op, { id, body }, ctx) {
+  if (!Object.hasOwn(REGISTRY_ROUTES, op)) throw new TypeError(`registryWrite: unknown op "${op}" (${Object.keys(REGISTRY_ROUTES).join(', ')})`);
+  if (op !== 'add' && (typeof id !== 'string' || id === '')) throw new TypeError(`registryWrite ${op}: a Resource id is required`);
+  return call({ method: 'POST', path: REGISTRY_ROUTES[op](id), body }, { policy: ctx.policy ?? loadPolicy().policy, fetchImpl: ctx.fetchImpl, timeout: ctx.timeout });
+}
+
+// The revision of `registry.json` on disk, or 0 when there is no readable file: what an edit is based on when the caller names none.
+export const registryRev = ctx => readRegistryFile(ctx.env ?? process.env)?.rev ?? 0;
+
+// The Registry as a reader on this host sees it, read from the disk alone (no service): `{rev, source, resources, pools}` with each
+// record through the one view (hidden ones dropped; a marked record's lock read for held and queued) and the Pools through `viewPools`.
+// `audience` `local` keeps QA identities (this host's own user); the API serves `service`.
+export function registryList({ audience = 'local' } = {}, ctx) {
+  const env = ctx.env ?? process.env;
+  const registry = readRegistry({ env, qaDevices: ctx.qaDevices ?? (() => loadQaDevices({ env })), warn: ctx.warn });
+  const policy = ctx.policy ?? loadPolicy().policy;
+  const resources = registry.resources.map(record => {
+    const activity = retirement(record) !== null ? lockActivity(record.lock, { env, now: ctx.timing?.now ?? ctx.now }) : {};
+    return viewRecord(record, { audience, held: activity.held === true, queued: activity.queued === true });
+  }).filter(Boolean);
+  return { rev: registry.rev, source: registry.source, resources, pools: viewPools(registry, policy) };
 }
 
 // A target names one lease (an id: an emulator lease, then the phone holding it, then the phone it waits on) or a device word

@@ -41,6 +41,16 @@
 //                    hub's announce job runs it over ssh on the Mac. Exits 0 whether or not one was held: HUB_DEVICE_RESERVATION_RELEASED or
 //                    HUB_DEVICE_RESERVATION_NONE)
 //
+//   hub-device registry add --kind K --name N [--model M] [--serial S] [--udid U] [--profile P] [--host H] [--cap k=v]... [--if-rev N]
+//                    [--why TEXT] [--holder WHO] [--json]   (registers a Resource through the Hub API, the Registry's only writer; --host
+//                    defaults to this host's key; prints HUB_DEVICE_REGISTERED <id> <name> and HUB_DEVICE_REV <rev>)
+//   hub-device registry edit <id> [--name N] [--cap k=v]... [--uncap k]... [--if-rev N] [--why TEXT] [--holder WHO] [--json]
+//                    (HUB_DEVICE_EDITED <id> <name>; without --if-rev it is the rev of registry.json on disk, or 0)
+//   hub-device registry retire <id> [--if-rev N] [--why TEXT] [--holder WHO] [--json]   (HUB_DEVICE_RETIRED <id> <visibility>)
+//   hub-device registry list [--json]   (read only, from registry.json on disk or the seed: no service is called)
+//                    With the Hub API down a registry write fails plainly (HUB_API_DOWN, exit 1: nothing was sent; HUB_API_UNKNOWN, exit 1: it
+//                    was sent and may have applied); leases, runs, releases and status never call the API.
+//
 // This file is argument parsing and output only: every action and every rule lives in claims.mjs (AD-24), which the Hub API
 // and the Host Agent call too, so no front door can take, refuse or report one action differently.
 //
@@ -70,12 +80,13 @@ export function parseDuration(text, flag = 'duration') {
   return parts.reduce((total, [, count, unit]) => total + Number(count) * { d: 86_400_000, h: 3_600_000, m: 60_000, s: 1000 }[unit], 0);
 }
 
-const VALUE_FLAGS = new Set(['for', 'why', 'wait', 'id', 'pid', 'holder', 'env-serial', 'profile', 'pool', 'run', 'name', 'match']);
+const VALUE_FLAGS = new Set(['for', 'why', 'wait', 'id', 'pid', 'holder', 'env-serial', 'profile', 'pool', 'run', 'name', 'match', 'kind', 'model', 'serial', 'udid', 'host', 'cap', 'uncap', 'if-rev']);
 const SWITCHES = new Set(['no-connect', 'json', 'verbose', 'any']);
 
-// Words, flags (`--flag value` or `--flag=value`), and everything after `--` as the command.
+// Words, flags (`--flag value` or `--flag=value`), and everything after `--` as the command. `--env-serial`, `--cap` and `--uncap` repeat
+// (`envSerial`, `cap`, `uncap`); every other flag keeps its last value.
 export function parseArgs(argv) {
-  const out = { words: [], flags: {}, envSerial: [], command: null };
+  const out = { words: [], flags: {}, envSerial: [], cap: [], uncap: [], command: null };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--') { out.command = argv.slice(i + 1); break; }
@@ -88,14 +99,15 @@ export function parseArgs(argv) {
     if (flag === 'env-serial') {
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) throw usage(`--env-serial ${value}: not an environment variable name`);
       out.envSerial.push(value);
-    } else out.flags[flag] = value;
+    } else if (flag === 'cap' || flag === 'uncap') out[flag].push(value);
+    else out.flags[flag] = value;
   }
   return out;
 }
 
 const shellQuote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 
-const USAGE = 'usage: hub-device lease s24|s26|phone --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | lease emulator [--profile NAME] --for <dur> --why <text> [--wait <dur>] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] | release [emulator] [<lease_id>|--any] | status [--json] | discover [--json] | reservation release --run <key> [--name adb|mac-ios] [--json] | run s24|s26|phone|emulator [--profile NAME] [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...> | lease --match <query> --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | run --match <query> [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...>';
+const USAGE = 'usage: hub-device lease s24|s26|phone --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | lease emulator [--profile NAME] --for <dur> --why <text> [--wait <dur>] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] | release [emulator] [<lease_id>|--any] | status [--json] | discover [--json] | reservation release --run <key> [--name adb|mac-ios] [--json] | run s24|s26|phone|emulator [--profile NAME] [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...> | lease --match <query> --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | run --match <query> [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...> | registry add --kind K --name N [--model M] [--serial S] [--udid U] [--profile P] [--host H] [--cap k=v]... [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry edit <id> [--name N] [--cap k=v]... [--uncap k]... [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry retire <id> [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry list [--json]';
 
 // Leases are honoured only by a hub whose lock.mjs knows them. The catch-up runs from the installed release, and an
 // older one sees a lease's short-lived pid as a dead job and reclaims the lock at once, so lease and run say so.
@@ -146,6 +158,16 @@ function report(error, parsed, context) {
   const { stdout, stderr } = context;
   const device = labelOf(parsed);
   const code = claims.exitCodeOf(error);
+  // The Hub API's answers to a verb that called it (the registry verbs today): the problem's own code, detail and reason, and its own exit. With --json the body is on stdout too.
+  if (error.api === true || error.code === 'HUB_API_DOWN' || error.code === 'HUB_API_UNKNOWN') {
+    if (error.api === true) {
+      stderr(`${error.code} ${parsed.words[0]} ${error.message} (reason: ${error.reason})`);
+      if (parsed.flags.json) stdout(JSON.stringify(error.problem));
+      return Number.isInteger(error.exit) ? error.exit : code;
+    }
+    stderr(`${error.code} ${error.message}`);
+    return code;
+  }
   // These exit 2 like a usage error, but say what they are.
   if (error.code === 'HUB_NO_MATCH' || error.code === 'HUB_POOL_CROSS_HOST' || error.code === 'HUB_RESOURCE_RETIRED') { stderr(`${error.code} ${device} ${error.message}`); return code; }
   if (code === claims.EXIT_CODES.HUB_USAGE) { stderr(`hub-device: ${error.message}`); return code; }
@@ -537,6 +559,124 @@ async function runCommand(parsed, context) {
   }
 }
 
+// ---- registry (Story 6.8) ----
+
+// What each registry verb takes beyond its words: a flag outside its list is `unknown flag --X` (exit 2), like any command's.
+const REGISTRY_FLAGS = Object.freeze({
+  add: ['kind', 'name', 'model', 'serial', 'udid', 'profile', 'host', 'cap', 'if-rev', 'why', 'holder', 'json'],
+  edit: ['name', 'cap', 'uncap', 'if-rev', 'why', 'holder', 'json'],
+  retire: ['if-rev', 'why', 'holder', 'json'],
+  list: ['json'],
+});
+
+// `k=v` as a Capability: `true` and `false` are booleans, a number is a number, anything else a string.
+function parseCap(text, flag) {
+  const at = text.indexOf('=');
+  if (at < 1 || at === text.length - 1) throw usage(`--${flag} ${text}: say it as key=value`);
+  const [key, value] = [text.slice(0, at), text.slice(at + 1)];
+  if (value === 'true') return [key, true];
+  if (value === 'false') return [key, false];
+  // A number only when it reads back as the same text: `0123`, `1.10` and a 20-digit id stay strings.
+  const number = Number(value);
+  return [key, Number.isFinite(number) && String(number) === value ? number : value];
+}
+
+function capabilitiesOf(parsed) {
+  // No prototype: a key like `__proto__` reaches the API (which refuses it) instead of being swallowed by the setter.
+  const set = Object.create(null);
+  for (const text of parsed.cap) {
+    const [key, value] = parseCap(text, 'cap');
+    if (Object.hasOwn(set, key)) throw usage(`--cap ${key} is given twice`);
+    set[key] = value;
+  }
+  for (const key of parsed.uncap) {
+    if (!/^[^=\s]+$/.test(key)) throw usage(`--uncap ${key}: say it as a capability key`);
+    if (Object.hasOwn(set, key) && set[key] !== null) throw usage(`${key} is given to both --cap and --uncap`);
+    set[key] = null;
+  }
+  return Object.keys(set).length === 0 ? undefined : set;
+}
+
+function ifRevOf(flags) {
+  if (flags['if-rev'] === undefined) return undefined;
+  if (!/^\d+$/.test(flags['if-rev']) || !Number.isSafeInteger(Number(flags['if-rev']))) throw usage(`--if-rev takes a whole number, not "${flags['if-rev']}"`);
+  return Number(flags['if-rev']);
+}
+
+function printRegistryList(result, context) {
+  const { stdout } = context;
+  stdout(`REGISTRY rev ${result.rev} (${result.source})`);
+  for (const resource of result.resources) {
+    const caps = Object.entries(resource.capabilities).map(([key, value]) => `${key}=${value}`).join(',') || '-';
+    stdout(`  ${resource.id}  ${resource.name}  ${resource.kind}  ${resource.host}  lock ${resource.lock}  ${resource.identity?.model ?? '-'}  caps ${caps}${resource.deploy_target ? '  deploy target' : ''}${resource.seeded ? '  seeded' : ''}${resource.visibility === 'retiring' ? '  [retiring]' : ''}`);
+  }
+  stdout('POOLS');
+  for (const pool of result.pools) stdout(`  ${pool.name}  ${pool.kind}  ${pool.members.join(',') || '-'}${pool.gate ? `  gate ${pool.gate}` : ''}`);
+}
+
+async function registryCommand(parsed, context) {
+  const { stdout, env } = context;
+  const verb = parsed.words[1];
+  if (!Object.hasOwn(REGISTRY_FLAGS, verb ?? '')) throw usage(`registry takes: ${Object.keys(REGISTRY_FLAGS).join(' | ')}`);
+  const given = [...Object.keys(parsed.flags), ...(parsed.cap.length > 0 ? ['cap'] : []), ...(parsed.uncap.length > 0 ? ['uncap'] : []), ...(parsed.envSerial.length > 0 ? ['env-serial'] : [])];
+  for (const flag of given) if (!REGISTRY_FLAGS[verb].includes(flag)) throw usage(`unknown flag --${flag}`);
+  const wanted = verb === 'edit' || verb === 'retire' ? 3 : 2;
+  if (parsed.words.length > wanted) throw usage(`registry ${verb} takes no further argument ("${parsed.words[wanted]}")`);
+  const { flags } = parsed;
+  if (verb === 'list') {
+    const result = claims.registryList({ audience: 'local' }, context);
+    if (flags.json) stdout(JSON.stringify(result)); else printRegistryList(result, context);
+    return claims.EXIT_OK;
+  }
+  const id = parsed.words[2];
+  if (verb !== 'add' && !id) throw usage(`registry ${verb} needs a Resource id`);
+  const ifRev = ifRevOf(flags);
+  const capabilities = capabilitiesOf(parsed);
+  const holder = flags.holder ?? env.HUB_DEVICE_HOLDER ?? `${env.USER ?? 'unknown'}@${hostname()}`;
+  const body = { actor: { holder, via: 'cli' } };
+  if (flags.why !== undefined) body.why = flags.why;
+  if (verb === 'add') {
+    if (flags.kind === undefined) throw usage('--kind <kind> is required');
+    if (flags.name === undefined) throw usage('--name <name> is required');
+    const identity = Object.fromEntries(['model', 'serial', 'udid', 'profile'].filter(key => flags[key] !== undefined).map(key => [key, flags[key]]));
+    Object.assign(body, { kind: flags.kind, name: flags.name, host: flags.host ?? (context.hostKey ?? claims.hostKey)({ env }) });
+    if (Object.keys(identity).length > 0) body.identity = identity;
+    if (capabilities !== undefined) body.capabilities = capabilities;
+    if (ifRev !== undefined) body.if_rev = ifRev;
+  } else if (verb === 'edit') {
+    if (flags.name !== undefined) body.name = flags.name;
+    if (capabilities !== undefined) body.capabilities = capabilities;
+    body.if_rev = ifRev ?? claims.registryRev(context);
+  } else if (ifRev !== undefined) body.if_rev = ifRev;
+  const answer = await claims.registryWrite(verb, { id, body }, context);
+  if (flags.json) { stdout(JSON.stringify(answer.body)); return claims.EXIT_OK; }
+  const done = answer.body;
+  if (verb === 'retire') stdout(`HUB_DEVICE_RETIRED ${done.id} ${done.visibility}`);
+  else stdout(`${verb === 'add' ? 'HUB_DEVICE_REGISTERED' : 'HUB_DEVICE_EDITED'} ${done.resource.id} ${done.resource.name}`);
+  stdout(`HUB_DEVICE_REV ${done.rev}`);
+  return claims.EXIT_OK;
+}
+
+// Who owns each flag that not every command takes: any other command refuses it as an unknown flag (AD-17: exit 2 stays exit 2).
+const FLAG_OWNERS = Object.freeze({
+  run: ['reservation'],
+  name: ['reservation', 'registry'],
+  match: ['lease', 'run'],
+  kind: ['registry'],
+  model: ['registry'],
+  serial: ['registry'],
+  udid: ['registry'],
+  host: ['registry'],
+  cap: ['registry'],
+  uncap: ['registry'],
+  'if-rev': ['registry'],
+});
+
+function checkFlagOwners(parsed) {
+  const given = flag => (flag === 'cap' || flag === 'uncap' ? parsed[flag].length > 0 : parsed.flags[flag] !== undefined);
+  for (const [flag, owners] of Object.entries(FLAG_OWNERS)) if (given(flag) && !owners.includes(parsed.words[0])) throw usage(`unknown flag --${flag}`);
+}
+
 export async function main(argv, {
   env = process.env,
   stdout = line => process.stdout.write(`${line}\n`),
@@ -552,18 +692,17 @@ export async function main(argv, {
   policy = null,
   qaDevices,
   registry,
+  fetchImpl,
+  timeout,
 } = {}) {
-  let parsed = { flags: {}, words: [], envSerial: [], command: null };
+  let parsed = { flags: {}, words: [], envSerial: [], cap: [], uncap: [], command: null };
   const context = {
-    ...claims.createContext({ env, sleep, now, log: line => stderr(line), warn: message => stderr(`hub-device: warning: ${message}`), adbFactory, adbWire, devicectl, hostKey, inventory: inventoryImpl, policy, qaDevices, registry }),
+    ...claims.createContext({ env, sleep, now, log: line => stderr(line), warn: message => stderr(`hub-device: warning: ${message}`), adbFactory, adbWire, devicectl, hostKey, inventory: inventoryImpl, policy, qaDevices, registry, fetchImpl, timeout }),
     stdout, stderr, signals, killGraceMs: Number(env.HUB_DEVICE_KILL_GRACE_MS) || 10_000,
   };
   try {
     parsed = parseArgs(argv);
-    // `--run` and `--name` belong to `reservation release` alone: every other command still refuses them as unknown flags (AD-17: exit 2 stays exit 2).
-    if (parsed.words[0] !== 'reservation') for (const flag of ['run', 'name']) if (parsed.flags[flag] !== undefined) throw usage(`unknown flag --${flag}`);
-    // `--match` belongs to `lease` and `run` alone.
-    if (parsed.flags.match !== undefined && parsed.words[0] !== 'lease' && parsed.words[0] !== 'run') throw usage('unknown flag --match');
+    checkFlagOwners(parsed);
     // The phones this checkout's devices.json names; a broken one is a tool failure, named like any other.
     context.fleet = claims.loadFleet(env);
     switch (parsed.words[0]) {
@@ -573,6 +712,7 @@ export async function main(argv, {
       case 'discover': return await discover(parsed, context);
       case 'reservation': return reservationCommand(parsed, context);
       case 'run': return await runCommand(parsed, context);
+      case 'registry': return await registryCommand(parsed, context);
       default: throw usage(USAGE);
     }
   } catch (error) {
