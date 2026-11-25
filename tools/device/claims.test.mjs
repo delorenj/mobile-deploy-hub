@@ -68,6 +68,8 @@ test('the library exports the whole action surface and the exit table as frozen 
     HUB_API_ALREADY_RUNNING: 1, HUB_API_NODE: 1, HUB_API_NO_HEAVY: 1, HUB_NO_ROUTE: 2, HUB_API_ERROR: 1,
     // Story 6.5: a Registry read of an id no reader shows.
     HUB_RESOURCE_NOT_FOUND: 2,
+    // Story 6.6: a register refused for its name or a duplicate identity.
+    HUB_REGISTRY_NAME: 2, HUB_REGISTRY_DUPLICATE: 2,
   });
 });
 

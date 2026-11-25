@@ -11,7 +11,7 @@ import { readEvents } from '../ci/lib/events.mjs';
 import { writeFileAtomic } from '../ci/lib/lock.mjs';
 import { hermetic } from '../ci/test-fixtures.mjs';
 import { exitCodeOf } from '../device/claims.mjs';
-import { REGISTRY_ERRORS, REGISTRY_FILE, REGISTRY_FORMAT, readRegistry, recoverRegistry, registryPath, registryState, writeRegistry } from './store.mjs';
+import { REGISTRY_ERRORS, REGISTRY_FILE, REGISTRY_FORMAT, readRegistry, recoverRegistry, registryPath, registryState, updateRegistry, writeRegistry } from './store.mjs';
 import { seed } from './seed.mjs';
 
 hermetic();
@@ -349,5 +349,81 @@ test('registryState says missing, ok or unreadable, fresh on each call, and neve
     writeFileSync(registryPath(s.env), '{"format": 2}');
     assert.equal(registryState(s.env), 'unreadable');
     assert.equal(readFileSync(registryPath(s.env), 'utf8'), '{"format": 2}');
+  } finally { s.cleanup(); }
+});
+
+// ---- Story 6.6: updateRegistry ----
+
+test('updateRegistry without if_rev: no rev check, the change sees the file, and the commit is rev + 1 with its events', async () => {
+  const s = scratch();
+  try {
+    const { resources, pools } = s.seeded();
+    await s.write({ if_rev: 0, resources, pools });
+    const seen = [];
+    const result = await updateRegistry({
+      env: s.env, hostId: HOST, log: () => {}, reason: 'register', actor: { holder: 'jarad', via: 'api' }, why: 'test',
+      change: state => { seen.push(state); return { resources: [...state.resources, { id: 'res-x', lock: 'res-x', name: 'x' }], pools: state.pools }; },
+    });
+    assert.equal(seen[0].rev, 1);
+    assert.equal(seen[0].state, 'file');
+    assert.ok(Array.isArray(seen[0].pools));
+    assert.equal(result.rev, 2);
+    assert.deepEqual(result.events.map(event => [event.event, event.resource, event.rev]), [['registry-add', 'res-x', 2]]);
+    const line = s.events().filter(event => event.rev === 2);
+    assert.deepEqual([line.length, line[0].reason, line[0].actor, line[0].why], [1, 'register', { holder: 'jarad', via: 'api' }, 'test']);
+  } finally { s.cleanup(); }
+});
+
+test('updateRegistry: a given if_rev is checked inside the queue, and a missing file reads as rev 0 with state missing', async () => {
+  const s = scratch();
+  try {
+    const states = [];
+    const first = await updateRegistry({ env: s.env, if_rev: 0, hostId: HOST, log: () => {}, change: state => { states.push([state.rev, state.state, state.resources.length]); return { resources: [{ id: 'a', lock: 'a' }], pools: [] }; } });
+    assert.deepEqual(states, [[0, 'missing', 0]]);
+    assert.equal(first.rev, 1);
+    await assert.rejects(updateRegistry({ env: s.env, if_rev: 0, hostId: HOST, log: () => {}, change: () => assert.fail('change must not run on a conflict') }), error => error.code === 'HUB_REGISTRY_CONFLICT' && error.rev === 1);
+    await assert.rejects(updateRegistry({ env: s.env, if_rev: -1, change: () => ({}) }), TypeError);
+    await assert.rejects(updateRegistry({ env: s.env, change: 'no' }), TypeError);
+  } finally { s.cleanup(); }
+});
+
+test('updateRegistry: a change that throws commits nothing and its error reaches the caller as it is', async () => {
+  const s = scratch();
+  try {
+    const { resources, pools } = s.seeded();
+    await s.write({ if_rev: 0, resources, pools });
+    const before = readFileSync(registryPath(s.env), 'utf8');
+    const count = s.events().length;
+    const refusal = Object.assign(new Error('no'), { code: 'HUB_REGISTRY_NAME', status: 409 });
+    await assert.rejects(updateRegistry({ env: s.env, change: () => { throw refusal; } }), error => error === refusal);
+    await assert.rejects(updateRegistry({ env: s.env, change: async () => { throw refusal; } }), error => error === refusal);
+    // A change that returns a bad shape is a TypeError, and a record dropped is too.
+    await assert.rejects(updateRegistry({ env: s.env, change: () => ({ resources: resources.slice(1), pools }) }), TypeError);
+    await assert.rejects(updateRegistry({ env: s.env, change: () => null }), TypeError);
+    assert.equal(readFileSync(registryPath(s.env), 'utf8'), before);
+    assert.equal(s.events().length, count);
+  } finally { s.cleanup(); }
+});
+
+test('updateRegistry: the change of a queued write sees what the write before it committed', async () => {
+  const s = scratch();
+  try {
+    const { resources, pools } = s.seeded();
+    await s.write({ if_rev: 0, resources, pools });
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    let entered;
+    const started = new Promise(resolve => { entered = resolve; });
+    const add = id => state => ({ resources: [...state.resources, { id, lock: id }], pools: state.pools });
+    const a = updateRegistry({ env: s.env, hostId: HOST, log: () => {}, afterRead: async () => { entered(); await gate; }, change: add('a') });
+    await started;
+    const seen = [];
+    const b = updateRegistry({ env: s.env, hostId: HOST, log: () => {}, change: state => { seen.push([state.rev, state.resources.map(record => record.id).includes('a')]); return add('b')(state); } });
+    await new Promise(resolve => setImmediate(resolve));
+    release();
+    await Promise.all([a, b]);
+    assert.deepEqual(seen, [[2, true]]);
+    assert.equal(s.file().rev, 3);
+    assert.deepEqual(s.file().resources.slice(-2).map(record => record.id), ['a', 'b']);
   } finally { s.cleanup(); }
 });
