@@ -38,7 +38,7 @@ export const EXIT_CODES = Object.freeze({
   HUB_LEASE_EXTEND_REFUSED: 1,
   HUB_LEASE_LOST: 1,
 });
-export const exitCodeOf = error => EXIT_CODES[error?.code] ?? EXIT_FAILURE;
+export const exitCodeOf = error => (Object.hasOwn(EXIT_CODES, error?.code) ? EXIT_CODES[error.code] : EXIT_FAILURE);
 
 const usage = message => Object.assign(new Error(message), { code: 'HUB_USAGE' });
 const failure = (code, message) => Object.assign(new Error(message), { code });
@@ -118,7 +118,7 @@ export function resolve(target, { fleet, env = process.env, words = true, ids = 
 // A lease id names one lease: with more than one phone lock, the same --id could otherwise name two live leases
 // (or a waiter and a lease), and `release <id>` would free only the first it meets.
 export function checkLeaseId(id, { fleet, env = process.env }) {
-  if (id === undefined) return;
+  if (id === undefined || id === null) return;
   const onPhone = fleet.find(phone => {
     const owner = readOwnerOf(phone.lock, env);
     return (isLease(owner) && owner.lease_id === id) || queueView(phone.lock, { env, includeStale: true }).some(waiter => waiter.lease_id === id);
@@ -275,13 +275,18 @@ async function takeEmulator(options, ctx) {
 }
 
 // One take for every kind of target: a phone, the `phone` Pool (an ordered try under one Pool request) or an emulator.
+// A library caller gets the refusals the CLI makes: an unknown target, an id that is already taken, and --for's bounds (the
+// Pool is narrowed to the phones whose cap allows it). The CLI checks the same rules earlier, for its message order.
 // options: holder, why, forMs, waitMs, id, holderPid, noConnect, phoneWaitMs, signal (and profile, pool for an emulator).
-export function take(resolved, options, ctx) {
-  switch (resolved.kind) {
-    case 'phone': return takePhone(resolved.entry, options, ctx);
-    case 'pool': return takeAnyPhone(resolved.members, options, ctx);
+export async function take(resolved, options, ctx) {
+  if (!resolved || typeof resolved !== 'object') throw usage('take needs a resolved target (resolve a device word first)');
+  checkLeaseId(options.id, { fleet: ctx.fleet ?? [], env: ctx.env });
+  const target = checkBounds(resolved, { forMs: options.forMs, fleet: resolved.members, policy: ctx.policy });
+  switch (target.kind) {
+    case 'phone': return takePhone(target.entry, options, ctx);
+    case 'pool': return takeAnyPhone(target.members, options, ctx);
     case EMULATOR: return takeEmulator(options, ctx);
-    default: throw usage(`cannot take a ${resolved.kind}`);
+    default: throw usage(`cannot take a ${target.kind}`);
   }
 }
 
@@ -301,7 +306,8 @@ export function leaseExports(taken, envSerial = []) {
 // ---- release ----
 
 // A deploy job's ticket id is its place in line, not a lease: nothing here can release it, so say which run to cancel.
-// Returns null for any other id; otherwise {code, id, message} (the code exits through the table).
+// Returns null for any other id; otherwise {code, id, message} (the code exits through the table; a front door prints the
+// `HUB_DEVICE_JOB_ID` marker before the message).
 export function jobTicket(id) {
   if (typeof id !== 'string' || !id.startsWith('job:')) return null;
   const [, repo, run] = /^job:([^#]+)#([^.]+)\.[^/]+\/.+$/.exec(id) ?? [];
@@ -309,14 +315,14 @@ export function jobTicket(id) {
   // A local run's id carries the process: the catch-up and a hand-run deploy have no GitHub run to cancel.
   const pid = repo === 'local' ? /^local-(\d+)$/.exec(run)?.[1] : undefined;
   const what = pid ? `it is the local process ${pid}, stop that process instead` : `cancel ${repo ? `run ${run} of ${repo}` : 'its run'} instead${hint}`;
-  return { code: 'HUB_DEVICE_JOB_ID', id, message: `HUB_DEVICE_JOB_ID ${id} is a deploy job's place in line, not a lease; ${what}` };
+  return { code: 'HUB_DEVICE_JOB_ID', id, message: `${id} is a deploy job's place in line, not a lease; ${what}` };
 }
 
 // Gives one lock's lease back by id, with no report (the holder's own exit paths).
 export const releaseHeld = (lock, id, { env = process.env } = {}) => releaseLease(lock, id, { env });
 
 // An emulator lease: its slot, record and processes, torn down. Returns emulator.mjs's result ({outcome, slot, record, result}).
-export const releaseEmulator = (id, ctx) => releaseEmulatorLease(id, { env: ctx.env, log: ctx.log, graceMs: ctx.emulator.graceMs });
+export const releaseEmulator = async (id, ctx) => releaseEmulatorLease(checkEmulatorLeaseId(id), { env: ctx.env, log: ctx.log, graceMs: ctx.emulator.graceMs });
 
 // The last resort when a process exits without its normal release: SIGKILL to the recorded processes, then the slot.
 export function releaseEmulatorNow(id, { env = process.env } = {}) {
@@ -378,10 +384,14 @@ export function releaseAny(ctx) {
 }
 
 // One release for every kind: `{any: true}` frees whichever phone lease is held, `{emulator: id}` an emulator lease, and `{id}`
-// whatever holds that id (an emulator lease first, else a phone's).
+// whatever holds that id (an emulator lease first, else a phone's). A deploy job's ticket id is refused (HUB_DEVICE_JOB_ID),
+// and so is a target that names nothing (HUB_USAGE).
 export async function release(target, ctx) {
-  if (target.any) return releaseAny(ctx);
-  if (target.emulator) return { kind: EMULATOR, id: target.emulator, ...await releaseEmulator(target.emulator, ctx) };
+  if (target?.any) return releaseAny(ctx);
+  if (target?.emulator !== undefined) return { kind: EMULATOR, id: target.emulator, ...await releaseEmulator(target.emulator, ctx) };
+  const job = jobTicket(target?.id);
+  if (job) throw failure(job.code, job.message);
+  if (!target?.id) throw usage('release needs a lease id, an emulator lease id, or any');
   if (isEmulatorLease(ctx.env, target.id)) return { kind: EMULATOR, id: target.id, ...await releaseEmulator(target.id, ctx) };
   return releasePhone(target.id, ctx);
 }
@@ -404,12 +414,13 @@ export function releaseReservations({ key, name }, ctx) {
 // ---- extend ----
 
 // Extends a live Lease on a phone or an emulator slot by `forMs` (lock.mjs refuses while anyone waits, past the deploy cap and
-// past 48 h in total). Returns the new owner record.
-export function extend(id, { forMs, env = process.env, now = Date.now, policy = null, fleet = [] } = {}) {
+// past 48 h in total). Only a Lease that holds its lock extends: a waiter's id holds nothing. Returns the new owner record.
+export function extend(id, { forMs }, ctx) {
+  const { env, fleet = [], policy = null, timing } = ctx;
   if (!(forMs > 0) || !Number.isFinite(forMs)) throw usage('an extension is for more than 0 ms');
-  const lock = isEmulatorLease(env, id) ? readRecord(env, id)?.slot : (phoneOwning(fleet, env, id) ?? phoneWaiting(fleet, env, id))?.lock;
+  const lock = readRecord(env, id)?.slot ?? phoneOwning(fleet, env, id)?.lock;
   if (!lock) throw failure('HUB_LEASE_LOST', `lease ${id} holds nothing to extend`);
-  return extendLease(lock, id, { forMs, env, now, policy });
+  return extendLease(lock, id, { forMs, env, now: timing?.now, policy });
 }
 
 // ---- status ----

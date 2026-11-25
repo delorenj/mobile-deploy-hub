@@ -16,11 +16,11 @@ export const FORBIDDEN = Object.freeze(['tools/device/claims.mjs', 'tools/regist
 
 const repoRoot = resolve(fileURLToPath(new URL('../', import.meta.url)));
 
-// Relative specifiers of static imports, re-exports and literal dynamic imports. A computed dynamic import is not a literal
+// Relative specifiers of static imports, re-exports and literal dynamic imports (with or without an options argument). A computed dynamic import is not a literal
 // and cannot be followed; the deploy path has none.
 export function importsOf(source) {
   const found = new Set();
-  const patterns = [/\b(?:import|export)\s+(?:[^'"()]*?\s+from\s+)?['"]([^'"]+)['"]/g, /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g];
+  const patterns = [/\b(?:import|export)\s+(?:[^'"()]*?\s+from\s+)?['"]([^'"]+)['"]/g, /\bimport\s*\(\s*['"]([^'"]+)['"]\s*[,)]/g];
   for (const pattern of patterns) for (const match of source.matchAll(pattern)) if (match[1].startsWith('.')) found.add(match[1]);
   return [...found];
 }
@@ -46,7 +46,8 @@ export function violations(root, { deployPath = DEPLOY_PATH, forbidden = FORBIDD
     let source;
     try { source = readFileSync(file, 'utf8'); } catch { continue; }
     for (const specifier of importsOf(source)) {
-      const target = resolve(dirname(file), specifier);
+      // A `?query` or `#hash` names the same file.
+      const target = resolve(dirname(file), specifier.replace(/[?#].*$/, ''));
       const hit = forbiddenHit(root, target, forbidden);
       if (hit) { found.push({ forbidden: hit, chain: [...chain, relative(root, target)] }); continue; }
       if (isFile(target)) queue.push({ file: target, chain: [...chain, relative(root, target)] });
@@ -69,8 +70,8 @@ test('the live deploy path imports nothing forbidden, directly or transitively',
 });
 
 test('importsOf reads static, re-export, side-effect and literal dynamic imports, relative only', () => {
-  const source = `import a from './a.mjs';\nimport { b } from "../b.mjs";\nimport './c.mjs';\nexport * from './d.mjs';\nexport { e } from './e.mjs';\nconst f = await import('./f.mjs');\nimport fs from 'node:fs';\nimport pkg from 'pkg';\nimport {\n  g,\n  h,\n} from './g.mjs';\n`;
-  assert.deepEqual(importsOf(source).sort(), ['../b.mjs', './a.mjs', './c.mjs', './d.mjs', './e.mjs', './f.mjs', './g.mjs']);
+  const source = `import a from './a.mjs';\nimport { b } from "../b.mjs";\nimport './c.mjs';\nexport * from './d.mjs';\nexport { e } from './e.mjs';\nconst f = await import('./f.mjs');\nconst j = await import('./j.json', { with: { type: 'json' } });\nimport k from './k.mjs?v=1';\nimport fs from 'node:fs';\nimport pkg from 'pkg';\nimport {\n  g,\n  h,\n} from './g.mjs';\n`;
+  assert.deepEqual(importsOf(source).sort(), ['../b.mjs', './a.mjs', './c.mjs', './d.mjs', './e.mjs', './f.mjs', './g.mjs', './j.json', './k.mjs?v=1']);
 });
 
 function fixture(files) {
@@ -87,6 +88,9 @@ test('a fixture that reaches a forbidden path is caught: directly, through a lib
     direct: { 'tools/ci/commands/a.mjs': "import { take } from '../../device/claims.mjs';\n", 'tools/device/claims.mjs': 'export const take = 1;\n' },
     transitive: { 'tools/ci/commands/a.mjs': "import { x } from '../lib/x.mjs';\n", 'tools/ci/lib/x.mjs': "import { y } from '../../device/y.mjs';\nexport const x = y;\n", 'tools/device/y.mjs': "export { take as y } from './claims.mjs';\n", 'tools/device/claims.mjs': 'export const take = 1;\n' },
     dynamic: { 'tools/catchup/c.mjs': "const mod = await import('../hub-client.mjs');\n" },
+    options: { 'tools/catchup/c.mjs': "const mod = await import('../hub-client.mjs', { with: { type: 'javascript' } });\n" },
+    query: { 'tools/catchup/c.mjs': "import '../hub-client.mjs?cache=1';\n" },
+    hash: { 'tools/ci/commands/a.mjs': "import { take } from '../../device/claims.mjs#x';\n", 'tools/device/claims.mjs': 'export const take = 1;\n' },
     directory: { 'tools/catchup/c.mjs': "import '../registry/match.mjs';\n" },
     api: { 'tools/ci/commands/a.mjs': "import '../../hub-api/server.mjs';\n" },
     agent: { 'tools/ci/commands/a.mjs': "import '../../host-agent/agent.mjs';\n" },

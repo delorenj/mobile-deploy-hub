@@ -244,26 +244,25 @@ function reservationCommand(parsed, context) {
 
 function printPhoneRelease(result, { any, id }, context) {
   const { stdout, stderr } = context;
-  // The verdict first, then what each phone was doing: the order the two streams always had.
-  const notes = () => { for (const note of result.notes) stderr(`hub-device: ${note}`); };
-  try { return printPhoneVerdict(result, { any, id }, context); } finally { notes(); }
-}
-
-function printPhoneVerdict(result, { any, id }, context) {
-  const { stdout, stderr } = context;
+  let verdict = null;
+  let code = claims.EXIT_OK;
   if (any) {
-    if (result.outcome === 'released') { stdout(`HUB_DEVICE_RELEASED ${result.device} ${result.leaseId}`); return claims.EXIT_OK; }
-    if (result.outcome === 'refused') { stderr(`hub-device: ${result.refusal}`); return claims.EXIT_FAILURE; }
-    stdout('HUB_DEVICE_NOT_HELD phone - (no phone is held)');
-    return claims.EXIT_OK;
+    if (result.outcome === 'released') verdict = `HUB_DEVICE_RELEASED ${result.device} ${result.leaseId}`;
+    else if (result.outcome === 'refused') code = claims.EXIT_FAILURE;
+    else verdict = 'HUB_DEVICE_NOT_HELD phone - (no phone is held)';
+  } else {
+    switch (result.outcome) {
+      case 'none': verdict = `HUB_DEVICE_NOT_HELD phone ${id} (no phone lease by that id)`; break;
+      case 'cancelled': verdict = `HUB_DEVICE_CANCELLED ${result.device} ${id} (it was still waiting)`; break;
+      case 'released': verdict = `HUB_DEVICE_RELEASED ${result.device} ${result.leaseId}`; break;
+      case 'job-held': verdict = `HUB_DEVICE_NOT_HELD phone ${id}`; break;
+      default: code = claims.EXIT_FAILURE;
+    }
   }
-  switch (result.outcome) {
-    case 'none': stdout(`HUB_DEVICE_NOT_HELD phone ${id} (no phone lease by that id)`); return claims.EXIT_OK;
-    case 'cancelled': stdout(`HUB_DEVICE_CANCELLED ${result.device} ${id} (it was still waiting)`); return claims.EXIT_OK;
-    case 'released': stdout(`HUB_DEVICE_RELEASED ${result.device} ${result.leaseId}`); return claims.EXIT_OK;
-    case 'job-held': stdout(`HUB_DEVICE_NOT_HELD phone ${id}`); return claims.EXIT_OK;
-    default: return claims.EXIT_FAILURE;
-  }
+  if (verdict) stdout(verdict);
+  if (result.refusal) stderr(`hub-device: ${result.refusal}`);
+  for (const note of result.notes) stderr(`hub-device: ${note}`);
+  return code;
 }
 
 async function release(parsed, context) {
@@ -271,7 +270,7 @@ async function release(parsed, context) {
   // A deploy job's ticket id is its place in line, not a lease: nothing here can release it, so say which run to cancel.
   const given = parsed.flags.any ? null : parsed.words[1] === 'emulator' ? parsed.words[2] ?? env.HUB_LEASE_ID : parsed.words[1] ?? env.HUB_LEASE_ID;
   const job = claims.jobTicket(given);
-  if (job) { stderr(job.message); return claims.exitCodeOf(job); }
+  if (job) { stderr(`HUB_DEVICE_JOB_ID ${job.message}`); return claims.exitCodeOf(job); }
   // `release emulator [<id>]` (no id: $HUB_LEASE_ID); everything else is an id (given or $HUB_LEASE_ID) that the library
   // finds on an emulator or a phone, or --any.
   if (parsed.words[1] === 'emulator') {

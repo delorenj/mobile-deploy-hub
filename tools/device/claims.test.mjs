@@ -2,7 +2,7 @@
 // same refusal, the same exit code and the same events. Every case runs on temp lock and event dirs, with the adb seam injected.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -33,6 +33,18 @@ function side() {
 
 const options = (extra = {}) => ({ holder: 'h', why: 'x', forMs: 1_800_000, waitMs: 0, id: 'l-aaaaaaaaaaaa', holderPid: null, noConnect: true, phoneWaitMs: 0, ...extra });
 const cliLease = (device, extra = []) => ['lease', device, '--for', '30m', '--why', 'x', '--holder', 'h', '--id', 'l-aaaaaaaaaaaa', '--wait', '0', '--no-connect', ...extra];
+
+// A waiter queued behind a held lock. Its AbortController ends the wait whatever the test does next (the clock is frozen, so it
+// would otherwise poll for ever); the helper asserts that the ticket really landed in the queue.
+async function startWaiter(s, id, lock = 's24') {
+  const abort = new AbortController();
+  const settled = acquireLease(lock, { id, holder: 'w', why: 'next', forMs: 60_000, waitMs: 5000, env: s.env, log: () => {}, pollMs: 5, now: () => T0, signal: abort.signal }).catch(error => error);
+  const queue = join(s.root, `locks/${lock}.queue`);
+  const queued = () => { try { return readdirSync(queue).length > 0; } catch { return false; } };
+  for (let tries = 0; tries < 200 && !queued(); tries += 1) await new Promise(done => setTimeout(done, 10));
+  if (!queued()) { abort.abort(); await settled; assert.fail(`the waiter ${id} never appeared in ${lock}.queue`); }
+  return { settled, stop: async () => { abort.abort(); await settled; } };
+}
 
 // An adb with no phone on it: every phone is away.
 const emptyAdb = () => ({ startServer: async () => {}, devices: async () => [], prop: async () => '' });
@@ -65,6 +77,7 @@ test('exitCodeOf maps a code through the table and anything else to 1', () => {
   assert.equal(code('ENOENT'), 1);
   assert.equal(claims.exitCodeOf(new Error('no code')), 1);
   assert.equal(claims.exitCodeOf(null), 1);
+  for (const inherited of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) assert.equal(code(inherited), 1, inherited);
 });
 
 test('newLeaseId mints the exact formats: l-, e- and run-', () => {
@@ -79,7 +92,9 @@ test('newLeaseId mints the exact formats: l-, e- and run-', () => {
 test('hub-device is parsing and output: no takeLease or takeAnyPhone, and no direct lock, emulator or adb imports', () => {
   const source = readFileSync(fileURLToPath(new URL('./hub-device.mjs', import.meta.url)), 'utf8');
   assert.doesNotMatch(source, /\b(takeLease|takeAnyPhone|noPhoneError|resolveDevice)\b/);
-  const imports = [...source.matchAll(/^import .* from '([^']+)';$/gm)].map(match => match[1]);
+  // Every module specifier, however the import is laid out: `from '…'` (across lines too), a bare `import '…'` and `import('…')`.
+  const imports = [...source.matchAll(/\bfrom\s+'([^']+)'/g), ...source.matchAll(/^\s*import\s+'([^']+)'/gm), ...source.matchAll(/\bimport\s*\(\s*'([^']+)'/g)].map(match => match[1]);
+  assert.ok(imports.length >= 6, 'the scan found the imports');
   assert.ok(imports.includes('./claims.mjs'));
   for (const forbidden of ['lock.mjs', 'emulator.mjs', 'adb.mjs', 'async-adb.mjs', 'inventory.mjs', 'devices.mjs']) {
     assert.ok(!imports.some(path => path.endsWith(`/${forbidden}`)), `hub-device.mjs must not import ${forbidden}`);
@@ -188,16 +203,16 @@ test('parity: an absent phone is HUB_PHONE_AWAY, exit 75, and the CLI prints HUB
 
 test('release outcomes: held, queued, unknown, a job id and --any print the lines they always did', async () => {
   const s = side();
+  let waiter = null;
   try {
     const { fleet } = s.ctx;
     const held = claims.resolve('s24', { fleet, env: s.env, ids: false });
     await claims.take(held, options({ id: 'l-aaaaaaaaaaaa' }), s.ctx);
     // A waiter behind it.
-    const waiting = acquireLease('s24', { id: 'l-wwwwwwwwwwww', holder: 'w', why: 'next', forMs: 60_000, waitMs: 5000, env: s.env, log: () => {}, pollMs: 5, now: () => T0 }).catch(error => error);
-    for (let tries = 0; tries < 200 && !readdirSync(join(s.root, 'locks')).some(name => name.endsWith('.queue')); tries += 1) await new Promise(done => setTimeout(done, 10));
+    waiter = await startWaiter(s, 'l-wwwwwwwwwwww');
     const queued = await s.cli(['release', 'l-wwwwwwwwwwww']);
     assert.deepEqual([queued.code, queued.out], [0, ['HUB_DEVICE_CANCELLED s24 l-wwwwwwwwwwww (it was still waiting)']]);
-    assert.equal((await waiting).code, 'HUB_LEASE_CANCELLED');
+    assert.equal((await waiter.settled).code, 'HUB_LEASE_CANCELLED');
     const unknown = await s.cli(['release', 'l-nothing']);
     assert.deepEqual([unknown.code, unknown.out], [0, ['HUB_DEVICE_NOT_HELD phone l-nothing (no phone lease by that id)']]);
     assert.deepEqual(unknown.err, ['hub-device: s24 is leased as l-aaaaaaaaaaaa (h), not l-nothing; left alone']);
@@ -205,6 +220,12 @@ test('release outcomes: held, queued, unknown, a job id and --any print the line
     assert.equal(job.code, claims.EXIT_CODES.HUB_DEVICE_JOB_ID);
     assert.match(job.err[0], /^HUB_DEVICE_JOB_ID job:delorenj\/app#123\.android\/build is a deploy job's place in line, not a lease; cancel run 123 of delorenj\/app instead \(gh run cancel 123 --repo delorenj\/app\)$/);
     assert.equal(claims.jobTicket('l-aaaaaaaaaaaa'), null);
+    // The library refuses what the CLI refuses: a job ticket, and a target that names nothing.
+    await assert.rejects(claims.release({ id: 'job:delorenj/app#123.android/build' }, s.ctx), error => error.code === 'HUB_DEVICE_JOB_ID' && claims.exitCodeOf(error) === 2 && !error.message.startsWith('HUB_DEVICE_JOB_ID'));
+    await assert.rejects(claims.release({}, s.ctx), error => error.code === 'HUB_USAGE');
+    await assert.rejects(claims.release({ emulator: '' }, s.ctx), error => error.code === 'HUB_USAGE');
+    await assert.rejects(claims.releaseEmulator('', s.ctx), error => error.code === 'HUB_USAGE');
+    await assert.rejects(claims.releaseEmulator('Bad Id', s.ctx), error => error.code === 'HUB_USAGE');
     assert.match(claims.jobTicket('job:local#local-42.ios/x').message, /it is the local process 42, stop that process instead$/);
     const lib = await claims.release({ id: 'l-aaaaaaaaaaaa' }, s.ctx);
     assert.deepEqual([lib.kind, lib.outcome, lib.device, lib.leaseId], ['phone', 'released', 's24', 'l-aaaaaaaaaaaa']);
@@ -217,33 +238,80 @@ test('release outcomes: held, queued, unknown, a job id and --any print the line
     assert.deepEqual([none.code, none.out], [0, ['HUB_DEVICE_NOT_HELD phone - (no phone is held)']]);
     const bare = await s.cli(['release']);
     assert.deepEqual([bare.code, bare.err], [2, ['hub-device: release needs a lease id, $HUB_LEASE_ID, or --any to free whichever lease holds a phone']]);
-  } finally { s.cleanup(); }
+  } finally { await waiter?.stop(); s.cleanup(); }
 });
 
 test('extend: a live Lease with no waiter gets the new expiry and one extend event; a waiter, the cap or an unknown id refuse', async () => {
   const s = side();
+  let waiter = null;
   try {
     const { fleet } = s.ctx;
+    const extend = (id, forMs) => claims.extend(id, { forMs }, s.ctx);
+    const refusal = (id, forMs) => { try { return extend(id, forMs); } catch (error) { return error; } };
     await claims.take(claims.resolve('s24', { fleet, env: s.env, ids: false }), options({ id: 'l-aaaaaaaaaaaa' }), s.ctx);
-    const record = claims.extend('l-aaaaaaaaaaaa', { forMs: 600_000, env: s.env, now: () => T0, fleet });
+    const record = extend('l-aaaaaaaaaaaa', 600_000);
     assert.equal(record.expires_at, new Date(T0 + 1_800_000 + 600_000).toISOString());
     assert.equal(s.owner().expires_at, record.expires_at);
     assert.equal(s.events().filter(event => event.event === 'extend').length, 1);
-    // A waiter refuses it.
-    const waiting = acquireLease('s24', { id: 'l-wwwwwwwwwwww', holder: 'w', why: 'next', forMs: 60_000, waitMs: 5000, env: s.env, log: () => {}, pollMs: 5, now: () => T0 }).catch(error => error);
-    for (let tries = 0; tries < 200 && !readdirSync(join(s.root, 'locks')).some(name => name.endsWith('.queue')); tries += 1) await new Promise(done => setTimeout(done, 10));
-    const refused = (() => { try { return claims.extend('l-aaaaaaaaaaaa', { forMs: 600_000, env: s.env, now: () => T0, fleet }); } catch (error) { return error; } })();
+    // A waiter refuses it, and its own id holds nothing to extend.
+    waiter = await startWaiter(s, 'l-wwwwwwwwwwww');
+    const refused = refusal('l-aaaaaaaaaaaa', 600_000);
     assert.equal(refused.code, 'HUB_LEASE_EXTEND_REFUSED');
     assert.equal(claims.exitCodeOf(refused), 1);
     assert.match(refused.message, /cannot be extended while 1 waiter waits/);
+    assert.equal(refusal('l-wwwwwwwwwwww', 600_000).code, 'HUB_LEASE_LOST');
     await claims.release({ id: 'l-wwwwwwwwwwww' }, s.ctx);
-    assert.equal((await waiting).code, 'HUB_LEASE_CANCELLED');
+    assert.equal((await waiter.settled).code, 'HUB_LEASE_CANCELLED');
     // The deploy phone's 60 min cap.
     await claims.take(claims.resolve('s26', { fleet, env: s.env, ids: false }), options({ id: 'l-eeeeeeeeeeee', forMs: 3_000_000 }), s.ctx);
-    assert.throws(() => claims.extend('l-eeeeeeeeeeee', { forMs: 1_200_000, env: s.env, now: () => T0, fleet }), error => error.code === 'HUB_LEASE_EXTEND_REFUSED' && /total/.test(error.message));
-    assert.equal(claims.extend('l-eeeeeeeeeeee', { forMs: 300_000, env: s.env, now: () => T0, fleet }).expires_at, new Date(T0 + 3_300_000).toISOString());
-    assert.throws(() => claims.extend('l-nothing', { forMs: 1000, env: s.env, now: () => T0, fleet }), error => error.code === 'HUB_LEASE_LOST' && claims.exitCodeOf(error) === 1);
-    assert.throws(() => claims.extend('l-aaaaaaaaaaaa', { forMs: 0, env: s.env, fleet }), error => error.code === 'HUB_USAGE');
+    assert.ok(/total/.test(refusal('l-eeeeeeeeeeee', 1_200_000).message));
+    assert.equal(refusal('l-eeeeeeeeeeee', 1_200_000).code, 'HUB_LEASE_EXTEND_REFUSED');
+    assert.equal(extend('l-eeeeeeeeeeee', 300_000).expires_at, new Date(T0 + 3_300_000).toISOString());
+    const lost = refusal('l-nothing', 1000);
+    assert.equal(lost.code, 'HUB_LEASE_LOST');
+    assert.equal(claims.exitCodeOf(lost), 1);
+    assert.equal(refusal('l-aaaaaaaaaaaa', 0).code, 'HUB_USAGE');
+  } finally { await waiter?.stop(); s.cleanup(); }
+});
+
+test('take refuses what the CLI refuses: no target, a taken id, and a Pool over the deploy cap is narrowed to the S24', async () => {
+  const s = side();
+  try {
+    const { fleet } = s.ctx;
+    await assert.rejects(claims.take(null, options(), s.ctx), error => error.code === 'HUB_USAGE');
+    await assert.rejects(claims.take({ kind: 'nothing' }, options(), s.ctx), error => error.code === 'HUB_USAGE');
+    const pool = claims.resolve('phone', { fleet, env: s.env, ids: false });
+    const taken = await claims.take(pool, options({ id: 'l-aaaaaaaaaaaa', forMs: 7_200_000 }), s.ctx);
+    assert.equal(taken.phone.device, 's24', 'the S26 is over its cap, so the Pool tried the S24 only');
+    await assert.rejects(claims.take(claims.resolve('s26', { fleet, env: s.env, ids: false }), options({ id: 'l-aaaaaaaaaaaa' }), s.ctx), error => error.code === 'HUB_USAGE' && /already names a lease or a waiter on s24/.test(error.message));
+    await assert.rejects(claims.take(claims.resolve('s26', { fleet, env: s.env, ids: false }), options({ id: 'l-ffffffffffff', forMs: 7_200_000 }), s.ctx), error => error.code === 'HUB_USAGE' && /^--for 7200000: /.test(error.message));
+  } finally { s.cleanup(); }
+});
+
+test('releaseEmulatorNow gives back the gate, and with a record the record\'s slot too', async () => {
+  const s = side();
+  try {
+    const hold = (lock, id) => acquireLease(lock, { id, holder: 'h', why: 'x', forMs: 60_000, waitMs: 0, env: s.env, log: () => {}, pollMs: 5 });
+    const held = lock => existsSync(join(s.root, 'locks', `${lock}.lock`, 'owner.json'));
+    // No record: only the gate holds the id.
+    await hold('emulator', 'e-nnnnnnnnnnnn');
+    assert.ok(held('emulator'));
+    claims.releaseEmulatorNow('e-nnnnnnnnnnnn', { env: s.env });
+    assert.equal(held('emulator'), false, 'the gate is released');
+    // A record whose processes are gone: its slot and the gate are released and the record is dropped.
+    await hold('emulator', 'e-rrrrrrrrrrrr');
+    await hold('emulator-1', 'e-rrrrrrrrrrrr');
+    const records = join(s.env.HUB_LOCK_DIR, 'emulators');
+    mkdirSync(records, { recursive: true });
+    writeFileSync(join(records, 'e-rrrrrrrrrrrr.json'), JSON.stringify({ lease_id: 'e-rrrrrrrrrrrr', slot: 'emulator-1', pids: [], dir: join(s.root, 'rt', 'e-rrrrrrrrrrrr') }));
+    claims.releaseEmulatorNow('e-rrrrrrrrrrrr', { env: s.env });
+    assert.equal(held('emulator'), false);
+    assert.equal(held('emulator-1'), false, 'the record\'s slot is released');
+    assert.equal(existsSync(join(records, 'e-rrrrrrrrrrrr.json')), false, 'the record is dropped');
+    // Another lease's gate is left alone.
+    await hold('emulator', 'e-oooooooooooo');
+    claims.releaseEmulatorNow('e-nnnnnnnnnnnn', { env: s.env });
+    assert.ok(held('emulator'));
   } finally { s.cleanup(); }
 });
 
