@@ -1,0 +1,23 @@
+# The Hub API (mobile-deploy-hub, docs/design-hub-v1.1.md, Epic 6, AD-45). units/install.sh renders the release ref and the node 24 directory into this and writes the
+# result to ~/.config/systemd/user/ (a rendered file, no code is copied); `mise run hosts:install` then enables and restarts it and reads /health back. It runs from the
+# release directory the install named (never `current`), so the code switches only at hosts:install. It is a service, not a job:
+# there is no .timer, and it sets no HUB_LOCK_DIR, so it shares the default lock dir with deploys and hub-device.
+[Unit]
+Description=Mobile Deploy Hub API: the Registry's one writer on 127.0.0.1 (port: policy.json api.hub_api_port)
+Documentation=https://github.com/delorenj/mobile-deploy-hub/blob/main/docs/hub-api-contract.md
+
+[Service]
+Type=simple
+Environment=HOME=%h
+# %h/.local/bin first: that is where `heavy` lives, and the service refuses to start without it.
+Environment=PATH=%h/.local/bin:@NODE@/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=@NODE@/bin/node %h/.local/share/mobile-deploy-hub/releases/@REF@/tools/hub-api/server.mjs
+Restart=on-failure
+RestartSec=5
+# A stop sends SIGTERM to the server alone; only a process still left in this cgroup is then killed. An emulator or an adb server a
+# lease started is not in it: the emulator pool boots them through `heavy`, which gives each its own scope (tools/device/emulator.mjs).
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

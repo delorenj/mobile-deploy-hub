@@ -2,17 +2,18 @@
 // `handle()`. `startService` is generic (a service name, a port, a route table), so the Host Agent (Epic 7) starts the same way;
 // `startHubApi` adds this service's own part: the policy port, then recovery and the seed once the bind has won.
 //
-// Start order: Node >= 24.15 (HUB_API_NODE), `heavy` on PATH (HUB_API_NO_HEAVY), bind 127.0.0.1 (EADDRINUSE is the singleton:
+// Start order: Node >= 24.15 (HUB_API_NODE), `heavy` on PATH (HUB_API_NO_HEAVY: emulators boot through the spawn seam in
+// tools/device/emulator.mjs, `bootCommand`, which wraps them in `heavy` so a stop with KillMode=mixed never kills one), bind 127.0.0.1 (EADDRINUSE is the singleton:
 // HUB_API_ALREADY_RUNNING), recoverRegistry, applySeed, then `HUB_API_LISTEN port=<n>` on stdout. The bind comes first so a second
 // instance never writes. A seed failure never stops the service (holds never depend on the Registry): one `HUB_API_SEED_FAILED` line
 // on stderr, and the next start retries. SIGTERM and SIGINT close the server, print `HUB_API_STOP` and let the process end 0.
 //
 // Every seam is injected (env, policy, log, versions, onPath, createServer, now, hostId, devices, qaDevices, signals). There is no
 // timer here: the keepalive of a later stream lives in stream.mjs, the one file the no-new-clock rule names (tools/clock.test.mjs).
-import { accessSync, constants, realpathSync, statSync } from 'node:fs';
+import { realpathSync } from 'node:fs';
 import { createServer as nodeCreateServer } from 'node:http';
-import { delimiter, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { onPath } from '../ci/lib/heavy.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { exitCodeOf } from '../device/claims.mjs';
 import { recoverRegistry, applySeed } from '../registry/store.mjs';
@@ -41,19 +42,9 @@ export function nodeAtLeast(version, minimum) {
   return true;
 }
 
-// True when an executable file called `name` is in a PATH directory of `env`.
-export function onPath(name, env = process.env) {
-  for (const dir of String(env.PATH ?? '').split(delimiter)) {
-    if (dir === '') continue;
-    const file = join(dir, name);
-    try {
-      if (!statSync(file).isFile()) continue;
-      accessSync(file, constants.X_OK);
-      return true;
-    } catch { /* not here */ }
-  }
-  return false;
-}
+// `onPath` is the one PATH resolver (tools/ci/lib/heavy.mjs): the emulator spawn seam decides from the same function, so the
+// service's `heavy` check and the seam cannot disagree. Re-exported here because the service's callers and tests import it from here.
+export { onPath };
 
 // ---- the node http adapter ----
 

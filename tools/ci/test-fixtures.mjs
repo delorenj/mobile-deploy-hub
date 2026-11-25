@@ -1,5 +1,5 @@
 // Shared test fixtures (not a test file: node --test runs only *.test.mjs).
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deflateRawSync } from 'node:zlib';
@@ -33,9 +33,23 @@ const jobVariable = name => /^(GITHUB_|RUNNER_|ACTIONS_|HUB_)/.test(name) || nam
 //
 // The lock directory is scratched the same way: a gate or preflight-ios under test reserves a device (Story 2.5), and a lane
 // that forgot its own HUB_LOCK_DIR must never write ~/.cache/mobile-deploy-hub/locks.
+//
+// `heavy`: the emulator spawn seam wraps every emulator and adb server it launches in `heavy` when `heavy` is on PATH (Linux). A
+// test must never open a real systemd scope, so hermetic() puts a fake first on PATH (see heavyShim). A fixture that builds its
+// own env from scratch puts a heavyShim on its own PATH, or has no heavy and spawns the command unchanged.
 let eventScratch = null;
+let heavyScratch = null;
 let lockScratch = null;
 let qaScratch = null;
+// A fake `heavy` in `dir`: it appends its arguments to `<dir>/heavy.log` and execs them, which is all the real one does to the pid
+// (systemd-run --scope execs the command). Returns `dir`, ready to go on the front of a PATH.
+export function heavyShim(dir) {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'heavy'), `#!/bin/sh\necho "$*" >> "${join(dir, 'heavy.log')}"\nexec "$@"\n`);
+  chmodSync(join(dir, 'heavy'), 0o755);
+  return dir;
+}
+
 export function hermetic() {
   for (const name of Object.keys(process.env)) if (jobVariable(name)) delete process.env[name];
   if (!eventScratch) {
@@ -43,6 +57,12 @@ export function hermetic() {
     process.on('exit', () => { try { rmSync(eventScratch, { recursive: true, force: true }); } catch { /* temp */ } });
   }
   process.env.HUB_EVENT_DIR = eventScratch;
+  if (!heavyScratch) {
+    heavyScratch = mkdtempSync(join(tmpdir(), 'hub-test-heavy-'));
+    heavyShim(heavyScratch);
+    process.on('exit', () => { try { rmSync(heavyScratch, { recursive: true, force: true }); } catch { /* temp */ } });
+    process.env.PATH = `${heavyScratch}:${process.env.PATH ?? ''}`;
+  }
   if (!lockScratch) {
     lockScratch = mkdtempSync(join(tmpdir(), 'hub-test-locks-'));
     process.on('exit', () => { try { rmSync(lockScratch, { recursive: true, force: true }); } catch { /* temp */ } });

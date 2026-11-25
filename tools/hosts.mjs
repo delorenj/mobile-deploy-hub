@@ -5,16 +5,23 @@
 //   - the Mac's quickdrop .stignore holds /builds, so APKs never cross its link;
 //   - the Mac's handoff cache is seeded from the newest handoff tarball already there (0 bytes over the link);
 //   - each host's key (AD-47), `linux` on big-chungus and `mac` on the Mac, in ~/.config/mobile-deploy-hub/host-key, read back;
-//   - the catch-up units, CATCHUP's tools/catchup/units/install.sh, on big-chungus and (through hub-mac) on the Mac.
+//   - the catch-up units, CATCHUP's tools/catchup/units/install.sh, on big-chungus and (through hub-mac) on the Mac;
+//   - the Hub API on big-chungus only (Story 6.11, AD-45): tools/hosts/units/install.sh renders its unit for this release, then the
+//     service is enabled, restarted and /health read back (at most 10 s, one invocation) until it answers as this release. The
+//     Mac gets nothing (its Host Agent is Epic 7). A release directory is never removed or replaced by this step: when
+//     releases/<ref> already exists the catch-up installer runs from that copy, so a same-ref reinstall never swaps the tree a
+//     running service reads.
 // Writes to the bucket use the hub writer's keys from 1Password, as deliver does.
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { accessFor } from './ci/lib/access.mjs';
 import { loadDevices } from './ci/lib/devices.mjs';
 import { latestKey, parseLatest } from './ci/lib/latest.mjs';
 import { indexData, indexPage } from './ci/lib/pages.mjs';
+import { pause, sleep as realSleep } from './ci/lib/pause.mjs';
 import { loadPolicy } from './ci/lib/policy.mjs';
 import { createS3, readObject, writerCredentials } from './ci/lib/s3.mjs';
 import { HOST_KEY_FILE, HOST_PLATFORMS } from './device/claims.mjs';
@@ -72,7 +79,44 @@ printf 'HOST_KEY=%s\\n' "$(cat "${file}")"
 `;
 }
 
-export async function hostsInstall({ log = console.log, run = sh, fetchImpl = fetch } = {}) {
+export const HUB_API_UNIT = 'mobile-deploy-hub-api.service';
+export const READBACK_MS = 10_000;
+const READBACK_RETRY_MS = 500;
+const releasesDir = home => join(home, '.local/share/mobile-deploy-hub/releases');
+
+// The Hub API on this host (Story 6.11): the units installer from the release copy (rendered unit + daemon-reload only), then
+// enable, restart, and a bounded readback of /health: ok, service hub-api and hub_version equal to `ref` (the service runs from
+// releases/<ref>, so its answer names the release). The retry is one loop in this call, within READBACK_MS by the injected clock
+// (AD-19: no timer outlives it); no attempt starts after the deadline. Returns a one-line summary or throws.
+export async function installHubApi({ ref, run = sh, fetchImpl = fetch, sleep = realSleep, now = Date.now, home = homedir(), port, log = () => {} } = {}) {
+  const installer = join(releasesDir(home), ref, 'tools/hosts/units/install.sh');
+  if (!existsSync(installer)) throw new Error(`release copy missing: ${installer} (the catch-up step puts releases/${ref} there)`);
+  const installed = run('bash', [installer, ref], { timeout: 2 * 60_000 });
+  if (!installed.ok) throw new Error(installed.out.slice(-300));
+  for (const verb of ['enable', 'restart']) {
+    const result = run('systemctl', ['--user', verb, HUB_API_UNIT], { timeout: 2 * 60_000 });
+    if (!result.ok) throw new Error(`systemctl --user ${verb} ${HUB_API_UNIT}: ${result.out.slice(-200)}`);
+  }
+  const deadline = now() + READBACK_MS;
+  let last = 'no answer';
+  for (;;) {
+    try {
+      const response = await fetchImpl(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(Math.max(1, Math.min(2000, deadline - now()))), headers: { 'Cache-Control': 'no-cache' } });
+      const body = response.ok ? await response.json() : null;
+      if (body?.ok === true && body.service === 'hub-api' && body.hub_version === ref) return `${ref} serves 127.0.0.1:${port} (${installed.out.split('\n').slice(-1)[0]})`;
+      last = body ? `hub_version ${body.hub_version ?? 'missing'}, service ${body.service ?? 'missing'}` : `HTTP ${response.status}`;
+    } catch (error) {
+      last = String(error?.cause?.code ?? error?.message ?? error).split('\n')[0];
+    }
+    log(`HOSTS hub api: not ready yet (${last})`);
+    if (now() >= deadline) break;
+    await pause(READBACK_RETRY_MS, { sleep });
+    if (now() >= deadline) break;
+  }
+  throw new Error(`/health on 127.0.0.1:${port} did not report hub-api ${ref} within ${READBACK_MS / 1000}s (last: ${last}); see journalctl --user -u ${HUB_API_UNIT}`);
+}
+
+export async function hostsInstall({ log = console.log, run = sh, fetchImpl = fetch, sleep = realSleep, now = Date.now, home = homedir(), credentials = writerCredentials } = {}) {
   const { policy } = loadPolicy();
   const devices = loadDevices();
   const failures = [];
@@ -86,15 +130,15 @@ export async function hostsInstall({ log = console.log, run = sh, fetchImpl = fe
     const health = await fetchImpl(`${policy.delivery.s3.write}/minio/health/live`, { signal: AbortSignal.timeout(10_000) });
     if (!health.ok) throw new Error(`MinIO on ${policy.delivery.s3.write} answered ${health.status}`);
     // MOBI-17: the pointers of a private app are not anonymous, so the hub reads them with the writer's keys.
-    const credentials = await writerCredentials();
-    const existing = await readObject(policy, 'index.html', { credentials });
+    const keys = await credentials();
+    const existing = await readObject(policy, 'index.html', { credentials: keys, fetchImpl });
     if (existing) return `${policy.delivery.s3.public}/index.html exists`;
     const apps = [];
     for (const app of Object.values(policy.apps)) {
-      const text = await readObject(policy, latestKey(app.slug), { credentials });
+      const text = await readObject(policy, latestKey(app.slug), { credentials: keys, fetchImpl });
       if (text) apps.push(parseLatest(text, { slug: app.slug }));
     }
-    const s3 = createS3({ policy, credentials });
+    const s3 = createS3({ policy, credentials: keys });
     const access = slug => accessFor(policy, slug);
     s3.putText(`${JSON.stringify(indexData(apps, { access }), null, 2)}\n`, 'index.json');
     s3.putText(indexPage(apps, { access }), 'index.html');
@@ -129,7 +173,11 @@ export async function hostsInstall({ log = console.log, run = sh, fetchImpl = fe
     return result.out.split('\n').join('; ') || 'nothing to seed';
   });
 
-  const installer = resolve(hubRoot, 'tools/catchup/units/install.sh');
+  // The release copy when it already exists: the installer replaces releases/<ref> whenever it runs from another tree, and a
+  // running Hub API reads its code from there.
+  const checkoutInstaller = resolve(hubRoot, 'tools/catchup/units/install.sh');
+  const releaseInstaller = join(releasesDir(home), ref, 'tools/catchup/units/install.sh');
+  const installer = existsSync(releaseInstaller) ? releaseInstaller : checkoutInstaller;
   if (!existsSync(installer)) {
     log('HOSTS catch-up: tools/catchup/units/install.sh is not in this checkout yet (CATCHUP); skipped');
   } else {
@@ -138,6 +186,10 @@ export async function hostsInstall({ log = console.log, run = sh, fetchImpl = fe
       if (!result.ok) throw new Error(result.out.slice(-300));
       return `${ref}: ${result.out.split('\n').slice(-2).join('; ')}`;
     });
+  }
+  // Always runs, after the big-chungus catch-up step (which puts releases/<ref> in place): a missing release copy fails loudly here.
+  await step('hub api on big-chungus', () => installHubApi({ ref, run, fetchImpl, sleep, now, home, port: policy.api.hub_api_port, log }));
+  if (existsSync(installer)) {
     await step('catch-up on the Mac', async () => {
       const target = `.local/share/mobile-deploy-hub/releases/${ref}/tools/`;
       const mk = run('ssh', [...ssh, host, `mkdir -p '${target}'`]);

@@ -4,14 +4,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadDevices } from '../ci/lib/devices.mjs';
 import { readEvents } from '../ci/lib/events.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
-import { writeFileAtomic } from '../ci/lib/lock.mjs';
+import { acquireLease, writeFileAtomic } from '../ci/lib/lock.mjs';
 import { hermetic } from '../ci/test-fixtures.mjs';
 import { fakeWire } from '../device/wire-fixtures.mjs';
 import { applySeed, registryPath } from '../registry/store.mjs';
@@ -525,5 +525,39 @@ test('Registry routes with no file and a QA seed that cannot be built answer 500
     }
     assert.equal(errors.length, 3);
     assert.ok(errors.every(line => line.startsWith('HUB_API_ERROR GET /')));
+  } finally { s.cleanup(); }
+});
+
+// Story 6.11 (AD-23, AD-45): the service holds no state beyond the lock dir, so a restart (a stop, then a start on the same dirs, as
+// `hosts:install` does on a release) leaves every byte of it as it was, and the new instance serves what the old one registered.
+const snapshot = dir => {
+  const files = {};
+  const walk = (path, rel) => {
+    if (statSync(path).isDirectory()) { for (const name of readdirSync(path).sort()) walk(join(path, name), join(rel, name)); } else files[rel] = readFileSync(path, 'utf8');
+  };
+  walk(dir, '');
+  return files;
+};
+
+test('a restart on the same dirs: the lock dir is byte-identical after the new instance starts, and it serves the Resource the old one registered', async () => {
+  const s = scratch();
+  try {
+    const a = await s.start();
+    const ask = async (listener, method, url, body) => { const e = exchange(method, url, body); await listener(e.req, e.res); return e; };
+    const registered = await ask(s.servers[0].listener, 'POST', '/registry/resources', { kind: 'phone', name: 'pixel', host: 'linux', identity: { serial: 'PX9', model: 'Pixel 9' }, capabilities: { api_level: 35 }, holder: 'jarad' });
+    assert.equal(registered.res.head.status, 201, registered.res.text);
+    const id = registered.json().resource.id;
+    const lease = await acquireLease(registered.json().resource.lock, { holder: 'agent-a', why: 'survives a restart', forMs: 60_000, env: s.env, log: () => {}, hostId: HOST });
+    await a.stop();
+    await a.stopped;
+    const before = snapshot(join(s.root, 'locks'));
+    assert.ok(Object.keys(before).includes('registry.json') && Object.keys(before).some(name => name.endsWith('owner.json')), 'a registry and a held Lease are in the lock dir');
+    const b = await s.start();
+    assert.deepEqual(snapshot(join(s.root, 'locks')), before, 'the new instance wrote nothing to the lock dir');
+    const served = await ask(s.servers[1].listener, 'GET', `/resources/${id}`);
+    assert.equal(served.res.head.status, 200);
+    assert.equal(served.json().resource.id, id);
+    assert.equal(JSON.parse(before[Object.keys(before).find(name => name.endsWith('owner.json'))]).lease_id, lease.lease_id, 'the Lease is still held, untouched');
+    await b.stop();
   } finally { s.cleanup(); }
 });
