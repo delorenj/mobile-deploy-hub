@@ -26,7 +26,7 @@ import { findPhone, idMatchesSerial } from '../ci/lib/adb.mjs';
 import { createDevicectl } from '../ci/lib/devicectl.mjs';
 import { earliest } from '../ci/lib/eta.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
-import { CLAIMANT_KINDS, MAX_LEASE_MS, RESERVABLE, SEED_RESOURCES, acquireLease, acquirePool, cachedProcessStart, cancelRequest, capText, checkActor, deployTargetCapMs, etaHistory, extendLease, heldText, isLease, listLocks, lockDir, newLeaseId as newLockLeaseId, queueView, readOwner, releaseLease, releaseReservation, resourceOf, updateLease, waiterEtas } from '../ci/lib/lock.mjs';
+import { CLAIMANT_KINDS, MAX_LEASE_MS, RESERVABLE, SEED_RESOURCES, acquireLease, acquirePool, cachedProcessStart, cancelRequest, capText, checkActor, deployTargetCapMs, etaHistory, extendLease, forceRelease, forceReleaseJobError, heldText, isLease, listLocks, lockDir, newLeaseId as newLockLeaseId, queueView, readOwner, releaseLease, releaseReservation, resourceOf, updateLease, waiterEtas } from '../ci/lib/lock.mjs';
 import { sleep as realSleep } from '../ci/lib/pause.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { createAdbWire } from './adb-wire.mjs';
@@ -69,6 +69,8 @@ export const EXIT_CODES = Object.freeze({
   HUB_REQUEST_NOT_FOUND: 2,
   HUB_CANCEL_RESERVATION: 2,
   HUB_WRONG_HOST: 2,
+  // Story 7.6: a force-release of a deploy job's Hold (a Job Hold is only ended by cancelling its run).
+  HUB_FORCE_RELEASE_JOB: 2,
   // Story 7.4: an emulator that would not boot (or whose teardown would not finish) through a service: the host's trouble, the busy exit's opposite.
   HUB_EMULATOR_FAILED: 1,
   HUB_HOST_UNKNOWN: 1,
@@ -118,6 +120,8 @@ export const HTTP_ANSWERS = Object.freeze({
   HUB_REQUEST_NOT_FOUND: Object.freeze({ status: 404 }),
   HUB_CANCEL_RESERVATION: Object.freeze({ status: 409, reason: 'reservation' }),
   HUB_WRONG_HOST: Object.freeze({ status: 409, reason: 'wrong-host' }),
+  // Story 7.6: carries its own `repo`, `run` and `job` members (null when unknown).
+  HUB_FORCE_RELEASE_JOB: Object.freeze({ status: 409, reason: 'job' }),
   HUB_API_RESTARTING: Object.freeze({ status: 503, reason: 'restarting' }),
   HUB_PHONE_AWAY: Object.freeze({ status: 503, reason: 'away' }),
   HUB_DEVICE_AWAY: Object.freeze({ status: 503, reason: 'away' }),
@@ -956,12 +960,15 @@ export function createLeaseWaits({ now = Date.now, startOf } = {}) {
 
 // ---- release ----
 
+// A deploy job's ticket id: `job:<repo>#<run>.<attempt>/<job>`.
+const JOB_ID = /^job:([^#]+)#([^.]+)\.[^/]+\/(.+)$/;
+
 // A deploy job's ticket id is its place in line, not a lease: nothing here can release it, so say which run to cancel.
 // Returns null for any other id; otherwise {code, id, message} (the code exits through the table; a front door prints the
 // `HUB_DEVICE_JOB_ID` marker before the message).
 export function jobTicket(id) {
   if (typeof id !== 'string' || !id.startsWith('job:')) return null;
-  const [, repo, run] = /^job:([^#]+)#([^.]+)\.[^/]+\/.+$/.exec(id) ?? [];
+  const [, repo, run] = JOB_ID.exec(id) ?? [];
   const hint = repo && repo !== 'local' ? ` (gh run cancel ${run} --repo ${repo})` : '';
   // A local run's id carries the process: the catch-up and a hand-run deploy have no GitHub run to cancel.
   const pid = repo === 'local' ? /^local-(\d+)$/.exec(run)?.[1] : undefined;
@@ -1139,13 +1146,18 @@ export function checkReleaseBody(body) {
   return { holder: body.holder ?? null, actor };
 }
 
-// What a service extend and release both do first: the environment without `GITHUB_*` (as a take), the context, and a deploy job's ticket
-// id refused (HUB_DEVICE_JOB_ID, which names the run to cancel). An emulator lease id is served like a phone's (Story 7.4).
-function serviceHold(id, ctx) {
+// The context a service action runs in: the environment without `GITHUB_*` (as a take), the fleet, the policy and the clocks.
+function serviceLocal(ctx) {
   const env = withoutDeployIdentity(ctx.env ?? process.env);
   const fleet = ctx.fleet ?? loadFleet(env, { warn: ctx.warn });
   const base = createContext({ env, log: ctx.log, warn: ctx.warn, policy: ctx.policy, now: ctx.timing?.now ?? ctx.now, sleep: ctx.timing?.sleep ?? ctx.sleep, fleet, qaDevices: ctx.qaDevices, registry: ctx.registry });
-  const local = { ...ctx, env, fleet, log: base.log, warn: base.warn, policy: base.policy, timing: ctx.timing ?? base.timing, emulator: ctx.emulator ?? base.emulator };
+  return { ...ctx, env, fleet, log: base.log, warn: base.warn, policy: base.policy, timing: ctx.timing ?? base.timing, emulator: ctx.emulator ?? base.emulator };
+}
+
+// What a service extend and release both do first: that context, and a deploy job's ticket id refused (HUB_DEVICE_JOB_ID, which names the
+// run to cancel). An emulator lease id is served like a phone's (Story 7.4).
+function serviceHold(id, ctx) {
+  const local = serviceLocal(ctx);
   const job = jobTicket(id);
   if (job) throw failure(job.code, job.message);
   return local;
@@ -1304,6 +1316,69 @@ export function cancel(id, input, ctx) {
   if (!held && locks.includes(GATE)) held = slotHolding(local.env, id) !== null || readRecord(local.env, id) !== null;
   if (held) throw requestNotFound('held', `request ${id} already holds its lock, so there is no waiting request to cancel; release it (hub-device release ${id}, POST /leases/${id}/release)`);
   throw requestNotFound('unknown', `no request waits under the id "${id}"${named ? ` on ${input.resource}` : ' on this host'}${input.pool ? ` in the Pool ${input.pool}` : ''}`);
+}
+
+// ---- force-release a Lease (Story 7.6) ----
+
+const FORCE_RELEASE_BODY_KEYS = Object.freeze(['why', 'holder', 'actor']);
+
+// A force-release's `why`: missing is `no-why`, anything but a non-empty string `bad-why` (HUB_USAGE, before anything is read).
+function checkWhy(why) {
+  if (why === undefined || why === null) throw bodyUsage('no-why', 'a force-release says why: a non-empty why');
+  if (!isText(why)) throw bodyUsage('bad-why', 'why must be a non-empty string');
+  return why;
+}
+
+// Checks the body of a service's force-release into `{why, holder, actor}` (`holder` and `actor` null when absent). HUB_USAGE with a `reason`,
+// before anything is read: bad-body (not an object, or a key outside `why`, `holder`, `actor`), no-why, bad-why, bad-actor, no-holder (neither
+// an `actor` nor a `holder`). There is no holder check on the Lease and no confirmation step (NFR-6).
+export function checkForceReleaseBody(body) {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) throw bodyUsage('bad-body', 'the body must be a JSON object');
+  for (const key of Object.keys(body)) if (!FORCE_RELEASE_BODY_KEYS.includes(key)) throw bodyUsage('bad-body', `the body has no key "${key}" (${FORCE_RELEASE_BODY_KEYS.join(', ')})`);
+  const why = checkWhy(body.why);
+  const actor = bodyActor(body);
+  if (actor === null && !isText(body.holder)) throw bodyUsage('no-holder', 'say who is force-releasing: an actor or a holder');
+  return { why, holder: body.holder ?? null, actor };
+}
+
+// The members of a `job:` id as forceReleaseJobError takes them: the repo and run it names (a local run's `local` repo and `local-<pid>` run
+// are no GitHub run: null, with the pid), and its job.
+function jobMembers(id) {
+  const [, repo, run, job] = JOB_ID.exec(id) ?? [];
+  if (!repo) return {};
+  if (repo === 'local') return { pid: Number(/^local-(\d+)$/.exec(run)?.[1]) || null, job };
+  return { repo, run, job };
+}
+
+// `POST /leases/{id}/force-release` (and `hub-device force-release <id> --why`; the Host Agent's too): ends the Lease `id` holds on this host,
+// whatever its holder, on any lock (a phone, a registered phone, the iOS lane or any `res-*` lock), by the one protocol writer `forceRelease`.
+// `input` is `{why, actor}` (`checkForceReleaseBody`'s result with the actor defaulted by the caller); both are required and recorded on the one
+// `force-release` event. Answers `{lease_id, outcome: 'force-released', resource, lock, device, holder, why}`.
+//
+// Refusals, in order, before anything is written: HUB_USAGE (an actor, `no-why` / `bad-why`); HUB_FORCE_RELEASE_JOB for a `job:` id (a deploy job's
+// place in line; built from the id alone) or a lock whose owner is a Job Hold (`repo`, `run`, `job`; cancel the run); HUB_USAGE `reason: emulator`
+// for an id that holds an emulator slot or the gate or has an emulator record (Story 7.8's `forceReleaseEmulator` tears it down); HUB_LEASE_NOT_FOUND
+// (`waiting`, `unknown`: an id that only waits is cancelled instead). A lock that changed hands between the read and the rename is HUB_LEASE_LOST
+// (`changed-hands`; `being-taken` for a lock with no owner record yet), and the new owner is untouched. `ctx.beforeRetire` is the test seam of the rename.
+export function forceReleaseLease(id, input, ctx) {
+  const actor = checkActor(input?.actor);
+  if (actor === null) throw usage('a force-release names its actor ({holder, via})');
+  const why = checkWhy(input?.why);
+  const local = serviceLocal(ctx);
+  if (typeof id === 'string' && id.startsWith('job:')) throw forceReleaseJobError({ kind: 'job', ...jobMembers(id) });
+  const { env } = local;
+  const emulatorSlot = typeof id === 'string' && id !== '' ? readRecord(env, id)?.slot ?? slotHolding(env, id) ?? (readOwnerOf(GATE, env)?.lease_id === id ? GATE : null) : null;
+  const refuseEmulator = slot => Object.assign(usage(`lease ${id} holds ${slot === GATE ? 'the emulator gate' : slot}, part of an emulator: force-releasing it tears the emulator down, so that is the slot's force-release (hub-device force-release ${slot === GATE ? 'emulator-<n>' : slot}), never this one`), { reason: EMULATOR });
+  if (emulatorSlot !== null) throw refuseEmulator(emulatorSlot);
+  const found = typeof id === 'string' ? listLocks({ env, now: local.timing.now }).find(lock => lock.kind === 'lease' && lock.owner.lease_id === id) : undefined;
+  if (!found) throw leaseNotFound(id, local.fleet, env);
+  if (isEmulatorLock(found.name)) throw refuseEmulator(found.name);
+  const result = forceRelease(found.name, { actor, why, lease_id: id, env, now: local.timing.now, log: local.log, ...(local.beforeRetire ? { beforeRetire: local.beforeRetire } : {}) });
+  if (!result.released) {
+    const message = result.reason === 'unknown-holder' ? `${found.name} is being taken (its lock has no owner record yet); left alone` : `lease ${id} changed hands while it was being force-released; left alone, check \`hub-device status\``;
+    throw Object.assign(failure('HUB_LEASE_LOST', message), { reason: result.reason === 'unknown-holder' ? 'being-taken' : 'changed-hands' });
+  }
+  return { lease_id: id, outcome: 'force-released', resource: resourceOf(found.name), lock: found.name, device: nameOf(local.fleet, found.name), holder: result.owner.holder ?? null, why };
 }
 
 // ---- status ----

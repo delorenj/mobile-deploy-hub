@@ -153,6 +153,7 @@ const POST_SAMPLES = Object.freeze({
   '/leases': { status: 200, body: { resource: 's24', for_ms: 1_800_000, holder: 'contract-test', why: 'contract', id: 'contract-1' } },
   '/leases/{id}/extend': { status: 200, params: { id: 'contract-1' }, setup: ['/leases'], body: { for_ms: 600_000, holder: 'contract-test' } },
   '/leases/{id}/release': { status: 200, params: { id: 'contract-1' }, setup: ['/leases'], body: { holder: 'contract-test' } },
+  '/leases/{id}/force-release': { status: 200, params: { id: 'contract-1' }, setup: ['/leases'], body: { why: 'contract', holder: 'contract-test' } },
   '/requests/{id}/cancel': { status: 200, params: { id: 'contract-wait' }, prepare: prepareCancel, after: afterCancel, body: { resource: 's24', host: 'linux', why: 'contract', holder: 'contract-test' } },
 });
 
@@ -283,6 +284,8 @@ test('the Problem extensions of the document equal PROBLEM_EXTENSIONS both ways,
       HUB_REGISTRY_CONFLICT: await post({ ...base, name: 'other', identity: { model: 'x' }, if_rev: 0 }),
       HUB_REGISTRY_DUPLICATE: await post({ ...base, name: 'other' }),
       HUB_API_RESTARTING: await handle({ method: 'POST', url: lease.path, body: sampleBody(lease) }, { ...s.ctx, waits }),
+      // A deploy job's place in line is refused from the id alone, naming the run to cancel.
+      HUB_FORCE_RELEASE_JOB: await handle({ method: 'POST', url: '/leases/job:o%2Fr%2341.1%2Fandroid/force-release', body: { why: 'contract', holder: 'contract-test' } }, s.ctx),
     };
     assert.deepEqual(Object.keys(answers).sort(), Object.keys(PROBLEM_EXTENSIONS).sort(), 'every extension code has a live answer here');
     for (const [code, answer] of Object.entries(answers)) {

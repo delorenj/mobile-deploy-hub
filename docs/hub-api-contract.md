@@ -35,6 +35,7 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 | GET | `/leases/{id}` | Lease | 7.2 |
 | POST | `/leases/{id}/extend` | Lease | 7.3 |
 | POST | `/leases/{id}/release` | Release | 7.3 |
+| POST | `/leases/{id}/force-release` | ForceRelease | 7.6 |
 | POST | `/requests/{id}/cancel` | Cancel | 7.5 |
 
 ## Shapes
@@ -167,6 +168,18 @@ The age rule: a reader on the service's host computes `age_ms = age_ms_at_receip
 - `lock` the lock that was released or waited on, or `null` for `none`
 - `device` the word a Claimant says for the phone, or `null` for `none`
 
+### ForceRelease
+
+`POST /leases/{id}/force-release`: status 200, the Lease `id` held, ended by force. It is `hub-device force-release <id> --why ...`: the Lease's lock is gone (the next waiter in line is served as after any release) and one `force-release` event records the actor and the `why`. Unlike a release it is not idempotent: an id that holds nothing is 404.
+
+- `lease_id` the id that was force-released
+- `outcome` always `force-released`
+- `resource` the Resource id the lock stands for
+- `lock` the lock the Lease held
+- `device` the word a Claimant says for the phone, or `null` for a lock that is no phone of this host's fleet (the iOS lane)
+- `holder` who held the Lease
+- `why` the `why` the force-release was given
+
 ### Cancel
 
 `POST /requests/{id}/cancel`: status 200, a waiting request taken out of the line, and the queue of every lock it was taken out of as it stands afterwards. It is `hub-device cancel <id> --resource ...`. The request's own wait ends `HUB_LEASE_CANCELLED` and names the canceller. A Hold is never touched: a request that already holds its lock is 404 `HUB_REQUEST_NOT_FOUND` with `reason: held` (release it).
@@ -209,6 +222,7 @@ An error of these codes carries the named members besides the `Problem` fields a
 | `HUB_REGISTRY_CONFLICT` | `rev` | The Registry's current revision, so a client can read again and retry. |
 | `HUB_REGISTRY_DUPLICATE` | `holder` | The id of the live Resource that already has the serial or UDID. |
 | `HUB_API_RESTARTING` | `retry` | Always `requeue`: the service is stopping, so ask again (a wait is placed again with the same `id`). |
+| `HUB_FORCE_RELEASE_JOB` | `repo`, `run`, `job` | The run to cancel instead (`owner/name`, the run id, the job name); each is `null` when unknown (a local run, the catch-up). |
 
 ## Request bodies
 
@@ -281,6 +295,15 @@ Refusals, in the order they are checked: `HUB_USAGE` 400 for the body (`bad-body
 
 **`POST /leases/{id}/release`** gives a phone or an emulator Lease back, or withdraws a waiter. The body is a JSON object with only `holder` and `actor`, as for an extend (`bad-body`, `bad-actor`, `no-holder`); there is no holder check. A `job:` id is `HUB_DEVICE_JOB_ID` 400. A phone's lock is released through the library's `releaseLease`: a Lease writes one `release` event (`reason: by-id`) with `actor`, a waiter one `cancel` event with `actor`. An emulator lease id is released as `hub-device release <id>` does, its teardown (its processes, AVD and ports) run in a worker thread: `released` (the answer's `lock` is the slot), or `cancelled` for a request still waiting its turn (`lock` is `emulator`, `device` `emulator`); an emulator whose processes would not stop is `HUB_EMULATOR_FAILED` 503. An emulator release records no `actor` yet. A lock that is being taken or changed hands since the read is left alone: `HUB_LEASE_LOST` 409 (`reason: being-taken`, `changed-hands`).
 
+**`POST /leases/{id}/force-release`** ends a Lease by force (Story 7.6). `{id}` is the Lease's id; it is looked for on every lock of this host (a phone's, a registered phone's, the iOS lane's, any `res-*` lock), never on another host. There is no holder check and no confirmation step: the caller says who and why, and both are recorded. The body is a JSON object with only these keys:
+
+- `why` (required): a non-empty string, recorded on the event and answered back.
+- `actor`, `holder`: as for an extend (`actor` as given, else `{holder, via: 'api'}`; one of the two is required).
+
+The Lease's owner is renamed to a tomb by the one writer (`forceRelease`, `tools/ci/lib/lock.mjs`: the rename decides) and one `force-release` event is written with `hold_kind: lease`, `lease_id`, the Lease's `claimant` and `held_ms`, `actor` and `why` (`reason` is `null`). A waiter already in line is served next. A deploy job's Hold is never ended from outside its run, and a waiter or a Reservation is not a Lease.
+
+Refusals, in the order they are checked: `HUB_USAGE` 400 for the body (`bad-body`, `no-why`, `bad-why`, `bad-actor`, `no-holder`), before anything is read; `HUB_FORCE_RELEASE_JOB` 409 for a `job:` id (a deploy job's place in line), or for a Job Hold that took the Lease's lock between the find and the rename (a lock name is no Lease id: naming a lock a job holds is `HUB_LEASE_NOT_FOUND` `unknown`), with `repo`, `run` and `job` and a `detail` that names `gh run cancel <run> --repo <repo>` (a local run or the catch-up has none: it says to stop the process); `HUB_USAGE` 400 with `reason: emulator` for an id that holds an emulator slot or the `emulator` gate or has an emulator record (its slot's force-release tears it down: Story 7.8); `HUB_LEASE_NOT_FOUND` 404 (`waiting` for an id that only waits: cancel it instead; `unknown`); `HUB_LEASE_LOST` 409 (`changed-hands`, `being-taken`) when the lock changed hands between the read and the rename: nothing was written and the new owner is untouched.
+
 **`POST /requests/{id}/cancel`** takes a waiting request out of the line (Story 7.5). `{id}` is the request's id (the Lease id of a waiter, the Lease id an emulator request was made with); there is no holder check (no authentication, so the id is the handle, as on the CLI). The body is a JSON object with only these keys:
 
 - `resource` (required): a non-empty string naming the Resource the request waits on: a device word (`s24`, a registered phone's name, `phone`, `emulator`) or a Resource id. The service never searches the fleet by request id.
@@ -303,20 +326,21 @@ For every write route the actor is `actor` as given, else `{holder, via: 'api'}`
 | `HUB_RESOURCE_NOT_FOUND` | 404 | 2 | No Resource has this id (`reason: unknown`), or on a read it is retired and idle (`reason: retired`). The write routes (`/registry/resources/{id}` and `/retire`) answer only `unknown`. |
 | `HUB_RESOURCE_RETIRED` | 409 | 2 | An edit of a Resource that is retired (`reason: retired`) or no longer in `devices.json` (`reason: seed-missing`). Also what `POST /leases` refuses a take of one with, with the same reasons. |
 | `HUB_REGISTRY_SEEDED` | 409 | 2 | A retire (`reason: retire`), an edit of `id`, `lock`, `kind`, `host` or `identity` (`reason` is that key) or a different name (`reason: name`) of a seeded Resource: a hub release changes those. |
-| `HUB_USAGE` | 400, 413 | 2 | The request body is not valid JSON (`bad-json`) or is over 1 MiB (`too-large`), or a write body is wrong (`bad-body`, `bad-kind`, `bad-host`, `bad-identity`, `no-model`, `bad-capabilities`, `bad-if-rev`, `no-if-rev`, `bad-why`, `bad-actor`, `no-holder`, `no-change`), or an edit names a key a runtime Resource keeps for good (`immutable`). An extend body is wrong with `bad-body`, `bad-for`, `bad-actor`, `bad-override` or `no-holder`, a release body with `bad-body`, `bad-actor` or `no-holder`, a cancel body with `bad-body`, `no-resource`, `bad-resource`, `bad-pool`, `bad-host`, `bad-why`, `bad-actor` or `no-holder`. A lease body is wrong with `bad-body`, `bad-target`, `bad-for`, `bad-wait`, `bad-claimant-kind`, `bad-id`, `no-id`, `bad-actor`, `no-holder` or `bad-why`; a lease request the library refuses (an unknown word, a bad `profile` clause, a taken `id`, a `for_ms` over a cap) has `reason: hub_usage` and a `detail` that says why. |
+| `HUB_USAGE` | 400, 413 | 2 | The request body is not valid JSON (`bad-json`) or is over 1 MiB (`too-large`), or a write body is wrong (`bad-body`, `bad-kind`, `bad-host`, `bad-identity`, `no-model`, `bad-capabilities`, `bad-if-rev`, `no-if-rev`, `bad-why`, `bad-actor`, `no-holder`, `no-change`), or an edit names a key a runtime Resource keeps for good (`immutable`). An extend body is wrong with `bad-body`, `bad-for`, `bad-actor`, `bad-override` or `no-holder`, a release body with `bad-body`, `bad-actor` or `no-holder`, a cancel body with `bad-body`, `no-resource`, `bad-resource`, `bad-pool`, `bad-host`, `bad-why`, `bad-actor` or `no-holder`, a force-release body with `bad-body`, `no-why`, `bad-why`, `bad-actor` or `no-holder` (and `reason: emulator` for an emulator lease id, which is the slot's to force-release). A lease body is wrong with `bad-body`, `bad-target`, `bad-for`, `bad-wait`, `bad-claimant-kind`, `bad-id`, `no-id`, `bad-actor`, `no-holder` or `bad-why`; a lease request the library refuses (an unknown word, a bad `profile` clause, a taken `id`, a `for_ms` over a cap) has `reason: hub_usage` and a `detail` that says why. |
 | `HUB_LOCK_TIMEOUT` | 409 | 76 | `POST /leases`: the lock is held or someone waits (`reason: busy`), or a wait ran out of time. `detail` keeps the library's wording, `host lock <name> is held …` (for a Pool, once per held member; a full emulator Pool says `the emulator pool is full …`); a try writes no event, a wait ends with its `timeout` event. |
 | `HUB_DEVICE_AWAY` | 503 | 75 | `POST /leases` with a `match` whose every member the service's cache knows is away: `absent`, `offline` or `unauthorized` (`reason: away`). |
 | `HUB_NO_MATCH` | 404 | 2 | `POST /leases` with a `match` nothing can serve, or an emulator profile that is unknown or whose image is not installed (`reason: no-match`); `detail` says what excluded each Resource, or names the image. |
 | `HUB_EMULATOR_FAILED` | 503 | 1 | `POST /leases` for an emulator that did not boot (the message says why; everything it made is torn down), or `POST /leases/{id}/release` of one whose processes would not stop (`reason: emulator-failed`). |
 | `HUB_POOL_CROSS_HOST` | 409 | 2 | `POST /leases` with a `match` whose members are on more than one host. |
-| `HUB_LEASE_NOT_FOUND` | 404 | 2 | `GET /leases/{id}`, and an extend (the release answers `none`): no Lease holds this id. `reason: waiting` when a waiter has it (it holds nothing yet), `reason: unknown` otherwise. |
+| `HUB_LEASE_NOT_FOUND` | 404 | 2 | `GET /leases/{id}`, an extend and a force-release (the release answers `none`): no Lease holds this id. `reason: waiting` when a waiter has it (it holds nothing yet), `reason: unknown` otherwise. |
 | `HUB_LEASE_EXTEND_REFUSED` | 409 | 76 | `POST /leases/{id}/extend`: the extension is refused and nothing was written. `reason` is `waiters`, `expired`, `cap` or `too-long`. |
 | `HUB_LEASE_CANCELLED` | 409 | 1 | `POST /leases`: a wait ended without a Hold: its place was released while it waited, or it was taken out of the line by `POST /requests/{id}/cancel` (`reason: cancelled`; `detail` says `cancelled by <holder>` and the `why` given). |
-| `HUB_LEASE_LOST` | 409 | 1 | `POST /leases/{id}/extend` or `/release`: the lock changed hands between the read and the write (`reason` is `hub_lease_lost` on an extend, `being-taken` or `changed-hands` on a release). Nothing of this request's was written. |
+| `HUB_LEASE_LOST` | 409 | 1 | `POST /leases/{id}/extend`, `/release` or `/force-release`: the lock changed hands between the read and the write (`reason` is `hub_lease_lost` on an extend, `being-taken` or `changed-hands` on a release or a force-release). Nothing of this request's was written. |
 | `HUB_REQUEST_NOT_FOUND` | 404 | 2 | `POST /requests/{id}/cancel`: no waiting request has this id on the Resource (`reason: unknown`), or the request already holds its lock and is a Lease to release (`reason: held`). |
 | `HUB_CANCEL_RESERVATION` | 409 | 2 | `POST /requests/{id}/cancel` with the key of a deploy run's Reservation (`reason: reservation`): a cancel never takes one; `detail` says to force-release it (a Reservation is released by its own run key: `hub-device reservation release --run <key>`). |
 | `HUB_WRONG_HOST` | 409 | 2 | `POST /requests/{id}/cancel` whose `host` is not this host's key (`reason: wrong-host`): a cancel never reaches another host. |
 | `HUB_DEVICE_JOB_ID` | 400 | 2 | `POST /leases/{id}/extend`, `/release` or `POST /requests/{id}/cancel` with a `job:` id (or, for a cancel, the id of a deploy job's ticket): a deploy job's place in line is not a lease, and the hub never extends, releases or cancels it; `detail` names the run to cancel (`gh run cancel`). |
+| `HUB_FORCE_RELEASE_JOB` | 409 | 2 | `POST /leases/{id}/force-release` of a deploy job's Hold (`reason: job`): a Job Hold is only ended by cancelling its run; `repo`, `run` and `job` name it and `detail` says `gh run cancel`. |
 | `HUB_LEASE_SUPERSEDED` | 409 | 1 | `POST /leases`: a newer request with the same `id` and `holder` took over this wait (`reason: superseded`). The wait itself goes on. |
 | `HUB_API_RESTARTING` | 503 | 1 | The service is stopping (`reason: restarting`; member `retry: requeue`). Every open wait gets it, and so does a lease request that arrives while it stops. |
 | `HUB_REGISTRY_NAME` | 400, 409 | 2 | A register's or edit's name is not a slug (`not-slug`) or is too long (`too-long`) with 400; reserved (`reserved`), already used (`taken`) or out of `-<n>` suffixes (`exhausted`) with 409. |

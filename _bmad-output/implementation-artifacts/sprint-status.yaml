@@ -102,7 +102,7 @@ development_status:
   7-3-extend-and-release-a-lease-with-a-recorded-override: done
   7-4-lease-an-emulator-through-the-api: done
   7-5-cancel-a-queued-request: done
-  7-6-force-release-a-lease: backlog
+  7-6-force-release-a-lease: done
   7-7-force-release-a-reservation: backlog
   7-8-force-release-an-emulator-slot: backlog
   7-9-ship-leases-through-the-api: backlog
