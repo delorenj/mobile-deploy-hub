@@ -1846,7 +1846,8 @@ export function releaseLease(name, id, { env = process.env, now = Date.now, reas
 // such waiter), `gone` (it was granted or withdrew between the find and the unlink) or `held` (it holds a lock). Throws
 // HUB_DEVICE_JOB_ID for a job's id or ticket and HUB_CANCEL_RESERVATION for a Reservation key (deploy jobs are cancelled through
 // GitHub, a Reservation is force-released), both before anything is written; TypeError without an actor.
-export function cancelRequest(name, lease_id, { actor, why = null, pool, env = process.env, now = Date.now, hostId = machineId() } = {}) {
+// `unlink` is the seam a test races the unlink through (a waiter granted, or withdrawn, between the find and the unlink).
+export function cancelRequest(name, lease_id, { actor, why = null, pool, env = process.env, now = Date.now, hostId = machineId(), unlink = unlinkSync } = {}) {
   const who = checkActor(actor);
   if (!who) throw new TypeError('a cancel names its actor ({holder, via})');
   if (why !== null && typeof why !== 'string') throw new TypeError('why must be a string');
@@ -1893,7 +1894,7 @@ export function cancelRequest(name, lease_id, { actor, why = null, pool, env = p
   for (const target of targets) {
     writeFileAtomic(cancelNotePath(target.path), JSON.stringify({ format: CANCEL_NOTE_FORMAT, cancel: { actor: who, why, at: iso(now()) } }));
     try {
-      unlinkSync(target.path);
+      unlink(target.path);
     } catch (error) {
       // Granted or withdrawn first: the waiter owns that ending, and no note of ours may outlive it.
       dropNote(target.path);

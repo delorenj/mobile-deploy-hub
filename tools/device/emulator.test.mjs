@@ -774,3 +774,45 @@ test('isEmulatorLease sees a lease id waiting on the gate, live or dead, through
     assert.ok(readdirSync(queue).length === 3, 'looking prunes nothing');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+// Story 7.5: an emulator request waiting on the gate (behind the one that holds it, next for a slot) is cancelled through `hub-device cancel`:
+// its gate wait ends with the gate's lock-level `cancel` and the Pool request around it with its Pool-level `cancel`, as a release of a waiting
+// one does, both naming the canceller; its own `lease` fails CANCELLED naming it. The request holding the gate holds a lock: `held`, release it.
+test('cancel takes an emulator request off the gate: one gate cancel and one Pool cancel, both naming the canceller', async () => {
+  const f = fixture();
+  try {
+    f.env.HUB_EMULATOR_POOL = '1';
+    const HOLDER = uid('holder');
+    assert.equal((await f.run(['lease', 'emulator', '--for', '10m', '--why', 'holder', '--id', HOLDER])).code, 0);
+    const NEXT = uid('next');
+    const LATE = uid('late');
+    const queue = join(f.root, 'locks/emulator.queue');
+    const tickets = () => (existsSync(queue) ? readdirSync(queue).filter(file => file.endsWith('.json')).length : 0);
+    const ownerOf = lock => { try { return f.owner(lock); } catch { return null; } };
+    const next = spawnCli(f, ['lease', 'emulator', '--for', '1m', '--why', 'next', '--wait', '60s', '--id', NEXT]);
+    assert.ok(await waitFor(() => ownerOf('emulator')?.lease_id === NEXT), 'the next request holds the gate');
+    const late = spawnCli(f, ['lease', 'emulator', '--for', '1m', '--why', 'late', '--wait', '60s', '--id', LATE]);
+    assert.ok(await waitFor(() => tickets() === 1), 'the late request waits on the gate');
+    const held = await f.run(['cancel', NEXT, '--resource', 'emulator', '--holder', 'ops']);
+    assert.equal(held.code, 2);
+    assert.match(held.err.join('\n'), /^HUB_REQUEST_NOT_FOUND .*release it/m);
+    const done = await f.run(['cancel', LATE, '--resource', 'emulator', '--holder', 'ops', '--why', 'not needed']);
+    assert.equal(done.code, 0, done.err.join('\n'));
+    assert.match(done.out.join('\n'), new RegExp(`^HUB_DEVICE_CANCELLED emulator ${LATE}$`, 'm'));
+    const ended = await late.exit;
+    assert.notEqual(ended.code, 0);
+    assert.match(ended.err, /cancelled by ops: not needed/);
+    const endings = logged(f).filter(event => event.lease_id === LATE && event.event !== 'request');
+    assert.deepEqual(endings.map(event => [event.event, event.lock, event.pool ?? null, event.reason, event.actor?.holder, event.why]), [
+      ['cancel', 'emulator', null, 'cancelled', 'ops', 'not needed'],
+      ['cancel', null, 'emulator', 'cancelled', 'ops', 'not needed'],
+    ]);
+    assert.deepEqual(readdirSync(queue), [], 'no ticket and no note is left');
+    assert.equal((await f.run(['release', HOLDER])).code, 0);
+    assert.ok(await waitFor(() => ownerOf('emulator-1')?.lease_id === NEXT, 15_000), 'the request holding the gate still gets the emulator');
+    assert.equal((await f.run(['release', 'emulator', NEXT])).code, 0);
+    next.child.kill('SIGTERM');
+    await next.exit;
+    f.clean();
+  } finally { f.cleanup(); }
+});

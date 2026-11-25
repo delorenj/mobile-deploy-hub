@@ -170,3 +170,52 @@ test('releaseLease and every ticket reader ignore a cancel note; an orphan note 
     assert.deepEqual(f.events().filter(event => event.event === 'prune'), [], 'with no event');
   } finally { f.cleanup(); }
 });
+
+// The race rows: a waiter granted or withdrawn between the find and the unlink (the `unlink` seam stands in for it).
+const plant = (f, lock, id, { pool = null, file = '000000000000001-000001-00000001.json' } = {}) => {
+  const queue = join(f.env.HUB_LOCK_DIR, `${lock}.queue`);
+  mkdirSync(queue, { recursive: true });
+  writeFileSync(join(queue, file), JSON.stringify({ format: 1, kind: 'lease', lease_id: id, holder: `waiter-${id}`, why: 'wants it', pid: process.pid, enqueued_at: new Date(f.now() - MIN).toISOString(), pool, request: pool ? id : null }));
+};
+const enoent = () => Object.assign(new Error('gone'), { code: 'ENOENT' });
+
+test('a ticket that goes between the find and the unlink is gone: no event, and the canceller leaves no note behind', async () => {
+  const f = fixture();
+  try {
+    await f.hold('s24', 'a-1');
+    plant(f, 's24', 'b-1');
+    const before = f.events().length;
+    const raced = path => { rmSync(path); throw enoent(); };
+    assert.deepEqual(f.cancel('s24', 'b-1', { unlink: raced }), { cancelled: false, reason: 'gone' });
+    assert.deepEqual(f.queue('s24'), [], 'neither the ticket nor a note');
+    assert.equal(f.events().length, before, 'the waiter owns that ending');
+  } finally { f.cleanup(); }
+});
+
+test('a Pool request granted a member while it is being cancelled is held: no Pool ticket is left to serve and no event is written', async () => {
+  const f = fixture();
+  try {
+    await f.hold('s24', 'a-1');
+    await f.hold('adb', 'a-2');
+    plant(f, 's24', 'p-1', { pool: 'phone' });
+    plant(f, 'adb', 'p-1', { pool: 'phone' });
+    const before = f.events().length;
+    let calls = 0;
+    // The first unlink lands; meanwhile the request takes the other member and withdraws its ticket there, so the second finds nothing.
+    const granted = path => {
+      calls += 1;
+      if (calls === 1) {
+        rmSync(path);
+        const other = path.includes(`${join('locks', 's24.queue')}`) ? 'adb' : 's24';
+        writeFileSync(join(f.env.HUB_LOCK_DIR, `${other}.lock`, 'owner.json'), JSON.stringify({ kind: 'lease', lease_id: 'p-1', holder: 'waiter-p-1' }));
+        rmSync(join(f.env.HUB_LOCK_DIR, `${other}.queue`, '000000000000001-000001-00000001.json'));
+        return;
+      }
+      throw enoent();
+    };
+    assert.deepEqual(f.cancel('s24', 'p-1', { pool: 'phone', unlink: granted }), { cancelled: false, reason: 'held' });
+    assert.equal(calls, 2);
+    assert.equal(f.tickets('s24').length + f.tickets('adb').length, 0);
+    assert.equal(f.events().length, before, 'a Pool cancel never writes the ending itself');
+  } finally { f.cleanup(); }
+});
