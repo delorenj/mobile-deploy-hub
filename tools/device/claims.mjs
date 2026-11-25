@@ -315,6 +315,19 @@ export function resolve(target, { fleet, env = process.env, words = true, ids = 
   return { kind: 'phone', by: 'word', entry };
 }
 
+// The device words `take` would try for `phone` right now, in order: the `phone` Pool after the retired and seed-missing narrowing, as
+// the names a caller types; `[]` when none is left. Read only (the Registry file, else the seed), never the QA file, no warning. It is
+// what `mise run hosts:smoke` checks a registered phone against (the Pool `phone` holds it, and a retired one is gone from it).
+export function phoneWordMembers({ env = process.env } = {}) {
+  try {
+    const target = withoutRetired(resolve(PHONE, { fleet: loadFleet(env), env, ids: false }), env);
+    return target.members.map(phone => phone.device);
+  } catch (error) {
+    if (error?.code === 'HUB_RESOURCE_RETIRED') return [];
+    throw error;
+  }
+}
+
 // ---- bounds ----
 
 // A lease id names one lease: with more than one phone lock, the same --id could otherwise name two live leases
