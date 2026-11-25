@@ -621,7 +621,7 @@ test('the train dispatches Tower, then Green In Between, then Gruvato, and stops
 // ---------------------------------------------------------------------------------------------------- conformance and release
 
 import { checkApp, miseTasks, scriptsOf } from '../conformance.mjs';
-import { flipInnerRefs, notesMaxBytes, notesPath, releaseNotes, tagArgs, tagMessage } from '../release.mjs';
+import { flipInnerRefs, notesMaxBytes, notesPath, pinTag, releaseNotes, remoteTag, rollbackLine, tagArgs, tagMessage } from '../release.mjs';
 
 test('conformance: the template caller and a clean app pass; uploads, bumps, tags and announcements outside the hub fail', () => {
   const app = { slug: 'gruvato', lanes: ['android', 'ios'] };
@@ -729,6 +729,71 @@ test('release notes: a CRLF file reads like an LF one, a NUL is dropped, odd tex
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+// Story 5.10 (NFR-2, AD-47): every release states its rollback, computed from where the major tag pointed before it.
+test('rollback: pinTag picks the highest release tag numerically and ignores other names; rollbackLine names the tag, the commit, or none', () => {
+  assert.equal(pinTag(['v1.2.9', 'v1.2.10', 'v1', 'foo']), 'v1.2.10', 'numeric, not lexical; v1 and foo are not release tags');
+  assert.equal(pinTag(['v1.2.51']), 'v1.2.51');
+  assert.equal(pinTag(['v1.10.0', 'v1.9.99', 'v2.0.0-rc1', 'v1.2.3.4']), 'v1.10.0');
+  assert.equal(pinTag(['v1', 'foo', 'v1.2']), null);
+  assert.equal(pinTag([]), null);
+  assert.equal(pinTag(undefined), null);
+  const golden = "Roll back: move v1 back to v1.2.51 (git tag -f v1 'v1.2.51^{commit}' && git push -f origin refs/tags/v1), then run mise run hosts:install on big-chungus from a clean checkout at v1.2.51 (it installs the Mac through hub-mac).";
+  assert.equal(rollbackLine({ major: 'v1', previous: { object: 'a'.repeat(40), commit: 'b'.repeat(40) }, previousTag: 'v1.2.51' }), golden);
+  const commit = 'deadbeef0123456789abcdef0123456789abcdef';
+  assert.equal(rollbackLine({ major: 'v1', previous: { object: commit, commit }, previousTag: null }), `Roll back: move v1 back to ${commit} (git tag -f v1 '${commit}^{commit}' && git push -f origin refs/tags/v1), then run mise run hosts:install on big-chungus from a clean checkout at ${commit} (it installs the Mac through hub-mac).`);
+  assert.equal(rollbackLine({ major: 'v1', previous: null }), 'Roll back: none: v1 is new with this release.');
+  assert.equal(rollbackLine({ major: 'v2', previous: null, previousTag: 'v2.0.1' }), 'Roll back: none: v2 is new with this release.', 'a new major has nothing to go back to, whatever tags exist');
+});
+
+test('remoteTag: a failed ls-remote throws (never "the tag is new"); a successful lookup of nothing is null', () => {
+  const answer = (ok, out) => () => ({ ok, out });
+  assert.throws(() => remoteTag('v1', answer(false, '')), /ls-remote for v1 failed/);
+  assert.equal(remoteTag('v1', answer(true, '')), null);
+  assert.deepEqual(remoteTag('v1', answer(true, 'aaa\trefs/tags/v1\nbbb\trefs/tags/v1^{}')), { object: 'aaa', commit: 'bbb' });
+});
+
+test('rollback: the annotation puts the line between the notes and the status, and without it is byte-identical to before', () => {
+  const line = 'Roll back: move v1 back to v1.2.51 (...).';
+  assert.equal(tagMessage('v1.2.52', 'Release dry runs pending.', 'a\nb', line), 'mobile-deploy-hub v1.2.52\n\na\nb\n\nRoll back: move v1 back to v1.2.51 (...).\n\nRelease dry runs pending.');
+  assert.equal(tagMessage('v1.2.52', 'pending', null, line), 'mobile-deploy-hub v1.2.52\n\nRoll back: move v1 back to v1.2.51 (...).\n\npending');
+  assert.equal(tagMessage('v1.2.52', 'pending', 'n', null), tagMessage('v1.2.52', 'pending', 'n'));
+  assert.equal(tagMessage('v1.2.52', 'pending', 'n', undefined), 'mobile-deploy-hub v1.2.52\n\nn\n\npending');
+  assert.equal(tagMessage('v1.2.52', 'pending', null, ''), 'mobile-deploy-hub v1.2.52\n\npending');
+});
+
+test('rollback: git keeps the line through every re-annotation (pending, unknown, red, green), computed from the tags on the commit v1 pointed at', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'hub-rollback-'));
+  try {
+    const run = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: root, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' } });
+    run('init', '-q', '-b', 'main');
+    await writeFile(join(root, 'f'), 'x');
+    run('add', 'f');
+    run('commit', '-q', '-m', 'one');
+    const old = run('rev-parse', 'HEAD').trim();
+    // v1.2.49 was tagged and rolled back; v1 stood on v1.2.48 (and v1.2.9 is older by number, newer by letters)
+    for (const name of ['v1.2.9', 'v1.2.48', 'foo']) run('tag', '-a', '-m', name, name);
+    run('tag', '-f', 'v1', old);
+    await writeFile(join(root, 'f'), 'y');
+    run('commit', '-q', '-am', 'two');
+    run('tag', '-a', '-m', 'rolled back', 'v1.2.49');
+    const previous = { object: run('rev-parse', 'v1').trim(), commit: run('rev-parse', 'v1^{commit}').trim() };
+    assert.equal(previous.commit, old);
+    const previousTag = pinTag(run('tag', '--list', 'v*', '--points-at', previous.commit).split('\n').filter(Boolean));
+    assert.equal(previousTag, 'v1.2.48', 'from where v1 pointed, not the previous number (v1.2.49)');
+    const rollback = rollbackLine({ major: 'v1', previous, previousTag });
+    const notes = releaseNotes('## v1.2.52\n\nintro\n\n### Read this\n- item\n', 'v1.2.52');
+    const annotation = () => run('tag', '-l', '--format=%(contents)', 'v1.2.52').trimEnd();
+    run(...tagArgs('v1.2.52', null, tagMessage('v1.2.52', 'Release dry runs pending.', notes, rollback)));
+    assert.equal(annotation(), `mobile-deploy-hub v1.2.52\n\nintro\n\n### Read this\n- item\n\n${rollback}\n\nRelease dry runs pending.`);
+    const commit = run('rev-parse', 'HEAD').trim();
+    for (const status of ['Release dry runs: UNKNOWN at a/b\nx', 'Release dry runs: RED at a/b; v1 not moved.\nx', 'Release dry runs (strict), all green:\nx']) {
+      run(...tagArgs('v1.2.52', commit, tagMessage('v1.2.52', status, notes, rollback), { force: true }));
+      assert.equal(annotation(), `mobile-deploy-hub v1.2.52\n\nintro\n\n### Read this\n- item\n\n${rollback}\n\n${status}`);
+    }
+    assert.match(annotation(), /Roll back: move v1 back to v1\.2\.48 \(git tag -f v1 'v1\.2\.48\^\{commit\}'/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('the v1.2.46 release notes say what a reader of the tag must know', () => {
   const notes = releaseNotes(readFileSync(notesPath, 'utf8'), 'v1.2.46');
   assert.ok(notes, 'docs/hub-releases.md has a v1.2.46 section');
@@ -737,6 +802,16 @@ test('the v1.2.46 release notes say what a reader of the tag must know', () => {
   for (const word of [/Event Log/, /Queue/, /Reservations?/, /Deadlines?/, /Lease cap/, /concurrency group/i, /HUB_LOCK_TIMEOUT/, /wording/i, /hosts:install/]) assert.match(notes, word);
   assert.ok(notes.split('\n').every(line => !line.startsWith('## ')), 'no line of the section may look like a heading of the next release');
   assert.equal(releaseNotes(readFileSync(notesPath, 'utf8'), 'v9.9.9'), null);
+});
+
+test('the v1.2.52 release notes (Epic 5) say what a reader of the tag must know: no service, the rollback, and every operator-visible change', () => {
+  const notes = releaseNotes(readFileSync(notesPath, 'utf8'), 'v1.2.52');
+  assert.ok(notes, 'docs/hub-releases.md has a v1.2.52 section');
+  assert.match(notes, /Nothing in this release is a service/);
+  assert.match(notes, /Rolling back is `hosts:install` of `v1\.2\.51`/);
+  assert.match(notes, /v1\.2\.51/);
+  for (const word of [/reachability/, /deploy_target/, /--match/, /`phone`/, /discover/, /host-key/, /HUB_HOST_UNKNOWN/, /HUB_NO_MATCH/, /HUB_POOL_CROSS_HOST/, /registry\.reachability_max_age_s/, /Test changes you will see/, /hub-device\.test\.mjs/, /lease\.test\.mjs/, /emulator\.test\.mjs/, /Roll back:/]) assert.match(notes, word);
+  assert.ok(notes.split('\n').every(line => !line.startsWith('## ')), 'no line of the section may look like a heading of the next release');
 });
 
 // v1.x never removes or retypes a caller input: callers pinned @v1 must keep working when v1 moves (D1).

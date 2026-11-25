@@ -10,6 +10,10 @@
 // The release notes: the `## vX.Y.Z` section of docs/hub-releases.md, when there is one, is put into every annotation of
 // vX.Y.Z (pending, green, red or unknown), between the header and the dry-run lines. A release with no section is annotated
 // as before.
+// The rollback: every annotation of vX.Y.Z also carries a `Roll back:` line (logged as RELEASE_ROLLBACK), after the notes and
+// before the dry-run lines. It is computed from where the major tag (v1) pointed before this release started, never from "the
+// previous version number": a red release moves v1 back, so a tag can exist that v1 never stood on (v1.2.47, v1.2.49 and
+// v1.2.50 were rolled back).
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -41,7 +45,25 @@ export function releaseNotes(text, tag) {
 }
 
 // The annotation of a release tag: the header, the release's notes when it has any, then what its dry runs said.
-export const tagMessage = (tag, status, notes = null) => `mobile-deploy-hub ${tag}\n\n${notes ? `${notes}\n\n` : ''}${status}`;
+// The rollback line, when there is one, sits between the notes and the status.
+export const tagMessage = (tag, status, notes = null, rollback = null) => `mobile-deploy-hub ${tag}\n\n${notes ? `${notes}\n\n` : ''}${rollback ? `${rollback}\n\n` : ''}${status}`;
+
+// The release tag a commit stands for: the highest vX.Y.Z of the names given (numeric, not lexical; other names such as `v1`
+// or `foo` are ignored), null when none is a release tag.
+export function pinTag(names) {
+  const versions = (names ?? []).filter(name => /^v\d+\.\d+\.\d+$/.test(name)).map(name => ({ name, parts: name.slice(1).split('.').map(Number) }));
+  versions.sort((a, b) => b.parts[0] - a.parts[0] || b.parts[1] - a.parts[1] || b.parts[2] - a.parts[2]);
+  return versions[0]?.name ?? null;
+}
+
+// How to undo a release: put the callers' pin (the major tag) and the hosts' tools back on what the major tag named before.
+// `previous` is remoteTag(major) read before the first tag of the release ({object, commit} or null when the major is new);
+// `previousTag` is pinTag of the tags on that commit. Without a tag the full commit is named (a short form can be ambiguous).
+export function rollbackLine({ major, previous, previousTag = null }) {
+  if (!previous) return `Roll back: none: ${major} is new with this release.`;
+  const ref = previousTag ?? previous.commit;
+  return `Roll back: move ${major} back to ${ref} (git tag -f ${major} '${ref}^{commit}' && git push -f origin refs/tags/${major}), then run mise run hosts:install on big-chungus from a clean checkout at ${ref} (it installs the Mac through hub-mac).`;
+}
 
 // `git tag` strips `#` lines from a message by default; whitespace cleanup keeps a notes heading.
 export const tagArgs = (tag, commit, message, { force = false } = {}) => ['tag', ...(force ? ['-f'] : []), '-a', '--cleanup=whitespace', tag, ...(commit ? [commit] : []), '-m', message];
@@ -56,8 +78,12 @@ export function flipInnerRefs(text, tag) {
   return text.replace(/(uses: delorenj\/mobile-deploy-hub\/actions\/hub@)\S+/g, `$1${tag}`);
 }
 
-export function remoteTag(name) {
-  const line = git(['ls-remote', '--tags', 'origin', `refs/tags/${name}`, `refs/tags/${name}^{}`], { allowFail: true }).out;
+// null only when the lookup succeeded and lists no such ref; a lookup that itself fails (network, auth) throws, so a release
+// never reads "could not ask" as "v1 is new" (which would delete v1 on a red dry run) or "the tag is free".
+export function remoteTag(name, run = git) {
+  const found = run(['ls-remote', '--tags', 'origin', `refs/tags/${name}`, `refs/tags/${name}^{}`], { allowFail: true });
+  if (!found.ok) throw new Error(`git ls-remote for ${name} failed; cannot tell whether it exists on origin`);
+  const line = found.out;
   let object = null;
   let commit = null;
   for (const entry of line.split('\n').filter(Boolean)) {
@@ -99,14 +125,18 @@ export async function release(version, { log = console.log, dryRuns = true } = {
     git(['commit', '-q', '-m', `feat(hub): ${tag}: the workflow's inner actions/hub refs pin ${tag}`, '-m', coAuthor, '--', '.github/workflows/mobile-deploy.yml']);
   }
   const commit = git(['rev-parse', 'HEAD']).out;
+  // Where the major tag stands before this release touches anything: the rollback target (read before the first tag).
+  const previous = remoteTag(major);
+  const previousTag = previous ? pinTag(git(['tag', '--list', 'v*', '--points-at', previous.commit], { allowFail: true }).out.split('\n').filter(Boolean)) : null;
+  const rollback = rollbackLine({ major, previous, previousTag });
+  log(`RELEASE_ROLLBACK ${rollback}`);
   let notes = null;
   try { notes = existsSync(notesPath) ? releaseNotes(readFileSync(notesPath, 'utf8'), tag) : null; } catch (error) { log(`RELEASE_NOTES ${tag}: docs/hub-releases.md unreadable (${error.code ?? error.message}); tagging without notes`); }
   log(notes ? `RELEASE_NOTES ${tag}: ${notes.split('\n').length} lines from docs/hub-releases.md` : `RELEASE_NOTES ${tag}: none (no section in docs/hub-releases.md)`);
-  git(tagArgs(tag, null, tagMessage(tag, 'Release dry runs pending.', notes)));
+  git(tagArgs(tag, null, tagMessage(tag, 'Release dry runs pending.', notes, rollback)));
   git(['push', '-q', '--atomic', 'origin', 'HEAD:refs/heads/main', `refs/tags/${tag}`]);
   log(`RELEASE_TAGGED ${tag} at ${commit.slice(0, 8)}`);
 
-  const previous = remoteTag(major);
   git(['tag', '-f', major, commit]);
   git(['push', '-q', '-f', 'origin', `refs/tags/${major}`]);
   log(`RELEASE_MOVED ${major} -> ${tag}${previous ? ` (was ${previous.commit.slice(0, 8)})` : ' (new)'}`);
@@ -131,7 +161,7 @@ export async function release(version, { log = console.log, dryRuns = true } = {
   const lines = runs.map(item => `${item.repo}: ${item.status === 0 ? 'green' : item.status === unknownStatus ? 'UNKNOWN' : 'RED'} ${item.id ?? ''} ${item.url ?? item.error ?? ''}`.trim());
   if (unknown) {
     // No verdict is not red: v1 stays where it is, the release stays unproven, and a person finishes the watch.
-    git(tagArgs(tag, commit, tagMessage(tag, `Release dry runs: UNKNOWN at ${unknown.repo} (GitHub gave no verdict); ${major} was moved and not rolled back.\n${lines.join('\n')}`, notes), { force: true }));
+    git(tagArgs(tag, commit, tagMessage(tag, `Release dry runs: UNKNOWN at ${unknown.repo} (GitHub gave no verdict); ${major} was moved and not rolled back.\n${lines.join('\n')}`, notes, rollback), { force: true }));
     git(['push', '-q', '-f', 'origin', `refs/tags/${tag}`]);
     throw new Error(`the release dry run of ${unknown.repo} has no verdict (${unknown.url ?? 'no run'}); ${major} stays on ${tag}, unproven, not rolled back. Finish by hand: ${finishByHand(unknown.id, ['--repo', unknown.repo])}`);
   }
@@ -145,11 +175,11 @@ export async function release(version, { log = console.log, dryRuns = true } = {
       git(['tag', '-d', major], { allowFail: true });
       log(`RELEASE_ROLLED_BACK ${major} removed (it was new): the dry run of ${red} is red`);
     }
-    git(tagArgs(tag, commit, tagMessage(tag, `Release dry runs: RED at ${red}; ${major} not moved.\n${lines.join('\n')}`, notes), { force: true }));
+    git(tagArgs(tag, commit, tagMessage(tag, `Release dry runs: RED at ${red}; ${major} not moved.\n${lines.join('\n')}`, notes, rollback), { force: true }));
     git(['push', '-q', '-f', 'origin', `refs/tags/${tag}`]);
     throw new Error(`the release dry run of ${red} is red; ${major} is back where it was. Fix it and release the next patch`);
   }
-  git(tagArgs(tag, commit, tagMessage(tag, `Release dry runs (strict, --dry-handoff true, at ${major}), all green:\n${lines.join('\n')}`, notes), { force: true }));
+  git(tagArgs(tag, commit, tagMessage(tag, `Release dry runs (strict, --dry-handoff true, at ${major}), all green:\n${lines.join('\n')}`, notes, rollback), { force: true }));
   git(['push', '-q', '-f', 'origin', `refs/tags/${tag}`]);
   log(`RELEASE_DONE ${tag}: ${major} points at it; ${lines.join('; ')}`);
   return { tag, commit, runs };
