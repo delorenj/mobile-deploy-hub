@@ -129,7 +129,9 @@ test('a record that never became readable is waited for, then set aside once it 
     const later = Date.now() + 120_000;
     const got = take(f, f.env, 'adb', { now: () => later, wait: () => {} });
     assert.equal(got.status, 'claimed');
-    assert.deepEqual(events(f).map(event => event.event), ['claim']);
+    assert.deepEqual(events(f).map(event => event.event), ['prune', 'claim'], 'the set-aside is one prune (Story 6.1), then the claim');
+    const [prune] = events(f);
+    assert.deepEqual([prune.hold_kind, prune.run_key, prune.reason, prune.count], ['reservation', 'delorenj--example--5', 'unreadable', 1]);
   } finally { f.cleanup(); }
 });
 
