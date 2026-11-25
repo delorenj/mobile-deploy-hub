@@ -14,7 +14,7 @@
 // handler as `request.params`; a literal route wins over a parameterised one.
 import { STATUS_CODES } from 'node:http';
 import { idMatchesSerial } from '../ci/lib/adb.mjs';
-import { HOST_PLATFORMS, checkLeaseBody, discover as discoverHost, exitCodeOf, findLease, hostKey as realHostKey, httpAnswerOf, leaseRequestId, lockActivity, serviceLease } from '../device/claims.mjs';
+import { HOST_PLATFORMS, checkExtendBody, checkLeaseBody, checkReleaseBody, discover as discoverHost, exitCodeOf, findLease, hostKey as realHostKey, httpAnswerOf, leaseRequestId, lockActivity, serviceExtend, serviceLease, serviceRelease } from '../device/claims.mjs';
 import { hubRef } from '../ci/lib/receipt.mjs';
 import { NO_READING } from '../registry/reachability.mjs';
 import { loadQaDevices } from '../registry/seed.mjs';
@@ -260,14 +260,20 @@ function readingsOf(ctx) {
   };
 }
 
-export async function takeLease(ctx, { body, signal }) {
-  const input = checkLeaseBody(body);
-  const actor = input.actor ?? { holder: input.holder, via: 'api' };
+// The context the Claims library's service functions take, from the service's own: the lock dir environment, the policy and clock seams, a
+// log that never changes an answer, and the reading of a Pool's members (a `match`).
+function serviceContext(ctx) {
   const out = line => { try { ctx.log?.out?.(line); } catch { /* a broken log seam never changes the answer */ } };
-  const service = {
+  return {
     env: ctx.env ?? process.env, policy: ctx.policy, now: ctx.now, sleep: ctx.sleep, qaDevices: ctx.qaDevices,
     log: out, warn: () => {}, readingsOf: readingsOf(ctx),
   };
+}
+
+export async function takeLease(ctx, { body, signal }) {
+  const input = checkLeaseBody(body);
+  const actor = input.actor ?? { holder: input.holder, via: 'api' };
+  const service = serviceContext(ctx);
   return ctx.waits ? ctx.waits.lease({ ...input, actor }, service, { signal }) : serviceLease({ ...input, actor }, { ...service, signal });
 }
 
@@ -275,6 +281,24 @@ export async function takeLease(ctx, { body, signal }) {
 // after the grant finds its Hold. A waiter that holds nothing yet and an unknown id are 404 HUB_LEASE_NOT_FOUND (`waiting`, `unknown`).
 export function getLease(ctx, { params }) {
   return findLease(params.id, { env: ctx.env ?? process.env, warn: () => {} });
+}
+
+// POST /leases/{id}/extend: extends a phone Lease (Story 7.3), exactly `hub-device extend <id> --for ...`: `serviceExtend` is the one function
+// every service front door calls, and the status of a refusal comes from its HTTP table. The body is checked first (`checkExtendBody`);
+// the actor is the body's `actor`, else `{holder, via: 'api'}`, and an `override`'s actor defaults to it. 200 `Lease`.
+export function extendLeaseRoute(ctx, { body, params }) {
+  const input = checkExtendBody(body);
+  const actor = input.actor ?? { holder: input.holder, via: 'api' };
+  const override = input.override ? { ...input.override, actor: input.override.actor ?? actor } : null;
+  return serviceExtend(params.id, { ...input, actor, override }, serviceContext(ctx));
+}
+
+// POST /leases/{id}/release: gives a phone Lease back, or withdraws a waiter (Story 7.3), exactly `hub-device release <id>`, with the actor
+// on its events. 200 `Release`; an id that holds and waits for nothing is `outcome: none`.
+export function releaseLeaseRoute(ctx, { body, params }) {
+  const input = checkReleaseBody(body);
+  const actor = input.actor ?? { holder: input.holder, via: 'api' };
+  return serviceRelease(params.id, { ...input, actor }, serviceContext(ctx));
 }
 
 // `shape` names the `### <Shape>` section of the contract document that lists the response's fields.
@@ -290,6 +314,8 @@ export const ROUTES = Object.freeze([
   // `requestId` names the id a route echoes in `X-Request-Id` (from the request and its answer; the answer is null for an error).
   Object.freeze({ method: 'POST', path: '/leases', shape: 'Lease', handler: takeLease, requestId: ({ body }, view) => leaseRequestId(body, view) }),
   Object.freeze({ method: 'GET', path: '/leases/{id}', shape: 'Lease', handler: getLease }),
+  Object.freeze({ method: 'POST', path: '/leases/{id}/extend', shape: 'Lease', handler: extendLeaseRoute }),
+  Object.freeze({ method: 'POST', path: '/leases/{id}/release', shape: 'Release', handler: releaseLeaseRoute }),
 ]);
 
 // ---- dispatch ----

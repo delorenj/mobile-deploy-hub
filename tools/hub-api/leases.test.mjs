@@ -364,7 +364,7 @@ test('the HTTP table gives every library error a status; an unknown code has non
   assert.deepEqual(Object.entries(HTTP_ANSWERS).map(([code, answer]) => [code, answer.status, answer.reason ?? null]), [
     ['HUB_USAGE', 400, null], ['HUB_EMULATOR_USAGE', 400, null], ['HUB_LEASE_TOO_LONG', 400, null], ['HUB_DEVICE_JOB_ID', 400, null],
     ['HUB_NO_MATCH', 404, 'no-match'], ['HUB_LOCK_TIMEOUT', 409, 'busy'], ['HUB_DEVICE_BUSY', 409, 'busy'], ['HUB_POOL_CROSS_HOST', 409, null],
-    ['HUB_RESOURCE_RETIRED', 409, null], ['HUB_LEASE_CANCELLED', 409, null], ['HUB_LEASE_NOT_FOUND', 404, null], ['HUB_LEASE_SUPERSEDED', 409, 'superseded'], ['HUB_API_RESTARTING', 503, 'restarting'],
+    ['HUB_RESOURCE_RETIRED', 409, null], ['HUB_LEASE_CANCELLED', 409, null], ['HUB_LEASE_NOT_FOUND', 404, null], ['HUB_LEASE_EXTEND_REFUSED', 409, null], ['HUB_LEASE_LOST', 409, null], ['HUB_LEASE_SUPERSEDED', 409, 'superseded'], ['HUB_API_RESTARTING', 503, 'restarting'],
     ['HUB_PHONE_AWAY', 503, 'away'], ['HUB_DEVICE_AWAY', 503, 'away'], ['HUB_HOST_UNKNOWN', 503, 'host-unknown'],
   ]);
   for (const code of Object.keys(HTTP_ANSWERS)) assert.ok(code in EXIT_CODES, `${code} has an exit`);

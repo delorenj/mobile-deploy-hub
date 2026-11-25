@@ -50,7 +50,7 @@ async function startWaiter(s, id, lock = 's24') {
 const emptyAdb = () => ({ startServer: async () => {}, devices: async () => [], prop: async () => '' });
 
 test('the library exports the whole action surface and the exit table as frozen data', () => {
-  for (const name of ['resolve', 'take', 'release', 'extend', 'newLeaseId', 'checkBounds', 'checkLeaseId', 'usableFleet', 'emulatorBounds', 'statusView', 'leaseExports', 'jobTicket', 'releaseEmulatorNow', 'releaseReservations', 'exitCodeOf', 'fleetOf', 'loadFleet', 'matchTarget', 'hostKey', 'isLocal', 'hostKeyPath']) {
+  for (const name of ['resolve', 'take', 'release', 'extend', 'newLeaseId', 'checkBounds', 'checkLeaseId', 'usableFleet', 'emulatorBounds', 'statusView', 'leaseExports', 'jobTicket', 'releaseEmulatorNow', 'releaseReservations', 'extendHeld', 'serviceExtend', 'serviceRelease', 'checkExtendBody', 'checkReleaseBody', 'exitCodeOf', 'fleetOf', 'loadFleet', 'matchTarget', 'hostKey', 'isLocal', 'hostKeyPath']) {
     assert.equal(typeof claims[name], 'function', name);
   }
   assert.equal(claims.PHONE, 'phone');
@@ -59,7 +59,7 @@ test('the library exports the whole action surface and the exit table as frozen 
   assert.deepEqual({ ...claims.EXIT_CODES }, {
     HUB_USAGE: 2, HUB_EMULATOR_USAGE: 2, HUB_LEASE_TOO_LONG: 2, HUB_DEVICE_JOB_ID: 2,
     HUB_DEVICE_AWAY: 75, HUB_PHONE_AWAY: 75, HUB_DEVICE_BUSY: 76, HUB_LOCK_TIMEOUT: 76,
-    HUB_LEASE_CANCELLED: 1, HUB_LEASE_EXTEND_REFUSED: 1, HUB_LEASE_LOST: 1, HUB_HOST_UNKNOWN: 1,
+    HUB_LEASE_CANCELLED: 1, HUB_LEASE_EXTEND_REFUSED: 76, HUB_LEASE_LOST: 1, HUB_HOST_UNKNOWN: 1,
     // Story 5.7 (intended): the matcher's two refusals.
     HUB_NO_MATCH: 2, HUB_POOL_CROSS_HOST: 2, HUB_REGISTRY_CONFLICT: 1, HUB_REGISTRY_FORMAT: 1,
     // Story 6.3: a take of a retired or seed-missing Resource.
@@ -89,7 +89,7 @@ test('exitCodeOf maps a code through the table and anything else to 1', () => {
   assert.equal(code('HUB_EMULATOR_USAGE'), 2);
   assert.equal(code('HUB_LEASE_TOO_LONG'), 2);
   assert.equal(code('HUB_LEASE_CANCELLED'), 1);
-  assert.equal(code('HUB_LEASE_EXTEND_REFUSED'), 1);
+  assert.equal(code('HUB_LEASE_EXTEND_REFUSED'), 76);
   assert.equal(code('ENOENT'), 1);
   assert.equal(claims.exitCodeOf(new Error('no code')), 1);
   assert.equal(claims.exitCodeOf(null), 1);
@@ -293,19 +293,21 @@ test('extend: a live Lease with no waiter gets the new expiry and one extend eve
     waiter = await startWaiter(s, 'l-wwwwwwwwwwww');
     const refused = refusal('l-aaaaaaaaaaaa', 600_000);
     assert.equal(refused.code, 'HUB_LEASE_EXTEND_REFUSED');
-    assert.equal(claims.exitCodeOf(refused), 1);
+    assert.equal(claims.exitCodeOf(refused), 76);
+    assert.equal(refused.reason, 'waiters');
     assert.match(refused.message, /cannot be extended while 1 waiter waits/);
-    assert.equal(refusal('l-wwwwwwwwwwww', 600_000).code, 'HUB_LEASE_LOST');
+    assert.deepEqual([refusal('l-wwwwwwwwwwww', 600_000).code, refusal('l-wwwwwwwwwwww', 600_000).reason], ['HUB_LEASE_NOT_FOUND', 'waiting']);
     await claims.release({ id: 'l-wwwwwwwwwwww' }, s.ctx);
     assert.equal((await waiter.settled).code, 'HUB_LEASE_CANCELLED');
     // The deploy phone's 60 min cap.
     await claims.take(claims.resolve('s26', { fleet, env: s.env, ids: false }), options({ id: 'l-eeeeeeeeeeee', forMs: 3_000_000 }), s.ctx);
     assert.ok(/total/.test(refusal('l-eeeeeeeeeeee', 1_200_000).message));
     assert.equal(refusal('l-eeeeeeeeeeee', 1_200_000).code, 'HUB_LEASE_EXTEND_REFUSED');
+    assert.equal(refusal('l-eeeeeeeeeeee', 1_200_000).reason, 'cap');
     assert.equal(extend('l-eeeeeeeeeeee', 300_000).expires_at, new Date(T0 + 3_300_000).toISOString());
     const lost = refusal('l-nothing', 1000);
-    assert.equal(lost.code, 'HUB_LEASE_LOST');
-    assert.equal(claims.exitCodeOf(lost), 1);
+    assert.deepEqual([lost.code, lost.reason, claims.exitCodeOf(lost)], ['HUB_LEASE_NOT_FOUND', 'unknown', 2]);
+    assert.equal(refusal('job:delorenj/app#123.android/build', 1000).code, 'HUB_DEVICE_JOB_ID');
     assert.equal(refusal('l-aaaaaaaaaaaa', 0).code, 'HUB_USAGE');
   } finally { await waiter?.stop(); s.cleanup(); }
 });

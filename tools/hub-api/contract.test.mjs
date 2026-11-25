@@ -119,6 +119,8 @@ const POST_SAMPLES = Object.freeze({
   '/registry/resources/{id}': { status: 200, params: { id: 'res-pixel' }, setup: ['/registry/resources'], body: { if_rev: 2, name: 'pixel-9', capabilities: { api_level: 36 }, holder: 'contract-test' } },
   '/registry/resources/{id}/retire': { status: 200, params: { id: 'res-pixel' }, setup: ['/registry/resources'], body: { holder: 'contract-test' } },
   '/leases': { status: 200, body: { resource: 's24', for_ms: 1_800_000, holder: 'contract-test', why: 'contract', id: 'contract-1' } },
+  '/leases/{id}/extend': { status: 200, params: { id: 'contract-1' }, setup: ['/leases'], body: { for_ms: 600_000, holder: 'contract-test' } },
+  '/leases/{id}/release': { status: 200, params: { id: 'contract-1' }, setup: ['/leases'], body: { holder: 'contract-test' } },
 });
 
 // How each GET route with a parameter the default sample cannot stand for is called: `params` (over PARAM_SAMPLES) and `setup` (the
