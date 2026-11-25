@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadDevices } from '../ci/lib/devices.mjs';
-import { acquireLease, listWaiters } from '../ci/lib/lock.mjs';
+import { acquireLease, listWaiters, reserve } from '../ci/lib/lock.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { hermetic } from '../ci/test-fixtures.mjs';
 import { EXIT_CODES, createLeaseWaits } from '../device/claims.mjs';
@@ -145,6 +145,11 @@ async function afterCancel(state, answer) {
   }
 }
 
+// The live state `POST /reservations/{run_key}/force-release` needs: run acme/app#77 holding a Reservation of adb.
+function prepareReservation(ctx) {
+  reserve('adb', { env: { ...ctx.env, GITHUB_REPOSITORY: 'acme/app', GITHUB_RUN_ID: '77' }, log: () => {} });
+}
+
 const POST_SAMPLES = Object.freeze({
   '/registry/resources': { status: 201, body: { kind: 'phone', name: 'pixel', host: 'linux', identity: { serial: 'PX9', model: 'Pixel 9' }, capabilities: { api_level: 35 }, holder: 'contract-test' } },
   // After the seed (rev 1) and the setup register (rev 2), the edit is based on rev 2.
@@ -154,6 +159,7 @@ const POST_SAMPLES = Object.freeze({
   '/leases/{id}/extend': { status: 200, params: { id: 'contract-1' }, setup: ['/leases'], body: { for_ms: 600_000, holder: 'contract-test' } },
   '/leases/{id}/release': { status: 200, params: { id: 'contract-1' }, setup: ['/leases'], body: { holder: 'contract-test' } },
   '/leases/{id}/force-release': { status: 200, params: { id: 'contract-1' }, setup: ['/leases'], body: { why: 'contract', holder: 'contract-test' } },
+  '/reservations/{run_key}/force-release': { status: 200, params: { run_key: 'acme--app--77' }, prepare: prepareReservation, body: { why: 'contract', holder: 'contract-test' } },
   '/requests/{id}/cancel': { status: 200, params: { id: 'contract-wait' }, prepare: prepareCancel, after: afterCancel, body: { resource: 's24', host: 'linux', why: 'contract', holder: 'contract-test' } },
 });
 

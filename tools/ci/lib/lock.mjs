@@ -864,9 +864,10 @@ let lastReleased = 0;
 // Retires a Reservation: renames its directory to `.released-<key>-<ms>` (inside the reservations directory, so the key can be
 // reserved again at once and nothing ever lists it), and only the process whose rename won reads on: it puts the directory back
 // when it moved a different Reservation than the one it judged (a rerun reserved again in between), deletes it, and appends
-// `as` (`expiry` here, a release in Story 2.6) when the name is Queued and an event is wanted. True for the winner; every
-// failure is a false, never a throw, because this runs inside readers. `afterRename` is a test seam, called with the new path.
-function retireReservation(name, found, { as = null, reason = null, env = process.env, now = Date.now, hostId, afterRename = () => {} } = {}) {
+// `as` (`expiry` here, a release in Story 2.6, a force-release in Story 7.7) when the name is Queued and an event is wanted;
+// `fields` (the actor and why of a force-release) join the event's own. True for the winner; every failure is a false, never a
+// throw, because this runs inside readers. `afterRename` is a test seam, called with the new path.
+function retireReservation(name, found, { as = null, reason = null, fields = {}, env = process.env, now = Date.now, hostId, afterRename = () => {} } = {}) {
   const base = reservationsPath(name, env);
   const at = now();
   lastReleased = Math.max(Number.isFinite(at) ? Math.trunc(at) : 0, lastReleased + 1);
@@ -886,7 +887,7 @@ function retireReservation(name, found, { as = null, reason = null, env = proces
   try { rmSync(moved, { recursive: true }); } catch { /* a released directory never blocks the key */ }
   // A release by the run itself names its attempt and job; an expiry (some other run's acquirer) never does.
   const own = as === 'release' && runKey(env) === found.key ? env : null;
-  if (as && found.record) note(name, eventOf(as, name, reservationSubject(found.record, own), reservationFields(found, { held_ms: Math.max(0, at - found.reserved_ms), reason })), { env, at, hostId });
+  if (as && found.record) note(name, eventOf(as, name, reservationSubject(found.record, own), reservationFields(found, { held_ms: Math.max(0, at - found.reserved_ms), reason, ...fields })), { env, at, hostId });
   return true;
 }
 
@@ -895,12 +896,22 @@ function retireReservation(name, found, { as = null, reason = null, env = proces
 // `key` is the run to release (default: this process's own run). Returns { status: 'released' | 'none', key }: none when nothing
 // is reserved, the record is unreadable (an owner mid-write is never taken away), or another process released it first. Never
 // throws: a release is an optimization and the ceiling ends a Reservation this misses.
-export function releaseReservation(name, { env = process.env, now = Date.now, hostId = machineId(), key = null, reason = 'done' } = {}) {
+// With an `actor` (Story 7.7) it is a force-release by someone outside the run: the same rename decides, the one event is a
+// `force-release` (`hold_kind: reservation`, `actor`, `why`, `reason: null`) and the answer also carries `reservation` (the record
+// it ended). There is no holder check. A malformed actor is a TypeError and an empty or non-string `why` HUB_USAGE (`bad-why`),
+// both before anything is read: that is the one way this throws. Without an actor nothing here changes (the deploy path never passes one).
+export function releaseReservation(name, { env = process.env, now = Date.now, hostId = machineId(), key = null, reason = 'done', actor = null, why = null } = {}) {
+  const forced = actor !== null && actor !== undefined ? checkActor(actor) : null;
+  if (forced && (typeof why !== 'string' || why.trim() === '')) throw Object.assign(failure('HUB_USAGE', 'a force-release says why: a non-empty why'), { reason: 'bad-why' });
   const run = key ?? runKey(env);
   if (!RESERVABLE.includes(name) || typeof run !== 'string' || run === '' || run.startsWith('.') || run.includes('/')) return { status: 'none', key: run };
   try {
     const found = readReservation(join(reservationsPath(name, env), run), run);
     if (!found) return { status: 'none', key: run };
+    if (forced) {
+      const ended = retireReservation(name, found, { as: 'force-release', reason: null, fields: { actor: forced, why }, env, now, hostId });
+      return ended ? { status: 'released', key: run, reservation: found.record } : { status: 'none', key: run };
+    }
     return { status: retireReservation(name, found, { as: 'release', reason, env, now, hostId }) ? 'released' : 'none', key: run };
   } catch { return { status: 'none', key: run }; }
 }
@@ -1898,7 +1909,7 @@ export function cancelRequest(name, lease_id, { actor, why = null, pool, env = p
   const jobTicket = () => Object.assign(failure('HUB_DEVICE_JOB_ID', `${lease_id} is a deploy job, not a Lease request: cancel it through GitHub`), { id: lease_id });
   if (lease_id.startsWith('job:')) throw jobTicket();
   if (readReservations(name, env).some(found => found.key === lease_id)) {
-    throw Object.assign(failure('HUB_CANCEL_RESERVATION', `${lease_id} is a Reservation on ${name}, not a queued request: force-release it`), { id: lease_id });
+    throw Object.assign(failure('HUB_CANCEL_RESERVATION', `${lease_id} is a Reservation on ${name}, not a queued request: force-release it (hub-device force-release --reservation ${lease_id} --why ..., POST /reservations/${lease_id}/force-release)`), { id: lease_id });
   }
   const none = { cancelled: false, reason: 'none' };
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(lease_id)) return none;
