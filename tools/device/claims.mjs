@@ -11,7 +11,7 @@ import { statSync } from 'node:fs';
 import { join } from 'node:path';
 import { findPhone, idMatchesSerial } from '../ci/lib/adb.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
-import { MAX_LEASE_MS, RESERVABLE, acquireLease, capText, deployTargetCapMs, etaHistory, extendLease, isLease, listLocks, lockDir, newLeaseId as newLockLeaseId, poolRequest, queueView, readOwner, releaseLease, releaseReservation, updateLease, waiterEtas } from '../ci/lib/lock.mjs';
+import { MAX_LEASE_MS, RESERVABLE, acquireLease, capText, deployTargetCapMs, etaHistory, extendLease, isLease, listLocks, lockDir, nameRefusal, newLeaseId as newLockLeaseId, poolRequest, queueView, readOwner, releaseLease, releaseReservation, updateLease, waiterEtas } from '../ci/lib/lock.mjs';
 import { pause, sleep as realSleep } from '../ci/lib/pause.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { createAsyncAdb } from './async-adb.mjs';
@@ -69,6 +69,9 @@ export function fleetOf(devices) {
   const deploy = { device: 's26', lock: 'adb', deploy: true, name: devices.android.name, serial: devices.android.serial, model: devices.android.model };
   const extras = (devices.android_extra ?? []).map(entry => {
     const device = entry.name.toLowerCase();
+    // The same name rule parseDevices applies (lock.mjs), so a fleet built from hand-made devices never carries a reserved word that is not seeded.
+    const refusal = nameRefusal(device);
+    if (refusal) throw new Error(`devices.json: android_extra[].name may not be "${device}" (${refusal})`);
     return { device, lock: device, deploy: false, name: entry.name, serial: entry.serial, model: entry.model };
   });
   return [...extras, deploy];

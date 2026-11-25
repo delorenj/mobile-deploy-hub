@@ -25,10 +25,57 @@ import { eta, etaMoved, formatEta } from './eta.mjs';
 
 export const lockDir = (env = process.env, home = homedir()) => env.HUB_LOCK_DIR || join(home, '.cache/mobile-deploy-hub/locks');
 
+// Names (AD-28, AD-29): this module is the one owner of what a lock, a Resource word or a Lease id may be called. A slug is
+// lowercase letters and digits in runs split by single dashes; a slug is 1 to 32 characters and a Resource name at most 28, so
+// `res-<name>-999` (a Registry-minted lock with a numeric suffix) is still a slug of at most 32.
+export const SLUG = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+export const SLUG_MAX = 32;
+export const NAME_MAX = 28;
+export const isSlug = (text, max = SLUG_MAX) => typeof text === 'string' && text.length >= 1 && text.length <= max && SLUG.test(text);
+
+// The one reserved-word list: exact words, `<prefix>*` shapes and the `emulator-<n>` shape. These are the CLI's device words,
+// the lock names the hub itself takes, the service names and the id shapes it mints, so no Resource can be named like one.
+// `ios-lane` is a seeded Resource id and `run-*` an id shape `claims.newLeaseId` mints: id resolution comes before word
+// resolution, so a name in either shape would be shadowed. Data only (strings), so the Registry store imports it as it is.
+export const RESERVED = Object.freeze([
+  'phone', 'emulator', 'adb', 's24', 's26', 'ipad', 'mac', 'mac-ios', 'ios-lane', 'emulator-reaper',
+  's3-*', 'emulator-<n>', 'registry', 'hub-api', 'host-agent', 'res-*', 'l-*', 'e-*', 'run-*', 'job:*',
+]);
+const reservedMatches = (entry, name) => {
+  if (entry === 'emulator-<n>') return /^emulator-\d+$/.test(name);
+  return entry.endsWith('*') ? name.startsWith(entry.slice(0, -1)) : entry === name;
+};
+// The RESERVED entry `name` matches, or null.
+export const reservedBy = name => (typeof name === 'string' ? RESERVED.find(entry => reservedMatches(entry, name)) ?? null : null);
+
+// The seed (AD-40): the Resources devices.json declares, as the lock each one has always sat on, mapped to its Resource id. A
+// pure name map; names.test.mjs keeps it equal to what devices.json derives. The emulator Pool is the Resource of `emulator`
+// and every `emulator-<n>` slot; a `res-<slug>` lock is its own Resource.
+export const SEED_RESOURCES = Object.freeze({ adb: 's26', s24: 's24', 'mac-ios': 'ios-lane' });
+export const EMULATOR_POOL = 'emulator';
+export const resourceOf = lock => {
+  if (typeof lock !== 'string') return null;
+  if (Object.hasOwn(SEED_RESOURCES, lock)) return SEED_RESOURCES[lock];
+  if (lock === 'emulator' || /^emulator-\d+$/.test(lock)) return EMULATOR_POOL;
+  return isRegistryLock(lock) ? lock : null;
+};
+
+// Why `name` cannot name a Resource, or null when it can: not a slug, over 28 characters, or a reserved word that is not the
+// seeded Resource's own (a seeded Resource keeps its word: `s24` is allowed because SEED_RESOURCES maps the lock `s24` to `s24`).
+export function nameRefusal(name) {
+  if (typeof name !== 'string' || !SLUG.test(name)) return 'not a slug: lowercase letters and digits, single dashes between';
+  if (name.length > NAME_MAX) return `longer than ${NAME_MAX} characters`;
+  const entry = reservedBy(name);
+  if (entry !== null && !(Object.hasOwn(SEED_RESOURCES, name) && SEED_RESOURCES[name] === name)) return `a reserved word (${entry})`;
+  return null;
+}
+
 // The Queued set (AD-4): the device locks whose transitions are history. `emulator` is the pool gate; its slots are
-// `emulator-<n>`. Every other name (s3-*, s3-index, emulator-reaper) writes no events.
+// `emulator-<n>`; a Registry lock is `res-<slug>` (AD-29). Decided by name alone, never by reading a file. Every other name
+// (s3-*, s3-index, emulator-reaper) writes no events.
 export const QUEUED = Object.freeze(['adb', 's24', 'mac-ios', 'emulator']);
-export const isQueued = name => QUEUED.includes(name) || /^emulator-\d+$/.test(name);
+const isRegistryLock = name => typeof name === 'string' && name.startsWith('res-') && isSlug(name.slice('res-'.length));
+export const isQueued = name => QUEUED.includes(name) || (typeof name === 'string' && /^emulator-\d+$/.test(name)) || isRegistryLock(name);
 
 // A holder of a Queued lock touches <name>.lock/alive this often at most (AD-19), so a reclaim can say when it was last seen.
 export const ALIVE_MS = 60_000;
@@ -103,12 +150,13 @@ const iso = ms => (Number.isFinite(ms) ? new Date(ms).toISOString() : null);
 // The AD-9 event body for a hold or a request. `subject` is an owner record, or the would-be owner of a request (a Lease:
 // kind 'lease', lease_id, holder; a job: its owner without started_at). A Lease is taken by an agent (v1a has no person
 // surface), a withLock job by a deploy run unless it says `hub-job` (the catch-up). An owner from before v1a (no kind) is a
-// deploy job. for_ms and expires_at describe a Lease; `fields` fills or overrides the rest.
+// deploy job. for_ms and expires_at describe a Lease; `fields` fills or overrides the rest. `resource` is the Resource the lock
+// stands for (resourceOf, by name alone), null on a Pool-level event; old readers ignore it (AD-2).
 function eventOf(event, name, subject, fields = {}) {
   const lease = isLease(subject);
   const forMs = expiresAt(subject) - Date.parse(subject?.started_at);
   return {
-    event, lock: name, hold_kind: subject ? (lease ? 'lease' : 'job') : null,
+    event, lock: name, resource: resourceOf(name), hold_kind: subject ? (lease ? 'lease' : 'job') : null,
     claimant: {
       kind: subject ? (lease ? 'agent' : subject.kind === 'hub-job' ? 'hub-job' : 'deploy') : null,
       holder: subject?.holder ?? null, repo: subject?.repo ?? null, run: subject?.run ?? null, attempt: subject?.attempt ?? null, job: subject?.job ?? null,
@@ -1373,8 +1421,8 @@ export function extendLease(name, id, { forMs, env = process.env, now = Date.now
 
 // The most Lease holders a `refused` event names; the rest are counted in `installed_by_more`, so the line stays under 4 KiB.
 export const REFUSED_NAMES_MAX = 10;
-const NAME_MAX = 64;
-const clip = value => (typeof value === 'string' ? value.slice(0, NAME_MAX) : null);
+const CLIP_MAX = 64;
+const clip = value => (typeof value === 'string' ? value.slice(0, CLIP_MAX) : null);
 const msOf = value => (typeof value === 'number' ? value : Date.parse(value));
 const LEASE_EVENTS = Object.freeze(['acquire', 'extend', 'release', 'reclaim', 'force-release']);
 const LEASE_ENDS = Object.freeze(['release', 'reclaim', 'force-release']);

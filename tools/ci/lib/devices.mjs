@@ -4,6 +4,7 @@
 // outbox) and big-chungus (its ssh alias on the Mac, the staging folder).
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { nameRefusal } from './lock.mjs';
 
 const defaultFile = fileURLToPath(new URL('../devices.json', import.meta.url));
 const fail = message => { throw new Error(`devices.json: ${message}`); };
@@ -30,9 +31,12 @@ export function parseDevices(source) {
       names.push(entry.name.toLowerCase());
     }
     if (new Set(names).size !== names.length) fail('android_extra[].name must be unique');
-    // s26/phone/emulator are hub-device's own words; adb is the deploy lock — an extra phone named "Adb" would
-    // build a second fleet entry on the lock deploys take.
-    for (const reserved of ['s26', 'phone', 'emulator', 'adb']) if (names.includes(reserved)) fail(`android_extra[].name may not be "${reserved}" (a hub-device device word or the deploy lock already)`);
+    // One name rule for every Resource word and lock (lock.mjs): a reserved word (a hub-device device word, a deploy lock, an id
+    // shape) is refused unless it is the seeded Resource's own. An extra phone named "Adb" would build a second fleet entry on the lock deploys take.
+    for (const name of names) {
+      const reason = nameRefusal(name);
+      if (reason) fail(`android_extra[].name may not be "${name}" (${reason})`);
+    }
   }
   if (!/^[0-9A-F]{8}-[0-9A-F]{16}$|^[0-9a-f]{40}$/.test(ios?.udid ?? '')) fail('ios.udid must be the device UDID');
   if (!/^[A-Za-z]+\d+,\d+$/.test(ios?.model ?? '')) fail('ios.model must be a product type like iPad14,5');
