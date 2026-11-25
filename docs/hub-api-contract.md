@@ -26,6 +26,7 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 | GET | `/resources` | ResourceList | 6.5 |
 | GET | `/resources/{id}` | Resource | 6.5 |
 | GET | `/pools` | PoolList | 6.5 |
+| GET | `/discovery` | Discovery | 6.10 |
 | POST | `/registry/resources` | Resource | 6.6 |
 | POST | `/registry/resources/{id}` | Resource | 6.7 |
 | POST | `/registry/resources/{id}/retire` | Retirement | 6.7 |
@@ -61,6 +62,15 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 - `resources[].created_at` an ISO time, or `null` (the in-memory seed has none)
 - `resources[].retired_at` an ISO time, or `null`
 - `resources[].visibility` `visible`, or `retiring` (retired or seed-missing but still held or waited on)
+- `resources[].reachability.state` `reachable`, `unauthorized`, `offline`, `absent` or `unknown`. `unknown` means nobody checked (or the transport could not say); it is never shown as `reachable`. `stale` is never served: a reader derives it from the age
+- `resources[].reachability.checked_at` an ISO time, when the service's probe took the reading, or `null`. A reader never computes an age from it
+- `resources[].reachability.age_ms_at_receipt` the reading's age in ms as of this response, or `null` when there is no reading
+- `resources[].reachability.received_at` the service's clock when it answered, in ms since the epoch, or `null` when there is no reading
+- `resources[].reachability.source` `probe` (the service read it from the host's adb server), or `null` when there is no reading
+
+`reachability` is on this list only: the `Resource` of the other routes has no such field. A reading is never waited for: a request answers from the service's cache at once, and a missing or stale reading (older than `registry.reachability_max_age_s`, 60 s) starts one refresh in the background (at most one at a time), so the first read after a start shows `unknown` with every other field `null`. Only the Resources on the service's own host are probed; an `ios-lane` or the `emulator` Pool reads `unknown`. A change of state is logged once as a `reachability` event. The service remembers what it logged only for as long as it runs, so the first reading after a service start is logged with `from: null`.
+
+The age rule: a reader on the service's host computes `age_ms = age_ms_at_receipt + now - received_at` on its own clock. A client on another host first re-stamps the reading with `receive` (`tools/registry/reachability.mjs`), which keeps `age_ms_at_receipt` and sets `received_at` to the client's own clock, so neither clock's skew can make a reading look fresher than it is.
 
 ### Resource
 
@@ -106,6 +116,20 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 - `pools[].kind` `named` (a list of Resources) or `gate` (one lock, no list)
 - `pools[].members` for a `named` Pool the ids a lease of it would try, in order (`[]` when none can serve it); always `[]` for a `gate`
 - `pools[].gate` the gate's lock name, or `null`
+
+### Discovery
+
+`GET /discovery`: the devices on the hub's adb server that no live Resource of the Registry names (FR-4, FR-5), so a freshly paired phone shows up before anyone registers it. Read only: it asks `host:version` and `host:devices-l`, plus one serial read for each `host:port` id in `device` state, and never starts a server, connects or pairs. A Resource that is retired or seed-missing no longer names its phone. A device the private QA file names is left out, so no QA serial appears in the body. An adb server that is not running is `note: no adb server` with `devices: []`, still 200. An unknown host key is 503 `HUB_HOST_UNKNOWN`.
+
+- `format` always `1`
+- `host` the host key the service runs on: `linux` (the Hub API on big-chungus). A service on the Mac's key answers `host: mac`, `via: devicectl`, `port: null`
+- `via` how the host was asked: `adb` on `linux`, `devicectl` on `mac`
+- `port` the adb server port that was asked, or `null` on a host that does not use adb
+- `note` `null`, `no adb server` (none is running) or `adb did not answer` (it is wedged or not adb)
+- `devices[].serial` the phone's serial, or `null` when it could not be read (an `unauthorized` or `offline` `host:port` id)
+- `devices[].model` the model adb lists, or `null`
+- `devices[].id` the adb id: the serial over USB, the mDNS service name, or `host:port`
+- `devices[].state` the state adb lists it in (`device`, `unauthorized`, `offline`, ...)
 
 ### Problem
 
@@ -176,6 +200,7 @@ For every write route the actor is `actor` as given, else `{holder, via: 'api'}`
 | `HUB_REGISTRY_NAME` | 400, 409 | 2 | A register's or edit's name is not a slug (`not-slug`) or is too long (`too-long`) with 400; reserved (`reserved`), already used (`taken`) or out of `-<n>` suffixes (`exhausted`) with 409. |
 | `HUB_REGISTRY_DUPLICATE` | 409 | 2 | A live Resource already has the serial (`reason: serial`) or UDID (`reason: udid`); `holder` names it. |
 | `HUB_REGISTRY_CONFLICT` | 409 | 1 | `if_rev` is not the Registry's revision; `rev` is the current one. |
+| `HUB_HOST_UNKNOWN` | 503 | 1 | `GET /discovery` on a host that does not know which host it is (`reason: host-unknown`): `~/.config/mobile-deploy-hub/host-key` is missing, empty, unknown or for another platform. `mise run hosts:install` writes it. |
 | `HUB_REGISTRY_FORMAT` | 409 | 1 | `registry.json` exists and cannot be read, or is a format this service does not know. It is never written. |
 | `HUB_API_ERROR` | 500 | 1 | A bug in the service. The detail is one line; the journal has the same line. |
 | `HUB_API_ALREADY_RUNNING` | none | 1 | Start only: the port is taken. Never an HTTP answer. |

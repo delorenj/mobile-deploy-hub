@@ -3,18 +3,26 @@
 // once and takes the route table as a parameter, so the Host Agent (Epic 7) reuses it and every route story adds one row to `ROUTES`, one
 // row and one `### <Shape>` section to docs/hub-api-contract.md, and nothing else (tools/hub-api/contract.test.mjs holds the two equal).
 //
+// Reachability and discovery (Story 6.10): `GET /resources` rows carry the service's cached reading of each Resource (`ctx.readings`,
+// tools/hub-api/readings.mjs) and `GET /discovery` lists what the host's adb server shows that no live Resource names. A reader never
+// waits for a probe; the context's device seams (`adbWire`, `inventory`, `hostKey`, `sleep`, `devicectl`) are injected, never reached.
+//
 // Every response carries `Cache-Control: no-store` and snake_case keys. Success is `application/json`; an error is
 // `application/problem+json` with exactly {type, title, status, detail, code, exit, reason}, where `exit` is what a CLI front door
 // exits with for the same error (claims.mjs's one table). Paths match exactly: no prefix, no trailing-slash folding, and the query
 // string is ignored for routing. A `{name}` segment in a route path is a parameter: one non-empty, URI-decoded segment, handed to the
 // handler as `request.params`; a literal route wins over a parameterised one.
 import { STATUS_CODES } from 'node:http';
-import { HOST_PLATFORMS, exitCodeOf, lockActivity } from '../device/claims.mjs';
+import { idMatchesSerial } from '../ci/lib/adb.mjs';
+import { HOST_PLATFORMS, discover as discoverHost, exitCodeOf, hostKey as realHostKey, lockActivity } from '../device/claims.mjs';
 import { hubRef } from '../ci/lib/receipt.mjs';
+import { NO_READING } from '../registry/reachability.mjs';
+import { loadQaDevices } from '../registry/seed.mjs';
 import { retirement, visibility } from '../registry/match.mjs';
 import { checkEditBody, checkRegisterBody, checkRetireBody, planEdit, planRegister, planRetire } from '../registry/changes.mjs';
 import { REGISTRY_ERRORS, applySeed, readRegistry, registryState, updateRegistry } from '../registry/store.mjs';
 import { viewPools, viewRecord } from '../registry/view.mjs';
+import { deviceCtx } from './readings.mjs';
 
 export const CONTRACT_VERSION = 1;
 export const SERVICE = 'mobile-deploy-hub-api';
@@ -93,10 +101,18 @@ function serve(ctx, record) {
   return viewRecord(record, { audience: 'service', held: activity.held === true, queued: activity.queued === true });
 }
 
-// GET /resources: every visible Resource (visible or retiring), in the Registry's order.
+// GET /resources: every visible Resource (visible or retiring), in the Registry's order, each with its `reachability` (AD-35): the
+// service's cached reading in its served form, read without waiting (a stale or missing one starts one refresh in the background), or
+// the no-reading form when the context has no cache. Only this list carries it: the `Resource` shape is the same for every route.
 export function listResources(ctx) {
   const registry = readIt(ctx);
-  return { rev: registry.rev, source: registry.source, resources: registry.resources.map(record => serve(ctx, record)).filter(Boolean) };
+  const shown = registry.resources.map(record => ({ record, resource: serve(ctx, record) })).filter(entry => entry.resource !== null);
+  const readings = ctx.readings?.read(shown.map(entry => entry.record)) ?? new Map();
+  return {
+    rev: registry.rev,
+    source: registry.source,
+    resources: shown.map(({ record, resource }) => ({ ...resource, reachability: readings.get(record.id) ?? { ...NO_READING } })),
+  };
 }
 
 // GET /resources/{id}: one Resource by id (only the id). Unknown is 404 `unknown`; a hidden one is 404 `retired`.
@@ -113,6 +129,30 @@ export function getResource(ctx, { params }) {
 export function listPools(ctx) {
   const registry = readIt(ctx);
   return { rev: registry.rev, source: registry.source, pools: viewPools(registry, ctx.policy) };
+}
+
+// GET /discovery: the devices this host can see that no live Resource names (FR-4, FR-5): `claims.discover` over the hub's adb server
+// (read only: never started or connected), with the Registry's live records as the exclusion set. A device the private QA file names
+// (by serial, or an adb id that embeds it) is dropped here, so a QA serial is in no part of the body. A host that does not know its
+// key is 503 HUB_HOST_UNKNOWN.
+const HOST_UNKNOWN = message => routeError(503, 'HUB_HOST_UNKNOWN', message, 'host-unknown');
+
+export async function discovery(ctx) {
+  const env = ctx.env ?? process.env;
+  let document;
+  try {
+    const key = (ctx.hostKey ?? realHostKey)({ env });
+    // `/health` already reports an unreadable registry.json, so a read of it here stays silent, as `/resources` does.
+    document = await discoverHost(key, { ...deviceCtx(ctx), warn: () => {} }, { devices: ctx.devices, qaDevices: ctx.qaDevices });
+  } catch (error) {
+    throw error?.code === 'HUB_HOST_UNKNOWN' ? HOST_UNKNOWN(oneLine(error.message)) : error;
+  }
+  const qa = (ctx.qaDevices ?? (() => loadQaDevices({ env })))().map(entry => entry?.serial).filter(serial => typeof serial === 'string' && serial !== '');
+  const named = device => qa.some(serial => device.serial === serial || (typeof device.id === 'string' && idMatchesSerial(device.id, serial)));
+  return {
+    format: document.format, host: document.host, via: document.via, port: document.port, note: document.note,
+    devices: document.devices.filter(device => !named(device)).map(({ serial, model, id, state }) => ({ serial, model, id, state })),
+  };
 }
 
 // POST /registry/resources: registers a Resource (FR-1). The body is checked first (a bad one writes nothing, not even the seed). The
@@ -201,6 +241,7 @@ export const ROUTES = Object.freeze([
   Object.freeze({ method: 'GET', path: '/resources', shape: 'ResourceList', handler: listResources }),
   Object.freeze({ method: 'GET', path: '/resources/{id}', shape: 'Resource', handler: getResource }),
   Object.freeze({ method: 'GET', path: '/pools', shape: 'PoolList', handler: listPools }),
+  Object.freeze({ method: 'GET', path: '/discovery', shape: 'Discovery', handler: discovery }),
   Object.freeze({ method: 'POST', path: '/registry/resources', shape: 'Resource', handler: registerResource }),
   Object.freeze({ method: 'POST', path: '/registry/resources/{id}', shape: 'Resource', handler: editResource }),
   Object.freeze({ method: 'POST', path: '/registry/resources/{id}/retire', shape: 'Retirement', handler: retireResource }),

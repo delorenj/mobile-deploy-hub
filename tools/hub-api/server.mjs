@@ -16,6 +16,7 @@ import { pathToFileURL } from 'node:url';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { exitCodeOf } from '../device/claims.mjs';
 import { recoverRegistry, applySeed } from '../registry/store.mjs';
+import { createReadings } from './readings.mjs';
 import { ROUTES, SERVICE, handle } from './routes.mjs';
 
 export const HOST = '127.0.0.1';
@@ -137,8 +138,10 @@ export async function startService({
 // ---- the Hub API ----
 
 // The Hub API: the policy's port, then (after the bind has won) recovery and the seed. A recovery or seed error is one line on stderr
-// and the service keeps serving; `/health` says `registry: unreadable` when the file is the problem.
-export async function startHubApi({ policy, env = process.env, log = defaultLog(), now, hostId, devices, qaDevices, routes = ROUTES, ...seams } = {}) {
+// and the service keeps serving; `/health` says `registry: unreadable` when the file is the problem. The device seams (`adbWire`,
+// `inventory`, `hostKey`, `sleep`, `devicectl`) go into the request context and into the one readings cache (Story 6.10); a refresh of
+// it is started by a read, never by a timer.
+export async function startHubApi({ policy, env = process.env, log = defaultLog(), now, hostId, devices, qaDevices, routes = ROUTES, adbWire, inventory, hostKey, sleep, devicectl, ...seams } = {}) {
   const resolved = policy ?? loadPolicy().policy;
   const afterBind = async () => {
     try {
@@ -148,7 +151,9 @@ export async function startHubApi({ policy, env = process.env, log = defaultLog(
       log.err(`HUB_API_SEED_FAILED ${error?.code ?? 'ERROR'} ${oneLine(error)}`);
     }
   };
-  return startService({ ...seams, service: SERVICE, port: resolved.api.hub_api_port, routes, ctx: { policy: resolved, now, hostId, devices, qaDevices }, afterBind, env, log });
+  const device = { adbWire, inventory, hostKey, sleep, devicectl };
+  const readings = createReadings({ env, policy: resolved, now, hostId, log: log.err, ...device });
+  return startService({ ...seams, service: SERVICE, port: resolved.api.hub_api_port, routes, ctx: { policy: resolved, now, hostId, devices, qaDevices, readings, ...device }, afterBind, env, log });
 }
 
 // The process entry: starts the service and ends 0 after a stop. An error prints `<CODE> <message>` on stderr and exits with its `exit`.

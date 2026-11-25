@@ -682,6 +682,16 @@ async function phoneObservations(fleet, ctx, found) {
   }));
 }
 
+// The one adb-to-Reachability path (AD-35): the hub's adb server over the wire (inventory first, so a server nobody started is never
+// asked), then each phone's observation mapped to a Reachability. `phones` are fleet entries (`phonesOf`); returns Map(device -> state).
+// Read only: the same two wire requests `status` and `discover` make (and the one serial read per `host:port` id), nothing started.
+export async function phoneReadings(phones, ctx) {
+  const { env } = ctx;
+  const found = (ctx.inventory ?? realInventory)({ lockRoot: lockDir(env), hubAdbPort: Number(env.HUB_ADB_SERVER_PORT) || 5037 });
+  const observed = await phoneObservations(phones, ctx, found);
+  return new Map(phones.map(phone => [phone.device, phoneReachability(observed.get(phone.device) ?? null)]));
+}
+
 // What `presence` has always said for an observation: adb's own word for a state, `reachable` for `device`, `absent` for none.
 const presenceOf = observed => (observed === 'device' ? 'reachable' : observed === null ? 'absent' : observed);
 
@@ -865,22 +875,23 @@ export async function statusView(key, options, ctx) {
 
 // ---- discover (FR-4) ----
 
-// The devices this host can see that no seeded Resource names, from the read-only queries only: the hub's adb server over the wire on
-// the Linux host (never started, connected or asked through the adb client; no server answers `no adb server`), `devicectl list
-// devices` on the Mac. The host key picks the transport (AD-47): a host that does not know its key throws HUB_HOST_UNKNOWN, because
-// guessing from the platform would list the Mac's adb devices, which are not the hub's. The seed is devices.json's alone: the QA file
-// is never read. Returns `reachability.discover`'s document. Writes nothing.
-export async function discover(key, ctx) {
+// The devices this host can see that no live Resource of the Registry names, from the read-only queries only: the hub's adb server over
+// the wire on the Linux host (never started, connected or asked through the adb client; no server answers `no adb server`), `devicectl
+// list devices` on the Mac. The host key picks the transport (AD-47): a host that does not know its key throws HUB_HOST_UNKNOWN, because
+// guessing from the platform would list the Mac's adb devices, which are not the hub's. "Names" is the Registry's live records
+// (`readRegistry`, retired and seed-missing ones excluded): the file when it is good, else the seed of `devices` (default devices.json)
+// with the caller's `qaDevices` (default none: the CLI never reads the QA file). Returns `reachability.discover`'s document. Writes nothing.
+export async function discover(key, ctx, { devices, qaDevices } = {}) {
   if (key !== 'linux' && key !== 'mac') throw failure('HUB_HOST_UNKNOWN', `this host does not know which host it is${key ? ` ("${key}" is neither linux nor mac)` : ''}, so it cannot choose how to discover devices; run \`mise run hosts:install\` on it`);
   const { env, timing } = ctx;
-  const registry = seed(loadDevices(env), { qaDevices: () => [] });
+  const live = readRegistry({ env, devices, qaDevices: qaDevices ?? (() => []), warn: ctx.warn }).resources.filter(record => retirement(record) === null);
   if (key === 'mac') {
     let ipads;
     try { ipads = { document: await (ctx.devicectl ?? createDevicectl({ env }))(['list', 'devices'], 10) }; } catch (error) { ipads = { error }; }
-    return discoverDevices({ seed: registry, host: 'mac', ipads });
+    return discoverDevices({ seed: live, host: 'mac', ipads });
   }
   const hubPort = Number(env.HUB_ADB_SERVER_PORT) || 5037;
   const found = (ctx.inventory ?? realInventory)({ lockRoot: lockDir(env), hubAdbPort: hubPort });
   const adb = await queryAdb({ port: hubPort, running: found.adb_servers.some(server => server.port === hubPort), wire: ctx.adbWire ?? createAdbWire, sleep: timing.sleep });
-  return discoverDevices({ seed: registry, host: 'linux', adb });
+  return discoverDevices({ seed: live, host: 'linux', adb });
 }

@@ -59,7 +59,7 @@ test('no file: the seed at rev 0, s24, s26 (a deploy target), ios-lane and emula
     assert.equal(answer.body.source, 'seed');
     assert.deepEqual(ids(answer), ['s24', 's26', 'ios-lane', 'emulator', 'res-pixel-qa']);
     for (const resource of answer.body.resources) {
-      assert.deepEqual(Object.keys(resource), [...RECORD_KEYS]);
+      assert.deepEqual(Object.keys(resource), [...RECORD_KEYS, 'reachability']);
       assert.equal(resource.created_at, null);
       assert.equal(resource.visibility, 'visible');
       assert.equal(resource.seed_missing, false);

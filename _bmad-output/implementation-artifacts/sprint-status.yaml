@@ -91,7 +91,7 @@ development_status:
   6-7-edit-and-retire-a-resource: done
   6-8-registry-verbs-in-hub-device-and-a-clear-message-when-the-ap: done
   6-9-a-registered-phone-is-leasable-within-a-minute: done
-  6-10-reachability-and-discovery-through-the-api: backlog
+  6-10-reachability-and-discovery-through-the-api: done
   6-11-the-service-runs-from-a-release-and-a-stop-never-kills-an-em: backlog
   6-12-ship-the-registry-and-the-hub-api: backlog
   epic-6-retrospective: optional

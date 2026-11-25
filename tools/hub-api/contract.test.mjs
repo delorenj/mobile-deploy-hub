@@ -16,6 +16,7 @@ import { loadDevices } from '../ci/lib/devices.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { hermetic } from '../ci/test-fixtures.mjs';
 import { EXIT_CODES } from '../device/claims.mjs';
+import { fakeWire } from '../device/wire-fixtures.mjs';
 import { CONTRACT_VERSION, PROBLEM_EXTENSIONS, ROUTES, handle } from './routes.mjs';
 
 hermetic();
@@ -148,7 +149,10 @@ function scratch() {
   const root = mkdtempSync(join(tmpdir(), 'hub-api-contract-'));
   const env = { PATH: process.env.PATH, HOME: root, HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events') };
   const devices = structuredClone(loadDevices({}));
-  return { root, ctx: { env, policy: loadPolicy().policy, devices, qaDevices: () => [], log: { out: () => {}, err: () => {} } }, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  // One unregistered phone on a fake adb server, so `GET /discovery` has a device to describe; nothing here touches a real adb.
+  const serverUp = () => ({ adb_servers: [{ port: 5037, pid: 4242, cwd: null }], emulators: [], xvfb: [] });
+  const adbWire = fakeWire({ listed: [{ id: 'ZY22PIX', state: 'device', model: 'Pixel_9' }] });
+  return { root, ctx: { env, policy: loadPolicy().policy, devices, qaDevices: () => [], hostKey: () => 'linux', inventory: serverUp, adbWire, log: { out: () => {}, err: () => {} } }, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 test('the Status line carries the contract version of the code', () => {

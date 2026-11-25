@@ -13,6 +13,7 @@ import { readEvents } from '../ci/lib/events.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { writeFileAtomic } from '../ci/lib/lock.mjs';
 import { hermetic } from '../ci/test-fixtures.mjs';
+import { fakeWire } from '../device/wire-fixtures.mjs';
 import { applySeed, registryPath } from '../registry/store.mjs';
 import { CONTRACT_VERSION, ROUTES, SERVICE, handle } from './routes.mjs';
 import { MAX_BODY_BYTES, main, nodeAtLeast, onPath, requestListener, startHubApi, startService } from './server.mjs';
@@ -479,6 +480,33 @@ test('startHubApi hands its devices and qaDevices to the routes: an injected QA 
     assert.equal(one.res.head.status, 200);
     assert.equal(one.json().resource.id, 's26');
     assert.equal(list.res.text.includes(SERIAL) || one.res.text.includes(SERIAL), false);
+    await running.stop();
+  } finally { s.cleanup(); }
+});
+
+test('startHubApi gives the routes its readings cache and device seams: /resources reads reachable after one refresh and /discovery lists the fake wire\'s device', async () => {
+  const s = scratch();
+  try {
+    const usb = serial => `adb-${serial}-zz._adb-tls-connect._tcp`;
+    const wire = fakeWire({ listed: [{ id: usb('R5GL43A7PCH'), state: 'device' }, { id: 'ZY22PIX', state: 'device', model: 'Pixel_9' }] });
+    const sleep = (ms, signal) => new Promise(done => {
+      const timer = setTimeout(done, ms / 100);
+      signal?.addEventListener('abort', () => { clearTimeout(timer); done(); }, { once: true });
+    });
+    const running = await s.start({ adbWire: wire, inventory: () => ({ adb_servers: [{ port: 5037, pid: 1, cwd: null }], emulators: [], xvfb: [] }), hostKey: () => 'linux', sleep });
+    const listener = s.servers[0].listener;
+    const ask = async url => { const e = exchange('GET', url); await listener(e.req, e.res); return e.json(); };
+    const stateOf = body => body.resources.find(resource => resource.id === 's26').reachability.state;
+    assert.equal(stateOf(await ask('/resources')), 'unknown', 'the first read never waits for the probe');
+    let state = 'unknown';
+    for (let turn = 0; turn < 200 && state === 'unknown'; turn += 1) {
+      await new Promise(done => setImmediate(done));
+      state = stateOf(await ask('/resources'));
+    }
+    assert.equal(state, 'reachable');
+    const discovery = await ask('/discovery');
+    assert.deepEqual(discovery.devices, [{ serial: 'ZY22PIX', model: 'Pixel_9', id: 'ZY22PIX', state: 'device' }]);
+    assert.ok(wire.requests.every(request => request === 'host:version' || request === 'host:devices-l'));
     await running.stop();
   } finally { s.cleanup(); }
 });
