@@ -57,6 +57,9 @@
 //   hub-device registry edit <id> [--name N] [--cap k=v]... [--uncap k]... [--if-rev N] [--why TEXT] [--holder WHO] [--json]
 //                    (HUB_DEVICE_EDITED <id> <name>; without --if-rev it is the rev of registry.json on disk, or 0)
 //   hub-device registry retire <id> [--if-rev N] [--why TEXT] [--holder WHO] [--json]   (HUB_DEVICE_RETIRED <id> <visibility>)
+//   hub-device cancel <request_id> [--resource R] [--pool P] [--why TEXT] [--holder WHO] [--json]   (takes a waiting request out of the line, in every member's queue
+//                    for a Pool request (`--pool phone`); never touches a Hold: one that holds its lock is `release`'s. Without --resource it looks on this host.
+//                    The waiter's own wait ends HUB_DEVICE_CANCELLED naming the canceller; prints `HUB_DEVICE_CANCELLED <resource> <id>`)
 //   hub-device registry list [--json]   (read only, from registry.json on disk or the seed: no service is called)
 //                    With the Hub API down a registry write fails plainly (HUB_API_DOWN, exit 1: nothing was sent; HUB_API_UNKNOWN, exit 1: it
 //                    was sent and may have applied); leases, runs, releases and status never call the API.
@@ -90,7 +93,7 @@ export function parseDuration(text, flag = 'duration') {
   return parts.reduce((total, [, count, unit]) => total + Number(count) * { d: 86_400_000, h: 3_600_000, m: 60_000, s: 1000 }[unit], 0);
 }
 
-const VALUE_FLAGS = new Set(['for', 'why', 'wait', 'id', 'pid', 'holder', 'env-serial', 'profile', 'pool', 'run', 'name', 'match', 'kind', 'model', 'serial', 'udid', 'host', 'cap', 'uncap', 'if-rev', 'override']);
+const VALUE_FLAGS = new Set(['for', 'why', 'wait', 'id', 'pid', 'holder', 'env-serial', 'profile', 'pool', 'run', 'name', 'match', 'kind', 'model', 'serial', 'udid', 'host', 'cap', 'uncap', 'if-rev', 'override', 'resource']);
 const SWITCHES = new Set(['no-connect', 'json', 'verbose', 'any']);
 
 // Words, flags (`--flag value` or `--flag=value`), and everything after `--` as the command. `--env-serial`, `--cap` and `--uncap` repeat
@@ -117,7 +120,7 @@ export function parseArgs(argv) {
 
 const shellQuote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 
-const USAGE = 'usage: hub-device lease s24|s26|phone --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | lease emulator [--profile NAME] --for <dur> --why <text> [--wait <dur>] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] | release [emulator] [<lease_id>|--any] [--holder WHO] | extend [<lease_id>] --for <dur> [--override <why>] [--holder WHO] [--json] | status [--json] | discover [--json] | reservation release --run <key> [--name adb|mac-ios] [--json] | run s24|s26|phone|emulator [--profile NAME] [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...> | lease --match <query> --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | run --match <query> [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...> | registry add --kind K --name N [--model M] [--serial S] [--udid U] [--profile P] [--host H] [--cap k=v]... [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry edit <id> [--name N] [--cap k=v]... [--uncap k]... [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry retire <id> [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry list [--json]';
+const USAGE = 'usage: hub-device lease s24|s26|phone --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | lease emulator [--profile NAME] --for <dur> --why <text> [--wait <dur>] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] | release [emulator] [<lease_id>|--any] [--holder WHO] | extend [<lease_id>] --for <dur> [--override <why>] [--holder WHO] [--json] | cancel <request_id> [--resource R] [--pool P] [--why <text>] [--holder WHO] [--json] | status [--json] | discover [--json] | reservation release --run <key> [--name adb|mac-ios] [--json] | run s24|s26|phone|emulator [--profile NAME] [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...> | lease --match <query> --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | run --match <query> [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...> | registry add --kind K --name N [--model M] [--serial S] [--udid U] [--profile P] [--host H] [--cap k=v]... [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry edit <id> [--name N] [--cap k=v]... [--uncap k]... [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry retire <id> [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry list [--json]';
 
 // Leases are honoured only by a hub whose lock.mjs knows them. The catch-up runs from the installed release, and an
 // older one sees a lease's short-lived pid as a dead job and reclaims the lock at once, so lease and run say so.
@@ -178,8 +181,8 @@ function report(error, parsed, context) {
     stderr(`${error.code} ${error.message}`);
     return code;
   }
-  // An extension that was refused, and an id that holds nothing: they say what they are, and the library's `reason` says which.
-  if (error.code === 'HUB_LEASE_EXTEND_REFUSED' || error.code === 'HUB_LEASE_NOT_FOUND' || error.code === 'HUB_DEVICE_JOB_ID') { stderr(`${error.code} ${error.message}`); return code; }
+  // An extension that was refused, an id that holds nothing, and a cancel that found no waiting request (or a Reservation, or another host): they say what they are, and the library's `reason` says which.
+  if (['HUB_LEASE_EXTEND_REFUSED', 'HUB_LEASE_NOT_FOUND', 'HUB_DEVICE_JOB_ID', 'HUB_REQUEST_NOT_FOUND', 'HUB_CANCEL_RESERVATION', 'HUB_WRONG_HOST'].includes(error.code)) { stderr(`${error.code} ${error.message}`); return code; }
   // These exit 2 like a usage error, but say what they are.
   if (error.code === 'HUB_NO_MATCH' || error.code === 'HUB_POOL_CROSS_HOST' || error.code === 'HUB_RESOURCE_RETIRED') { stderr(`${error.code} ${device} ${error.message}`); return code; }
   if (code === claims.EXIT_CODES.HUB_USAGE) { stderr(`hub-device: ${error.message}`); return code; }
@@ -343,6 +346,20 @@ function extend(parsed, context) {
   const { lock, device, record } = claims.extendHeld(id, { forMs, actor, override }, context);
   if (parsed.flags.json) stdout(JSON.stringify({ lease_id: id, lock, device, expires_at: record.expires_at }));
   else stdout(`HUB_DEVICE_EXTENDED ${device ?? lock} ${id} until ${record.expires_at}`);
+  return claims.EXIT_OK;
+}
+
+// `cancel <request_id> [--resource R] [--pool P] [--why <text>]`: the library's `cancel` (the Hub API's `POST /requests/{id}/cancel` is the same call).
+// Takes a waiting request out of the line (every member's queue for a Pool request: `--pool phone`) and touches no Hold; a request that already holds
+// its lock is `release`'s. Without `--resource` it looks for the request in this host's queues. Not found, a Reservation or a job's id exit 2.
+function cancel(parsed, context) {
+  const { env, stdout } = context;
+  if (parsed.words.length !== 2) throw usage('cancel takes one request id');
+  if (parsed.flags.why !== undefined && parsed.flags.why.trim() === '') throw usage('--why says why: a non-empty reason');
+  const id = parsed.words[1];
+  const answer = claims.cancel(id, { resource: parsed.flags.resource ?? null, pool: parsed.flags.pool ?? null, host: null, why: parsed.flags.why ?? null, actor: cliActor(parsed, env) }, context);
+  if (parsed.flags.json) stdout(JSON.stringify(answer));
+  else stdout(`HUB_DEVICE_CANCELLED ${answer.resource} ${id}`);
   return claims.EXIT_OK;
 }
 
@@ -708,6 +725,7 @@ const FLAG_OWNERS = Object.freeze({
   uncap: ['registry'],
   'if-rev': ['registry'],
   override: ['extend'],
+  resource: ['cancel'],
 });
 
 function checkFlagOwners(parsed) {
@@ -756,6 +774,7 @@ export async function main(argv, {
       case 'lease': return await lease(parsed, context);
       case 'release': return await release(parsed, context);
       case 'extend': return extend(parsed, context);
+      case 'cancel': return cancel(parsed, context);
       case 'status': return await status(parsed, context);
       case 'discover': return await discover(parsed, context);
       case 'reservation': return reservationCommand(parsed, context);

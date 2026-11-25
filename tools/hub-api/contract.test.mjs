@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadDevices } from '../ci/lib/devices.mjs';
+import { acquireLease, listWaiters } from '../ci/lib/lock.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { hermetic } from '../ci/test-fixtures.mjs';
 import { EXIT_CODES, createLeaseWaits } from '../device/claims.mjs';
@@ -112,7 +113,38 @@ const PARAM_SAMPLES = Object.freeze({ id: 's26' });
 
 // How each POST route is called (a POST route with no sample fails the test): `body`, `status` (the success status it must answer),
 // `params` (its own route parameters, over PARAM_SAMPLES) and `setup` (the paths of other POST samples called first, in order, on the
-// same fresh scratch). Each call gets a fresh scratch.
+// same fresh scratch). A route that needs live state no other route makes has `prepare(ctx)` (run first, returns what `after` is given)
+// and `after(state, answer)` (always run last: it ends what `prepare` started and checks what it saw). Each call gets a fresh scratch.
+const tick = ms => new Promise(done => setTimeout(done, ms));
+const until = async (check, what) => {
+  for (let tries = 0; tries < 500; tries += 1) { if (check()) return; await tick(10); }
+  throw new Error(`never happened: ${what}`);
+};
+
+// The live state `POST /requests/{id}/cancel` needs: s24 held, and two waiters on it, `contract-wait` (the one cancelled) and `contract-keep`
+// (still there afterwards, so the answer's queue has a waiter to describe). Their waits are real, so they notice a cancel on their own.
+async function prepareCancel(ctx) {
+  const abort = new AbortController();
+  const wait = (id, extra) => acquireLease('s24', { holder: `waiter-${id}`, why: 'contract', forMs: 600_000, id, env: ctx.env, log: () => {}, pollMs: 5, sleep: () => tick(5), ...extra });
+  await wait('contract-held', { waitMs: 0 });
+  const waiting = wait('contract-wait', { waitMs: 60_000 });
+  const kept = wait('contract-keep', { waitMs: 60_000, signal: abort.signal });
+  waiting.catch(() => {});
+  kept.catch(() => {});
+  await until(() => listWaiters('s24', { env: ctx.env }).length === 2, 'both waiters queued');
+  return { abort, waiting, kept };
+}
+
+async function afterCancel(state, answer) {
+  state.abort.abort();
+  const [waiting] = await Promise.allSettled([state.waiting, state.kept]);
+  if (answer?.status === 200) {
+    assert.equal(waiting.status, 'rejected');
+    assert.equal(waiting.reason.code, 'HUB_LEASE_CANCELLED');
+    assert.match(waiting.reason.message, /cancelled by contract-test/);
+  }
+}
+
 const POST_SAMPLES = Object.freeze({
   '/registry/resources': { status: 201, body: { kind: 'phone', name: 'pixel', host: 'linux', identity: { serial: 'PX9', model: 'Pixel 9' }, capabilities: { api_level: 35 }, holder: 'contract-test' } },
   // After the seed (rev 1) and the setup register (rev 2), the edit is based on rev 2.
@@ -121,6 +153,7 @@ const POST_SAMPLES = Object.freeze({
   '/leases': { status: 200, body: { resource: 's24', for_ms: 1_800_000, holder: 'contract-test', why: 'contract', id: 'contract-1' } },
   '/leases/{id}/extend': { status: 200, params: { id: 'contract-1' }, setup: ['/leases'], body: { for_ms: 600_000, holder: 'contract-test' } },
   '/leases/{id}/release': { status: 200, params: { id: 'contract-1' }, setup: ['/leases'], body: { holder: 'contract-test' } },
+  '/requests/{id}/cancel': { status: 200, params: { id: 'contract-wait' }, prepare: prepareCancel, after: afterCancel, body: { resource: 's24', host: 'linux', why: 'contract', holder: 'contract-test' } },
 });
 
 // How each GET route with a parameter the default sample cannot stand for is called: `params` (over PARAM_SAMPLES) and `setup` (the
@@ -151,7 +184,12 @@ async function callPost(route, ctx) {
     const answer = await handle({ method: 'POST', url: samplePath(path, { ...PARAM_SAMPLES, ...sampleOf(earlier).params }), body: sampleBody(earlier) }, ctx);
     assert.equal(answer.status, sampleOf(earlier).status, `setup ${path}`);
   }
-  return handle({ method: 'POST', url: samplePath(route.path, { ...PARAM_SAMPLES, ...sample.params }), body: sampleBody(route) }, ctx);
+  const state = await sample.prepare?.(ctx);
+  let answer = null;
+  try {
+    answer = await handle({ method: 'POST', url: samplePath(route.path, { ...PARAM_SAMPLES, ...sample.params }), body: sampleBody(route) }, ctx);
+    return answer;
+  } finally { await sample.after?.(state, answer); }
 }
 
 // Calls a GET route as its sample says (setup POSTs first, their answers successes). Returns the answer.

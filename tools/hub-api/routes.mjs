@@ -14,7 +14,7 @@
 // handler as `request.params`; a literal route wins over a parameterised one.
 import { STATUS_CODES } from 'node:http';
 import { idMatchesSerial } from '../ci/lib/adb.mjs';
-import { HOST_PLATFORMS, checkExtendBody, checkLeaseBody, checkReleaseBody, discover as discoverHost, exitCodeOf, findLease, hostKey as realHostKey, httpAnswerOf, leaseRequestId, lockActivity, serviceExtend, serviceLease, serviceRelease } from '../device/claims.mjs';
+import { HOST_PLATFORMS, cancel, checkCancelBody, checkExtendBody, checkLeaseBody, checkReleaseBody, discover as discoverHost, exitCodeOf, findLease, hostKey as realHostKey, httpAnswerOf, leaseRequestId, lockActivity, serviceExtend, serviceLease, serviceRelease } from '../device/claims.mjs';
 import { hubRef } from '../ci/lib/receipt.mjs';
 import { NO_READING } from '../registry/reachability.mjs';
 import { loadQaDevices } from '../registry/seed.mjs';
@@ -266,7 +266,7 @@ function serviceContext(ctx) {
   const out = line => { try { ctx.log?.out?.(line); } catch { /* a broken log seam never changes the answer */ } };
   return {
     env: ctx.env ?? process.env, policy: ctx.policy, now: ctx.now, sleep: ctx.sleep, qaDevices: ctx.qaDevices,
-    log: out, warn: () => {}, readingsOf: readingsOf(ctx),
+    log: out, warn: () => {}, readingsOf: readingsOf(ctx), ...(ctx.hostKey ? { hostKey: ctx.hostKey } : {}),
     ...(ctx.provisionOffThread ? { provisionOffThread: ctx.provisionOffThread } : {}), ...(ctx.releaseOffThread ? { releaseOffThread: ctx.releaseOffThread } : {}),
   };
 }
@@ -302,6 +302,14 @@ export function releaseLeaseRoute(ctx, { body, params }) {
   return serviceRelease(params.id, { ...input, actor }, serviceContext(ctx));
 }
 
+// POST /requests/{id}/cancel: takes a waiting request out of the line (Story 7.5), exactly `hub-device cancel <id> --resource ...`: `cancel` is the one function every front door calls,
+// and the status of a refusal comes from its HTTP table. The body is checked first (`checkCancelBody`); the actor is the body's `actor`, else `{holder, via: 'api'}`. 200 `Cancel`.
+export function cancelRequestRoute(ctx, { body, params }) {
+  const input = checkCancelBody(body);
+  const actor = input.actor ?? { holder: input.holder, via: 'api' };
+  return cancel(params.id, { ...input, actor }, serviceContext(ctx));
+}
+
 // `shape` names the `### <Shape>` section of the contract document that lists the response's fields.
 export const ROUTES = Object.freeze([
   Object.freeze({ method: 'GET', path: '/health', shape: 'Health', handler: health }),
@@ -317,6 +325,7 @@ export const ROUTES = Object.freeze([
   Object.freeze({ method: 'GET', path: '/leases/{id}', shape: 'Lease', handler: getLease }),
   Object.freeze({ method: 'POST', path: '/leases/{id}/extend', shape: 'Lease', handler: extendLeaseRoute }),
   Object.freeze({ method: 'POST', path: '/leases/{id}/release', shape: 'Release', handler: releaseLeaseRoute }),
+  Object.freeze({ method: 'POST', path: '/requests/{id}/cancel', shape: 'Cancel', handler: cancelRequestRoute }),
 ]);
 
 // ---- dispatch ----
