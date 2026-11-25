@@ -72,6 +72,8 @@ test('the library exports the whole action surface and the exit table as frozen 
     HUB_REGISTRY_NAME: 2, HUB_REGISTRY_DUPLICATE: 2,
     // Story 6.7: a retire or an identity or name edit of a seeded Resource.
     HUB_REGISTRY_SEEDED: 2,
+    // Story 6.8: the same-host client's two answers.
+    HUB_API_DOWN: 1, HUB_API_UNKNOWN: 1,
   });
 });
 
@@ -431,5 +433,42 @@ test('emulator bounds and reservation checks are library usage errors with today
     assert.throws(() => claims.releaseReservations({ key: 'nope' }, s.ctx), error => error.code === 'HUB_USAGE' && /is not a run key/.test(error.message));
     assert.throws(() => claims.releaseReservations({ key: 'o--r--1', name: 'bogus' }, s.ctx), /--name is one of adb, mac-ios/);
     assert.deepEqual(claims.releaseReservations({ key: 'o--r--1' }, s.ctx), []);
+  } finally { s.cleanup(); }
+});
+
+// Story 6.8: the Registry verbs' library half. registryWrite goes through the one client; registryList reads the disk alone.
+test('registryWrite: the three routes (id URI-encoded), an unknown op or a missing id is a TypeError, and the client DOWN passes through', async () => {
+  const s = side();
+  try {
+    const seen = [];
+    const fetchImpl = async (url, init = {}) => {
+      const { pathname } = new URL(url);
+      seen.push(`${init.method} ${pathname}`);
+      return pathname === '/health' ? new Response('{"ok":true,"service":"mobile-deploy-hub-api"}', { status: 200 }) : new Response('{"rev":1}', { status: 200 });
+    };
+    const ctx = { env: s.env, fetchImpl };
+    await claims.registryWrite('add', { body: {} }, ctx);
+    await claims.registryWrite('edit', { id: 'res-a b', body: {} }, ctx);
+    await claims.registryWrite('retire', { id: 'res-a', body: {} }, ctx);
+    assert.deepEqual(seen.filter(line => !line.endsWith('/health')), ['POST /registry/resources', 'POST /registry/resources/res-a%20b', 'POST /registry/resources/res-a/retire']);
+    await assert.rejects(claims.registryWrite('drop', { id: 'x' }, ctx), TypeError);
+    await assert.rejects(claims.registryWrite('edit', { body: {} }, ctx), TypeError);
+    const down = await claims.registryWrite('add', { body: {} }, { env: s.env, fetchImpl: async () => { throw Object.assign(new TypeError('x'), { cause: { code: 'ECONNREFUSED' } }); } }).catch(error => error);
+    assert.deepEqual([down.code, down.exit, claims.exitCodeOf(down)], ['HUB_API_DOWN', claims.EXIT_CODES.HUB_API_DOWN, claims.EXIT_CODES.HUB_API_DOWN]);
+    const unknown = await claims.registryWrite('add', { body: {} }, { env: s.env, fetchImpl: async url => { if (new URL(url).pathname === '/health') return new Response('{"service":"mobile-deploy-hub-api"}', { status: 200 }); throw new TypeError('reset'); } }).catch(error => error);
+    assert.deepEqual([unknown.code, unknown.exit], ['HUB_API_UNKNOWN', claims.EXIT_CODES.HUB_API_UNKNOWN]);
+  } finally { s.cleanup(); }
+});
+
+test('registryList: the seed at rev 0 with no file, no service, and a QA warning goes through ctx.warn', () => {
+  const s = side();
+  try {
+    const warnings = [];
+    const listed = claims.registryList({}, { env: s.env, qaDevices: () => [], warn: message => warnings.push(message), fetchImpl: () => assert.fail('list called the API') });
+    assert.deepEqual(Object.keys(listed), ['rev', 'source', 'resources', 'pools']);
+    assert.deepEqual([listed.rev, listed.source], [0, 'seed']);
+    assert.ok(listed.resources.some(resource => resource.id === 's24') && listed.pools.some(pool => pool.name === 'phone'));
+    assert.deepEqual(warnings, []);
+    assert.equal(claims.registryRev({ env: s.env }), 0);
   } finally { s.cleanup(); }
 });

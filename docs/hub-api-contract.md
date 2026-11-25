@@ -181,6 +181,8 @@ For every write route the actor is `actor` as given, else `{holder, via: 'api'}`
 | `HUB_API_ALREADY_RUNNING` | none | 1 | Start only: the port is taken. Never an HTTP answer. |
 | `HUB_API_NODE` | none | 1 | Start only: Node is older than 24.15. |
 | `HUB_API_NO_HEAVY` | none | 1 | Start only: `heavy` is not on `PATH`. |
+| `HUB_API_DOWN` | none | 1 | Client side only (`tools/hub-client.mjs`), never an HTTP answer: `GET /health` was refused, silent for 2 s, not a 200 or not this service, or the request itself was refused, so nothing was sent. |
+| `HUB_API_UNKNOWN` | none | 1 | Client side only, never an HTTP answer: a write was sent and the answer did not come (timeout, reset, or something that is not a problem document), so it may have applied. `hub-device registry list` shows. |
 
 ## For the v1c module (non-binding)
 
