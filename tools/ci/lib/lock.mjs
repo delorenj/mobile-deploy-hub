@@ -624,7 +624,7 @@ export const jobLeaseId = ({ repo, run, attempt, job }) => `job:${repo}#${run}.$
 export function buildTicket(kind, {
   env = process.env, requested, deadline = null, lease_id = null, holder = null, why = null,
   host = hostname(), hostId = machineId(), pid = process.pid, processStart: startOf = processStart,
-  expires_at = null, reservation = null, request = null, pool = null, eta = null, delivery = null,
+  expires_at = null, reservation = null, request = null, pool = null, eta = null, delivery = null, claimant_kind = null,
 } = {}) {
   if (!TICKET_KINDS.includes(kind)) throw new Error(`bad ticket kind "${kind}" (${TICKET_KINDS.join(', ')}; this format writes no remote tickets)`);
   if (!Number.isFinite(requested)) throw new TypeError('a ticket carries the real request time');
@@ -646,7 +646,7 @@ export function buildTicket(kind, {
     format: TICKET_FORMAT, kind, lease_id: id, holder: who, why: because,
     pid, host, host_id: hostId ?? null, process_start: startOf(pid),
     enqueued_at: iso(requested), deadline_at: Number.isFinite(deadline) ? iso(deadline) : null, expires_at,
-    repo, run, attempt, job, reservation, request, pool, eta, delivery,
+    repo, run, attempt, job, reservation, request, pool, eta, delivery, claimant_kind,
   };
 }
 
@@ -733,7 +733,7 @@ function notePruned(name, pruned, { env, hostId }) {
       const kind = ticketKind(ticket);
       subject = kind === 'job' || kind === 'hub-job'
         ? { kind, repo: ticket.repo ?? null, run: ticket.run ?? null, attempt: ticket.attempt ?? null, job: ticket.job ?? null }
-        : { kind: 'lease', lease_id: ticket.lease_id ?? null, holder: ticket.holder ?? null };
+        : { kind: 'lease', lease_id: ticket.lease_id ?? null, holder: ticket.holder ?? null, claimant_kind: ticket.claimant_kind ?? 'agent' };
     }
     const pool = typeof ticket?.pool === 'string' && typeof ticket?.request === 'string' ? { pool: ticket.pool, request: ticket.request } : {};
     note(name, eventOf('prune', name, subject, { count: 1, reason: why, waited_ms: waited, ...pool }), { env, at, hostId });
@@ -1010,7 +1010,7 @@ const blockersAhead = (view, file = null, own = null) => view.filter(entry => en
 // The AD-5 wording of every timeout on a Queued lock: `host lock <name> is held by <holder>`, then (when a Claimant waits ahead
 // of this one) how many and who, each with its place. Callers add what the wait gave up on.
 const waiterText = entry => `${entry.place}. ${entry.holder ?? entry.lease_id}${entry.why ? ` (${entry.why})` : ''}`;
-function heldText(name, owner, blockers = [], self = null) {
+export function heldText(name, owner, blockers = [], self = null) {
   const ahead = blockers.length;
   const list = ahead > 0 ? `; ${ahead} waiter${ahead === 1 ? '' : 's'} ahead${self ? ` of ${self}` : ''} (${blockers.map(waiterText).join(', ')})` : '';
   return `host lock ${name} is held by ${describe(owner)}${list}`;
@@ -1116,17 +1116,21 @@ function waitReporter(name, { ticket, deadline, estimate, requested, env, now, p
 }
 
 // A process start read at most once per pid in JOB_POLL_MS: a Mac pass spawns `ps` per ticket otherwise (AD "liveness cost").
-function cachedStart(startOf, now) {
+function cachedStart(startOf, now, ttlMs = JOB_POLL_MS) {
   const seen = new Map();
   return pid => {
     const at = now();
     const hit = seen.get(pid);
-    if (hit && at >= hit.at && at - hit.at < JOB_POLL_MS) return hit.start;
+    if (hit && at >= hit.at && at - hit.at < ttlMs) return hit.start;
     const start = startOf(pid);
     seen.set(pid, { at, start });
     return start;
   };
 }
+
+// The same cache for a long-lived caller (a service that holds many waits at once): one reader per service, shared by every wait it
+// passes it to as `processStart`, so a poll never reads a pid's start more than once per `ttlMs` (AD-44). Real clock and reader by default.
+export const cachedProcessStart = ({ startOf = processStart, now = Date.now, ttlMs = JOB_POLL_MS } = {}) => cachedStart(startOf, now, ttlMs);
 
 // A fresh lease id, for a caller that must name its request before the first take (a Pool request).
 export const newLeaseId = () => `l-${randomBytes(6).toString('hex')}`;
@@ -1243,7 +1247,7 @@ export async function acquirePool(pool, members, {
   let estimate = null;
   if (!tryOnly) {
     estimate = earliest(names.map(name => enqueueEta(name, { file, deadline, env, now: () => requested, policy, host, hostId, processStart: startOf, log })));
-    body = buildTicket('lease', { env, requested, deadline, lease_id, holder, why, host, hostId, processStart: startOf, pool, request: lease_id, eta: estimate });
+    body = buildTicket('lease', { env, requested, deadline, lease_id, holder, why, host, hostId, processStart: startOf, pool, request: lease_id, eta: estimate, claimant_kind: claimantKind });
   }
   // Withdrawing a ticket: renamed to <file>.tomb-<ms>-<pid> (never ending in .json, so no reader lists it) and removed; ENOENT means a
   // release cancelled it first. No event: the request writes its own ending.
@@ -1391,8 +1395,9 @@ export async function acquirePool(pool, members, {
       }
       if (now() >= deadline) {
         if (giveUp) throw giveUp(new Map(states));
-        const by = names.map(name => (states.get(name) === 'held' ? `${name} is held by ${describe(holds.get(name)?.owner ?? null)}` : `${name} ${states.get(name) ?? 'absent'}`)).join('; ');
-        throw failure('HUB_LOCK_TIMEOUT', `no member of ${pool} was free: ${by}; gave up after ${Math.round(waitMs / 1000)}s`);
+        // AD-5's wording per held member (`host lock <name> is held by ...`), so a Pool timeout reads like every other one.
+        const by = names.map(name => (states.get(name) === 'held' ? heldText(name, holds.get(name)?.owner ?? null, holds.get(name)?.blockers ?? [], `lease ${lease_id}`) : `${name} ${states.get(name) ?? 'absent'}`)).join('; ');
+        throw failure('HUB_LOCK_TIMEOUT', `${by}; no member of ${pool} was free; gave up after ${Math.round(waitMs / 1000)}s`);
       }
       // The held member with the fewest blockers ahead is where this request stands (the first on a tie).
       let best = null;
@@ -1621,7 +1626,7 @@ export async function acquireLease(name, {
   if (!tryOnly) {
     const named = ticketName(requested);
     estimate = enqueueEta(name, { file: named, deadline, env, now: () => requested, policy, host, hostId, processStart: startOf, log });
-    ({ file: ticket, path: ticketFile } = writeTicket(name, buildTicket('lease', { env, requested, deadline, lease_id, holder, why, host, hostId, processStart: startOf, eta: estimate }), { env, requested, file: named }));
+    ({ file: ticket, path: ticketFile } = writeTicket(name, buildTicket('lease', { env, requested, deadline, lease_id, holder, why, host, hostId, processStart: startOf, eta: estimate, claimant_kind: claimantKind }), { env, requested, file: named }));
   }
   const attempt = env.GITHUB_RUN_ATTEMPT ?? null;
   const job = env.GITHUB_JOB ?? null;
@@ -1759,7 +1764,7 @@ export function releaseLease(name, id, { env = process.env, now = Date.now, reas
         const kind = ticketKind(ticket);
         const subject = kind === 'job' || kind === 'hub-job'
           ? { kind, repo: ticket.repo ?? null, run: ticket.run ?? null, attempt: ticket.attempt ?? null, job: ticket.job ?? null }
-          : { kind: 'lease', lease_id: id, holder: ticket.holder ?? null };
+          : { kind: 'lease', lease_id: id, holder: ticket.holder ?? null, claimant_kind: ticket.claimant_kind ?? 'agent' };
         note(name, eventOf('cancel', name, subject, { waited_ms: Number.isFinite(enqueued) ? Math.max(0, at - enqueued) : null, reason: 'released' }), { env, at, hostId });
       } catch { /* gone, or being written */ }
     }

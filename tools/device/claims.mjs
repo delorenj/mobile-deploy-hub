@@ -22,7 +22,7 @@ import { findPhone, idMatchesSerial } from '../ci/lib/adb.mjs';
 import { createDevicectl } from '../ci/lib/devicectl.mjs';
 import { earliest } from '../ci/lib/eta.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
-import { CLAIMANT_KINDS, MAX_LEASE_MS, RESERVABLE, SEED_RESOURCES, acquireLease, acquirePool, capText, checkActor, deployTargetCapMs, etaHistory, extendLease, isLease, listLocks, lockDir, newLeaseId as newLockLeaseId, queueView, readOwner, releaseLease, releaseReservation, resourceOf, updateLease, waiterEtas } from '../ci/lib/lock.mjs';
+import { CLAIMANT_KINDS, MAX_LEASE_MS, RESERVABLE, SEED_RESOURCES, acquireLease, acquirePool, cachedProcessStart, capText, checkActor, deployTargetCapMs, etaHistory, extendLease, heldText, isLease, listLocks, lockDir, newLeaseId as newLockLeaseId, queueView, readOwner, releaseLease, releaseReservation, resourceOf, updateLease, waiterEtas } from '../ci/lib/lock.mjs';
 import { sleep as realSleep } from '../ci/lib/pause.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { createAdbWire } from './adb-wire.mjs';
@@ -55,6 +55,10 @@ export const EXIT_CODES = Object.freeze({
   HUB_LEASE_CANCELLED: 1,
   HUB_LEASE_EXTEND_REFUSED: 1,
   HUB_LEASE_LOST: 1,
+  // Story 7.2: a service's wait: a Lease or a waiter no id names (2), a wait another connection took over, a service that is stopping (1).
+  HUB_LEASE_NOT_FOUND: 2,
+  HUB_LEASE_SUPERSEDED: 1,
+  HUB_API_RESTARTING: 1,
   HUB_HOST_UNKNOWN: 1,
   HUB_NO_MATCH: 2,
   HUB_POOL_CROSS_HOST: 2,
@@ -94,6 +98,9 @@ export const HTTP_ANSWERS = Object.freeze({
   HUB_POOL_CROSS_HOST: Object.freeze({ status: 409 }),
   HUB_RESOURCE_RETIRED: Object.freeze({ status: 409 }),
   HUB_LEASE_CANCELLED: Object.freeze({ status: 409 }),
+  HUB_LEASE_NOT_FOUND: Object.freeze({ status: 404 }),
+  HUB_LEASE_SUPERSEDED: Object.freeze({ status: 409, reason: 'superseded' }),
+  HUB_API_RESTARTING: Object.freeze({ status: 503, reason: 'restarting' }),
   HUB_PHONE_AWAY: Object.freeze({ status: 503, reason: 'away' }),
   HUB_DEVICE_AWAY: Object.freeze({ status: 503, reason: 'away' }),
   HUB_HOST_UNKNOWN: Object.freeze({ status: 503, reason: 'host-unknown' }),
@@ -468,9 +475,10 @@ async function takePhone(phone, options, ctx) {
 function noPhoneError(fleet, states, waitMs, ctx) {
   const held = fleet.filter(phone => states.get(phone.device) === 'held');
   if (held.length === fleet.length) {
+    // AD-5's wording for each held member (`host lock <lock> is held by ...`), the one every timeout of a Queued lock uses.
     const locks = listLocks({ env: ctx.env });
-    const by = held.map(phone => `${phone.device} (${phone.lock}) is held by ${locks.find(entry => entry.name === phone.lock)?.describe ?? 'someone'}`).join('; ');
-    return failure('HUB_LOCK_TIMEOUT', `every phone is held: ${by}; gave up after ${Math.round(waitMs / 1000)}s`);
+    const by = held.map(phone => heldText(phone.lock, locks.find(entry => entry.name === phone.lock)?.owner ?? null)).join('; ');
+    return failure('HUB_LOCK_TIMEOUT', `${by} (every phone is held); gave up after ${Math.round(waitMs / 1000)}s`);
   }
   const reasons = fleet.map(phone => `${phone.device} ${states.get(phone.device) ?? 'absent'}`).join(', ');
   const awayStates = [...new Set([...states.values()].filter(state => state !== 'held'))].join(', ') || 'absent';
@@ -491,7 +499,7 @@ async function takeAnyPhone(members, options, ctx, poolName = PHONE) {
   const deadline = timing.now() + options.waitMs;
   const taken = await acquirePool(poolName, fleet.map(phone => phone.lock), {
     holder: options.holder, why: options.why, forMs: options.forMs, waitMs: options.waitMs, id: options.id ?? null, holderPid: options.holderPid ?? null,
-    claimantKind: options.claimantKind, actor: options.actor,
+    claimantKind: options.claimantKind, actor: options.actor, processStart: options.processStart,
     env, log: ctx.log, pollMs: timing.leasePollMs, sleep: timing.sleep, now: timing.now, signal: options.signal, policy: ctx.policy,
     accept: async (lock, record) => {
       const phone = fleet.find(entry => entry.lock === lock);
@@ -591,16 +599,17 @@ export function leaseExports(taken, envSerial = []) {
 // attempt, job) from its environment, and a service belongs to no run; whatever deploy identity leaked into its environment is dropped.
 export const withoutDeployIdentity = env => Object.fromEntries(Object.entries(env ?? {}).filter(([key]) => !key.startsWith('GITHUB_')));
 
-const LEASE_BODY_KEYS = Object.freeze(['resource', 'match', 'for_ms', 'holder', 'why', 'claimant_kind', 'id', 'actor']);
+const LEASE_BODY_KEYS = Object.freeze(['resource', 'match', 'for_ms', 'wait_ms', 'holder', 'why', 'claimant_kind', 'id', 'actor']);
 const bodyUsage = (reason, message) => Object.assign(usage(message), { reason });
 const isText = value => typeof value === 'string' && value.trim() !== '';
 
-// Checks the body of a service's take into `{resource, match, forMs, holder, why, claimantKind, id, actor}` (`resource`, `match`, `id`
-// and `actor` null when absent; `actor` as `checkActor` writes it, the caller defaults it). HUB_USAGE with a `reason`, checked in this
-// order and before anything is read: bad-body (not an object, or a key outside the list), bad-target (exactly one of `resource` and
-// `match`, a non-empty string), bad-for (`for_ms` a whole number of ms, more than 0), bad-claimant-kind, bad-id (a lease id: lowercase
-// letters, digits and dashes), bad-actor, no-holder, bad-why. The caps (48 h, and 60 min on a deploy target) are `take`'s own.
-// A wait (`wait_ms`) is not a key: it is refused as any unknown one.
+// Checks the body of a service's take into `{resource, match, forMs, waitMs, holder, why, claimantKind, id, actor}` (`resource`, `match`,
+// `id` and `actor` null when absent, `waitMs` 0; `actor` as `checkActor` writes it, the caller defaults it). HUB_USAGE with a `reason`,
+// checked in this order and before anything is read: bad-body (not an object, or a key outside the list), bad-target (exactly one of
+// `resource` and `match`, a non-empty string), bad-for (`for_ms` a whole number of ms, more than 0), bad-wait (`wait_ms` a whole number
+// of ms, 0 or more), bad-claimant-kind, bad-id (a lease id: lowercase letters, digits and dashes), no-id (a wait names its id: the client
+// mints it, so a lost answer can be asked for again, AD-37), bad-actor, no-holder, bad-why. The caps (48 h, and 60 min on a deploy
+// target) are `take`'s own.
 export function checkLeaseBody(body) {
   if (body === null || typeof body !== 'object' || Array.isArray(body)) throw bodyUsage('bad-body', 'the body must be a JSON object');
   for (const key of Object.keys(body)) if (!LEASE_BODY_KEYS.includes(key)) throw bodyUsage('bad-body', `the body has no key "${key}" (${LEASE_BODY_KEYS.join(', ')})`);
@@ -609,9 +618,11 @@ export function checkLeaseBody(body) {
   if (hasResource === hasMatch) throw bodyUsage('bad-target', 'name exactly one of resource (a device word or Resource id) and match (a Capability query)');
   if (!isText(hasResource ? body.resource : body.match)) throw bodyUsage('bad-target', `${hasResource ? 'resource' : 'match'} must be a non-empty string`);
   if (!Number.isSafeInteger(body.for_ms) || body.for_ms <= 0) throw bodyUsage('bad-for', 'for_ms must be a whole number of milliseconds, more than 0');
+  if (body.wait_ms !== undefined && (!Number.isSafeInteger(body.wait_ms) || body.wait_ms < 0)) throw bodyUsage('bad-wait', 'wait_ms must be a whole number of milliseconds, 0 or more');
   const claimantKind = body.claimant_kind ?? 'agent';
   if (!CLAIMANT_KINDS.includes(claimantKind)) throw bodyUsage('bad-claimant-kind', `claimant_kind is one of ${CLAIMANT_KINDS.join(', ')}`);
   if (body.id !== undefined && (typeof body.id !== 'string' || !LEASE_ID.test(body.id))) throw bodyUsage('bad-id', 'id must be a lease id (lowercase letters, digits and dashes, at most 64)');
+  if (body.wait_ms > 0 && body.id === undefined) throw bodyUsage('no-id', 'a wait names its id: mint one (lowercase letters, digits and dashes) so the request can be asked for again');
   let actor = null;
   if (body.actor !== undefined) {
     try { actor = checkActor(body.actor); } catch (error) { throw bodyUsage('bad-actor', error.message); }
@@ -619,7 +630,7 @@ export function checkLeaseBody(body) {
   }
   if (!isText(body.holder)) throw bodyUsage('no-holder', 'say who holds the lease: a holder');
   if (!isText(body.why)) throw bodyUsage('bad-why', 'why is required: say what the lease is for');
-  return { resource: hasResource ? body.resource : null, match: hasMatch ? body.match : null, forMs: body.for_ms, holder: body.holder, why: body.why, claimantKind, id: body.id ?? null, actor };
+  return { resource: hasResource ? body.resource : null, match: hasMatch ? body.match : null, forMs: body.for_ms, waitMs: body.wait_ms ?? 0, holder: body.holder, why: body.why, claimantKind, id: body.id ?? null, actor };
 }
 
 // A taken phone Lease as a service answers it: the Lease, the Resource and device it is on, and what the Claimant exports to use it
@@ -632,24 +643,146 @@ export function leaseView(taken) {
   };
 }
 
+// The Lease a held id names, for a service: the phone whose lock holds a Lease by this id, as a `taken` (`leaseView`'s input), or null.
+// The device is the one the record carries (a Lease taken with a connect has an adb id), else the lock-only shape a `--no-connect`
+// Lease has. Read only. `ctx`: env, fleet (loaded when absent), warn.
+export function heldLease(id, ctx) {
+  const env = ctx.env ?? process.env;
+  const fleet = ctx.fleet ?? loadFleet(env, { warn: ctx.warn });
+  const phone = typeof id === 'string' && id !== '' ? phoneOwning(fleet, env, id) : null;
+  if (!phone) return null;
+  const lease = readOwnerOf(phone.lock, env);
+  if (!isLease(lease) || lease.lease_id !== id) return null;
+  const device = lease.device ?? { phone: phone.device, serial: null, adb_id: null, adb_port: Number(String(env.HUB_ADB_SERVER_PORT || '5037')) };
+  return { kind: 'phone', phone, lease, device };
+}
+
+// `GET /leases/{id}`: the Lease an id names, as `leaseView`. A Lease that is still waiting for its lock is 404 `waiting` and an id
+// nothing knows is 404 `unknown`: both HUB_LEASE_NOT_FOUND (exit 2), so a client that lost an answer can tell "not yet" from "never".
+export function findLease(id, ctx) {
+  const env = ctx.env ?? process.env;
+  const fleet = ctx.fleet ?? loadFleet(env, { warn: ctx.warn });
+  const held = heldLease(id, { ...ctx, env, fleet });
+  if (held) return leaseView(held);
+  const waiting = typeof id === 'string' && id !== '' ? phoneWaiting(fleet, env, id) : null;
+  if (waiting) throw Object.assign(failure('HUB_LEASE_NOT_FOUND', `lease ${id} is waiting for ${waiting.device}; it holds nothing yet`), { reason: 'waiting' });
+  throw Object.assign(failure('HUB_LEASE_NOT_FOUND', `no lease or waiter has the id "${id}"`), { reason: 'unknown' });
+}
+
+// The id a service echoes in `X-Request-Id` for a lease request: the Lease it answered with, else the body's `id` when that is a valid
+// lease id (so a header is never written with arbitrary text), else null.
+export const leaseRequestId = (body, view) => {
+  if (typeof view?.lease_id === 'string') return view.lease_id;
+  return typeof body?.id === 'string' && LEASE_ID.test(body.id) ? body.id : null;
+};
+
 // The Lease a service takes (`POST /leases`, and the Host Agent's): exactly `hub-device lease <word> --no-connect`: the lock only, no
 // `findPhone`, no adb on the request path, `holderPid` null (the Lease lives until `expires_at` or its release; it is never reclaimed
-// for a dead process), no wait, and an environment with no `GITHUB_*` key. `input` is `checkLeaseBody`'s result (its actor already
-// defaulted by the caller). A `resource` is a word or a Resource id (a lease id is never a target); a `match` Pool drops the members
-// `ctx.readingsOf` (a function of the members, returning Map(device -> state)) already knows are away. An emulator is refused here.
+// for a dead process), and an environment with no `GITHUB_*` key. `input` is `checkLeaseBody`'s result (its actor already defaulted by
+// the caller). A `resource` is a word or a Resource id (a lease id is never a target); a `match` Pool drops the members `ctx.readingsOf`
+// (a function of the members, returning Map(device -> state)) already knows are away. An emulator is refused here.
+//
+// A wait (`input.waitMs` > 0, Story 7.2) is the same take with a place in line: `ctx.signal` ends it (the ticket leaves with a `cancel`,
+// reason `aborted`) and `ctx.processStart` is the service's one cached process-start reader (AD-44). A Hold granted to a request whose
+// signal had already aborted is given back at once (a `release`, reason `undelivered`: nobody received it) and the signal's reason is
+// thrown. An id this holder already holds answers its existing Lease: no second take, no event (a client asking again after a lost answer).
 // Returns `leaseView`. Throws what `resolve`, `matchTarget` and `take` throw (the HTTP table gives them their status).
 export async function serviceLease(input, ctx) {
   const env = withoutDeployIdentity(ctx.env ?? process.env);
   const fleet = ctx.fleet ?? loadFleet(env, { warn: ctx.warn });
   const base = createContext({ env, log: ctx.log, warn: ctx.warn, policy: ctx.policy, now: ctx.timing?.now ?? ctx.now, sleep: ctx.timing?.sleep ?? ctx.sleep, fleet, qaDevices: ctx.qaDevices, registry: ctx.registry });
   const local = { ...ctx, env, fleet, log: base.log, warn: base.warn, timing: ctx.timing ?? base.timing, emulator: ctx.emulator ?? base.emulator };
+  if (input.id) {
+    const held = heldLease(input.id, local);
+    if (held && held.lease.holder === input.holder) return leaseView(held);
+  }
   const resolved = input.match !== null ? matchTarget(input.match, { forMs: input.forMs }, local) : resolve(input.resource, { fleet, env, ids: false });
   if (resolved.kind === EMULATOR) throw usage('an emulator is not leased through this route yet; lease a phone');
+  const signal = ctx.signal ?? null;
   const taken = await take(resolved, {
-    holder: input.holder, why: input.why, forMs: input.forMs, waitMs: 0, id: input.id, holderPid: null, noConnect: true,
+    holder: input.holder, why: input.why, forMs: input.forMs, waitMs: input.waitMs ?? 0, id: input.id, holderPid: null, noConnect: true,
     claimantKind: input.claimantKind, actor: input.actor, readingsOf: ctx.readingsOf, flag: 'for_ms',
+    ...(signal ? { signal } : {}), ...(ctx.processStart ? { processStart: ctx.processStart } : {}),
   }, local);
+  if (signal?.aborted) {
+    releaseLease(taken.phone.lock, taken.lease.lease_id, { env, now: local.timing.now, reason: 'undelivered' });
+    throw signal.reason;
+  }
   return leaseView(taken);
+}
+
+// ---- waits bound to the connection (Story 7.2; AD-37, AD-48) ----
+
+const restartingError = () => Object.assign(failure('HUB_API_RESTARTING', 'the service is stopping; ask again when it is back'), { retry: 'requeue' });
+const supersededError = id => failure('HUB_LEASE_SUPERSEDED', `the wait for lease ${id} was taken over by a newer request with the same id`);
+const disconnectedError = id => Object.assign(failure('HUB_LEASE_CANCELLED', `the connection that asked for lease ${id} closed`), { reason: 'disconnected' });
+
+// The registry of a service's lease requests (`POST /leases`; the Host Agent's too): the one place that binds a wait to the HTTP
+// connection that asked for it. The service builds one (`createLeaseWaits`) and every request calls `waits.lease(input, ctx, {signal})`
+// with the connection's own abort signal; the rules are these and nothing in a route repeats them:
+//   - The client mints the `id`. A disconnect (the current request's signal aborts) aborts the wait: the ticket leaves with a `cancel`
+//     (`aborted`) and the answer is dropped. A Hold granted after that is released at once (`serviceLease`).
+//   - A request with the id and holder of a wait that is still open takes it over: the wait goes on with its original resource, `for_ms`
+//     and deadline (its place in line, no event), the new connection gets its outcome, and the old one gets HUB_LEASE_SUPERSEDED. Another
+//     holder's repeat is refused as a taken id.
+//   - A repeat of an id already held by the same holder answers the Lease (`serviceLease`).
+//   - `shutdown()` ends every open wait with HUB_API_RESTARTING (`retry: 'requeue'`) and refuses every later request the same way.
+// One cached process-start reader (AD-44) is shared by every wait of the registry. `now` and `startOf` are test seams.
+export function createLeaseWaits({ now = Date.now, startOf } = {}) {
+  const processStart = cachedProcessStart({ now: () => now(), ...(startOf ? { startOf } : {}) });
+  const open = new Map();
+  let closed = false;
+
+  // The new request becomes the one that receives the wait's outcome; the one before it is superseded.
+  const attach = (entry, signal) => new Promise((resolve, reject) => {
+    const subscriber = { resolve, reject };
+    const onAbort = () => { if (entry.subscriber === subscriber) entry.controller.abort(disconnectedError(entry.id)); };
+    subscriber.detach = () => signal?.removeEventListener?.('abort', onAbort);
+    const previous = entry.subscriber;
+    entry.subscriber = subscriber;
+    if (previous) { previous.detach(); previous.reject(supersededError(entry.id)); }
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener?.('abort', onAbort, { once: true });
+  });
+
+  const finish = (entry, method, value) => {
+    if (open.get(entry.id) === entry) open.delete(entry.id);
+    const { subscriber } = entry;
+    subscriber?.detach();
+    subscriber?.[method](value);
+  };
+
+  const registry = {
+    get size() { return open.size; },
+    async lease(input, ctx, { signal } = {}) {
+      if (closed) throw restartingError();
+      const entry = input.id ? open.get(input.id) : undefined;
+      if (entry && entry.holder === input.holder) {
+        // A wait whose connection just closed is still unwinding: its ticket is gone in a moment, and this request is a fresh one.
+        if (entry.controller.signal.aborted) { await entry.work; return registry.lease(input, ctx, { signal }); }
+        return attach(entry, signal);
+      }
+      // Another holder's open wait names this id: refused as any taken id (never registered over it).
+      if (entry) throw usage(`id ${input.id} already names a lease or a waiter; a lease id names one lease`);
+      const served = { ...ctx, processStart: ctx.processStart ?? processStart };
+      if (!(input.waitMs > 0)) return serviceLease(input, { ...served, signal: signal ?? null });
+      const created = { id: input.id, holder: input.holder, controller: new AbortController(), subscriber: null, work: null };
+      open.set(input.id, created);
+      const outcome = attach(created, signal);
+      created.work = serviceLease(input, { ...served, signal: created.controller.signal })
+        .then(view => finish(created, 'resolve', view), error => finish(created, 'reject', error));
+      return outcome;
+    },
+    // Ends every open wait with HUB_API_RESTARTING and refuses what comes after. Resolves when every wait has unwound (its ticket
+    // withdrawn, its answer handed to its connection).
+    async shutdown() {
+      closed = true;
+      const entries = [...open.values()];
+      for (const entry of entries) entry.controller.abort(restartingError());
+      await Promise.all(entries.map(entry => entry.work));
+    },
+  };
+  return registry;
 }
 
 // ---- release ----

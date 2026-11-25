@@ -32,6 +32,7 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 | POST | `/registry/resources/{id}` | Resource | 6.7 |
 | POST | `/registry/resources/{id}/retire` | Retirement | 6.7 |
 | POST | `/leases` | Lease | 7.1 |
+| GET | `/leases/{id}` | Lease | 7.2 |
 
 ## Shapes
 
@@ -135,7 +136,9 @@ The age rule: a reader on the service's host computes `age_ms = age_ms_at_receip
 
 ### Lease
 
-`POST /leases`: status 200, the Lease that was taken. It is the Lease `hub-device lease <word> --no-connect --json` would take, and the one view every service route that answers with a Lease uses (`leaseView` in `tools/device/claims.mjs`).
+`POST /leases`: status 200, the Lease that was taken (after a wait, when the body asked for one). It is the Lease `hub-device lease <word> --no-connect --json` would take, and the one view every service route that answers with a Lease uses (`leaseView` in `tools/device/claims.mjs`).
+
+`GET /leases/{id}`: status 200, the same shape for the Lease the id names (a client whose connection dropped after the grant fetches its Hold here). A Lease that is still waiting for its lock holds nothing: 404 `HUB_LEASE_NOT_FOUND` with `reason: waiting`; an id nothing knows is 404 with `reason: unknown`. Only a phone Lease is found here for now.
 
 - `lease_id` the Lease's id (the body's `id`, else one the lock layer minted)
 - `resource` the Resource id the lock stands for
@@ -168,6 +171,7 @@ An error of these codes carries the named members besides the `Problem` fields a
 |------|---------|---------|
 | `HUB_REGISTRY_CONFLICT` | `rev` | The Registry's current revision, so a client can read again and retry. |
 | `HUB_REGISTRY_DUPLICATE` | `holder` | The id of the live Resource that already has the serial or UDID. |
+| `HUB_API_RESTARTING` | `retry` | Always `requeue`: the service is stopping, so ask again (a wait is placed again with the same `id`). |
 
 ## Request bodies
 
@@ -210,12 +214,22 @@ Refusals, in the order they are checked: `HUB_USAGE` 400 for the body (`bad-body
 - `holder` (required): who holds the Lease, recorded as given.
 - `why` (required): a non-empty string, what the Lease is for.
 - `claimant_kind`: `agent` (the default) or `person`. Recorded on the owner record and on every event of the Lease.
-- `id`: the Lease's id: lowercase letters, digits and dashes, at most 64. An id that already names a Lease or a waiter on any phone is refused. When absent one is minted.
+- `wait_ms`: a whole number of milliseconds, 0 or more (default 0, no wait). With more than 0 the request waits for its place in line up to that long, with the connection open and nothing written until the outcome; it needs an `id`.
+- `id`: the Lease's id: lowercase letters, digits and dashes, at most 64. An id that already names a Lease or a waiter on any phone is refused, except by the same `holder` (see "Waits"). When absent one is minted (a request with no wait only).
 - `actor`: `{holder, via}`, recorded as given on the take's events. When absent the actor is `{holder: <holder>, via: 'api'}`.
 
-There is no `wait_ms`: a key not listed is `bad-body`, so a wait is refused until the route that has one (a later story). The take is `hub-device lease <word> --no-connect`: the lock only (the owner record has `holder_pid: null` and no `device.adb_id`), `findPhone` never runs and adb is never asked. The service's environment is stripped of every `GITHUB_*` key before it is used, so no Lease or event of the API names a repo or a run. For a `match` the members whose reading in the service's own cache is `absent`, `offline` or `unauthorized` are dropped (an `unknown` or missing reading drops nothing); a word is never away, as for `--no-connect` on the CLI.
+A key not listed is `bad-body`. The take is `hub-device lease <word> --no-connect`: the lock only (the owner record has `holder_pid: null` and no `device.adb_id`), `findPhone` never runs and adb is never asked. The service's environment is stripped of every `GITHUB_*` key before it is used, so no Lease or event of the API names a repo or a run. For a `match` the members whose reading in the service's own cache is `absent`, `offline` or `unauthorized` are dropped (an `unknown` or missing reading drops nothing); a word is never away, as for `--no-connect` on the CLI.
 
-Refusals, in the order they are checked: `HUB_USAGE` 400 for the body (`bad-body`, `bad-target`, `bad-for`, `bad-claimant-kind`, `bad-id`, `bad-actor`, `no-holder`, `bad-why`), all before anything is read; `HUB_USAGE` 400 for an unknown device word, `emulator`, an `id` that is already taken, and a `for_ms` over 48 h or over a deploy target's cap (the message names the cap; the deploy-target one ends `lease s24 or an emulator for longer`), with nothing written; `HUB_RESOURCE_RETIRED` 409 (`retired`, `seed-missing`) for a Resource the Registry marks retired or seed-missing; `HUB_NO_MATCH` 404 (`no-match`) when a `match` finds nothing; `HUB_POOL_CROSS_HOST` 409 when its members span hosts; `HUB_DEVICE_AWAY` 503 (`away`) when every member of a `match` is known away; `HUB_LOCK_TIMEOUT` 409 (`busy`) when the lock is held or anyone waits: `detail` keeps `host lock <name> is held …`, and no event is written.
+Refusals, in the order they are checked: `HUB_USAGE` 400 for the body (`bad-body`, `bad-target`, `bad-for`, `bad-wait`, `bad-claimant-kind`, `bad-id`, `no-id`, `bad-actor`, `no-holder`, `bad-why`), all before anything is read; `HUB_USAGE` 400 for an unknown device word, `emulator`, an `id` that is already taken, and a `for_ms` over 48 h or over a deploy target's cap (the message names the cap; the deploy-target one ends `lease s24 or an emulator for longer`), with nothing written; `HUB_RESOURCE_RETIRED` 409 (`retired`, `seed-missing`) for a Resource the Registry marks retired or seed-missing; `HUB_NO_MATCH` 404 (`no-match`) when a `match` finds nothing; `HUB_POOL_CROSS_HOST` 409 when its members span hosts; `HUB_DEVICE_AWAY` 503 (`away`) when every member of a `match` is known away; `HUB_LOCK_TIMEOUT` 409 (`busy`) when the lock is held or anyone waits and no wait was asked for: `detail` keeps `host lock <name> is held …`, and no event is written. A wait that runs out of time is the same answer (the `timeout` event is written, and for a Pool `detail` starts `host lock <lock> is held by …` for each held member).
+
+**Waits** (`wait_ms` more than 0, `POST /leases`). The wait is the CLI's `hub-device lease --wait`: one place in line in the queue of the Resource (of every member of a Pool), a `request` event, then one `acquire`, `timeout` or `cancel`. It is bound to the HTTP connection, so a vanished client holds no place and is granted no Hold nobody receives:
+
+- The client mints the `id`, so it can ask again after a lost answer. The server writes nothing, no status line and no header, until the outcome. Every answer of `POST /leases` that knows the id (the body's `id`, else the minted `lease_id` of a success) carries `X-Request-Id: <id>`.
+- The ticket's `pid` is the serving process and it carries `claimant_kind`, so a `prune`, `cancel` or `timeout` names the right kind. Nothing is asked of the system for a pid more than once per 2 s.
+- The connection closing before the answer is written ends the wait: the ticket is gone and the Event Log has a `cancel` with `reason: aborted`. A Hold granted after that is released at once (a `release` with `reason: undelivered`); a Hold granted before it, with its answer written, stands, and `GET /leases/{id}` returns it.
+- A repeat of an `id` already held by the same `holder` answers 200 with the existing Lease (no second take, no event), whether or not it asks for a wait. A repeat of an `id` held by another `holder` is `HUB_USAGE` 400 as any taken id.
+- A repeat with the `id` and `holder` of a wait that is still open takes it over: the wait goes on with its original Resource, `for_ms` and deadline and keeps its place (no event), the new connection gets the outcome, and the old connection gets `HUB_LEASE_SUPERSEDED` 409.
+- When the service stops (`SIGTERM`), every open wait gets `HUB_API_RESTARTING` 503 with `retry: requeue` and its ticket is withdrawn (a `cancel` with `reason: aborted`); a request that arrives while it stops gets the same. A client places its wait again with the same `id` when the service is back.
 
 For every write route the actor is `actor` as given, else `{holder, via: 'api'}`, else `no-holder`; the body is checked before the name's shape, which is checked before anything is read from the Registry.
 
@@ -227,11 +241,14 @@ For every write route the actor is `actor` as given, else `{holder, via: 'api'}`
 | `HUB_RESOURCE_NOT_FOUND` | 404 | 2 | No Resource has this id (`reason: unknown`), or on a read it is retired and idle (`reason: retired`). The write routes (`/registry/resources/{id}` and `/retire`) answer only `unknown`. |
 | `HUB_RESOURCE_RETIRED` | 409 | 2 | An edit of a Resource that is retired (`reason: retired`) or no longer in `devices.json` (`reason: seed-missing`). Also what `POST /leases` refuses a take of one with, with the same reasons. |
 | `HUB_REGISTRY_SEEDED` | 409 | 2 | A retire (`reason: retire`), an edit of `id`, `lock`, `kind`, `host` or `identity` (`reason` is that key) or a different name (`reason: name`) of a seeded Resource: a hub release changes those. |
-| `HUB_USAGE` | 400, 413 | 2 | The request body is not valid JSON (`bad-json`) or is over 1 MiB (`too-large`), or a write body is wrong (`bad-body`, `bad-kind`, `bad-host`, `bad-identity`, `no-model`, `bad-capabilities`, `bad-if-rev`, `no-if-rev`, `bad-why`, `bad-actor`, `no-holder`, `no-change`), or an edit names a key a runtime Resource keeps for good (`immutable`). A lease body is wrong with `bad-body`, `bad-target`, `bad-for`, `bad-claimant-kind`, `bad-id`, `bad-actor`, `no-holder` or `bad-why`; a lease request the library refuses (an unknown word, `emulator`, a taken `id`, a `for_ms` over a cap) has `reason: hub_usage` and a `detail` that says why. |
-| `HUB_LOCK_TIMEOUT` | 409 | 76 | `POST /leases`: the lock is held or someone waits (`reason: busy`). `detail` keeps the library's wording, `host lock <name> is held …`; nothing is written. |
+| `HUB_USAGE` | 400, 413 | 2 | The request body is not valid JSON (`bad-json`) or is over 1 MiB (`too-large`), or a write body is wrong (`bad-body`, `bad-kind`, `bad-host`, `bad-identity`, `no-model`, `bad-capabilities`, `bad-if-rev`, `no-if-rev`, `bad-why`, `bad-actor`, `no-holder`, `no-change`), or an edit names a key a runtime Resource keeps for good (`immutable`). A lease body is wrong with `bad-body`, `bad-target`, `bad-for`, `bad-wait`, `bad-claimant-kind`, `bad-id`, `no-id`, `bad-actor`, `no-holder` or `bad-why`; a lease request the library refuses (an unknown word, `emulator`, a taken `id`, a `for_ms` over a cap) has `reason: hub_usage` and a `detail` that says why. |
+| `HUB_LOCK_TIMEOUT` | 409 | 76 | `POST /leases`: the lock is held or someone waits (`reason: busy`), or a wait ran out of time. `detail` keeps the library's wording, `host lock <name> is held …` (for a Pool, once per held member); a try writes no event, a wait ends with its `timeout` event. |
 | `HUB_DEVICE_AWAY` | 503 | 75 | `POST /leases` with a `match` whose every member the service's cache knows is away: `absent`, `offline` or `unauthorized` (`reason: away`). |
 | `HUB_NO_MATCH` | 404 | 2 | `POST /leases` with a `match` nothing can serve (`reason: no-match`); `detail` says what excluded each Resource. |
 | `HUB_POOL_CROSS_HOST` | 409 | 2 | `POST /leases` with a `match` whose members are on more than one host. |
+| `HUB_LEASE_NOT_FOUND` | 404 | 2 | `GET /leases/{id}`: no Lease holds this id. `reason: waiting` when a waiter has it (it holds nothing yet), `reason: unknown` otherwise. |
+| `HUB_LEASE_SUPERSEDED` | 409 | 1 | `POST /leases`: a newer request with the same `id` and `holder` took over this wait (`reason: superseded`). The wait itself goes on. |
+| `HUB_API_RESTARTING` | 503 | 1 | The service is stopping (`reason: restarting`; member `retry: requeue`). Every open wait gets it, and so does a lease request that arrives while it stops. |
 | `HUB_REGISTRY_NAME` | 400, 409 | 2 | A register's or edit's name is not a slug (`not-slug`) or is too long (`too-long`) with 400; reserved (`reserved`), already used (`taken`) or out of `-<n>` suffixes (`exhausted`) with 409. |
 | `HUB_REGISTRY_DUPLICATE` | 409 | 2 | A live Resource already has the serial (`reason: serial`) or UDID (`reason: udid`); `holder` names it. |
 | `HUB_REGISTRY_CONFLICT` | 409 | 1 | `if_rev` is not the Registry's revision; `rev` is the current one. |
