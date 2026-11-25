@@ -473,6 +473,8 @@ const leaseId = id => { if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(id)) throw new Err
 const lockPath = (name, env) => join(lockDir(env), `${leaseName(name)}.lock`);
 const queuePath = (name, env) => join(lockDir(env), `${leaseName(name)}.queue`);
 const failure = (code, message) => Object.assign(new Error(message), { code });
+// A refused extension: the code, and a `reason` a front door answers with (waiters, expired, cap, too-long).
+const refusal = (reason, message) => Object.assign(failure('HUB_LEASE_EXTEND_REFUSED', message), { reason });
 
 // Who a Lease is for: an agent (the default) or a person (Holocene's page, a person's own tool). Anything else is a caller bug.
 export const CLAIMANT_KINDS = Object.freeze(['agent', 'person']);
@@ -1742,8 +1744,10 @@ export async function acquireLease(name, {
 // another holder's lease or a lock that has moved on. Returns {released, cancelled, reason}. A release writes one
 // `release` event (`reason`, else `by-id`, or `any` when no id was given); each waiter it cancels, one `cancel` event
 // (reason `released`), written because this unlink of the ticket decided it.
-export function releaseLease(name, id, { env = process.env, now = Date.now, reason = null, hostId } = {}) {
+export function releaseLease(name, id, { env = process.env, now = Date.now, reason = null, hostId, actor = null } = {}) {
   const path = lockPath(name, env);
+  const who = checkActor(actor);
+  const by = who ? { actor: who } : {};
   let cancelled = 0;
   if (id) {
     const dir = queuePath(name, env);
@@ -1765,7 +1769,7 @@ export function releaseLease(name, id, { env = process.env, now = Date.now, reas
         const subject = kind === 'job' || kind === 'hub-job'
           ? { kind, repo: ticket.repo ?? null, run: ticket.run ?? null, attempt: ticket.attempt ?? null, job: ticket.job ?? null }
           : { kind: 'lease', lease_id: id, holder: ticket.holder ?? null, claimant_kind: ticket.claimant_kind ?? 'agent' };
-        note(name, eventOf('cancel', name, subject, { waited_ms: Number.isFinite(enqueued) ? Math.max(0, at - enqueued) : null, reason: 'released' }), { env, at, hostId });
+        note(name, eventOf('cancel', name, subject, { waited_ms: Number.isFinite(enqueued) ? Math.max(0, at - enqueued) : null, reason: 'released', ...by }), { env, at, hostId });
       } catch { /* gone, or being written */ }
     }
   }
@@ -1780,7 +1784,7 @@ export function releaseLease(name, id, { env = process.env, now = Date.now, reas
   // A record whose ticket this call just cancelled was being taken: its taker never acquired it and gives it back, so
   // the cancel above is its whole history and the retire records nothing.
   const as = cancelled > 0 && id ? null : 'release';
-  if (!retire(name, path, owner, { as, reason: reason ?? (id ? 'by-id' : 'any'), env, now, hostId })) return { released: false, cancelled, reason: 'changed' };
+  if (!retire(name, path, owner, { as, reason: reason ?? (id ? 'by-id' : 'any'), fields: by, env, now, hostId })) return { released: false, cancelled, reason: 'changed' };
   return { released: true, cancelled, reason: 'released', owner };
 }
 
@@ -1837,31 +1841,44 @@ export function waitersBehind(name, id, { env = process.env, now = Date.now, hos
 //     not block, queueView says so);
 //   - when the Lease would then run past the cap: the policy's deploy-target cap on adb and mac-ios, MAX_LEASE_MS elsewhere, both
 //     counted from started_at.
-// Throws HUB_LEASE_LOST when the lock is not this Lease's any more. On success it appends one `extend` event (the rewrite decided it)
-// and returns the new record.
-export function extendLease(name, id, { forMs, env = process.env, now = Date.now, policy = null, hostId = machineId(), host, processStart: startOf, ino = null } = {}) {
+// Every refusal carries a `reason`: expired, waiters, cap or too-long. `override: {actor, why}` skips the waiters check and nothing
+// else (never the expiry check, the deploy-target cap or the 48 h limit); `actor` is who asked, recorded on the event.
+// Throws HUB_LEASE_LOST when the lock is not this Lease's any more. On success it appends one `extend` event (the rewrite decided it,
+// with `actor`, and for an override `why`, plus `reason: override` when it skipped waiters) and returns the new record.
+export function extendLease(name, id, { forMs, env = process.env, now = Date.now, policy = null, hostId = machineId(), host, processStart: startOf, ino = null, actor = null, override = null } = {}) {
   if (!(forMs > 0) || !Number.isFinite(forMs)) throw new Error('an extension is for more than 0 ms');
+  // An override skips the waiters check and nothing else; it names who did it and why (a caller bug, TypeError, when it does not).
+  let overridden = null;
+  if (override !== null && override !== undefined) {
+    const by = override && typeof override === 'object' && !Array.isArray(override) ? checkActor(override.actor) : null;
+    if (!by || typeof override.why !== 'string' || override.why.trim() === '') throw new TypeError('an override is {actor: {holder, via}, why: non-empty string}');
+    overridden = { actor: by, why: override.why };
+  }
+  const who = overridden?.actor ?? checkActor(actor);
   const path = lockPath(name, env);
   const current = ownLease(name, path, id, ino);
   if (!current) throw lost(name, id, 'nothing holds the lock');
   const at = now();
   const expiry = expiresAt(current);
-  if (!(expiry > at)) throw failure('HUB_LEASE_EXTEND_REFUSED', `lease ${id} on ${name} ${Number.isFinite(expiry) ? `ran out at ${current.expires_at}` : 'has no expiry'}; an expired lease cannot be extended, take a new one`);
+  if (!(expiry > at)) throw refusal('expired', `lease ${id} on ${name} ${Number.isFinite(expiry) ? `ran out at ${current.expires_at}` : 'has no expiry'}; an expired lease cannot be extended, take a new one`);
   const { own, gate } = waitersBehind(name, id, { env, now, hostId, host, processStart: startOf });
   const count = own.length + gate.length;
-  if (count > 0) {
+  const skipped = count > 0 && overridden !== null;
+  if (count > 0 && !skipped) {
     const groups = [...(own.length > 0 ? [own.map(waiterText).join(', ')] : []), ...(gate.length > 0 ? [`in the emulator line ${gate.map(waiterText).join(', ')}`] : [])];
-    throw failure('HUB_LEASE_EXTEND_REFUSED', `lease ${id} on ${name} cannot be extended while ${count} waiter${count === 1 ? '' : 's'} wait${count === 1 ? 's' : ''}: ${groups.join('; ')}`);
+    throw refusal('waiters', `lease ${id} on ${name} cannot be extended while ${count} waiter${count === 1 ? '' : 's'} wait${count === 1 ? 's' : ''}: ${groups.join('; ')}`);
   }
   const started = Date.parse(current.started_at);
   const next = expiry + forMs;
   const total = next - (Number.isFinite(started) ? started : at);
   const cap = deployTargetCapMs(name, { policy });
-  if (cap !== null && total > cap) throw failure('HUB_LEASE_EXTEND_REFUSED', `lease ${id} on ${name} would run ${Math.ceil(total / 60_000)} min in total; ${capText(name, cap)}`);
-  if (total > MAX_LEASE_MS) throw failure('HUB_LEASE_EXTEND_REFUSED', `lease ${id} on ${name} would run more than ${MAX_LEASE_MS / 3600_000}h in total, the longest a lease runs`);
+  if (cap !== null && total > cap) throw refusal('cap', `lease ${id} on ${name} would run ${Math.ceil(total / 60_000)} min in total; ${capText(name, cap)}`);
+  if (total > MAX_LEASE_MS) throw refusal('too-long', `lease ${id} on ${name} would run more than ${MAX_LEASE_MS / 3600_000}h in total, the longest a lease runs`);
   const record = { ...current, expires_at: iso(next) };
   if (!rewriteOwner(name, path, id, ino, record)) throw lost(name, id, 'the lock is gone');
-  note(name, eventOf('extend', name, record), { env, at: now(), hostId });
+  // The event says who did it; an override also says why, and `reason: override` only when it skipped waiters that were there.
+  const fields = { ...(who ? { actor: who } : {}), ...(overridden ? { why: overridden.why } : {}), ...(skipped ? { reason: 'override' } : {}) };
+  note(name, eventOf('extend', name, record, fields), { env, at: now(), hostId });
   return record;
 }
 

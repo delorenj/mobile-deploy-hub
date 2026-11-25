@@ -53,7 +53,8 @@ export const EXIT_CODES = Object.freeze({
   HUB_DEVICE_BUSY: 76,
   HUB_LOCK_TIMEOUT: 76,
   HUB_LEASE_CANCELLED: 1,
-  HUB_LEASE_EXTEND_REFUSED: 1,
+  // Story 7.3: an extension refused (reason waiters, expired, cap or too-long) is the busy exit, as a waiter's refusal always was in spirit.
+  HUB_LEASE_EXTEND_REFUSED: 76,
   HUB_LEASE_LOST: 1,
   // Story 7.2: a service's wait: a Lease or a waiter no id names (2), a wait another connection took over, a service that is stopping (1).
   HUB_LEASE_NOT_FOUND: 2,
@@ -99,6 +100,8 @@ export const HTTP_ANSWERS = Object.freeze({
   HUB_RESOURCE_RETIRED: Object.freeze({ status: 409 }),
   HUB_LEASE_CANCELLED: Object.freeze({ status: 409 }),
   HUB_LEASE_NOT_FOUND: Object.freeze({ status: 404 }),
+  HUB_LEASE_EXTEND_REFUSED: Object.freeze({ status: 409 }),
+  HUB_LEASE_LOST: Object.freeze({ status: 409 }),
   HUB_LEASE_SUPERSEDED: Object.freeze({ status: 409, reason: 'superseded' }),
   HUB_API_RESTARTING: Object.freeze({ status: 503, reason: 'restarting' }),
   HUB_PHONE_AWAY: Object.freeze({ status: 503, reason: 'away' }),
@@ -653,9 +656,11 @@ export function heldLease(id, ctx) {
   if (!phone) return null;
   const lease = readOwnerOf(phone.lock, env);
   if (!isLease(lease) || lease.lease_id !== id) return null;
-  const device = lease.device ?? { phone: phone.device, serial: null, adb_id: null, adb_port: Number(String(env.HUB_ADB_SERVER_PORT || '5037')) };
-  return { kind: 'phone', phone, lease, device };
+  return { kind: 'phone', phone, lease, device: leaseDevice(lease, phone, env) };
 }
+
+// The device a held Lease is on: the one its record carries (a Lease taken with a connect has an adb id), else the lock-only shape.
+const leaseDevice = (lease, phone, env) => lease.device ?? { phone: phone.device, serial: null, adb_id: null, adb_port: Number(String(env.HUB_ADB_SERVER_PORT || '5037')) };
 
 // `GET /leases/{id}`: the Lease an id names, as `leaseView`. A Lease that is still waiting for its lock is 404 `waiting` and an id
 // nothing knows is 404 `unknown`: both HUB_LEASE_NOT_FOUND (exit 2), so a client that lost an answer can tell "not yet" from "never".
@@ -664,9 +669,14 @@ export function findLease(id, ctx) {
   const fleet = ctx.fleet ?? loadFleet(env, { warn: ctx.warn });
   const held = heldLease(id, { ...ctx, env, fleet });
   if (held) return leaseView(held);
+  throw leaseNotFound(id, fleet, env);
+}
+
+// The refusal for an id that holds nothing: HUB_LEASE_NOT_FOUND, `reason: waiting` when a waiter has it (it holds nothing yet), else `unknown`.
+function leaseNotFound(id, fleet, env) {
   const waiting = typeof id === 'string' && id !== '' ? phoneWaiting(fleet, env, id) : null;
-  if (waiting) throw Object.assign(failure('HUB_LEASE_NOT_FOUND', `lease ${id} is waiting for ${waiting.device}; it holds nothing yet`), { reason: 'waiting' });
-  throw Object.assign(failure('HUB_LEASE_NOT_FOUND', `no lease or waiter has the id "${id}"`), { reason: 'unknown' });
+  if (waiting) return Object.assign(failure('HUB_LEASE_NOT_FOUND', `lease ${id} is waiting for ${waiting.device}; it holds nothing yet`), { reason: 'waiting' });
+  return Object.assign(failure('HUB_LEASE_NOT_FOUND', `no lease or waiter has the id "${id}"`), { reason: 'unknown' });
 }
 
 // The id a service echoes in `X-Request-Id` for a lease request: the Lease it answered with, else the body's `id` when that is a valid
@@ -822,7 +832,7 @@ const lockExists = (lock, env) => { try { statSync(join(lockDir(env), `${lock}.l
 // A phone lease by id: the phone whose lock holds it, or whose queue is still waiting for it (a Pool request waits in every member's). Says what it found as
 // {outcome, device, id, leaseId, notes}: released, cancelled, none (notes say what each phone is doing), job-held,
 // unknown-holder, changed-hands. Idempotent for a lease that is already gone.
-export function releasePhone(id, ctx) {
+export function releasePhone(id, ctx, actor = null) {
   const { env, fleet } = ctx;
   const owning = phoneOwning(fleet, env, id);
   const waiting = fleet.filter(phone => queueView(phone.lock, { env, includeStale: true }).some(waiter => waiter.lease_id === id));
@@ -840,9 +850,9 @@ export function releasePhone(id, ctx) {
   }
   // A Pool request waits in the queue of every member it can be served from: cancelling it takes it out of all of them (the request
   // writes its own one `cancel`).
-  for (const phone of waiting) if (phone !== found) releaseLease(phone.lock, id, { env });
-  const result = releaseLease(found.lock, id, { env });
-  const base = { kind: 'phone', device: found.device, id, notes: [] };
+  for (const phone of waiting) if (phone !== found) releaseLease(phone.lock, id, { env, actor });
+  const result = releaseLease(found.lock, id, { env, actor });
+  const base = { kind: 'phone', device: found.device, lock: found.lock, id, notes: [] };
   if (result.cancelled && !result.released) return { ...base, outcome: 'cancelled' };
   switch (result.reason) {
     case 'released': return { ...base, outcome: 'released', leaseId: result.owner.lease_id };
@@ -854,13 +864,13 @@ export function releasePhone(id, ctx) {
 
 // --any: whichever phone lease is held, in fleet order. A phone held by a deploy job (or mid-take) does not stop
 // the others being freed; --any refuses only when no phone yielded a release, and then names the first refusal.
-export function releaseAny(ctx) {
+export function releaseAny(ctx, actor = null) {
   const { env, fleet } = ctx;
   let refusal = null;
   for (const phone of fleet) {
-    const result = releaseLease(phone.lock, null, { env });
+    const result = releaseLease(phone.lock, null, { env, actor });
     switch (result.reason) {
-      case 'released': return { kind: 'phone', outcome: 'released', device: phone.device, leaseId: result.owner.lease_id, notes: [] };
+      case 'released': return { kind: 'phone', outcome: 'released', device: phone.device, lock: phone.lock, leaseId: result.owner.lease_id, notes: [] };
       case 'none': continue;
       case 'not-a-lease': refusal ??= `${phone.device} is held by a deploy job, not a lease; left alone`; continue;
       case 'unknown-holder': refusal ??= `${phone.device} is being taken (its lock has no owner record yet); left alone, try again`; continue;
@@ -872,15 +882,17 @@ export function releaseAny(ctx) {
 
 // One release for every kind: `{any: true}` frees whichever phone lease is held, `{emulator: id}` an emulator lease, and `{id}`
 // whatever holds that id (an emulator lease first, else a phone's). A deploy job's ticket id is refused (HUB_DEVICE_JOB_ID),
-// and so is a target that names nothing (HUB_USAGE).
+// and so is a target that names nothing (HUB_USAGE). `target.actor` ({holder, via}, optional) is recorded on a phone's `release` and
+// `cancel` events (Story 7.3).
 export async function release(target, ctx) {
-  if (target?.any) return releaseAny(ctx);
+  const actor = checkActor(target?.actor);
+  if (target?.any) return releaseAny(ctx, actor);
   if (target?.emulator !== undefined) return { kind: EMULATOR, id: target.emulator, ...await releaseEmulator(target.emulator, ctx) };
   const job = jobTicket(target?.id);
   if (job) throw failure(job.code, job.message);
   if (!target?.id) throw usage('release needs a lease id, an emulator lease id, or any');
   if (isEmulatorLease(ctx.env, target.id)) return { kind: EMULATOR, id: target.id, ...await releaseEmulator(target.id, ctx) };
-  return releasePhone(target.id, ctx);
+  return releasePhone(target.id, ctx, actor);
 }
 
 const RUN_KEY = /^[A-Za-z0-9][A-Za-z0-9-]*--[A-Za-z0-9._-]+--\d{1,20}$/;
@@ -901,13 +913,117 @@ export function releaseReservations({ key, name }, ctx) {
 // ---- extend ----
 
 // Extends a live Lease on a phone or an emulator slot by `forMs` (lock.mjs refuses while anyone waits, past the deploy cap and
-// past 48 h in total). Only a Lease that holds its lock extends: a waiter's id holds nothing. Returns the new owner record.
-export function extend(id, { forMs }, ctx) {
+// past 48 h in total). Only a Lease that holds its lock extends: a waiter's id (HUB_LEASE_NOT_FOUND, `waiting`), an id nothing knows
+// (`unknown`) and a deploy job's ticket id (HUB_DEVICE_JOB_ID, which names the run to cancel) hold nothing to extend. `actor` is who
+// asked and `override: {actor, why}` skips the waiters check and nothing else (lock.mjs `extendLease`); both go on the `extend` event
+// (Story 7.3). Returns `{lock, device, record}`: the lock the Lease holds, the word for it, and the new owner record.
+export function extendHeld(id, { forMs, actor = null, override = null }, ctx) {
   const { env, fleet, policy = null, timing } = ctx;
   if (!(forMs > 0) || !Number.isFinite(forMs)) throw usage('an extension is for more than 0 ms');
+  const job = jobTicket(id);
+  if (job) throw failure(job.code, job.message);
   const lock = readRecord(env, id)?.slot ?? phoneOwning(fleet, env, id)?.lock;
-  if (!lock) throw failure('HUB_LEASE_LOST', `lease ${id} holds nothing to extend`);
-  return extendLease(lock, id, { forMs, env, now: timing?.now, policy });
+  if (!lock) throw leaseNotFound(id, fleet, env);
+  const record = extendLease(lock, id, { forMs, env, now: timing?.now, policy, actor, override });
+  return { lock, device: nameOf(fleet, lock), record };
+}
+
+// The new owner record alone (the CLI's v1a shape).
+export const extend = (id, options, ctx) => extendHeld(id, options, ctx).record;
+
+const EXTEND_BODY_KEYS = Object.freeze(['for_ms', 'holder', 'actor', 'override']);
+const OVERRIDE_KEYS = Object.freeze(['why', 'actor']);
+const RELEASE_BODY_KEYS = Object.freeze(['holder', 'actor']);
+
+// The `actor` of a body, as `checkActor` writes it (null when absent), with the same refusal as a lease body.
+function bodyActor(body) {
+  if (body.actor === undefined) return null;
+  let actor = null;
+  try { actor = checkActor(body.actor); } catch (error) { throw bodyUsage('bad-actor', error.message); }
+  if (actor === null) throw bodyUsage('bad-actor', 'actor must be {holder, via}');
+  return actor;
+}
+
+// Checks the body of a service's extend into `{forMs, holder, actor, override}` (`holder`, `actor` and `override` null when absent;
+// `override` is `{why, actor}`, its `actor` null when absent: the caller defaults it to the request's). HUB_USAGE with a `reason`,
+// before anything is read: bad-body (not an object, or a key outside `for_ms`, `holder`, `actor`, `override`), bad-for, bad-actor,
+// bad-override (not `{why, actor?}`, an empty `why`, or a bad override actor), no-holder (neither an `actor` nor a `holder`).
+export function checkExtendBody(body) {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) throw bodyUsage('bad-body', 'the body must be a JSON object');
+  for (const key of Object.keys(body)) if (!EXTEND_BODY_KEYS.includes(key)) throw bodyUsage('bad-body', `the body has no key "${key}" (${EXTEND_BODY_KEYS.join(', ')})`);
+  if (!Number.isSafeInteger(body.for_ms) || body.for_ms <= 0) throw bodyUsage('bad-for', 'for_ms must be a whole number of milliseconds, more than 0');
+  const actor = bodyActor(body);
+  let override = null;
+  if (body.override !== undefined) {
+    const given = body.override;
+    if (given === null || typeof given !== 'object' || Array.isArray(given)) throw bodyUsage('bad-override', 'override must be {why, actor?}');
+    for (const key of Object.keys(given)) if (!OVERRIDE_KEYS.includes(key)) throw bodyUsage('bad-override', `override has no key "${key}" (${OVERRIDE_KEYS.join(', ')})`);
+    if (!isText(given.why)) throw bodyUsage('bad-override', 'an override says why: a non-empty why');
+    let by = null;
+    if (given.actor !== undefined) {
+      try { by = checkActor(given.actor); } catch (error) { throw bodyUsage('bad-override', `override ${error.message}`); }
+      if (by === null) throw bodyUsage('bad-override', 'override actor must be {holder, via}');
+    }
+    override = { why: given.why, actor: by };
+  }
+  if (actor === null && !isText(body.holder)) throw bodyUsage('no-holder', 'say who is extending: an actor or a holder');
+  return { forMs: body.for_ms, holder: body.holder ?? null, actor, override };
+}
+
+// Checks the body of a service's release into `{holder, actor}` (both null when absent). bad-body (not an object, or a key outside
+// `holder`, `actor`), bad-actor, no-holder (neither an `actor` nor a `holder`).
+export function checkReleaseBody(body) {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) throw bodyUsage('bad-body', 'the body must be a JSON object');
+  for (const key of Object.keys(body)) if (!RELEASE_BODY_KEYS.includes(key)) throw bodyUsage('bad-body', `the body has no key "${key}" (${RELEASE_BODY_KEYS.join(', ')})`);
+  const actor = bodyActor(body);
+  if (actor === null && !isText(body.holder)) throw bodyUsage('no-holder', 'say who is releasing: an actor or a holder');
+  return { holder: body.holder ?? null, actor };
+}
+
+// What a service extend and release both do first: the environment without `GITHUB_*` (as a take), the context, a deploy job's ticket
+// id refused (HUB_DEVICE_JOB_ID, which names the run to cancel) and an emulator lease id refused (HUB_USAGE, `reason: emulator`: an
+// emulator is not extended or released through a service yet).
+function serviceHold(id, ctx) {
+  const env = withoutDeployIdentity(ctx.env ?? process.env);
+  const fleet = ctx.fleet ?? loadFleet(env, { warn: ctx.warn });
+  const base = createContext({ env, log: ctx.log, warn: ctx.warn, policy: ctx.policy, now: ctx.timing?.now ?? ctx.now, sleep: ctx.timing?.sleep ?? ctx.sleep, fleet, qaDevices: ctx.qaDevices, registry: ctx.registry });
+  const local = { ...ctx, env, fleet, log: base.log, warn: base.warn, policy: base.policy, timing: ctx.timing ?? base.timing, emulator: ctx.emulator ?? base.emulator };
+  const job = jobTicket(id);
+  if (job) throw failure(job.code, job.message);
+  if (isEmulatorLease(env, id)) throw bodyUsage('emulator', 'an emulator lease is not extended or released through this route yet');
+  return local;
+}
+
+// `POST /leases/{id}/extend` (and the Host Agent's): exactly `hub-device extend <id> --for ...`. `input` is `checkExtendBody`'s result
+// with the actor defaulted by the caller (`actor`; `override.actor` too, defaulting to it). Returns `leaseView` of the extended Lease.
+// Throws what `extendHeld` throws (HUB_LEASE_EXTEND_REFUSED with its `reason`, HUB_LEASE_NOT_FOUND, HUB_DEVICE_JOB_ID, HUB_LEASE_LOST).
+export function serviceExtend(id, input, ctx) {
+  const local = serviceHold(id, ctx);
+  const override = input.override ? { why: input.override.why, actor: input.override.actor ?? input.actor } : null;
+  const { lock, record } = extendHeld(id, { forMs: input.forMs, actor: input.actor, override }, local);
+  // Built from what the extension wrote: no second read, so a committed extension is never answered as lost.
+  const phone = local.fleet.find(entry => entry.lock === lock);
+  return leaseView({ kind: 'phone', phone, lease: record, device: leaseDevice(record, phone, local.env) });
+}
+
+// `POST /leases/{id}/release` (and the Host Agent's): exactly `hub-device release <id>`, with the actor on its events. Idempotent: an id
+// that holds and waits for nothing is `none`. Returns `{lease_id, outcome, resource, lock, device}`, `outcome` `released` (the Lease was
+// given back), `cancelled` (it was only a waiter) or `none`; the last three keys are null for `none`. A lock that is being taken or
+// changed hands is HUB_LEASE_LOST (`being-taken`, `changed-hands`): left alone.
+export async function serviceRelease(id, input, ctx) {
+  const local = serviceHold(id, ctx);
+  return releaseAnswer(id, await release({ id, actor: input.actor }, local));
+}
+
+// The `Release` a service answers with for what `release` found (a pure mapping, so each outcome is testable on its own).
+export function releaseAnswer(id, result) {
+  switch (result.outcome) {
+    case 'released':
+    case 'cancelled': return { lease_id: id, outcome: result.outcome, resource: resourceOf(result.lock), lock: result.lock, device: result.device };
+    case 'unknown-holder': throw Object.assign(failure('HUB_LEASE_LOST', result.notes[0] ?? `lease ${id} is being taken`), { reason: 'being-taken' });
+    case 'changed-hands': throw Object.assign(failure('HUB_LEASE_LOST', result.notes[0] ?? `lease ${id} changed hands`), { reason: 'changed-hands' });
+    default: return { lease_id: id, outcome: 'none', resource: null, lock: null, device: null };
+  }
 }
 
 

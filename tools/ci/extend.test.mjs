@@ -393,3 +393,92 @@ test('an expired gate holder is not a waiter', async () => {
     assert.equal(extend(f, MIN, 'emulator-1').expires_at, at(T0 + 61 * MIN));
   } finally { f.cleanup(); }
 });
+
+// ---- Story 7.3: the refusal reasons, the override and the actor ----
+
+const reasonOf = fn => { try { fn(); } catch (error) { return [error.code, error.reason]; } return null; };
+const WHO = { holder: 'jarad', via: 'cli' };
+
+test('every HUB_LEASE_EXTEND_REFUSED carries a reason: waiters, expired, cap, too-long; a refusal writes nothing', async () => {
+  const f = fixture();
+  try {
+    const held = await take(f, 'adb', { forMs: 50 * MIN });
+    putTicket(f, T0 + MIN);
+    const events = f.events().length;
+    assert.deepEqual(reasonOf(() => extend(f, MIN)), ['HUB_LEASE_EXTEND_REFUSED', 'waiters']);
+    assert.deepEqual(reasonOf(() => extend(f, 20 * MIN, 'adb', { override: { actor: WHO, why: 'finish' } })), ['HUB_LEASE_EXTEND_REFUSED', 'cap']);
+    f.clock.at = T0 + 50 * MIN;
+    assert.deepEqual(reasonOf(() => extend(f, MIN, 'adb', { override: { actor: WHO, why: 'finish' } })), ['HUB_LEASE_EXTEND_REFUSED', 'expired']);
+    assert.deepEqual(f.owner('adb'), held);
+    assert.equal(f.events().length, events);
+    const long = fixture();
+    try {
+      await take(long, 's24', { forMs: 20 * MIN });
+      assert.deepEqual(reasonOf(() => extend(long, 48 * 3600_000, 's24')), ['HUB_LEASE_EXTEND_REFUSED', 'too-long']);
+      assert.deepEqual(reasonOf(() => extend(long, 48 * 3600_000, 's24', { override: { actor: WHO, why: 'x' } })), ['HUB_LEASE_EXTEND_REFUSED', 'too-long'], 'an override never lifts the 48 h limit');
+    } finally { long.cleanup(); }
+  } finally { f.cleanup(); }
+});
+
+test('an override extends past waiters and records actor, why and reason override; with nobody waiting it records no reason', async () => {
+  const f = fixture();
+  try {
+    await take(f, 's24', { forMs: 20 * MIN });
+    const quiet = extend(f, 5 * MIN, 's24', { override: { actor: WHO, why: 'no one waits' } });
+    assert.equal(quiet.expires_at, at(T0 + 25 * MIN));
+    const [, calm] = f.events();
+    assert.deepEqual([calm.event, calm.actor, calm.why, calm.reason], ['extend', WHO, 'no one waits', null]);
+    putTicket(f, T0 + MIN, {}, 's24');
+    const before = f.events().length;
+    const next = extend(f, 5 * MIN, 's24', { override: { actor: WHO, why: 'finish proof' } });
+    assert.equal(next.expires_at, at(T0 + 30 * MIN));
+    assert.equal(f.events().length, before + 1);
+    const event = f.events().at(-1);
+    assert.deepEqual([event.event, event.actor, event.why, event.reason, event.expires_at], ['extend', WHO, 'finish proof', 'override', at(T0 + 30 * MIN)]);
+    // A plain extension records only the actor.
+    const plain = fixture();
+    try {
+      await take(plain, 's24');
+      extend(plain, MIN, 's24', { actor: WHO });
+      const [, only] = plain.events();
+      assert.deepEqual([only.actor, 'why' in only, only.reason], [WHO, false, null]);
+      extend(plain, MIN, 's24');
+      assert.equal('actor' in plain.events().at(-1), false, 'no actor, none written');
+    } finally { plain.cleanup(); }
+  } finally { f.cleanup(); }
+});
+
+test('a bad override or actor is a caller bug (TypeError) and writes nothing', async () => {
+  const f = fixture();
+  try {
+    await take(f, 's24');
+    const events = f.events().length;
+    for (const override of [{}, { actor: WHO }, { actor: WHO, why: '' }, { actor: WHO, why: '  ' }, { actor: { holder: 'x', via: 'smoke' }, why: 'y' }, { why: 'y' }, 'finish', []]) {
+      assert.throws(() => extend(f, MIN, 's24', { override }), TypeError, JSON.stringify(override));
+    }
+    assert.throws(() => extend(f, MIN, 's24', { actor: { holder: '', via: 'cli' } }), TypeError);
+    assert.equal(f.events().length, events);
+  } finally { f.cleanup(); }
+});
+
+test('releaseLease records the actor on the release and on the cancel of a waiter, and only when it is given', async () => {
+  const f = fixture();
+  try {
+    await take(f, 's24');
+    putTicket(f, T0 + MIN, { lease_id: 'queued-1' }, 's24');
+    const cancelled = releaseLease('s24', 'queued-1', { env: f.env, now: f.now, actor: WHO });
+    assert.equal(cancelled.cancelled, 1);
+    const cancel = f.events().at(-1);
+    assert.deepEqual([cancel.event, cancel.reason, cancel.actor], ['cancel', 'released', WHO]);
+    const done = releaseLease('s24', 'mine', { env: f.env, now: f.now, actor: WHO });
+    assert.equal(done.released, true);
+    const release = f.events().at(-1);
+    assert.deepEqual([release.event, release.reason, release.actor], ['release', 'by-id', WHO]);
+    await take(f, 's24', { id: 'again' });
+    releaseLease('s24', 'again', { env: f.env, now: f.now });
+    assert.equal('actor' in f.events().at(-1), false);
+    await take(f, 's24', { id: 'third' });
+    assert.throws(() => releaseLease('s24', 'third', { env: f.env, now: f.now, actor: { holder: 'x' } }), TypeError);
+    assert.notEqual(f.owner('s24'), null, 'a bad actor released nothing');
+  } finally { f.cleanup(); }
+});

@@ -29,8 +29,12 @@
 //                    dedicated_qa, and the first that serves it is taken as one Pool request that holds a place in every match's queue; no match is HUB_NO_MATCH (exit 2) with a reason for each
 //                    Resource left out, every match away is HUB_DEVICE_AWAY (75); report lines say `match:<query>` where a device word goes;
 //                    `run --match <query> ... -- <cmd...>` is the same for run)
-//   hub-device release [<lease_id>|--any]    (no id: $HUB_LEASE_ID; --any: whichever lease holds a phone; a `job:` id is a deploy job's place in
+//   hub-device release [<lease_id>|--any] [--holder WHO]    (--holder is recorded as the actor; no id: $HUB_LEASE_ID; --any: whichever lease holds a phone; a `job:` id is a deploy job's place in
 //                    line, not a lease: exit 2, HUB_DEVICE_JOB_ID names the run to cancel)
+//   hub-device extend [<lease_id>] --for <dur> [--override <why>] [--holder WHO] [--json]   (no id: $HUB_LEASE_ID; moves the expiry later by
+//                    --for; refused with HUB_LEASE_EXTEND_REFUSED (exit 76) while anyone waits, past the deploy phone's 60 min or 48 h in total,
+//                    or at/after expiry. --override <why> skips only the waiters check and records who and why on the `extend` event; prints
+//                    HUB_DEVICE_EXTENDED <device> <id> until <iso>)
 //   hub-device status [--json]   (read only: locks, every waiter with its position and live ETA, the Reservations, the inventory; --json
 //                    gives every row its `resource` and its `reachability` {state, checked_at, age_ms, stale}, read over the adb wire on the
 //                    Linux host and through devicectl on the Mac, and none at all on a host that does not know its key)
@@ -86,7 +90,7 @@ export function parseDuration(text, flag = 'duration') {
   return parts.reduce((total, [, count, unit]) => total + Number(count) * { d: 86_400_000, h: 3_600_000, m: 60_000, s: 1000 }[unit], 0);
 }
 
-const VALUE_FLAGS = new Set(['for', 'why', 'wait', 'id', 'pid', 'holder', 'env-serial', 'profile', 'pool', 'run', 'name', 'match', 'kind', 'model', 'serial', 'udid', 'host', 'cap', 'uncap', 'if-rev']);
+const VALUE_FLAGS = new Set(['for', 'why', 'wait', 'id', 'pid', 'holder', 'env-serial', 'profile', 'pool', 'run', 'name', 'match', 'kind', 'model', 'serial', 'udid', 'host', 'cap', 'uncap', 'if-rev', 'override']);
 const SWITCHES = new Set(['no-connect', 'json', 'verbose', 'any']);
 
 // Words, flags (`--flag value` or `--flag=value`), and everything after `--` as the command. `--env-serial`, `--cap` and `--uncap` repeat
@@ -113,7 +117,7 @@ export function parseArgs(argv) {
 
 const shellQuote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 
-const USAGE = 'usage: hub-device lease s24|s26|phone --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | lease emulator [--profile NAME] --for <dur> --why <text> [--wait <dur>] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] | release [emulator] [<lease_id>|--any] | status [--json] | discover [--json] | reservation release --run <key> [--name adb|mac-ios] [--json] | run s24|s26|phone|emulator [--profile NAME] [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...> | lease --match <query> --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | run --match <query> [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...> | registry add --kind K --name N [--model M] [--serial S] [--udid U] [--profile P] [--host H] [--cap k=v]... [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry edit <id> [--name N] [--cap k=v]... [--uncap k]... [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry retire <id> [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry list [--json]';
+const USAGE = 'usage: hub-device lease s24|s26|phone --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | lease emulator [--profile NAME] --for <dur> --why <text> [--wait <dur>] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] | release [emulator] [<lease_id>|--any] [--holder WHO] | extend [<lease_id>] --for <dur> [--override <why>] [--holder WHO] [--json] | status [--json] | discover [--json] | reservation release --run <key> [--name adb|mac-ios] [--json] | run s24|s26|phone|emulator [--profile NAME] [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...> | lease --match <query> --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | run --match <query> [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...> | registry add --kind K --name N [--model M] [--serial S] [--udid U] [--profile P] [--host H] [--cap k=v]... [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry edit <id> [--name N] [--cap k=v]... [--uncap k]... [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry retire <id> [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry list [--json]';
 
 // Leases are honoured only by a hub whose lock.mjs knows them. The catch-up runs from the installed release, and an
 // older one sees a lease's short-lived pid as a dead job and reclaims the lock at once, so lease and run say so.
@@ -174,6 +178,8 @@ function report(error, parsed, context) {
     stderr(`${error.code} ${error.message}`);
     return code;
   }
+  // An extension that was refused, and an id that holds nothing: they say what they are, and the library's `reason` says which.
+  if (error.code === 'HUB_LEASE_EXTEND_REFUSED' || error.code === 'HUB_LEASE_NOT_FOUND' || error.code === 'HUB_DEVICE_JOB_ID') { stderr(`${error.code} ${error.message}`); return code; }
   // These exit 2 like a usage error, but say what they are.
   if (error.code === 'HUB_NO_MATCH' || error.code === 'HUB_POOL_CROSS_HOST' || error.code === 'HUB_RESOURCE_RETIRED') { stderr(`${error.code} ${device} ${error.message}`); return code; }
   if (code === claims.EXIT_CODES.HUB_USAGE) { stderr(`hub-device: ${error.message}`); return code; }
@@ -316,6 +322,30 @@ function printPhoneRelease(result, { any, id }, context) {
   return code;
 }
 
+// The actor of a manual action from this front door: who did it (`--holder`, else $HUB_DEVICE_HOLDER, else user@host), and `via: cli`.
+const cliActor = (parsed, env) => ({ holder: parsed.flags.holder || env.HUB_DEVICE_HOLDER || `${env.USER ?? 'unknown'}@${hostname()}`, via: 'cli' });
+
+// `extend [<id>] --for <dur> [--override <why>]`: the library's `extendHeld` (the Hub API's `POST /leases/{id}/extend` is the same call).
+// The refusals (waiters, expired, cap, too-long) are its own and exit 76; `--override` skips the waiters check and says why.
+function extend(parsed, context) {
+  const { env, stdout } = context;
+  if (parsed.words.length > 2) throw usage('extend takes at most one lease id');
+  const id = parsed.words[1] ?? env.HUB_LEASE_ID ?? null;
+  if (!id) throw usage('extend needs a lease id or $HUB_LEASE_ID');
+  if (parsed.flags.for === undefined) throw usage('--for <duration> is required');
+  const forMs = parseDuration(parsed.flags.for, '--for');
+  const actor = cliActor(parsed, env);
+  let override = null;
+  if (parsed.flags.override !== undefined) {
+    if (parsed.flags.override.trim() === '') throw usage('--override says why: a non-empty reason');
+    override = { actor, why: parsed.flags.override };
+  }
+  const { lock, device, record } = claims.extendHeld(id, { forMs, actor, override }, context);
+  if (parsed.flags.json) stdout(JSON.stringify({ lease_id: id, lock, device, expires_at: record.expires_at }));
+  else stdout(`HUB_DEVICE_EXTENDED ${device ?? lock} ${id} until ${record.expires_at}`);
+  return claims.EXIT_OK;
+}
+
 // Idempotent for a named lease: one that is already gone (expired, reclaimed, released) is not an error, so an adapter can
 // always call it. Without an id it releases $HUB_LEASE_ID (what `lease` exported), else whichever lease holds the phone;
 // a job's lock is never touched. Each outcome says what it found.
@@ -337,7 +367,8 @@ async function release(parsed, context) {
   if (parsed.flags.any && parsed.words[1]) throw usage('release takes --any or an id, not both');
   const id = parsed.flags.any ? null : parsed.words[1] ?? env.HUB_LEASE_ID ?? null;
   if (!id && !parsed.flags.any) throw usage('release needs a lease id, $HUB_LEASE_ID, or --any to free whichever lease holds a phone');
-  const result = await claims.release(parsed.flags.any ? { any: true } : { id }, context);
+  const actor = cliActor(parsed, env);
+  const result = await claims.release(parsed.flags.any ? { any: true, actor } : { id, actor }, context);
   return result.kind === 'emulator' ? printEmulatorRelease(result, context) : printPhoneRelease(result, { any: Boolean(parsed.flags.any), id }, context);
 }
 
@@ -676,6 +707,7 @@ const FLAG_OWNERS = Object.freeze({
   cap: ['registry'],
   uncap: ['registry'],
   'if-rev': ['registry'],
+  override: ['extend'],
 });
 
 function checkFlagOwners(parsed) {
@@ -723,6 +755,7 @@ export async function main(argv, {
     switch (parsed.words[0]) {
       case 'lease': return await lease(parsed, context);
       case 'release': return await release(parsed, context);
+      case 'extend': return extend(parsed, context);
       case 'status': return await status(parsed, context);
       case 'discover': return await discover(parsed, context);
       case 'reservation': return reservationCommand(parsed, context);
