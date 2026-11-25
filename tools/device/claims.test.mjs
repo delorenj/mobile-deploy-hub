@@ -70,6 +70,8 @@ test('the library exports the whole action surface and the exit table as frozen 
     HUB_RESOURCE_NOT_FOUND: 2,
     // Story 6.6: a register refused for its name or a duplicate identity.
     HUB_REGISTRY_NAME: 2, HUB_REGISTRY_DUPLICATE: 2,
+    // Story 6.7: a retire or an identity or name edit of a seeded Resource.
+    HUB_REGISTRY_SEEDED: 2,
   });
 });
 

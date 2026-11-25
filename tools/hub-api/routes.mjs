@@ -11,8 +11,8 @@
 import { STATUS_CODES } from 'node:http';
 import { HOST_PLATFORMS, exitCodeOf, lockActivity } from '../device/claims.mjs';
 import { hubRef } from '../ci/lib/receipt.mjs';
-import { retirement } from '../registry/match.mjs';
-import { checkRegisterBody, planRegister } from '../registry/changes.mjs';
+import { retirement, visibility } from '../registry/match.mjs';
+import { checkEditBody, checkRegisterBody, checkRetireBody, planEdit, planRegister, planRetire } from '../registry/changes.mjs';
 import { REGISTRY_ERRORS, applySeed, readRegistry, registryState, updateRegistry } from '../registry/store.mjs';
 import { viewPools, viewRecord } from '../registry/view.mjs';
 
@@ -115,10 +115,8 @@ export function listPools(ctx) {
   return { rev: registry.rev, source: registry.source, pools: viewPools(registry, ctx.policy) };
 }
 
-// POST /registry/resources: registers a Resource (FR-1). The body is checked first (a bad one writes nothing, not even the seed). A
-// missing file is the seed (AD-27): it is written first with the same inputs as at start, as its own `seed` event, then the register
-// is one more write; an `if_rev` other than 0 on a missing file is a conflict at rev 0, and 0 is accepted (the seed materialises what
-// that client read). The name, mint and duplicate checks run inside the store's queue, against the file as it is at commit time.
+// POST /registry/resources: registers a Resource (FR-1). The body is checked first (a bad one writes nothing, not even the seed). The
+// name, mint and duplicate checks run inside the store's queue, against the file as it is at commit time (`writeThrough`).
 // 201 `{rev, source: 'file', resource}`, the Resource with QA redaction.
 const SEED_ACTOR = Object.freeze({ holder: 'hub-api', via: 'api' });
 const SEED_TRIES = 3;
@@ -134,32 +132,67 @@ async function seedFirst(ctx, env) {
   }
 }
 
-export async function registerResource(ctx, { body }) {
+// The one write path of every Registry write route (register, edit, retire, and 6.10's register-from-discovery): the missing-file seed,
+// the `if_rev` rule and `updateRegistry`. `plan({resources})` runs inside the store's queue against the file as it is at commit time and
+// returns `{resources, ...}` (anything else it returns reaches the caller); a throw commits nothing. A missing file is the seed (AD-27):
+// it is written first as its own revision; an `if_rev` other than 0 on a missing file is a conflict at rev 0, and 0 is accepted (the seed
+// materialises what that client read). Only a missing file is seeded here; an existing one was seeded at start.
+// Returns `{written, planned}`: the store's result and what `plan` returned.
+async function writeThrough(ctx, { if_rev, reason, actor, why, plan }) {
   const env = ctx.env ?? process.env;
-  const input = checkRegisterBody(body, { hosts: HOST_PLATFORMS });
-  if (input.if_rev !== undefined && input.if_rev !== 0 && registryState(env) === 'missing') {
-    throw Object.assign(new Error(`the Registry has no file yet (rev 0), not rev ${input.if_rev}`), { code: 'HUB_REGISTRY_CONFLICT', ...REGISTRY_ERRORS.HUB_REGISTRY_CONFLICT, rev: 0 });
+  const missing = registryState(env) === 'missing';
+  if (if_rev !== undefined && if_rev !== 0 && missing) {
+    throw Object.assign(new Error(`the Registry has no file yet (rev 0), not rev ${if_rev}`), { code: 'HUB_REGISTRY_CONFLICT', ...REGISTRY_ERRORS.HUB_REGISTRY_CONFLICT, rev: 0 });
   }
-  // Only a missing file is seeded here; an existing one was seeded at start, and re-seeding it per request is the start's job.
-  const seeded = registryState(env) === 'missing' ? await seedFirst(ctx, env) : { first: false };
-  let record = null;
+  const seeded = missing ? await seedFirst(ctx, env) : { first: false };
+  let planned = null;
   const written = await updateRegistry({
     env,
     // The seed that was just written is what an `if_rev: 0` client read: no rev check for it.
-    if_rev: seeded.first && input.if_rev === 0 ? undefined : input.if_rev,
-    reason: 'register',
-    actor: input.actor,
-    why: input.why,
+    if_rev: seeded.first && if_rev === 0 ? undefined : if_rev,
+    reason,
+    actor,
+    why,
     now: ctx.now,
     hostId: ctx.hostId,
     log: ctx.log?.err,
     change: ({ resources, pools }) => {
-      const plan = planRegister({ resources }, input, { now: ctx.now });
-      record = plan.record;
-      return { resources: plan.resources, pools };
+      planned = plan({ resources });
+      return { resources: planned.resources, pools };
     },
   });
-  return reply(201, { rev: written.rev, source: 'file', resource: viewRecord(record, { audience: 'service' }) });
+  return { written, planned };
+}
+
+export async function registerResource(ctx, { body }) {
+  const input = checkRegisterBody(body, { hosts: HOST_PLATFORMS });
+  const { written, planned } = await writeThrough(ctx, {
+    if_rev: input.if_rev, reason: 'register', actor: input.actor, why: input.why, plan: current => planRegister(current, input, { now: ctx.now }),
+  });
+  return reply(201, { rev: written.rev, source: 'file', resource: viewRecord(planned.record, { audience: 'service' }) });
+}
+
+// POST /registry/resources/{id}: edits a Resource's name and Capabilities (FR-2). `if_rev` is required. 200 `{rev, source: 'file',
+// resource}`; an edit that changes nothing commits and logs nothing and answers the current rev. The plan's refusals are planEdit's.
+export async function editResource(ctx, { body, params }) {
+  const input = checkEditBody(body);
+  const { written, planned } = await writeThrough(ctx, {
+    if_rev: input.if_rev, reason: 'edit', actor: input.actor, why: input.why, plan: current => planEdit(current, params.id, input),
+  });
+  return { rev: written.rev, source: 'file', resource: viewRecord(planned.record, { audience: 'service' }) };
+}
+
+// POST /registry/resources/{id}/retire: sets `retired_at` and touches nothing else (AD-31): the Hold stays and queued waiters are
+// served; new takes are refused by the Claims library. 200 `{rev, source: 'file', id, retired_at, visibility}`, `visibility` `retiring`
+// while the lock is held or waited on, else `hidden`. Retiring a retired Resource answers the same, at the same rev.
+export async function retireResource(ctx, { body, params }) {
+  const input = checkRetireBody(body);
+  const { written, planned } = await writeThrough(ctx, {
+    if_rev: input.if_rev, reason: 'retire', actor: input.actor, why: input.why, plan: current => planRetire(current, params.id, input, { now: ctx.now }),
+  });
+  const { record } = planned;
+  const activity = (ctx.lockActivity ?? lockActivity)(record.lock, { env: ctx.env ?? process.env, now: ctx.now });
+  return { rev: written.rev, source: 'file', id: record.id, retired_at: record.retired_at, visibility: visibility(record, { held: activity.held === true, queued: activity.queued === true }) };
 }
 
 // `shape` names the `### <Shape>` section of the contract document that lists the response's fields.
@@ -169,6 +202,8 @@ export const ROUTES = Object.freeze([
   Object.freeze({ method: 'GET', path: '/resources/{id}', shape: 'Resource', handler: getResource }),
   Object.freeze({ method: 'GET', path: '/pools', shape: 'PoolList', handler: listPools }),
   Object.freeze({ method: 'POST', path: '/registry/resources', shape: 'Resource', handler: registerResource }),
+  Object.freeze({ method: 'POST', path: '/registry/resources/{id}', shape: 'Resource', handler: editResource }),
+  Object.freeze({ method: 'POST', path: '/registry/resources/{id}/retire', shape: 'Retirement', handler: retireResource }),
 ]);
 
 // ---- dispatch ----

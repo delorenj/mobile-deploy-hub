@@ -66,6 +66,8 @@ export const EXIT_CODES = Object.freeze({
   // Story 6.6: a Registry register refused for its name, or for an identity a live Resource already has.
   HUB_REGISTRY_NAME: 2,
   HUB_REGISTRY_DUPLICATE: 2,
+  // Story 6.7: a retire or an identity or name edit of a seeded Resource (a hub release changes those).
+  HUB_REGISTRY_SEEDED: 2,
 });
 export const exitCodeOf = error => (Object.hasOwn(EXIT_CODES, error?.code) ? EXIT_CODES[error.code] : EXIT_FAILURE);
 

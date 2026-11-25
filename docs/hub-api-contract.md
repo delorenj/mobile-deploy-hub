@@ -27,6 +27,8 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 | GET | `/resources/{id}` | Resource | 6.5 |
 | GET | `/pools` | PoolList | 6.5 |
 | POST | `/registry/resources` | Resource | 6.6 |
+| POST | `/registry/resources/{id}` | Resource | 6.7 |
+| POST | `/registry/resources/{id}/retire` | Retirement | 6.7 |
 
 ## Shapes
 
@@ -66,6 +68,8 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 
 `POST /registry/resources` answers the same shape with status 201: `rev` is the Registry's revision after the register, `source` is always `file`, and `resource` is the new Resource as a reader serves it (a `dedicated_qa` Resource's `serial`, `udid` and `adb_id` are `null`). The request body is under "Request bodies".
 
+`POST /registry/resources/{id}` (an edit, added in 6.7) answers the same shape with status 200: `rev` is the Registry's revision after the edit (the current one when the edit changed nothing), and `resource` is the edited Resource as a reader serves it. A retired Resource is never answered here: see `Retirement`.
+
 - `rev` the Registry's revision
 - `source` `file` or `seed`
 - `resource.id` as in `ResourceList`
@@ -81,6 +85,16 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 - `resource.created_at` as in `ResourceList`
 - `resource.retired_at` as in `ResourceList`
 - `resource.visibility` as in `ResourceList`
+
+### Retirement
+
+`POST /registry/resources/{id}/retire`: status 200. Retiring sets `retired_at` and changes nothing else: a Hold the Resource has stays, its queued waiters are served, and a new take is refused (`HUB_RESOURCE_RETIRED`). Retiring a Resource that is already retired answers the same shape with the stored `retired_at` and the unchanged `rev`.
+
+- `rev` the Registry's revision after the retire (unchanged for a Resource that was already retired)
+- `source` always `file`
+- `id` the Resource's id
+- `retired_at` the ISO time the Resource was retired
+- `visibility` `retiring` (the Resource's lock is held or waited on) or `hidden` (idle: no list shows it any more)
 
 ### PoolList
 
@@ -132,14 +146,34 @@ The Resource gets the id and lock `res-<name>`, or `res-<name>-<n>` (the smalles
 
 Refusals, in the order they are checked: `HUB_USAGE` 400 for the body (`bad-body`, `bad-kind`, `bad-host`, `bad-identity`, `no-model`, `bad-capabilities`, `bad-if-rev`, `bad-why`, `bad-actor`, `no-holder`); `HUB_REGISTRY_NAME` 400 for a name that is not a slug (`not-slug`) or is over 28 characters (`too-long`); `HUB_REGISTRY_CONFLICT` 409 for a stale `if_rev`; `HUB_REGISTRY_NAME` 409 for a reserved word (`reserved`), a name any Resource already has as a name, id, lock or word (`taken`), or no free `-<n>` up to 999 (`exhausted`); `HUB_REGISTRY_DUPLICATE` 409 for a serial or UDID a live Resource (neither retired nor seed-missing) has (`reason: serial` or `udid`, member `holder`). A retired or seed-missing Resource's identity is free, its name is not.
 
+**`POST /registry/resources/{id}`** edits a Resource's name and Capabilities. The body is a JSON object with only these keys:
+
+- `name`: a slug of at most 28 characters. `display_name` follows it. `id` and `lock` never change.
+- `capabilities`: a merge patch. Each key is set to a string, a finite number or a boolean, or removed by `null`; keys it does not name are kept (`dedicated_qa` included). Key rules are the register's.
+- `if_rev` (required): a whole number, the revision the edit is based on. Absent is `no-if-rev`; a stale one is `HUB_REGISTRY_CONFLICT` (with `rev`). A missing Registry file is revision 0, and `if_rev: 0` is accepted for it (the seed is written first).
+- `actor`, `holder`, `why`: as for a register.
+- `id`, `lock`, `kind`, `host` and `identity` are accepted by the body check and always refused, by presence and not by value.
+
+The body must name at least `name`, `capabilities` or one of the refused keys (`no-change` otherwise). An edit that changes nothing commits nothing, logs nothing and answers the current `rev`. Exactly one `registry-edit` event is logged for an edit that changes something; it names no identity.
+
+Refusals, in the order they are checked: `HUB_USAGE` 400 for the body (`bad-body`, `no-if-rev`, `bad-if-rev`, `bad-why`, `bad-capabilities`, `bad-actor`, `no-holder`, `no-change`); `HUB_REGISTRY_NAME` 400 for a name that is not a slug (`not-slug`) or is over 28 characters (`too-long`); `HUB_REGISTRY_CONFLICT` 409 for a stale `if_rev`; `HUB_RESOURCE_NOT_FOUND` 404 (`unknown`); `HUB_RESOURCE_RETIRED` 409 for a retired (`retired`) or seed-missing (`seed-missing`) Resource; for a seeded Resource `HUB_REGISTRY_SEEDED` 409 (`reason` the first refused key of `id`, `lock`, `kind`, `host`, `identity`; or `name` for a different name: a hub release changes those, and the seed overwrites them at each start; its Capabilities stay editable and survive a re-seed); for a runtime Resource `HUB_USAGE` 400 `immutable` for any of those keys; then `HUB_REGISTRY_NAME` 409 for a different name that is reserved (`reserved`) or that any other Resource has as a name, id, lock or word (`taken`, retired ones included).
+
+**`POST /registry/resources/{id}/retire`** retires a Resource. The body is a JSON object with only these keys: `if_rev` (optional, as for a register), `actor`, `holder` and `why`. Exactly one `registry-retire` event is logged, none for a Resource that is already retired.
+
+Refusals, in the order they are checked: `HUB_USAGE` 400 for the body (`bad-body`, `bad-if-rev`, `bad-why`, `bad-actor`, `no-holder`); `HUB_REGISTRY_CONFLICT` 409 for a stale `if_rev`; `HUB_RESOURCE_NOT_FOUND` 404 (`unknown`); `HUB_REGISTRY_SEEDED` 409 (`reason: retire`) for a seeded Resource. A retire is never undone: `retired_at` is not cleared.
+
+For every write route the actor is `actor` as given, else `{holder, via: 'api'}`, else `no-holder`; the body is checked before the name's shape, which is checked before anything is read from the Registry.
+
 ## Error codes
 
 | Code | Status | Exit | Meaning |
 |------|--------|------|---------|
 | `HUB_NO_ROUTE` | 404, 405 | 2 | No such path (`reason: no-route`), or the path exists and the method is not allowed (`reason: method`, with an `Allow` header). |
-| `HUB_RESOURCE_NOT_FOUND` | 404 | 2 | No Resource has this id (`reason: unknown`), or it is retired and idle (`reason: retired`). |
-| `HUB_USAGE` | 400, 413 | 2 | The request body is not valid JSON (`bad-json`) or is over 1 MiB (`too-large`), or a register body is wrong (`bad-body`, `bad-kind`, `bad-host`, `bad-identity`, `no-model`, `bad-capabilities`, `bad-if-rev`, `bad-why`, `bad-actor`, `no-holder`). |
-| `HUB_REGISTRY_NAME` | 400, 409 | 2 | A register's name is not a slug (`not-slug`) or is too long (`too-long`) with 400; reserved (`reserved`), already used (`taken`) or out of `-<n>` suffixes (`exhausted`) with 409. |
+| `HUB_RESOURCE_NOT_FOUND` | 404 | 2 | No Resource has this id (`reason: unknown`), or on a read it is retired and idle (`reason: retired`). The write routes (`/registry/resources/{id}` and `/retire`) answer only `unknown`. |
+| `HUB_RESOURCE_RETIRED` | 409 | 2 | An edit of a Resource that is retired (`reason: retired`) or no longer in `devices.json` (`reason: seed-missing`). Also what a take of one is refused with. |
+| `HUB_REGISTRY_SEEDED` | 409 | 2 | A retire (`reason: retire`), an edit of `id`, `lock`, `kind`, `host` or `identity` (`reason` is that key) or a different name (`reason: name`) of a seeded Resource: a hub release changes those. |
+| `HUB_USAGE` | 400, 413 | 2 | The request body is not valid JSON (`bad-json`) or is over 1 MiB (`too-large`), or a write body is wrong (`bad-body`, `bad-kind`, `bad-host`, `bad-identity`, `no-model`, `bad-capabilities`, `bad-if-rev`, `no-if-rev`, `bad-why`, `bad-actor`, `no-holder`, `no-change`), or an edit names a key a runtime Resource keeps for good (`immutable`). |
+| `HUB_REGISTRY_NAME` | 400, 409 | 2 | A register's or edit's name is not a slug (`not-slug`) or is too long (`too-long`) with 400; reserved (`reserved`), already used (`taken`) or out of `-<n>` suffixes (`exhausted`) with 409. |
 | `HUB_REGISTRY_DUPLICATE` | 409 | 2 | A live Resource already has the serial (`reason: serial`) or UDID (`reason: udid`); `holder` names it. |
 | `HUB_REGISTRY_CONFLICT` | 409 | 1 | `if_rev` is not the Registry's revision; `rev` is the current one. |
 | `HUB_REGISTRY_FORMAT` | 409 | 1 | `registry.json` exists and cannot be read, or is a format this service does not know. It is never written. |

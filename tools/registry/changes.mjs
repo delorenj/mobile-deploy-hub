@@ -1,6 +1,7 @@
 // The Registry's change planners (AD-28, FR-1): the pure half of every Registry write route. A route checks a request body into a
 // normalised input (`checkRegisterBody`), then, inside the store's per-path queue (`updateRegistry`'s `change`), plans the new records
-// against the file as it is at commit time (`planRegister`). 6.7 adds `planEdit` and `planRetire` here and nothing else.
+// against the file as it is at commit time (`planRegister`). 6.7 adds the edit and retire pairs (`checkEditBody`/`planEdit`,
+// `checkRetireBody`/`planRetire`) and the helpers they share with register (`checkWho`, `nameTaken`).
 //
 // Pure: no I/O, no clock of its own (the caller passes `now`), and the records it is given are never mutated. It imports only the
 // names rules of lock.mjs (`isSlug`, `NAME_MAX`, `reservedBy`, `checkActor`) and the matcher's one live/retired rule. Its errors are
@@ -14,6 +15,10 @@ export const IDENTITY_KEYS = Object.freeze(['serial', 'model', 'udid', 'profile'
 // What a capability key may never be: QA's user list, and the facets the matcher reads off the record itself.
 export const FORBIDDEN_CAPABILITIES = Object.freeze(['allowed_users', 'id', 'name', 'kind', 'host', 'model', 'deploy_target']);
 const BODY_KEYS = Object.freeze(['kind', 'name', 'host', 'identity', 'capabilities', 'if_rev', 'actor', 'holder', 'why']);
+// What an edit may carry. The immutable keys pass the body check and are always refused by the plan (AD-28): by presence, never by value.
+export const IMMUTABLE_KEYS = Object.freeze(['id', 'lock', 'kind', 'host', 'identity']);
+export const EDIT_KEYS = Object.freeze(['name', 'capabilities', 'if_rev', 'actor', 'holder', 'why', ...IMMUTABLE_KEYS]);
+export const RETIRE_KEYS = Object.freeze(['if_rev', 'actor', 'holder', 'why']);
 const CAPABILITY_KEY = /^[a-z][a-z0-9_]*$/;
 // A suffix `-<n>` of a minted id goes up to 999: `res-<28 chars>-999` is a lock of 36 characters, a slug part of 32.
 const MINT_MAX = 999;
@@ -40,28 +45,31 @@ function checkIdentity(identity, kind) {
   return { ...identity };
 }
 
-function checkCapabilities(capabilities) {
+// `patch` (an edit): a value of `null` removes the key; the key rules are the register's either way.
+function checkCapabilities(capabilities, { patch = false } = {}) {
   if (capabilities === undefined) return {};
   if (!isObject(capabilities)) throw usage('bad-capabilities', 'capabilities must be a flat object');
   for (const [key, value] of Object.entries(capabilities)) {
     if (!CAPABILITY_KEY.test(key)) throw usage('bad-capabilities', `capability key "${key}" must match ${CAPABILITY_KEY}`);
     if (FORBIDDEN_CAPABILITIES.includes(key)) throw usage('bad-capabilities', `"${key}" cannot be a capability`);
+    if (patch && value === null) continue;
     if (typeof value !== 'string' && typeof value !== 'boolean' && !(typeof value === 'number' && Number.isFinite(value))) {
-      throw usage('bad-capabilities', `capability "${key}" must be a string, a finite number or a boolean`);
+      throw usage('bad-capabilities', `capability "${key}" must be a string, a finite number${patch ? ', a boolean or null (remove)' : ' or a boolean'}`);
     }
   }
   return { ...capabilities };
 }
 
-// The actor of a write (AD-36): a given `actor` is recorded exactly as given; an absent one is `{holder, via: 'api'}`, set once here.
-function checkWho(body) {
+// The actor of a write (AD-36), the one rule of every Registry write route: a given `actor` is recorded exactly as given; an absent one
+// is `{holder, via: 'api'}`, set once here; neither is `no-holder`.
+export function checkWho(body) {
   if (body.actor !== undefined) {
     let actor = null;
     try { actor = checkActor(body.actor); } catch (error) { throw usage('bad-actor', error.message); }
     if (actor === null) throw usage('bad-actor', 'actor must be {holder, via}');
     return actor;
   }
-  if (!nonEmpty(body.holder)) throw usage('no-holder', 'say who is registering: an actor, or a holder');
+  if (!nonEmpty(body.holder)) throw usage('no-holder', 'say who is writing: an actor, or a holder');
   return { holder: body.holder, via: 'api' };
 }
 
@@ -84,6 +92,12 @@ export function checkRegisterBody(body, { hosts } = {}) {
   if (!isSlug(body.name)) throw nameError(400, 'not-slug', 'name must be a slug: lowercase letters and digits, single dashes between');
   if (body.name.length > NAME_MAX) throw nameError(400, 'too-long', `name is longer than ${NAME_MAX} characters`);
   return { kind: body.kind, name: body.name, host: body.host, identity, capabilities, if_rev: body.if_rev, actor, why: body.why };
+}
+
+// Whether any record (retired and seed-missing included) other than `exceptId` has `name` as a name, id, lock or word.
+export function nameTaken(name, resources, exceptId) {
+  return resources.some(record => record.id !== exceptId && (record.name === name || record.id === name || record.lock === name
+    || (Array.isArray(record.words) && record.words.includes(name))));
 }
 
 // The id a new Resource mints: `res-<name>`, or `res-<name>-<n>` with the smallest free n >= 2 when any record (retired included) has
@@ -115,9 +129,7 @@ export function planRegister(current, input, { now = Date.now } = {}) {
   const { name } = input;
   const reserved = reservedBy(name);
   if (reserved !== null) throw nameError(409, 'reserved', `"${name}" is a reserved word (${reserved})`);
-  if (resources.some(record => record.name === name || record.id === name || record.lock === name || (Array.isArray(record.words) && record.words.includes(name)))) {
-    throw nameError(409, 'taken', `"${name}" already names a Resource`);
-  }
+  if (nameTaken(name, resources)) throw nameError(409, 'taken', `"${name}" already names a Resource`);
   const duplicate = identityHolder(input.identity, resources);
   if (duplicate) throw coded('HUB_REGISTRY_DUPLICATE', 409, duplicate.key, `a live Resource (${duplicate.holder}) already has this ${duplicate.key}`, { holder: duplicate.holder });
   const id = mint(name, resources);
@@ -126,4 +138,97 @@ export function planRegister(current, input, { now = Date.now } = {}) {
     capabilities: { ...input.capabilities }, deploy_target: false, seeded: false, created_at: new Date(now()).toISOString(),
   };
   return { record, resources: [...resources, record] };
+}
+
+// ---- edit and retire (6.7) ----
+
+// The `if_rev` and `why` checks every write body shares; `required` makes an absent `if_rev` `no-if-rev`.
+function checkRevAndWhy(body, { required }) {
+  if (body.if_rev === undefined && required) throw usage('no-if-rev', 'an edit needs if_rev: the revision the change is based on');
+  if (body.if_rev !== undefined && !(Number.isSafeInteger(body.if_rev) && body.if_rev >= 0)) throw usage('bad-if-rev', 'if_rev must be a whole number');
+  if (body.why !== undefined && typeof body.why !== 'string') throw usage('bad-why', 'why must be a string');
+}
+
+function checkKeys(body, allowed) {
+  if (!isObject(body)) throw usage('bad-body', 'the body must be a JSON object');
+  for (const key of Object.keys(body)) if (!allowed.includes(key)) throw usage('bad-body', `the body has no key "${key}" (${allowed.join(', ')})`);
+}
+
+// Checks an edit body into `{name, capabilities, immutable, if_rev, actor, why}`: `name` and `capabilities` (a merge patch: a scalar
+// sets a key, `null` removes it) undefined when absent; `immutable` the immutable keys the body carries, in IMMUTABLE_KEYS order (the
+// plan refuses them). HUB_USAGE 400: bad-body, no-if-rev, bad-if-rev, bad-capabilities, bad-why, bad-actor, no-holder, no-change; then
+// HUB_REGISTRY_NAME 400 (`not-slug`, `too-long`). Stateless.
+export function checkEditBody(body) {
+  checkKeys(body, EDIT_KEYS);
+  checkRevAndWhy(body, { required: true });
+  const capabilities = body.capabilities === undefined ? undefined : checkCapabilities(body.capabilities, { patch: true });
+  const actor = checkWho(body);
+  const immutable = IMMUTABLE_KEYS.filter(key => body[key] !== undefined);
+  if (body.name === undefined && capabilities === undefined && immutable.length === 0) throw usage('no-change', 'an edit needs a name or capabilities to change');
+  if (body.name !== undefined) {
+    if (!isSlug(body.name)) throw nameError(400, 'not-slug', 'name must be a slug: lowercase letters and digits, single dashes between');
+    if (body.name.length > NAME_MAX) throw nameError(400, 'too-long', `name is longer than ${NAME_MAX} characters`);
+  }
+  return { name: body.name, capabilities, immutable, if_rev: body.if_rev, actor, why: body.why };
+}
+
+// Checks a retire body into `{if_rev, actor, why}` (`if_rev` and `why` undefined when absent). HUB_USAGE 400: bad-body, bad-if-rev,
+// bad-why, bad-actor, no-holder.
+export function checkRetireBody(body) {
+  checkKeys(body, RETIRE_KEYS);
+  checkRevAndWhy(body, { required: false });
+  return { if_rev: body.if_rev, actor: checkWho(body), why: body.why };
+}
+
+const notFound = id => coded('HUB_RESOURCE_NOT_FOUND', 404, 'unknown', `no Resource "${id}"`);
+const seededError = (reason, message) => coded('HUB_REGISTRY_SEEDED', 409, reason, message);
+
+// Plans an edit of the record `id` against `current` (`{resources}`, the file at commit time): `{record, resources}`, the record
+// replaced in place. Refusals, in order: HUB_RESOURCE_NOT_FOUND 404 `unknown`; HUB_RESOURCE_RETIRED 409 (`retired`, `seed-missing`);
+// for a seeded record HUB_REGISTRY_SEEDED 409 (an immutable key: that key; a different name: `name`: a hub release changes those, and
+// the seed overwrites them at each start; capabilities stay editable); for a runtime one HUB_USAGE 400 `immutable`; then the name rules
+// (HUB_REGISTRY_NAME 409 `reserved`, `taken`; a name equal to the record's is no change). `display_name` follows `name`. `current` is not mutated.
+export function planEdit(current, id, input) {
+  const resources = Array.isArray(current?.resources) ? current.resources : [];
+  const record = resources.find(entry => entry.id === id);
+  if (!record) throw notFound(id);
+  const marked = retirement(record);
+  if (marked !== null) {
+    throw coded('HUB_RESOURCE_RETIRED', 409, marked, `${id} is ${marked === 'retired' ? 'retired' : 'seed-missing'} (reason: ${marked}): it cannot be edited`, { resource: id });
+  }
+  const renamed = input.name !== undefined && input.name !== record.name;
+  if (record.seeded === true) {
+    if (input.immutable.length > 0) throw seededError(input.immutable[0], `${id} is seeded from devices.json: its ${input.immutable[0]} changes with a hub release`);
+    if (renamed) throw seededError('name', `${id} is seeded from devices.json: its name changes with a hub release`);
+  } else if (input.immutable.length > 0) {
+    throw usage('immutable', `${input.immutable.join(', ')} cannot be edited: ${id} keeps it for good`);
+  }
+  if (renamed) {
+    const reserved = reservedBy(input.name);
+    if (reserved !== null) throw nameError(409, 'reserved', `"${input.name}" is a reserved word (${reserved})`);
+    if (nameTaken(input.name, resources, id)) throw nameError(409, 'taken', `"${input.name}" already names a Resource`);
+  }
+  const next = structuredClone(record);
+  if (renamed) { next.name = input.name; next.display_name = input.name; }
+  if (input.capabilities !== undefined) {
+    const capabilities = isObject(next.capabilities) ? next.capabilities : {};
+    for (const [key, value] of Object.entries(input.capabilities)) {
+      if (value === null) delete capabilities[key]; else capabilities[key] = value;
+    }
+    next.capabilities = capabilities;
+  }
+  return { record: next, resources: resources.map(entry => (entry === record ? next : entry)) };
+}
+
+// Plans a retire of the record `id`: `retired_at` is set to now (ISO) and nothing else changes: the lock, its Hold and its queue are not
+// this function's. Refusals: HUB_RESOURCE_NOT_FOUND 404 `unknown`. An already-retired record is a no-op, seeded or not: the same record, the same list.
+// Then HUB_REGISTRY_SEEDED 409 `retire` (a hub release retires a seeded Resource). `current` is not mutated.
+export function planRetire(current, id, _input, { now = Date.now } = {}) {
+  const resources = Array.isArray(current?.resources) ? current.resources : [];
+  const record = resources.find(entry => entry.id === id);
+  if (!record) throw notFound(id);
+  if (record.retired_at) return { record, resources: [...resources] };
+  if (record.seeded === true) throw seededError('retire', `${id} is seeded from devices.json: a hub release retires it`);
+  const next = { ...structuredClone(record), retired_at: new Date(now()).toISOString() };
+  return { record: next, resources: resources.map(entry => (entry === record ? next : entry)) };
 }
