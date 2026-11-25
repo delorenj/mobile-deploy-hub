@@ -69,7 +69,7 @@ development_status:
   epic-4-retrospective: optional
 
   epic-5: backlog
-  5-1-one-claims-library-under-an-unchanged-cli: backlog
+  5-1-one-claims-library-under-an-unchanged-cli: done
   5-2-one-reserved-word-list-one-slug-rule-res-locks-queue: backlog
   5-3-a-host-knows-its-own-key: backlog
   5-4-status-through-one-builder-with-reachability: backlog
