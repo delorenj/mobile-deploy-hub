@@ -68,7 +68,7 @@ test('extend, nobody waits: the expiry moves later, one extend event carries the
     const answer = await s.api('/leases/x-1/extend', { for_ms: 10 * MIN, holder: 'agent-a' });
     assert.equal(answer.status, 200, JSON.stringify(answer.body));
     assert.equal(answer.headers['Cache-Control'], 'no-store');
-    assert.deepEqual(Object.keys(answer.body).sort(), ['claimant_kind', 'device', 'env', 'expires_at', 'holder', 'lease_id', 'lock', 'resource', 'started_at', 'why']);
+    assert.deepEqual(Object.keys(answer.body).sort(), ['claimant_kind', 'device', 'emulator', 'env', 'expires_at', 'holder', 'lease_id', 'lock', 'resource', 'started_at', 'why']);
     assert.equal(answer.body.expires_at, iso(T0 + 40 * MIN));
     assert.equal(s.owner('s24').expires_at, iso(T0 + 40 * MIN));
     const [event] = extendEvents(s);
@@ -281,16 +281,18 @@ test('releaseAnswer maps what release found: unknown-holder and changed-hands ar
   assert.deepEqual(releaseAnswer('x-1', { outcome: 'released', lock: 's24', device: 's24' }), { lease_id: 'x-1', outcome: 'released', resource: 's24', lock: 's24', device: 's24' });
 });
 
-test('an emulator lease id is refused by the API (HUB_USAGE, reason emulator) on extend and release; the CLI keeps releasing emulators', async () => {
+test('an emulator id that is only waiting for its turn: extend is 404 waiting, release is cancelled (in a worker); a booted one is tools/hub-api/emulator-lease.test.mjs', async () => {
   const s = scratch();
   try {
     s.wait('emulator', 'e-aaaaaaaaaaaa');
-    for (const [path, body] of [['/leases/e-aaaaaaaaaaaa/extend', { for_ms: MIN, holder: 'a' }], ['/leases/e-aaaaaaaaaaaa/release', { holder: 'a' }]]) {
-      assert.deepEqual(problemOf(await s.api(path, body)), [400, 'HUB_USAGE', 2, 'emulator'], path);
-    }
+    assert.deepEqual(problemOf(await s.api('/leases/e-aaaaaaaaaaaa/extend', { for_ms: MIN, holder: 'a' })), [404, 'HUB_LEASE_NOT_FOUND', 2, 'waiting']);
     assert.deepEqual(s.events(), []);
+    const released = await s.api('/leases/e-aaaaaaaaaaaa/release', { holder: 'a' });
+    assert.deepEqual([released.status, released.body], [200, { lease_id: 'e-aaaaaaaaaaaa', outcome: 'cancelled', resource: 'emulator', lock: 'emulator', device: 'emulator' }]);
+    const again = await s.api('/leases/e-aaaaaaaaaaaa/release', { holder: 'a' });
+    assert.deepEqual(again.body, { lease_id: 'e-aaaaaaaaaaaa', outcome: 'none', resource: null, lock: null, device: null });
     const cli = await s.cli(['release', 'e-aaaaaaaaaaaa']);
-    assert.deepEqual([cli.code, cli.out], [0, ['HUB_DEVICE_CANCELLED emulator e-aaaaaaaaaaaa (it was still waiting)']]);
+    assert.deepEqual([cli.code, cli.out.length, /^HUB_DEVICE_NOT_HELD /.test(cli.out[0])], [0, 1, true], 'the CLI agrees: nothing is held');
   } finally { s.cleanup(); }
 });
 

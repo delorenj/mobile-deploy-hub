@@ -58,14 +58,21 @@ export function resolveImage(profileName, { env = process.env, home = homeOf(env
   throw failure('HUB_EMULATOR_NO_IMAGE', `emulator profile "${profileName}" needs ${image}, which is not installed under ${join(sdk, 'system-images')}; install it with sdkmanager "${image}"`);
 }
 
-// The pool's size is the host's: $HUB_EMULATOR_POOL, else the number in <lock dir>/emulator-pool, else 2. A request may only
-// ask for fewer.
-export function hostPool(env = process.env) {
-  let text = env.HUB_EMULATOR_POOL;
+// The pool's size is the host's, in this order: $HUB_EMULATOR_POOL (the CLI only: `useEnv` false for a service, whose environment
+// carries none), else the number in <lock dir>/emulator-pool, else `registrySize` (the Registry's `pools.emulator.size`, which the
+// caller reads), else 2. Each must be 1 to 8; one that is not names where it came from. A request may only ask for fewer.
+export function hostPool(env = process.env, { useEnv = true, registrySize } = {}) {
+  let text = useEnv ? env.HUB_EMULATOR_POOL : undefined;
   let source = 'HUB_EMULATOR_POOL';
   if (text === undefined || text === '') {
-    try { text = readFileSync(join(lockDir(env), 'emulator-pool'), 'utf8').trim(); source = join(lockDir(env), 'emulator-pool'); } catch { return DEFAULT_POOL; }
+    text = undefined;
+    try { text = readFileSync(join(lockDir(env), 'emulator-pool'), 'utf8').trim(); source = join(lockDir(env), 'emulator-pool'); } catch { /* no file */ }
   }
+  if (text === undefined && registrySize !== undefined && registrySize !== null) {
+    text = String(registrySize);
+    source = 'the Registry\'s pools.emulator.size';
+  }
+  if (text === undefined) return DEFAULT_POOL;
   const pool = Number(text);
   if (!Number.isSafeInteger(pool) || pool < 1 || pool > MAX_POOL) throw failure('HUB_EMULATOR_USAGE', `${source}: the emulator pool is 1 to ${MAX_POOL} emulators, not "${text}"`);
   return pool;
@@ -319,7 +326,7 @@ export async function reap({ env = process.env, log = () => {}, graceMs, sleep, 
 }
 
 // The slot a lease id holds right now, if any.
-function slotHolding(env, id) {
+export function slotHolding(env, id) {
   let entries = [];
   try { entries = readdirSync(lockDir(env)).filter(entry => /^emulator-\d+\.lock$/.test(entry)); } catch { return null; }
   const found = entries.find(entry => readOwnerOf(entry.slice(0, -'.lock'.length), env)?.lease_id === id);
@@ -349,7 +356,8 @@ async function underReaper(id, fn, env) {
 // Releases an emulator lease by id: a request still waiting is cancelled; a held one is torn down and its slot freed.
 // Returns {outcome: released|cancelled|none|stuck, slot, record, result}. Only a lease id is accepted: lock.mjs reads an
 // empty id as "whichever lease", which is never what releasing one emulator means.
-export async function releaseEmulator(id, { env = process.env, log = () => {}, graceMs, sleep, now } = {}) {
+// `reason` (optional) is the slot release's `reason` (a service's undelivered grant says `undelivered`), else `by-id`.
+export async function releaseEmulator(id, { env = process.env, log = () => {}, graceMs, sleep, now, reason = null } = {}) {
   if (typeof id !== 'string' || !LEASE_ID.test(id)) throw failure('HUB_EMULATOR_USAGE', `release emulator needs a lease id (lowercase letters, digits and dashes), not "${id ?? ''}"`);
   const queued = releaseLease(GATE, id, { env });
   const record = readRecord(env, id);
@@ -357,7 +365,7 @@ export async function releaseEmulator(id, { env = process.env, log = () => {}, g
   if (!record && !slot) return { outcome: queued.released || queued.cancelled ? 'cancelled' : 'none' };
   // The slot goes first, so a process still making this emulator sees its lease is gone before its processes stop. The
   // record keeps the slot out of the pool until the teardown below has finished.
-  if (slot) releaseLease(slot, id, { env });
+  if (slot) releaseLease(slot, id, { env, reason });
   let result = { ok: true, signalled: [], survivors: [] };
   if (record) result = await underReaper(id, () => teardown(record, { env, log, graceMs, sleep, now }), env);
   if (!result.ok) return { outcome: 'stuck', slot, record, result };
@@ -499,12 +507,14 @@ function claim({ env, id, slot, image, profileName, ino = null }) {
 }
 
 // Takes a place in the pool and makes the emulator. Resolves with {lease, record} once sys.boot_completed=1, the lease
-// tied to holderPid (null: until release or expiry). Throws HUB_LOCK_TIMEOUT when no slot frees within waitMs,
+// tied to holderPid (null: until release or expiry). `claimantKind` and `actor` (a service's, optional) go on the Pool request and on
+// the acquire events of the gate and the slot. Throws HUB_LOCK_TIMEOUT when no slot frees within waitMs,
 // HUB_LEASE_CANCELLED when released meanwhile, HUB_EMULATOR_NO_IMAGE before taking anything; anything it started is
 // torn down on every failure.
 export async function provision({
   id, holder, why, forMs, waitMs = 120_000, holderPid = null, profileName = 'default', pool = DEFAULT_POOL, env = process.env,
   log = () => {}, signal, sleep = realSleep, now = Date.now, pollMs = 1000, graceMs = 15_000, bootTimeoutMs = 360_000, bootPollMs = 2000,
+  claimantKind = 'agent', actor = null,
 } = {}) {
   if (process.platform !== 'linux') throw failure('HUB_EMULATOR_HOST', 'the emulator pool runs on Linux (big-chungus) only');
   const image = resolveImage(profileName, { env });
@@ -513,10 +523,10 @@ export async function provision({
   // One Pool-level request for the whole wait (AD-4): the gate is its queue and each slot probe below a try. The probe that
   // takes a slot writes the one `acquire`, tagged with the request, waited_ms from here; a request that ends before any
   // slot is taken settles as one timeout or cancel.
-  const request = poolRequest('emulator', { id, holder, why, forMs, waitMs, env, now });
+  const request = poolRequest('emulator', { id, holder, why, forMs, waitMs, env, now, claimantKind, actor });
   // The acquire path has just reaped; the gate loop below reaps again without waiting on another reaper.
   try {
-    await acquireLease(GATE, { id, holder, why: `next for an emulator: ${why}`, forMs: Math.min(MAX_LEASE_MS, waitMs + 600_000), waitMs, holderPid: process.pid, env, log, pollMs, sleep, now, signal });
+    await acquireLease(GATE, { id, holder, why: `next for an emulator: ${why}`, forMs: Math.min(MAX_LEASE_MS, waitMs + 600_000), waitMs, holderPid: process.pid, env, log, pollMs, sleep, now, signal, claimantKind, actor });
   } catch (error) {
     const out = error.code !== 'HUB_LOCK_TIMEOUT' ? error : failure('HUB_LOCK_TIMEOUT', `the emulator pool is full, with other requests ahead of ${id} (${error.message})`);
     request.settle(out, { signal });
@@ -536,7 +546,7 @@ export async function provision({
         for (let k = 1; k <= pool && !slot; k += 1) {
           if (unreaped.has(slotName(k))) continue;
           try {
-            ({ lock_ino: slotIno } = await acquireLease(slotName(k), { id, holder, why, forMs: Math.min(MAX_LEASE_MS, bootTimeoutMs + forMs + 120_000), waitMs: 0, holderPid: process.pid, env, log, pollMs, sleep, now, signal, pool: request.tag }));
+            ({ lock_ino: slotIno } = await acquireLease(slotName(k), { id, holder, why, forMs: Math.min(MAX_LEASE_MS, bootTimeoutMs + forMs + 120_000), waitMs: 0, holderPid: process.pid, env, log, pollMs, sleep, now, signal, pool: request.tag, claimantKind, actor }));
             slot = slotName(k);
           } catch (error) {
             if (error.code !== 'HUB_LOCK_TIMEOUT') throw error;

@@ -297,7 +297,7 @@ test('GET /leases/{id}: held is 200 Lease, a waiter is 404 waiting, an unknown i
     const held = await handle({ method: 'GET', url: '/leases/holder-s24' }, s.ctx());
     assert.equal(held.status, 200);
     assert.deepEqual([held.body.lease_id, held.body.lock, held.body.holder, held.body.claimant_kind], ['holder-s24', 's24', 'holder-s24', 'agent']);
-    assert.deepEqual(Object.keys(held.body).sort(), ['claimant_kind', 'device', 'env', 'expires_at', 'holder', 'lease_id', 'lock', 'resource', 'started_at', 'why']);
+    assert.deepEqual(Object.keys(held.body).sort(), ['claimant_kind', 'device', 'emulator', 'env', 'expires_at', 'holder', 'lease_id', 'lock', 'resource', 'started_at', 'why']);
     assert.deepEqual(Object.keys(held.body.env).sort(), ['ANDROID_ADB_SERVER_PORT', 'HUB_DEVICE', 'HUB_LEASE_ID']);
     const post = await handle({ method: 'POST', url: '/leases/w-1', body: {} }, s.ctx());
     assert.deepEqual([post.status, post.headers.Allow], [405, 'GET']);
