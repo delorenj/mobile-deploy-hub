@@ -31,7 +31,7 @@ import { editionsOf, loadManifest } from '../lib/manifest.mjs';
 import { manifestPlist, resizeIcon } from '../lib/ota.mjs';
 import { appPage, editionPage, indexPage } from '../lib/pages.mjs';
 import { appFor, editionPinOf } from '../lib/policy.mjs';
-import { buildReceipt, sha256File, writeReceipt } from '../lib/receipt.mjs';
+import { buildReceipt, publicReason, sha256File, writeReceipt } from '../lib/receipt.mjs';
 import { notesKey, persistedNotes, validateNotes } from '../lib/release-notes.mjs';
 import { jobWriter, publishPages, pruneVersions, readObject } from '../lib/s3.mjs';
 import { catchupNote, firstLine, guarded, installCurrent, isoNow, parseNeeds, policyBanner, publicCopy, pruneStaging, readReceipts, requirePlan, runOf, stagingDir } from './common.mjs';
@@ -43,7 +43,7 @@ export function deviceOf(device, receipt, { stamp, catchup = null, host = 'this 
   const delivery = receipt?.delivery;
   const failed = receipt?.outcome === 'failure' && receipt.stage !== 'deliver';
   const status = failed ? 'failed' : ['installed', 'pending', 'skipped', 'failed'].includes(delivery?.status) ? delivery.status : 'pending';
-  let why = failed ? receipt.reason ?? delivery?.reason : delivery?.reason;
+  let why = failed ? publicReason(receipt) ?? delivery?.reason : delivery?.reason;
   if (status === 'pending') why = catchupNote(why, catchup, host);
   return { name: device.name, model: device.model, status, since: stamp, by: status === 'installed' ? 'deploy' : null, reason: why ? String(why).slice(0, 300) : null, failures: 0 };
 }
@@ -308,7 +308,10 @@ export async function deliver(config, { env = process.env, home = homedir(), fet
 export function publicReceipts(receipts) {
   const kept = Object.fromEntries(Object.entries(receipts).filter(([name]) => !isEditionLane(name)));
   for (const [name, receipt] of Object.entries(kept)) {
-    if (receipt && typeof receipt === 'object' && ('editions' in receipt || 'contention' in receipt)) { const { editions: _editions, contention: _contention, ...rest } = receipt; kept[name] = rest; }
+    if (receipt && typeof receipt === 'object' && ('editions' in receipt || 'contention' in receipt)) {
+      const { editions: _editions, contention: _contention, ...rest } = receipt;
+      kept[name] = rest.reason === undefined ? rest : { ...rest, reason: publicReason(receipt) };
+    }
   }
   return kept;
 }

@@ -28,6 +28,7 @@ import { basename, dirname, join } from 'node:path';
 import { isCredentialVariable } from './config.mjs';
 import { attempt } from './exec.mjs';
 import { megabytes } from './pages.mjs';
+import { publicReason } from './receipt.mjs';
 
 const urlNamespace = '6ba7b811-9dad-11d1-80b4-00c04fd430c8';
 
@@ -66,7 +67,7 @@ const ok = result => result === 'success';
 const broke = result => result === 'failure' || result === 'cancelled';
 
 function failureOf(job, result, receipt, fallbackStage) {
-  return { job, stage: stages.includes(receipt?.stage) ? receipt.stage : fallbackStage, reason: sanitizeReason(receipt?.reason, `the ${job} job ${result === 'cancelled' ? 'was cancelled or timed out' : 'failed'}`) };
+  return { job, stage: stages.includes(receipt?.stage) ? receipt.stage : fallbackStage, reason: sanitizeReason(publicReason(receipt), `the ${job} job ${result === 'cancelled' ? 'was cancelled or timed out' : 'failed'}`) };
 }
 
 export const iosSkipReasons = Object.freeze({
@@ -79,10 +80,10 @@ export const iosSkipReasons = Object.freeze({
 function laterStepFailure(job, result, receipts) {
   for (const side of [`${job}-release`, `${job}-play`]) {
     const receipt = receipts[side];
-    if (receipt?.outcome === 'failure') return { job, stage: 'deliver', reason: sanitizeReason(receipt.reason, `the ${side.replace(`${job}-`, '')} step failed`) };
+    if (receipt?.outcome === 'failure') return { job, stage: 'deliver', reason: sanitizeReason(publicReason(receipt), `the ${side.replace(`${job}-`, '')} step failed`) };
   }
   const own = receipts[job];
-  if (own?.outcome === 'failure' && own.stage === 'deliver') return { job, stage: 'deliver', reason: sanitizeReason(own.reason, 'a publishing step failed') };
+  if (own?.outcome === 'failure' && own.stage === 'deliver') return { job, stage: 'deliver', reason: sanitizeReason(publicReason(own), 'a publishing step failed') };
   return { job, stage: 'deliver', reason: `a step after the ${job} lane ${result === 'cancelled' ? 'was cancelled' : 'failed'} (the Release, Play or the receipt upload); the device's delivery stands` };
 }
 
@@ -121,7 +122,7 @@ export function deliveriesFrom({ declared, platform = 'both', devices, needs, re
       if (from.reason && status !== 'installed') delivery.reason = sanitizeReason(from.reason);
       if (status === 'failed' && from.stage) delivery.stage = from.stage;
       if (status === 'installed') delivery.by = 'deploy';
-      const failure = broke(outcome) ? laterStepFailure(job, outcome, receipts) : (status === 'failed' ? { job, stage: stages.includes(receipt?.stage) ? receipt.stage : 'install', reason: sanitizeReason(from.reason ?? receipt?.reason, `the ${name === 'android' ? 'S26' : 'iPad'} refused the build`) } : null);
+      const failure = broke(outcome) ? laterStepFailure(job, outcome, receipts) : (status === 'failed' ? { job, stage: stages.includes(receipt?.stage) ? receipt.stage : 'install', reason: sanitizeReason(from.reason ?? publicReason(receipt), `the ${name === 'android' ? 'S26' : 'iPad'} refused the build`) } : null);
       return failure ? { delivery, failure } : { delivery };
     }
     let failure;
