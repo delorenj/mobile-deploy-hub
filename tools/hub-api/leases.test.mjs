@@ -242,10 +242,12 @@ test('a bad body is 400 HUB_USAGE with its reason, before anything is read', asy
   try {
     const cases = [
       ['bad-body', undefined], ['bad-body', null], ['bad-body', []], ['bad-body', 'x'],
-      ['bad-body', { ...BODY, extra: 1 }], ['bad-body', { ...BODY, wait_ms: 5000 }],
+      ['bad-body', { ...BODY, extra: 1 }], ['bad-body', { ...BODY, waitMs: 5000 }],
       ['bad-target', { for_ms: BODY.for_ms, holder: 'h', why: 'w' }], ['bad-target', { ...BODY, match: 'kind=phone' }], ['bad-target', { ...BODY, resource: '' }], ['bad-target', { ...BODY, resource: 7 }],
       ['bad-for', { ...BODY, for_ms: 0 }], ['bad-for', { ...BODY, for_ms: '60000' }], ['bad-for', { ...BODY, for_ms: 1.5 }], ['bad-for', { ...BODY, for_ms: undefined }],
-      ['bad-id', { ...BODY, id: 'Bad Id' }], ['bad-id', { ...BODY, id: 7 }],
+      ['bad-wait', { ...BODY, wait_ms: -1 }], ['bad-wait', { ...BODY, wait_ms: '5000' }], ['bad-wait', { ...BODY, wait_ms: 1.5 }], ['bad-wait', { ...BODY, wait_ms: null }],
+      ['bad-id', { ...BODY, id: 'Bad Id' }], ['bad-id', { ...BODY, id: 7 }], ['bad-id', { ...BODY, id: 'Bad Id', wait_ms: 5000 }],
+      ['no-id', { ...BODY, wait_ms: 5000 }],
       ['bad-actor', { ...BODY, actor: 'jarad' }], ['bad-actor', { ...BODY, actor: { holder: 'h', via: 'smoke-signal' } }], ['bad-actor', { ...BODY, actor: null }],
       ['no-holder', { ...BODY, holder: undefined }], ['no-holder', { ...BODY, holder: '' }],
       ['bad-why', { ...BODY, why: '' }], ['bad-why', { ...BODY, why: undefined }], ['bad-why', { ...BODY, why: 3 }],
@@ -362,7 +364,8 @@ test('the HTTP table gives every library error a status; an unknown code has non
   assert.deepEqual(Object.entries(HTTP_ANSWERS).map(([code, answer]) => [code, answer.status, answer.reason ?? null]), [
     ['HUB_USAGE', 400, null], ['HUB_EMULATOR_USAGE', 400, null], ['HUB_LEASE_TOO_LONG', 400, null], ['HUB_DEVICE_JOB_ID', 400, null],
     ['HUB_NO_MATCH', 404, 'no-match'], ['HUB_LOCK_TIMEOUT', 409, 'busy'], ['HUB_DEVICE_BUSY', 409, 'busy'], ['HUB_POOL_CROSS_HOST', 409, null],
-    ['HUB_RESOURCE_RETIRED', 409, null], ['HUB_LEASE_CANCELLED', 409, null], ['HUB_PHONE_AWAY', 503, 'away'], ['HUB_DEVICE_AWAY', 503, 'away'], ['HUB_HOST_UNKNOWN', 503, 'host-unknown'],
+    ['HUB_RESOURCE_RETIRED', 409, null], ['HUB_LEASE_CANCELLED', 409, null], ['HUB_LEASE_NOT_FOUND', 404, null], ['HUB_LEASE_SUPERSEDED', 409, 'superseded'], ['HUB_API_RESTARTING', 503, 'restarting'],
+    ['HUB_PHONE_AWAY', 503, 'away'], ['HUB_DEVICE_AWAY', 503, 'away'], ['HUB_HOST_UNKNOWN', 503, 'host-unknown'],
   ]);
   for (const code of Object.keys(HTTP_ANSWERS)) assert.ok(code in EXIT_CODES, `${code} has an exit`);
   assert.equal(httpAnswerOf({ code: 'HUB_API_ERROR' }), null);
@@ -378,12 +381,12 @@ test('the HTTP table gives every library error a status; an unknown code has non
 });
 
 test('checkLeaseBody returns the normalised input, with defaults', () => {
-  assert.deepEqual(checkLeaseBody({ ...BODY }), { resource: 's24', match: null, forMs: 30 * MIN, holder: 'agent-a', why: 'proof', claimantKind: 'agent', id: null, actor: null });
+  assert.deepEqual(checkLeaseBody({ ...BODY }), { resource: 's24', match: null, forMs: 30 * MIN, waitMs: 0, holder: 'agent-a', why: 'proof', claimantKind: 'agent', id: null, actor: null });
   const full = checkLeaseBody({ match: 'kind=phone', for_ms: 1000, holder: 'h', why: 'w', claimant_kind: 'person', id: 'x-1', actor: { holder: 'jarad', via: 'cli' } });
   assert.deepEqual([full.resource, full.match, full.claimantKind, full.id, full.actor], [null, 'kind=phone', 'person', 'x-1', { holder: 'jarad', via: 'cli' }]);
 });
 
-test('requestListener answers POST /leases over the adapter, and a wait_ms key is refused', async () => {
+test('requestListener answers POST /leases over the adapter, and a bad wait_ms is refused', async () => {
   const s = scratch();
   try {
     const ok = exchange('POST', '/leases', BODY);
@@ -391,6 +394,6 @@ test('requestListener answers POST /leases over the adapter, and a wait_ms key i
     assert.equal(ok.res.head.status, 200);
     const waits = exchange('POST', '/leases', { ...BODY, wait_ms: 1000 });
     await requestListener(s.ctx())(waits.req, waits.res);
-    assert.deepEqual([waits.res.head.status, waits.json().reason], [400, 'bad-body']);
+    assert.deepEqual([waits.res.head.status, waits.json().reason], [400, 'no-id']);
   } finally { s.cleanup(); }
 });

@@ -680,7 +680,7 @@ test('owners written by v1.2.43 (no format, kind for jobs, attempt, job or host_
 
 // ---- Story 2.1: ticket format v1 and machine identity (AD-2, AD-3, AD-8) ----
 
-const AD3_KEYS = ['format', 'kind', 'lease_id', 'holder', 'why', 'pid', 'host', 'host_id', 'process_start', 'enqueued_at', 'deadline_at', 'expires_at', 'repo', 'run', 'attempt', 'job', 'reservation', 'request', 'pool', 'eta', 'delivery'];
+const AD3_KEYS = ['format', 'kind', 'lease_id', 'holder', 'why', 'pid', 'host', 'host_id', 'process_start', 'enqueued_at', 'deadline_at', 'expires_at', 'repo', 'run', 'attempt', 'job', 'reservation', 'request', 'pool', 'eta', 'delivery', 'claimant_kind'];
 const NOW = Date.parse('2026-11-23T12:00:00.000Z');
 const ago = ms => new Date(NOW - ms).toISOString();
 const ahead = ms => new Date(NOW + ms).toISOString();
@@ -705,6 +705,7 @@ test('a Lease ticket carries exactly the AD-3 keys in order, keeps its file name
     assert.equal(Date.parse(ticket.deadline_at) - Date.parse(ticket.enqueued_at), 10_000);
     assert.deepEqual([ticket.repo, ticket.run, ticket.attempt, ticket.job], ['delorenj/example', '9', '2', 'android']);
     assert.deepEqual([ticket.expires_at, ticket.reservation, ticket.request, ticket.pool, ticket.delivery], [null, null, null, null, null], 'the keys later stories fill are present and empty');
+    assert.equal(ticket.claimant_kind, 'agent', 'Story 7.2: a Lease ticket says who it waits for, so a prune or a release-cancel keeps the kind');
     assert.deepEqual(Object.keys(ticket.eta), ['lo_ms', 'hi_ms', 'low_data'], 'Story 4.1 (intended change): the ticket records its enqueue ETA');
     releaseLease('adb', 'waiter', { env: f.env });
     await assert.rejects(waiting, error => error.code === 'HUB_LEASE_CANCELLED');

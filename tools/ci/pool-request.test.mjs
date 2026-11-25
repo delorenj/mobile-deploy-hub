@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { earliest, eta, formatEta } from './lib/eta.mjs';
 import { readEvents } from './lib/events.mjs';
-import { ETA_REFRESH_MS, acquireLease, acquirePool, etaHistory, queueView, readOwner, releaseLease } from './lib/lock.mjs';
+import { ETA_REFRESH_MS, acquireLease, acquirePool, cachedProcessStart, etaHistory, queueView, readOwner, releaseLease } from './lib/lock.mjs';
 import { hermetic } from './test-fixtures.mjs';
 
 hermetic(); // offline, outside any workflow job, scratch HUB_EVENT_DIR and HUB_LOCK_DIR (test-fixtures.mjs)
@@ -291,6 +291,67 @@ test('no member serves it by the deadline: every ticket is withdrawn and the def
     assert.deepEqual([...given], [['s24', 'held'], ['adb', 'held']]);
     assert.deepEqual(shape(f.events().filter(event => event.request === 'req2')), [['request', null, null], ['cancel', null, 'error']], 'an error that is not a timeout ends as a cancel');
   } finally { f.cleanup(); }
+});
+
+test('Story 7.2: a Pool timeout keeps AD-5\'s `host lock <name> is held by` wording for every held member', async () => {
+  const f = fixture();
+  try {
+    await f.hold('s24', 'on-s24');
+    await f.hold('adb', 'on-adb');
+    await assert.rejects(f.pool({ waitMs: 3000 }), error => error.code === 'HUB_LOCK_TIMEOUT'
+      && /^host lock s24 is held by lease on-s24 of holder-on-s24 .*; host lock adb is held by lease on-adb of holder-on-adb .*; no member of phone was free; gave up after 3s$/.test(error.message));
+  } finally { f.cleanup(); }
+});
+
+test('Story 7.2: a ticket carries claimant_kind (Lease and Pool), and a prune or a release-cancel event keeps the kind (`agent` for a ticket that has none)', async () => {
+  const f = fixture();
+  try {
+    await f.hold('s24', 'on-s24');
+    await f.hold('adb', 'on-adb');
+    const dead = { pid: 2_000_000_000, hostId: 'M1', host: 'big-chungus' };
+    // A Lease waiter that is a person, and a Pool request that is one.
+    const lease = acquireLease('s24', { holder: 'p-1', why: 'person waits', forMs: MIN, id: 'p-lease', waitMs: 5 * MIN, claimantKind: 'person', env: f.env, log: () => {}, now: f.now, policy: policyOf(), pollMs: 1000, sleep: () => settle(5), hostId: 'M1', host: 'big-chungus' });
+    lease.catch(() => {});
+    await settle(30);
+    const [file] = f.tickets('s24');
+    assert.equal(f.ticket('s24', file).claimant_kind, 'person');
+    assert.equal(releaseLease('s24', 'p-lease', { env: f.env, now: f.now, hostId: 'M1' }).cancelled, 1);
+    const cancel = f.events().find(event => event.event === 'cancel' && event.lease_id === 'p-lease');
+    assert.deepEqual([cancel.claimant.kind, cancel.reason], ['person', 'released']);
+    await assert.rejects(lease, error => error.code === 'HUB_LEASE_CANCELLED');
+    const controller = new AbortController();
+    const pool = f.pool({ id: 'p-pool', waitMs: 5 * MIN, claimantKind: 'person', signal: controller.signal, sleep: () => settle(5) });
+    pool.catch(() => {});
+    await settle(30);
+    for (const name of MEMBERS) assert.equal(f.ticket(name, f.tickets(name).find(file => f.ticket(name, file).lease_id === 'p-pool')).claimant_kind, 'person');
+    controller.abort(new Error('gone'));
+    await assert.rejects(pool, /gone/);
+    // A crash leftover: the ticket of a dead pid on this host, as a person; and one written before the kind existed.
+    const { writeFileSync, mkdirSync } = await import('node:fs');
+    const queue = join(f.env.HUB_LOCK_DIR, 's24.queue');
+    mkdirSync(queue, { recursive: true });
+    const ticket = extra => ({ format: 1, kind: 'lease', holder: 'ghost', why: 'crashed', pid: dead.pid, host: dead.host, host_id: dead.hostId, process_start: 'x', enqueued_at: new Date(f.now()).toISOString(), deadline_at: null, expires_at: null, ...extra });
+    writeFileSync(join(queue, `${String(f.now()).padStart(15, '0')}-000001-00000001.json`), JSON.stringify(ticket({ lease_id: 'ghost-person', claimant_kind: 'person' })));
+    writeFileSync(join(queue, `${String(f.now() + 1).padStart(15, '0')}-000002-00000001.json`), JSON.stringify(ticket({ lease_id: 'ghost-old' })));
+    queueView('s24', { env: f.env, prune: true, now: f.now, host: dead.host, hostId: dead.hostId });
+    const pruned = f.events().filter(event => event.event === 'prune');
+    assert.deepEqual(pruned.map(event => [event.lease_id, event.claimant.kind, event.reason]), [['ghost-person', 'person', 'gone'], ['ghost-old', 'agent', 'gone']]);
+  } finally { f.cleanup(); }
+});
+
+test('Story 7.2: cachedProcessStart reads a pid once per ttl and again after it, on the clock it is given', () => {
+  let clock = 1000;
+  const reads = [];
+  const cached = cachedProcessStart({ startOf: pid => { reads.push(pid); return `s${pid}-${reads.length}`; }, now: () => clock, ttlMs: 2000 });
+  assert.equal(cached(7), 's7-1');
+  assert.equal(cached(7), 's7-1');
+  assert.equal(cached(8), 's8-2');
+  clock += 1999;
+  assert.equal(cached(7), 's7-1');
+  clock += 1;
+  assert.equal(cached(7), 's7-3');
+  assert.deepEqual(reads, [7, 8, 7]);
+  assert.equal(typeof cachedProcessStart()(process.pid), 'string', 'the defaults are the real reader and clock');
 });
 
 test('accept {ok: false} gives the member back (a release) and the request keeps its place under the same ticket name; the next member wins', async () => {

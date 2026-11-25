@@ -72,6 +72,8 @@ test('the library exports the whole action surface and the exit table as frozen 
     HUB_REGISTRY_NAME: 2, HUB_REGISTRY_DUPLICATE: 2,
     // Story 6.7: a retire or an identity or name edit of a seeded Resource.
     HUB_REGISTRY_SEEDED: 2,
+    // Story 7.2: a wait through a service.
+    HUB_LEASE_NOT_FOUND: 2, HUB_LEASE_SUPERSEDED: 1, HUB_API_RESTARTING: 1,
     // Story 6.8: the same-host client's two answers.
     HUB_API_DOWN: 1, HUB_API_UNKNOWN: 1,
   });

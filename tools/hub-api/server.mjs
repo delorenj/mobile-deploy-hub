@@ -6,7 +6,7 @@
 // tools/device/emulator.mjs, `bootCommand`, which wraps them in `heavy` so a stop with KillMode=mixed never kills one), bind 127.0.0.1 (EADDRINUSE is the singleton:
 // HUB_API_ALREADY_RUNNING), recoverRegistry, applySeed, then `HUB_API_LISTEN port=<n>` on stdout. The bind comes first so a second
 // instance never writes. A seed failure never stops the service (holds never depend on the Registry): one `HUB_API_SEED_FAILED` line
-// on stderr, and the next start retries. SIGTERM and SIGINT close the server, print `HUB_API_STOP` and let the process end 0.
+// on stderr, and the next start retries. SIGTERM and SIGINT end every open lease wait (503 HUB_API_RESTARTING), close the server, print `HUB_API_STOP` and let the process end 0.
 //
 // Every seam is injected (env, policy, log, versions, onPath, createServer, now, hostId, devices, qaDevices, signals). There is no
 // timer here: the keepalive of a later stream lives in stream.mjs, the one file the no-new-clock rule names (tools/clock.test.mjs).
@@ -15,7 +15,7 @@ import { createServer as nodeCreateServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
 import { onPath } from '../ci/lib/heavy.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
-import { exitCodeOf, withoutDeployIdentity } from '../device/claims.mjs';
+import { createLeaseWaits, exitCodeOf, withoutDeployIdentity } from '../device/claims.mjs';
 import { recoverRegistry, applySeed } from '../registry/store.mjs';
 import { createReadings } from './readings.mjs';
 import { ROUTES, SERVICE, handle } from './routes.mjs';
@@ -64,17 +64,33 @@ async function readJson(req) {
 }
 
 // The `(req, res)` listener for `createServer`: reads a JSON body (POST only, up to 1 MiB), calls `handle`, writes its answer.
-// `req` and `res` are the minimal node shapes (`method`, `url`, async-iterable body; `writeHead`, `end`), so a test drives it with fakes.
+// `req` and `res` are the minimal node shapes (`method`, `url`, async-iterable body; `writeHead`, `end`, and `on` for `close`), so a test
+// drives it with fakes.
+//
+// Nothing is written until the outcome (Story 7.2, AD-37): a wait keeps its connection open with no status line and no header. Every
+// request has an abort signal that aborts when `res` closes before the answer was fully written (the client went away): `handle` passes
+// it to the route, and an answer for an aborted request is dropped, not written. `listener.drain()` resolves when every request that
+// is past its body (being handled, or being answered) has ended: a stop awaits it so the answers of the waits it just ended are written.
 export function requestListener(ctx) {
-  return async (req, res) => {
+  const inflight = new Set();
+  const listener = async (req, res) => {
+    const controller = new AbortController();
+    res.on?.('close', () => { if (!res.writableFinished) controller.abort(new Error('the connection closed before the answer was written')); });
     let body;
     let bodyError;
     try { body = await readJson(req); } catch (error) { bodyError = error; }
-    const answer = await handle({ method: req.method, url: req.url, body, bodyError }, ctx);
-    const text = JSON.stringify(answer.body);
-    res.writeHead(answer.status, { ...answer.headers, 'Content-Length': Buffer.byteLength(text) });
-    res.end(text);
+    const work = (async () => {
+      const answer = await handle({ method: req.method, url: req.url, body, bodyError, signal: controller.signal }, ctx);
+      if (controller.signal.aborted) return;
+      const text = JSON.stringify(answer.body);
+      res.writeHead(answer.status, { ...answer.headers, 'Content-Length': Buffer.byteLength(text) });
+      res.end(text);
+    })();
+    inflight.add(work);
+    try { await work; } finally { inflight.delete(work); }
   };
+  listener.drain = async () => { await Promise.allSettled([...inflight]); };
+  return listener;
 }
 
 // ---- the generic service start ----
@@ -91,8 +107,10 @@ export async function startService({
   if (!nodeAtLeast(versions?.node, MIN_NODE)) throw coded('HUB_API_NODE', `${service} needs Node >= ${MIN_NODE}, this is ${versions?.node ?? 'unknown'}; run it from the release's node/24.x path`);
   if (!hasOnPath('heavy', env)) throw coded('HUB_API_NO_HEAVY', `${service} needs \`heavy\` on PATH: emulators boot through it`);
 
-  const context = { ...ctx, env, routes, log };
-  const server = createServer(requestListener(context));
+  // The registry of this service's lease waits (claims.mjs): a stop ends every open wait with HUB_API_RESTARTING before it closes.
+  const context = { ...ctx, env, routes, log, waits: ctx.waits ?? createLeaseWaits({ now: ctx.now }) };
+  const listener = requestListener(context);
+  const server = createServer(listener);
   await new Promise((resolve, reject) => {
     server.once('error', error => reject(error?.code === 'EADDRINUSE'
       ? coded('HUB_API_ALREADY_RUNNING', `${service} is already running: ${HOST}:${port} is taken`)
@@ -109,7 +127,11 @@ export async function startService({
       if (!called) {
         called = true;
         for (const [name, handler] of handlers) signals.removeListener?.(name, handler);
-        server.close(() => { log.out('HUB_API_STOP'); resolve(); });
+        // Open waits answer 503 HUB_API_RESTARTING (their tickets aborted) and those answers are written before the server closes.
+        (async () => {
+          try { await context.waits.shutdown(); await listener.drain?.(); } catch (error) { log.err(`HUB_API_ERROR stop ${oneLine(error)}`); }
+          server.close(() => { log.out('HUB_API_STOP'); resolve(); });
+        })();
       }
       return stopped;
     };

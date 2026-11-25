@@ -14,7 +14,7 @@
 // handler as `request.params`; a literal route wins over a parameterised one.
 import { STATUS_CODES } from 'node:http';
 import { idMatchesSerial } from '../ci/lib/adb.mjs';
-import { HOST_PLATFORMS, checkLeaseBody, discover as discoverHost, exitCodeOf, hostKey as realHostKey, httpAnswerOf, lockActivity, serviceLease } from '../device/claims.mjs';
+import { HOST_PLATFORMS, checkLeaseBody, discover as discoverHost, exitCodeOf, findLease, hostKey as realHostKey, httpAnswerOf, leaseRequestId, lockActivity, serviceLease } from '../device/claims.mjs';
 import { hubRef } from '../ci/lib/receipt.mjs';
 import { NO_READING } from '../registry/reachability.mjs';
 import { loadQaDevices } from '../registry/seed.mjs';
@@ -52,6 +52,7 @@ const oneLine = value => String(value).replace(/\s+/g, ' ').trim();
 export const PROBLEM_EXTENSIONS = Object.freeze({
   HUB_REGISTRY_CONFLICT: Object.freeze(['rev']),
   HUB_REGISTRY_DUPLICATE: Object.freeze(['holder']),
+  HUB_API_RESTARTING: Object.freeze(['retry']),
 });
 
 export function problem(error, extra = {}) {
@@ -246,6 +247,10 @@ export async function retireResource(ctx, { body, params }) {
 // function every service front door calls, and the status of a refusal comes from its HTTP table. The actor is the body's `actor`, else
 // `{holder, via: 'api'}`. A `match` drops the members this service's own cache knows are away (no adb is asked on a request: AD-44).
 // 200 `Lease`.
+//
+// A wait (`wait_ms`, Story 7.2) is bound to the connection that asked: the service's wait registry (`ctx.waits`, claims.mjs
+// `createLeaseWaits`, built by `startService`) owns the rules, this handler hands it the request's abort `signal`. A context with no
+// registry (a bare `handle()`) takes the Lease directly, with the same signal.
 function readingsOf(ctx) {
   return members => {
     const registry = readIt(ctx);
@@ -255,14 +260,21 @@ function readingsOf(ctx) {
   };
 }
 
-export async function takeLease(ctx, { body }) {
+export async function takeLease(ctx, { body, signal }) {
   const input = checkLeaseBody(body);
   const actor = input.actor ?? { holder: input.holder, via: 'api' };
   const out = line => { try { ctx.log?.out?.(line); } catch { /* a broken log seam never changes the answer */ } };
-  return serviceLease({ ...input, actor }, {
+  const service = {
     env: ctx.env ?? process.env, policy: ctx.policy, now: ctx.now, sleep: ctx.sleep, qaDevices: ctx.qaDevices,
     log: out, warn: () => {}, readingsOf: readingsOf(ctx),
-  });
+  };
+  return ctx.waits ? ctx.waits.lease({ ...input, actor }, service, { signal }) : serviceLease({ ...input, actor }, { ...service, signal });
+}
+
+// GET /leases/{id}: the Lease an id names (Story 7.2), the same `Lease` the take answered with: how a client whose connection dropped
+// after the grant finds its Hold. A waiter that holds nothing yet and an unknown id are 404 HUB_LEASE_NOT_FOUND (`waiting`, `unknown`).
+export function getLease(ctx, { params }) {
+  return findLease(params.id, { env: ctx.env ?? process.env, warn: () => {} });
 }
 
 // `shape` names the `### <Shape>` section of the contract document that lists the response's fields.
@@ -275,7 +287,9 @@ export const ROUTES = Object.freeze([
   Object.freeze({ method: 'POST', path: '/registry/resources', shape: 'Resource', handler: registerResource }),
   Object.freeze({ method: 'POST', path: '/registry/resources/{id}', shape: 'Resource', handler: editResource }),
   Object.freeze({ method: 'POST', path: '/registry/resources/{id}/retire', shape: 'Retirement', handler: retireResource }),
-  Object.freeze({ method: 'POST', path: '/leases', shape: 'Lease', handler: takeLease }),
+  // `requestId` names the id a route echoes in `X-Request-Id` (from the request and its answer; the answer is null for an error).
+  Object.freeze({ method: 'POST', path: '/leases', shape: 'Lease', handler: takeLease, requestId: ({ body }, view) => leaseRequestId(body, view) }),
+  Object.freeze({ method: 'GET', path: '/leases/{id}', shape: 'Lease', handler: getLease }),
 ]);
 
 // ---- dispatch ----
@@ -307,8 +321,8 @@ function matchPath(pattern, path) {
 
 // One request: `{method, url, body, bodyError}` (url as sent: path and query; body already parsed, or undefined; bodyError the error
 // of a body that could not be read, answered only once the route is known, so a wrong path or method is still a 404 or 405) to
-// `{status, headers, body}`. Never throws. `ctx.routes` (default ROUTES) is the route table; a handler error is logged once on `ctx.log.err` and answered as a 500.
-export async function handle({ method, url, body, bodyError } = {}, ctx = {}) {
+// `{status, headers, body}`. Never throws. `signal` (optional) is the connection's abort signal, handed to the handler. `ctx.routes` (default ROUTES) is the route table; a handler error is logged once on `ctx.log.err` and answered as a 500.
+export async function handle({ method, url, body, bodyError, signal } = {}, ctx = {}) {
   const routes = ctx.routes ?? ROUTES;
   const path = pathOf(url);
   const verb = String(method ?? '').toUpperCase();
@@ -323,17 +337,24 @@ export async function handle({ method, url, body, bodyError } = {}, ctx = {}) {
     return problem(routeError(405, 'HUB_NO_ROUTE', `${verb} is not allowed on ${path} (allowed: ${allow})`, 'method'), { Allow: allow });
   }
   if (bodyError) return problem(bodyError);
+  // The id the route echoes in `X-Request-Id`, when it names one and the request or the answer knows it.
+  const echo = answered => {
+    try {
+      const id = route.requestId?.({ method: verb, path, body }, answered);
+      return typeof id === 'string' && id !== '' ? { 'X-Request-Id': id } : {};
+    } catch { return {}; }
+  };
   try {
     const query = String(url ?? '').slice(path.length).replace(/^\?/, '').split('#')[0];
     const params = found.find(entry => entry.route === route).params;
-    const result = await route.handler(ctx, { method: verb, path, query: new URLSearchParams(query), body, params });
-    if (result?.[REPLY] === true) return respond(result.status, result.body);
+    const result = await route.handler(ctx, { method: verb, path, query: new URLSearchParams(query), body, params, signal });
+    if (result?.[REPLY] === true) return respond(result.status, result.body, echo(result.body));
     if (result === null || typeof result !== 'object') throw new TypeError(`the handler for ${verb} ${path} returned ${result === null ? 'null' : typeof result}, not an object`);
-    return respond(200, result);
+    return respond(200, result, echo(result));
   } catch (error) {
     if (!hasStatus(error) && tableAnswer(error) === null) {
       try { ctx.log?.err?.(`HUB_API_ERROR ${verb} ${path} ${oneLine(error?.message ?? error)}`); } catch { /* a broken log seam never changes the answer */ }
     }
-    return problem(error);
+    return problem(error, echo(null));
   }
 }

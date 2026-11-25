@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { loadDevices } from '../ci/lib/devices.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { hermetic } from '../ci/test-fixtures.mjs';
-import { EXIT_CODES } from '../device/claims.mjs';
+import { EXIT_CODES, createLeaseWaits } from '../device/claims.mjs';
 import { fakeWire } from '../device/wire-fixtures.mjs';
 import { CONTRACT_VERSION, PROBLEM_EXTENSIONS, ROUTES, handle } from './routes.mjs';
 
@@ -118,7 +118,13 @@ const POST_SAMPLES = Object.freeze({
   // After the seed (rev 1) and the setup register (rev 2), the edit is based on rev 2.
   '/registry/resources/{id}': { status: 200, params: { id: 'res-pixel' }, setup: ['/registry/resources'], body: { if_rev: 2, name: 'pixel-9', capabilities: { api_level: 36 }, holder: 'contract-test' } },
   '/registry/resources/{id}/retire': { status: 200, params: { id: 'res-pixel' }, setup: ['/registry/resources'], body: { holder: 'contract-test' } },
-  '/leases': { status: 200, body: { resource: 's24', for_ms: 1_800_000, holder: 'contract-test', why: 'contract' } },
+  '/leases': { status: 200, body: { resource: 's24', for_ms: 1_800_000, holder: 'contract-test', why: 'contract', id: 'contract-1' } },
+});
+
+// How each GET route with a parameter the default sample cannot stand for is called: `params` (over PARAM_SAMPLES) and `setup` (the
+// paths of POST samples called first, in order, on the same scratch). `/leases/{id}` needs a Lease the setup took.
+const GET_SAMPLES = Object.freeze({
+  '/leases/{id}': { params: { id: 'contract-1' }, setup: ['/leases'] },
 });
 const sampleOf = (route, samples = POST_SAMPLES) => {
   if (!Object.hasOwn(samples, route.path)) throw new Error(`no request body sample for ${route.method} ${route.path}: add it to POST_SAMPLES`);
@@ -144,6 +150,17 @@ async function callPost(route, ctx) {
     assert.equal(answer.status, sampleOf(earlier).status, `setup ${path}`);
   }
   return handle({ method: 'POST', url: samplePath(route.path, { ...PARAM_SAMPLES, ...sample.params }), body: sampleBody(route) }, ctx);
+}
+
+// Calls a GET route as its sample says (setup POSTs first, their answers successes). Returns the answer.
+async function callGet(route, ctx) {
+  const sample = GET_SAMPLES[route.path] ?? {};
+  for (const path of sample.setup ?? []) {
+    const earlier = ROUTES.find(candidate => candidate.method === 'POST' && candidate.path === path);
+    const answer = await handle({ method: 'POST', url: samplePath(path, { ...PARAM_SAMPLES, ...sampleOf(earlier).params }), body: sampleBody(earlier) }, ctx);
+    assert.equal(answer.status, sampleOf(earlier).status, `setup ${path}`);
+  }
+  return handle({ method: 'GET', url: samplePath(route.path, { ...PARAM_SAMPLES, ...sample.params }) }, ctx);
 }
 
 function scratch() {
@@ -188,7 +205,7 @@ test('each GET route answers with exactly the field list of its shape', async ()
   const s = scratch();
   try {
     for (const route of ROUTES.filter(candidate => candidate.method === 'GET')) {
-      const answer = await handle({ method: 'GET', url: samplePath(route.path) }, s.ctx);
+      const answer = await callGet(route, s.ctx);
       assert.equal(answer.status, 200, routeKey(route));
       assert.deepEqual(fieldDiff(contract.shapes[route.shape], shapeFields(route.shape, answer.body)), [], routeKey(route));
     }
@@ -218,9 +235,14 @@ test('the Problem extensions of the document equal PROBLEM_EXTENSIONS both ways,
     const post = body => handle({ method: 'POST', url: route.path, body }, s.ctx);
     const base = sampleBody(route);
     assert.equal((await post(base)).status, 201);
+    // A service that is stopping answers every lease request 503 HUB_API_RESTARTING.
+    const waits = createLeaseWaits();
+    await waits.shutdown();
+    const lease = ROUTES.find(candidate => candidate.method === 'POST' && candidate.path === '/leases');
     const answers = {
       HUB_REGISTRY_CONFLICT: await post({ ...base, name: 'other', identity: { model: 'x' }, if_rev: 0 }),
       HUB_REGISTRY_DUPLICATE: await post({ ...base, name: 'other' }),
+      HUB_API_RESTARTING: await handle({ method: 'POST', url: lease.path, body: sampleBody(lease) }, { ...s.ctx, waits }),
     };
     assert.deepEqual(Object.keys(answers).sort(), Object.keys(PROBLEM_EXTENSIONS).sort(), 'every extension code has a live answer here');
     for (const [code, answer] of Object.entries(answers)) {
@@ -269,7 +291,7 @@ test('every key, in the document and in a response, is snake_case', async () => 
     const keysOf = path => path.split('.').map(key => key.replace(/\[\]$/, '')).filter(key => key !== '*');
     const keys = new Set(Object.values(contract.shapes).flat().flatMap(keysOf));
     for (const route of ROUTES.filter(candidate => candidate.method === 'GET')) {
-      const body = (await handle({ method: 'GET', url: samplePath(route.path) }, s.ctx)).body;
+      const body = (await callGet(route, s.ctx)).body;
       for (const path of shapeFields(route.shape, body)) for (const key of keysOf(path)) keys.add(key);
     }
     for (const route of postRoutes()) {

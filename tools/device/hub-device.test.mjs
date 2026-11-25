@@ -342,7 +342,7 @@ test('phone with every phone held is BUSY naming the holders; with every free ph
     const busy = await f.run(['lease', 'phone', '--for', '5m', '--why', 'x', '--wait', '0']);
     assert.equal(busy.code, 76);
     assert.deepEqual(busy.out, [], 'BUSY never reaches stdout');
-    assert.match(busy.err.join('\n'), /^HUB_DEVICE_BUSY phone every phone is held: s24 \(s24\) is held by lease on-s24 of agent-a \(long proof\).*s26 \(adb\) is held by lease on-s26 of agent-b/m);
+    assert.match(busy.err.join('\n'), /^HUB_DEVICE_BUSY phone host lock s24 is held by lease on-s24 of agent-a \(long proof\).*; host lock adb is held by lease on-s26 of agent-b.* \(every phone is held\); gave up after 0s/m);
     const busyRun = await f.run(['run', 'phone', '--wait', '0', '--', 'true']);
     assert.equal(busyRun.code, 76);
     await f.run(['release', 'on-s24']);
