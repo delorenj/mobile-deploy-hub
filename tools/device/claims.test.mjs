@@ -50,7 +50,7 @@ async function startWaiter(s, id, lock = 's24') {
 const emptyAdb = () => ({ startServer: async () => {}, devices: async () => [], prop: async () => '' });
 
 test('the library exports the whole action surface and the exit table as frozen data', () => {
-  for (const name of ['resolve', 'take', 'release', 'extend', 'newLeaseId', 'checkBounds', 'checkLeaseId', 'usableFleet', 'emulatorBounds', 'statusView', 'leaseExports', 'jobTicket', 'releaseEmulatorNow', 'releaseReservations', 'extendHeld', 'serviceExtend', 'serviceRelease', 'checkExtendBody', 'checkReleaseBody', 'exitCodeOf', 'fleetOf', 'loadFleet', 'matchTarget', 'hostKey', 'isLocal', 'hostKeyPath']) {
+  for (const name of ['resolve', 'take', 'release', 'extend', 'newLeaseId', 'checkBounds', 'checkLeaseId', 'usableFleet', 'emulatorBounds', 'emulatorPool', 'serviceLease', 'statusView', 'leaseExports', 'jobTicket', 'releaseEmulatorNow', 'releaseReservations', 'extendHeld', 'serviceExtend', 'serviceRelease', 'checkExtendBody', 'checkReleaseBody', 'exitCodeOf', 'fleetOf', 'loadFleet', 'matchTarget', 'hostKey', 'isLocal', 'hostKeyPath']) {
     assert.equal(typeof claims[name], 'function', name);
   }
   assert.equal(claims.PHONE, 'phone');
@@ -74,6 +74,8 @@ test('the library exports the whole action surface and the exit table as frozen 
     HUB_REGISTRY_SEEDED: 2,
     // Story 7.2: a wait through a service.
     HUB_LEASE_NOT_FOUND: 2, HUB_LEASE_SUPERSEDED: 1, HUB_API_RESTARTING: 1,
+    // Story 7.4: an emulator that did not boot through a service.
+    HUB_EMULATOR_FAILED: 1,
     // Story 6.8: the same-host client's two answers.
     HUB_API_DOWN: 1, HUB_API_UNKNOWN: 1,
   });
@@ -474,5 +476,62 @@ test('registryList: the seed at rev 0 with no file, no service, and a QA warning
     assert.ok(listed.resources.some(resource => resource.id === 's24') && listed.pools.some(pool => pool.name === 'phone'));
     assert.deepEqual(warnings, []);
     assert.equal(claims.registryRev({ env: s.env }), 0);
+  } finally { s.cleanup(); }
+});
+
+// ---- the emulator Pool's size (Story 7.4): one function, one order ----
+
+const poolSide = () => {
+  const root = mkdtempSync(join(tmpdir(), 'claims-pool-'));
+  const env = { HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events') };
+  mkdirSync(env.HUB_LOCK_DIR, { recursive: true });
+  const file = text => writeFileSync(join(env.HUB_LOCK_DIR, 'emulator-pool'), text);
+  const registry = size => writeFileSync(join(env.HUB_LOCK_DIR, 'registry.json'), JSON.stringify({ format: 1, rev: 1, resources: [], pools: [{ name: 'phone', members: [], named: true }, { name: 'emulator', gate: 'emulator', ...(size === undefined ? {} : { size }) }] }));
+  return { env, file, registry, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+};
+
+test('the emulator Pool size: env (CLI only), then the emulator-pool file, then the Registry size, then 2, each 1 to 8', () => {
+  const s = poolSide();
+  try {
+    const both = { ...s.env, HUB_EMULATOR_POOL: '3' };
+    assert.equal(claims.emulatorPool(both), 3, 'the CLI reads the variable first');
+    assert.equal(claims.emulatorPool(both, { service: true }), 2, 'a service never reads it: nothing else says, so 2');
+    s.registry(4);
+    assert.equal(claims.emulatorPool(s.env), 4, 'the Registry size when there is no file');
+    assert.equal(claims.emulatorPool(both, { service: true }), 4);
+    assert.equal(claims.emulatorPool(both), 3, 'the CLI still takes its variable over the Registry');
+    s.file('2\n');
+    assert.equal(claims.emulatorPool(s.env), 2, 'the file beats the Registry');
+    assert.equal(claims.emulatorPool(both, { service: true }), 2);
+    assert.equal(claims.emulatorPool(both), 3);
+    assert.deepEqual(claims.emulatorBounds({ service: true }, both), { profile: 'default', pool: 2 });
+    assert.deepEqual(claims.emulatorBounds({}, both), { profile: 'default', pool: 3 });
+    s.file('9');
+    assert.throws(() => claims.emulatorPool(s.env), error => error.code === 'HUB_EMULATOR_USAGE' && error.message.startsWith(join(s.env.HUB_LOCK_DIR, 'emulator-pool')) && /1 to 8 emulators, not "9"/.test(error.message));
+    rmSync(join(s.env.HUB_LOCK_DIR, 'emulator-pool'));
+    s.registry(0);
+    assert.throws(() => claims.emulatorPool(s.env, { service: true }), error => error.code === 'HUB_EMULATOR_USAGE' && /^the Registry's pools\.emulator\.size: .*not "0"/.test(error.message));
+    assert.throws(() => claims.emulatorPool({ ...s.env, HUB_EMULATOR_POOL: '12' }), (error) => error.code === "HUB_EMULATOR_USAGE" && /^HUB_EMULATOR_POOL: the emulator pool is 1 to 8 emulators, not "12"/.test(error.message));
+    s.registry(undefined);
+    assert.equal(claims.emulatorPool(s.env, { service: true }), 2, 'a Registry with no size says nothing');
+    rmSync(join(s.env.HUB_LOCK_DIR, 'registry.json'));
+    assert.equal(claims.emulatorPool(s.env, { service: true }), 2, 'no Registry file: 2');
+  } finally { s.cleanup(); }
+});
+
+test('matchTarget with emulators: a profile= clause, or a query only the emulator Pool satisfies, names the emulator; without the option the CLI refuses it as before', () => {
+  const s = side();
+  try {
+    const ask = (text, extra = {}) => claims.matchTarget(text, { forMs: 1_800_000, ...extra }, s.ctx);
+    assert.deepEqual(ask('profile=playstore', { emulators: true }), { kind: 'emulator', by: 'match', profile: 'playstore' });
+    assert.deepEqual(ask('profile=default,kind=emulator-pool', { emulators: true }), { kind: 'emulator', by: 'match', profile: 'default' });
+    assert.deepEqual(ask('kind=emulator-pool', { emulators: true }), { kind: 'emulator', by: 'match', profile: null });
+    assert.equal(ask('kind=phone', { emulators: true }).kind, 'pool', 'a phone query is a phone Pool');
+    for (const text of ['profile>=1', 'profile=default,profile=playstore', 'profile<=3']) {
+      assert.throws(() => ask(text, { emulators: true }), error => error.code === 'HUB_USAGE', text);
+    }
+    assert.throws(() => ask('profile=default,kind=phone', { emulators: true }), error => error.code === 'HUB_NO_MATCH' && /emulator kind is emulator-pool, not phone/.test(error.reason));
+    assert.throws(() => ask('kind=emulator-pool'), error => error.code === 'HUB_NO_MATCH' && /--match takes a phone/.test(error.message));
+    assert.throws(() => ask('profile=default'), error => error.code === 'HUB_NO_MATCH', 'the CLI keeps `profile` an ordinary Capability');
   } finally { s.cleanup(); }
 });

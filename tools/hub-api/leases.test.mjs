@@ -61,10 +61,11 @@ test('a word lease on a free s24: 200 Lease, a lock-only owner record, one acqui
     const answer = await s.post({ ...BODY, id: 'api-1' });
     assert.equal(answer.status, 200);
     assert.equal(answer.headers['Cache-Control'], 'no-store');
-    assert.deepEqual(Object.keys(answer.body).sort(), ['claimant_kind', 'device', 'env', 'expires_at', 'holder', 'lease_id', 'lock', 'resource', 'started_at', 'why']);
+    assert.deepEqual(Object.keys(answer.body).sort(), ['claimant_kind', 'device', 'emulator', 'env', 'expires_at', 'holder', 'lease_id', 'lock', 'resource', 'started_at', 'why']);
     assert.deepEqual([answer.body.lease_id, answer.body.resource, answer.body.lock, answer.body.device, answer.body.holder, answer.body.why, answer.body.claimant_kind], ['api-1', 's24', 's24', 's24', 'agent-a', 'proof', 'agent']);
     assert.equal(answer.body.expires_at, new Date(NOW() + 30 * MIN).toISOString());
     assert.deepEqual(Object.keys(answer.body.env).sort(), ['ANDROID_ADB_SERVER_PORT', 'HUB_DEVICE', 'HUB_LEASE_ID']);
+    assert.equal(answer.body.emulator, null, 'a phone Lease has no emulator');
     const record = s.owner('s24');
     assert.equal(record.holder_pid, null);
     assert.equal(record.holder_process_start, null);
@@ -260,12 +261,9 @@ test('a bad body is 400 HUB_USAGE with its reason, before anything is read', asy
   } finally { s.cleanup(); }
 });
 
-test('emulator is refused as a word, an unknown word is a usage error, and a taken id is refused', async () => {
+test('an unknown word is a usage error, and a taken id is refused (the emulator word is leased: tools/hub-api/emulator-lease.test.mjs)', async () => {
   const s = scratch();
   try {
-    const emulator = await s.post({ ...BODY, resource: 'emulator' });
-    assert.deepEqual([emulator.status, emulator.body.code, emulator.body.exit], [400, 'HUB_USAGE', 2]);
-    assert.match(emulator.body.detail, /emulator/);
     const unknown = await s.post({ ...BODY, resource: 'nokia' });
     assert.deepEqual([unknown.status, unknown.body.code], [400, 'HUB_USAGE']);
     assert.match(unknown.body.detail, /unknown device "nokia"/);
@@ -365,7 +363,7 @@ test('the HTTP table gives every library error a status; an unknown code has non
     ['HUB_USAGE', 400, null], ['HUB_EMULATOR_USAGE', 400, null], ['HUB_LEASE_TOO_LONG', 400, null], ['HUB_DEVICE_JOB_ID', 400, null],
     ['HUB_NO_MATCH', 404, 'no-match'], ['HUB_LOCK_TIMEOUT', 409, 'busy'], ['HUB_DEVICE_BUSY', 409, 'busy'], ['HUB_POOL_CROSS_HOST', 409, null],
     ['HUB_RESOURCE_RETIRED', 409, null], ['HUB_LEASE_CANCELLED', 409, null], ['HUB_LEASE_NOT_FOUND', 404, null], ['HUB_LEASE_EXTEND_REFUSED', 409, null], ['HUB_LEASE_LOST', 409, null], ['HUB_LEASE_SUPERSEDED', 409, 'superseded'], ['HUB_API_RESTARTING', 503, 'restarting'],
-    ['HUB_PHONE_AWAY', 503, 'away'], ['HUB_DEVICE_AWAY', 503, 'away'], ['HUB_HOST_UNKNOWN', 503, 'host-unknown'],
+    ['HUB_PHONE_AWAY', 503, 'away'], ['HUB_DEVICE_AWAY', 503, 'away'], ['HUB_HOST_UNKNOWN', 503, 'host-unknown'], ['HUB_EMULATOR_FAILED', 503, 'emulator-failed'],
   ]);
   for (const code of Object.keys(HTTP_ANSWERS)) assert.ok(code in EXIT_CODES, `${code} has an exit`);
   assert.equal(httpAnswerOf({ code: 'HUB_API_ERROR' }), null);

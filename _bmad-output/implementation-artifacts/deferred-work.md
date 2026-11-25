@@ -148,3 +148,27 @@ source_spec: `spec-6-12-ship-the-registry-and-the-hub-api.md`
 severity: medium
 reason: release() has no seams (git, gh, mise run for real), as recorded at Story 5.10; unitsIn, stopUnitsOf and rollbackLine are tested directly, and the wiring at tools/release.mjs:153-154 was read at review. Dropping stopUnits from that call would pass the suite. Settled live by the operator action that reads `git show v1.2.53` for the systemctl stop, or by extracting a rollbackFor(major, previous, run) helper with a fake run.
 status: open
+
+### DW-9: An emulator release through the API drops the request's actor: neither the slot `release` nor the gate `cancel` records who released it.
+origin: spec-deferred cf4ccce223c1
+location: tools/device/claims.mjs serviceRelease; tools/device/emulator.mjs releaseEmulator
+source_spec: `spec-7-4-lease-an-emulator-through-the-api.md`
+severity: low
+reason: serviceRelease passes only {id, graceMs} to the worker, and releaseEmulator takes no actor. This matches the CLI, whose emulator release records no actor either (the 7.3 README already says "an emulator release records no actor yet"), so it is parity with pre-existing behaviour, not a regression. The fix threads `actor` through releaseEmulator to both releaseLease calls, for the CLI and the API at once.
+status: open
+
+### DW-10: An emulator take with wait_ms > 0 through the service's wait registry (open waits, supersede, a stop ending a queued emulator request) has no test.
+origin: spec-deferred a715d94dfb05
+location: tools/device/claims.mjs createLeaseWaits
+source_spec: `spec-7-4-lease-an-emulator-through-the-api.md`
+severity: medium
+reason: Only no-wait emulator takes run through createLeaseWaits in tools/hub-api/emulator-lease.test.mjs. The open-wait path is the same serviceLease call with the registry's controller signal, so it probably works. To settle it, fill the pool, then POST an emulator with wait_ms through createLeaseWaits(). Assert a grant once a slot frees, a supersede by the same id, and that shutdown() leaves a Pool `cancel` (reason aborted). (declared severity: medium (unverified))
+status: open
+
+### DW-11: An emulator take ignores a retired or seed-missing emulator Pool Resource: the word `emulator` (CLI and API) and the API's `profile=` match lease it anyway; only a `match` that runs the matcher
+origin: spec-deferred d01e2dc3e6e7
+location: tools/device/claims.mjs withoutRetired, matchTarget
+source_spec: `spec-7-4-lease-an-emulator-through-the-api.md`
+severity: low
+reason: `withoutRetired` in claims.take checks only a `phone` target or a word Pool, never the `emulator` kind, so `hub-device lease emulator` has never honoured a retired emulator Pool (pre-existing). The 7.4 `profile=` branch of `matchTarget` with no other clause returns the emulator target without consulting the Registry, inheriting the same gap. The fix belongs in `take`: refuse HUB_RESOURCE_RETIRED for the emulator Pool's Resource when the Registry file marks it retired or seed_missing, so every front door gets it at once.
+status: open

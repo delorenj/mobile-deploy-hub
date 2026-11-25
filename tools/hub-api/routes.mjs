@@ -242,11 +242,11 @@ export async function retireResource(ctx, { body, params }) {
   return { rev: written.rev, source: 'file', id: record.id, retired_at: record.retired_at, visibility: visibility(record, { held: activity.held === true, queued: activity.queued === true }) };
 }
 
-// POST /leases: takes a Lease on a phone, by word, Resource id or `match`, with no wait (Story 7.1). The body is checked first
+// POST /leases: takes a Lease on a phone or an emulator, by word, Resource id or `match` (Story 7.1, 7.4). The body is checked first
 // (`checkLeaseBody`), then the Claims library takes it exactly as `hub-device lease <word> --no-connect` would: `serviceLease` is the one
 // function every service front door calls, and the status of a refusal comes from its HTTP table. The actor is the body's `actor`, else
-// `{holder, via: 'api'}`. A `match` drops the members this service's own cache knows are away (no adb is asked on a request: AD-44).
-// 200 `Lease`.
+// `{holder, via: 'api'}`. A `match` drops the members this service's own cache knows are away (no adb is asked on a request: AD-44). The word `emulator`, or a `match` with a `profile=` clause (or only the emulator Pool),
+// takes an emulator: its boot runs in a worker thread (AD-44), never here. 200 `Lease`, with `emulator` set for one.
 //
 // A wait (`wait_ms`, Story 7.2) is bound to the connection that asked: the service's wait registry (`ctx.waits`, claims.mjs
 // `createLeaseWaits`, built by `startService`) owns the rules, this handler hands it the request's abort `signal`. A context with no
@@ -267,6 +267,7 @@ function serviceContext(ctx) {
   return {
     env: ctx.env ?? process.env, policy: ctx.policy, now: ctx.now, sleep: ctx.sleep, qaDevices: ctx.qaDevices,
     log: out, warn: () => {}, readingsOf: readingsOf(ctx),
+    ...(ctx.provisionOffThread ? { provisionOffThread: ctx.provisionOffThread } : {}), ...(ctx.releaseOffThread ? { releaseOffThread: ctx.releaseOffThread } : {}),
   };
 }
 
@@ -277,13 +278,13 @@ export async function takeLease(ctx, { body, signal }) {
   return ctx.waits ? ctx.waits.lease({ ...input, actor }, service, { signal }) : serviceLease({ ...input, actor }, { ...service, signal });
 }
 
-// GET /leases/{id}: the Lease an id names (Story 7.2), the same `Lease` the take answered with: how a client whose connection dropped
+// GET /leases/{id}: the Lease an id names, a phone's or an emulator's (Story 7.2, 7.4), the same `Lease` the take answered with: how a client whose connection dropped
 // after the grant finds its Hold. A waiter that holds nothing yet and an unknown id are 404 HUB_LEASE_NOT_FOUND (`waiting`, `unknown`).
 export function getLease(ctx, { params }) {
   return findLease(params.id, { env: ctx.env ?? process.env, warn: () => {} });
 }
 
-// POST /leases/{id}/extend: extends a phone Lease (Story 7.3), exactly `hub-device extend <id> --for ...`: `serviceExtend` is the one function
+// POST /leases/{id}/extend: extends a phone or emulator Lease (Story 7.3), exactly `hub-device extend <id> --for ...`: `serviceExtend` is the one function
 // every service front door calls, and the status of a refusal comes from its HTTP table. The body is checked first (`checkExtendBody`);
 // the actor is the body's `actor`, else `{holder, via: 'api'}`, and an `override`'s actor defaults to it. 200 `Lease`.
 export function extendLeaseRoute(ctx, { body, params }) {
@@ -293,7 +294,7 @@ export function extendLeaseRoute(ctx, { body, params }) {
   return serviceExtend(params.id, { ...input, actor, override }, serviceContext(ctx));
 }
 
-// POST /leases/{id}/release: gives a phone Lease back, or withdraws a waiter (Story 7.3), exactly `hub-device release <id>`, with the actor
+// POST /leases/{id}/release: gives a phone or emulator Lease back (an emulator is torn down in a worker), or withdraws a waiter (Story 7.3), exactly `hub-device release <id>`, with the actor
 // on its events. 200 `Release`; an id that holds and waits for nothing is `outcome: none`.
 export function releaseLeaseRoute(ctx, { body, params }) {
   const input = checkReleaseBody(body);
