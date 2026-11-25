@@ -12,11 +12,15 @@
 //
 // Removal is exactly once (AD-9): a release or reclaim renames `<name>.lock` to a tomb, and only the process whose rename
 // succeeded deletes it and records the event in the Event Log (events.mjs). This module is the only caller of appendEvent.
+//
+// `writeFileAtomic` (AD-27) is the one tmp-plus-rename helper for a file a service writes into the lock dir (the Registry store's
+// file is the first): a reader sees the old bytes or the new, never half. The older `writeOwner` and `writeTicket` keep
+// their own tmp names, which older pins share on disk.
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fchmodSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { appendEvent, hostId as machineId, readEvents } from './events.mjs';
 import { pause, sleep as realSleep } from './pause.mjs';
 import { jobDeadline, jobTimeoutMs } from './deadline.mjs';
@@ -490,6 +494,30 @@ export function holdsOf(owner, blockers = []) {
     }
     return holds;
   } catch { return []; }
+}
+
+// Writes `data` (a string or a Buffer) to `path` atomically (AD-27): a unique `<path>.<pid>.<hex>.tmp` opened `wx` at `mode`, written,
+// fsynced and closed, then renamed over `path`, so a reader never sees half a file and two writers never share a tmp. The parent is
+// created when missing. On any failure the tmp is removed and the error rethrown; `path` is then untouched. A tmp left by a process
+// that was killed mid-write is garbage nothing reads (no reader opens a `.tmp` name).
+export function writeFileAtomic(path, data, { mode = 0o600 } = {}) {
+  mkdirSync(dirname(path), { recursive: true });
+  const bytes = Buffer.isBuffer(data) ? data : Buffer.from(String(data), 'utf8');
+  const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  let fd = null;
+  try {
+    fd = openSync(tmp, 'wx', mode);
+    fchmodSync(fd, mode);
+    for (let written = 0; written < bytes.length;) written += writeSync(fd, bytes, written, bytes.length - written);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    renameSync(tmp, path);
+  } catch (error) {
+    if (fd !== null) { try { closeSync(fd); } catch { /* the first error is the one to report */ } }
+    try { unlinkSync(tmp); } catch { /* it may never have been created */ }
+    throw error;
+  }
 }
 
 // Write-then-rename: a reader never sees half a record.
