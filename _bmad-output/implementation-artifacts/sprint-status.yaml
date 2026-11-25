@@ -93,7 +93,7 @@ development_status:
   6-9-a-registered-phone-is-leasable-within-a-minute: done
   6-10-reachability-and-discovery-through-the-api: done
   6-11-the-service-runs-from-a-release-and-a-stop-never-kills-an-em: done
-  6-12-ship-the-registry-and-the-hub-api: backlog
+  6-12-ship-the-registry-and-the-hub-api: awaiting-operator
   epic-6-retrospective: optional
 
   epic-7: backlog

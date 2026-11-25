@@ -140,3 +140,11 @@ source_spec: `spec-6-11-the-service-runs-from-a-release-and-a-stop-never-kills-a
 severity: medium
 reason: tools/ci/test-fixtures.mjs heavyShim encodes the exec assumption; no test reads /proc/<pid>/cgroup. A suite test would need a live user manager, which the hermetic rule (CLAUDE.md "Running and verifying") forbids. Settled live by a 6.12 operator check: lease an emulator, `systemctl --user restart mobile-deploy-hub-api`, and confirm the emulator pid survives in a batch.slice scope.
 status: open
+
+### DW-8: The release() call that feeds stopUnitsOf into rollbackLine (and so the stop into every tag annotation) is run by no test.
+origin: spec-deferred 357cb0232230
+location: tools/release.mjs:153-154
+source_spec: `spec-6-12-ship-the-registry-and-the-hub-api.md`
+severity: medium
+reason: release() has no seams (git, gh, mise run for real), as recorded at Story 5.10; unitsIn, stopUnitsOf and rollbackLine are tested directly, and the wiring at tools/release.mjs:153-154 was read at review. Dropping stopUnits from that call would pass the suite. Settled live by the operator action that reads `git show v1.2.53` for the systemctl stop, or by extracting a rollbackFor(major, previous, run) helper with a fake run.
+status: open

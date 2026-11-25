@@ -14,6 +14,9 @@
 // before the dry-run lines. It is computed from where the major tag (v1) pointed before this release started, never from "the
 // previous version number": a red release moves v1 back, so a tag can exist that v1 never stood on (v1.2.47, v1.2.49 and
 // v1.2.50 were rolled back).
+// A release that adds a service (a tools/hosts/units/*.service that the rollback target does not have) also says to stop it, before the
+// target's hosts:install: the old tag's installer knows no such unit, so the service would otherwise keep running from the new
+// release. Stopping first is right either way: a target that does install the unit enables and restarts it again.
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -59,10 +62,29 @@ export function pinTag(names) {
 // How to undo a release: put the callers' pin (the major tag) and the hosts' tools back on what the major tag named before.
 // `previous` is remoteTag(major) read before the first tag of the release ({object, commit} or null when the major is new);
 // `previousTag` is pinTag of the tags on that commit. Without a tag the full commit is named (a short form can be ambiguous).
-export function rollbackLine({ major, previous, previousTag = null }) {
+export function rollbackLine({ major, previous, previousTag = null, stopUnits = [] }) {
   if (!previous) return `Roll back: none: ${major} is new with this release.`;
   const ref = previousTag ?? previous.commit;
-  return `Roll back: move ${major} back to ${ref} (git tag -f ${major} '${ref}^{commit}' && git push -f origin refs/tags/${major}), then run mise run hosts:install on big-chungus from a clean checkout at ${ref} (it installs the Mac through hub-mac).`;
+  const stop = stopUnits?.length > 0 ? `then stop what this release added and ${ref} does not install (systemctl --user disable --now ${stopUnits.join(' ')} on big-chungus), ` : '';
+  return `Roll back: move ${major} back to ${ref} (git tag -f ${major} '${ref}^{commit}' && git push -f origin refs/tags/${major}), ${stop}then run mise run hosts:install on big-chungus from a clean checkout at ${ref} (it installs the Mac through hub-mac).`;
+}
+
+// The `.service` units of a `git ls-tree --name-only <commit> tools/hosts/units/` listing, as sorted basenames. It takes the output
+// text (or the `{ok, out}` the git helper returns); a failed lookup (null, undefined or `ok: false`) is null, never an empty list.
+export function unitsIn(listing) {
+  const text = listing !== null && typeof listing === 'object' ? (listing.ok ? listing.out : null) : listing;
+  if (typeof text !== 'string') return null;
+  return text.split(/\r?\n/).map(line => line.trim().split('/').pop()).filter(name => name.endsWith('.service')).sort();
+}
+
+// The units to stop on a rollback: the services at `head` that `previousCommit` does not have. When the previous lookup fails every
+// service at `head` is listed (stopping first is always safe); when the lookup at `head` fails there is nothing to name.
+export function stopUnitsOf(head, previousCommit, run = git) {
+  const at = commit => unitsIn(run(['ls-tree', '--name-only', commit, 'tools/hosts/units/'], { allowFail: true }));
+  const added = at(head);
+  if (added === null) return [];
+  const before = at(previousCommit);
+  return before === null ? added : added.filter(name => !before.includes(name));
 }
 
 // `git tag` strips `#` lines from a message by default; whitespace cleanup keeps a notes heading.
@@ -128,7 +150,8 @@ export async function release(version, { log = console.log, dryRuns = true } = {
   // Where the major tag stands before this release touches anything: the rollback target (read before the first tag).
   const previous = remoteTag(major);
   const previousTag = previous ? pinTag(git(['tag', '--list', 'v*', '--points-at', previous.commit], { allowFail: true }).out.split('\n').filter(Boolean)) : null;
-  const rollback = rollbackLine({ major, previous, previousTag });
+  const stopUnits = previous ? stopUnitsOf('HEAD', previous.commit) : [];
+  const rollback = rollbackLine({ major, previous, previousTag, stopUnits });
   log(`RELEASE_ROLLBACK ${rollback}`);
   let notes = null;
   try { notes = existsSync(notesPath) ? releaseNotes(readFileSync(notesPath, 'utf8'), tag) : null; } catch (error) { log(`RELEASE_NOTES ${tag}: docs/hub-releases.md unreadable (${error.code ?? error.message}); tagging without notes`); }

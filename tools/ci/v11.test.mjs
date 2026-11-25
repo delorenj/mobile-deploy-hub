@@ -621,7 +621,7 @@ test('the train dispatches Tower, then Green In Between, then Gruvato, and stops
 // ---------------------------------------------------------------------------------------------------- conformance and release
 
 import { checkApp, miseTasks, scriptsOf } from '../conformance.mjs';
-import { flipInnerRefs, notesMaxBytes, notesPath, pinTag, releaseNotes, remoteTag, rollbackLine, tagArgs, tagMessage } from '../release.mjs';
+import { flipInnerRefs, notesMaxBytes, notesPath, pinTag, releaseNotes, remoteTag, rollbackLine, stopUnitsOf, tagArgs, tagMessage, unitsIn } from '../release.mjs';
 
 test('conformance: the template caller and a clean app pass; uploads, bumps, tags and announcements outside the hub fail', () => {
   const app = { slug: 'gruvato', lanes: ['android', 'ios'] };
@@ -745,6 +745,46 @@ test('rollback: pinTag picks the highest release tag numerically and ignores oth
   assert.equal(rollbackLine({ major: 'v2', previous: null, previousTag: 'v2.0.1' }), 'Roll back: none: v2 is new with this release.', 'a new major has nothing to go back to, whatever tags exist');
 });
 
+// Story 6.12 (NFR-2): a release that adds a service says to stop it before the rollback target's hosts:install.
+test('rollback: unitsIn lists the .service basenames of an ls-tree listing, sorted, and a failed lookup is null', () => {
+  assert.deepEqual(unitsIn('tools/hosts/units/install.sh\ntools/hosts/units/b.service\ntools/hosts/units/a.service\n'), ['a.service', 'b.service']);
+  assert.deepEqual(unitsIn('install.sh\nb.service\na.service'), ['a.service', 'b.service'], 'bare names too');
+  assert.deepEqual(unitsIn('tools/hosts/units/install.sh'), []);
+  assert.deepEqual(unitsIn(''), [], 'a successful lookup of nothing is an empty list');
+  assert.deepEqual(unitsIn({ ok: true, out: 'tools/hosts/units/a.service' }), ['a.service']);
+  for (const failed of [null, undefined, { ok: false, out: '' }]) assert.equal(unitsIn(failed), null);
+});
+
+test('rollback: stopUnits puts the systemctl stop before the hosts:install of the target, and none is byte-identical to before', () => {
+  const previous = { object: 'a'.repeat(40), commit: 'b'.repeat(40) };
+  const before = rollbackLine({ major: 'v1', previous, previousTag: 'v1.2.52' });
+  assert.equal(rollbackLine({ major: 'v1', previous, previousTag: 'v1.2.52', stopUnits: [] }), before);
+  assert.equal(rollbackLine({ major: 'v1', previous, previousTag: 'v1.2.52', stopUnits: undefined }), before);
+  assert.equal(rollbackLine({ major: 'v1', previous, previousTag: 'v1.2.52', stopUnits: ['mobile-deploy-hub-api.service'] }),
+    "Roll back: move v1 back to v1.2.52 (git tag -f v1 'v1.2.52^{commit}' && git push -f origin refs/tags/v1), then stop what this release added and v1.2.52 does not install (systemctl --user disable --now mobile-deploy-hub-api.service on big-chungus), then run mise run hosts:install on big-chungus from a clean checkout at v1.2.52 (it installs the Mac through hub-mac).");
+  assert.ok(rollbackLine({ major: 'v1', previous, stopUnits: ['a.service', 'b.service'] }).includes('(systemctl --user disable --now a.service b.service on big-chungus), then run mise run hosts:install'));
+  assert.equal(rollbackLine({ major: 'v1', previous: null, stopUnits: ['a.service'] }), 'Roll back: none: v1 is new with this release.');
+});
+
+test('rollback: stopUnitsOf is the units at HEAD minus the units at the rollback target; a failed target lookup lists every unit at HEAD', () => {
+  const lookups = answers => (args, options) => { assert.deepEqual([args[0], args[1], args[3], options], ['ls-tree', '--name-only', 'tools/hosts/units/', { allowFail: true }]); return answers[args[2]] ?? { ok: false, out: '' }; };
+  const listing = (...names) => ({ ok: true, out: ['install.sh', ...names].map(name => `tools/hosts/units/${name}`).join('\n') });
+  const head = listing('mobile-deploy-hub-api.service', 'old.service');
+  assert.deepEqual(stopUnitsOf('HEAD', 'prev', lookups({ HEAD: head, prev: listing('old.service') })), ['mobile-deploy-hub-api.service']);
+  assert.deepEqual(stopUnitsOf('HEAD', 'prev', lookups({ HEAD: head, prev: listing('old.service', 'mobile-deploy-hub-api.service') })), [], 'nothing added');
+  assert.deepEqual(stopUnitsOf('HEAD', 'prev', lookups({ HEAD: head, prev: { ok: true, out: '' } })), ['mobile-deploy-hub-api.service', 'old.service'], 'the target has no units directory');
+  assert.deepEqual(stopUnitsOf('HEAD', 'prev', lookups({ HEAD: head })), ['mobile-deploy-hub-api.service', 'old.service'], 'a failed lookup stops everything: stopping first is always safe');
+  assert.deepEqual(stopUnitsOf('HEAD', 'prev', lookups({ prev: listing('old.service') })), [], 'nothing to name when HEAD cannot be read');
+});
+
+test('rollback: git ls-tree of the real repo names the Hub API unit at HEAD and none at v1.2.52', t => {
+  const lookup = commit => ({ ok: true, out: execFileSync('git', ['ls-tree', '--name-only', commit, 'tools/hosts/units/'], { cwd: repoRoot, encoding: 'utf8' }) });
+  assert.ok(unitsIn(lookup('HEAD')).includes('mobile-deploy-hub-api.service'));
+  try { execFileSync('git', ['rev-parse', '--verify', '-q', 'v1.2.52^{commit}'], { cwd: repoRoot, stdio: 'ignore' }); } catch { t.skip('v1.2.52 is not fetched here'); return; }
+  assert.deepEqual(unitsIn(lookup('v1.2.52')), []);
+  assert.ok(stopUnitsOf('HEAD', 'v1.2.52').includes('mobile-deploy-hub-api.service'));
+});
+
 test('remoteTag: a failed ls-remote throws (never "the tag is new"); a successful lookup of nothing is null', () => {
   const answer = (ok, out) => () => ({ ok, out });
   assert.throws(() => remoteTag('v1', answer(false, '')), /ls-remote for v1 failed/);
@@ -812,6 +852,23 @@ test('the v1.2.52 release notes (Epic 5) say what a reader of the tag must know:
   assert.match(notes, /v1\.2\.51/);
   for (const word of [/reachability/, /deploy_target/, /--match/, /`phone`/, /discover/, /host-key/, /HUB_HOST_UNKNOWN/, /HUB_NO_MATCH/, /HUB_POOL_CROSS_HOST/, /registry\.reachability_max_age_s/, /Test changes you will see/, /hub-device\.test\.mjs/, /lease\.test\.mjs/, /emulator\.test\.mjs/, /Roll back:/]) assert.match(notes, word);
   assert.ok(notes.split('\n').every(line => !line.startsWith('## ')), 'no line of the section may look like a heading of the next release');
+});
+
+test('the v1.2.53 release notes (Epic 6) say what a reader of the tag must know: the service, AD-25, the stop on rollback, the Mac, and hosts:smoke', () => {
+  const notes = releaseNotes(readFileSync(notesPath, 'utf8'), 'v1.2.53');
+  assert.ok(notes, 'docs/hub-releases.md has a v1.2.53 section');
+  assert.match(notes, /The deploy path ignores the Registry and the API \(AD-25\)/);
+  assert.match(notes, /A stopped API only disables Registry writes/);
+  assert.match(notes, /holds keep working/);
+  assert.match(notes, /deploy targets change only by hub release/);
+  assert.match(notes, /installs a service on big-chungus/);
+  assert.match(notes, /Mac gets no service: only the `hub-device` and `host-key` changes/);
+  assert.match(notes, /systemctl --user disable --now mobile-deploy-hub-api\.service/);
+  assert.match(notes, /Rolling back is `hosts:install` of `v1\.2\.52`/);
+  assert.match(notes, /mise run hosts:smoke/);
+  for (const word of [/HUB_SMOKE_OK/, /HUB_API_DOWN/, /registry\.json/, /Test changes you will see/, /reservation\.test\.mjs/, /emulator\.test\.mjs/, /hub-device\.test\.mjs/, /hostkey\.test\.mjs/, /test-fixtures\.mjs/, /Roll back:/, /HUB_DEVICE_REGISTERED/, /HUB_RESOURCE_RETIRED/]) assert.match(notes, word);
+  assert.ok(notes.split('\n').every(line => !line.startsWith('## ')), 'no line of the section may look like a heading of the next release');
+  assert.ok(readFileSync(notesPath, 'utf8').indexOf('## v1.2.53') < readFileSync(notesPath, 'utf8').indexOf('## v1.2.52'), 'newest first');
 });
 
 // v1.x never removes or retypes a caller input: callers pinned @v1 must keep working when v1 moves (D1).
