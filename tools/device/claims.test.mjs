@@ -66,6 +66,8 @@ test('the library exports the whole action surface and the exit table as frozen 
     HUB_RESOURCE_RETIRED: 2,
     // Story 6.4: the Hub API.
     HUB_API_ALREADY_RUNNING: 1, HUB_API_NODE: 1, HUB_API_NO_HEAVY: 1, HUB_NO_ROUTE: 2, HUB_API_ERROR: 1,
+    // Story 6.5: a Registry read of an id no reader shows.
+    HUB_RESOURCE_NOT_FOUND: 2,
   });
 });
 
@@ -84,6 +86,26 @@ test('exitCodeOf maps a code through the table and anything else to 1', () => {
   assert.equal(claims.exitCodeOf(new Error('no code')), 1);
   assert.equal(claims.exitCodeOf(null), 1);
   for (const inherited of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) assert.equal(code(inherited), 1, inherited);
+});
+
+test('lockActivity: an owner dir is held, a live ticket is queued, a stale ticket and an idle lock are neither', () => {
+  const s = side();
+  try {
+    const idle = claims.lockActivity('res-idle', { env: s.env, now: () => T0 });
+    assert.deepEqual(idle, { held: false, queued: false });
+    mkdirSync(join(s.root, 'locks/res-held.lock'), { recursive: true });
+    writeFileSync(join(s.root, 'locks/res-held.lock/owner.json'), JSON.stringify({ kind: 'lease', lease_id: 'l-aaaaaaaaaaaa', holder: 'h' }));
+    assert.deepEqual(claims.lockActivity('res-held', { env: s.env, now: () => T0 }), { held: true, queued: false });
+    // A ticket with pid 0 and a future expiry is live; one that expired is stale.
+    mkdirSync(join(s.root, 'locks/res-live.queue'), { recursive: true });
+    writeFileSync(join(s.root, 'locks/res-live.queue/000000000000001-000000-00000000.json'), JSON.stringify({ kind: 'lease', pid: 0, lease_id: 'l-bbbbbbbbbbbb', holder: 'w', expires_at: new Date(T0 + 60_000).toISOString() }));
+    assert.deepEqual(claims.lockActivity('res-live', { env: s.env, now: () => T0 }), { held: false, queued: true });
+    mkdirSync(join(s.root, 'locks/res-old.queue'), { recursive: true });
+    writeFileSync(join(s.root, 'locks/res-old.queue/000000000000001-000000-00000000.json'), JSON.stringify({ kind: 'lease', pid: 0, lease_id: 'l-cccccccccccc', holder: 'w', expires_at: new Date(T0 - 60_000).toISOString() }));
+    assert.deepEqual(claims.lockActivity('res-old', { env: s.env, now: () => T0 }), { held: false, queued: false });
+    // Read only: the stale ticket is still there.
+    assert.equal(readdirSync(join(s.root, 'locks/res-old.queue')).length, 1);
+  } finally { s.cleanup(); }
 });
 
 test('newLeaseId mints the exact formats: l-, e- and run-', () => {

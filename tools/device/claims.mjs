@@ -61,6 +61,8 @@ export const EXIT_CODES = Object.freeze({
   HUB_API_NO_HEAVY: 1,
   HUB_NO_ROUTE: 2,
   HUB_API_ERROR: 1,
+  // Story 6.5: a Registry read of an id no reader shows.
+  HUB_RESOURCE_NOT_FOUND: 2,
 });
 export const exitCodeOf = error => (Object.hasOwn(EXIT_CODES, error?.code) ? EXIT_CODES[error.code] : EXIT_FAILURE);
 
@@ -68,6 +70,17 @@ const usage = message => Object.assign(new Error(message), { code: 'HUB_USAGE' }
 const failure = (code, message) => Object.assign(new Error(message), { code });
 const away = error => error?.code === 'HUB_PHONE_AWAY';
 const readOwnerOf = (name, env) => readOwner(join(lockDir(env), `${name}.lock`));
+
+// Whether the lock `lock` is held (an owner record is there) and whether anyone waits on it (any non-stale queue entry): the two facts
+// a Registry reader needs to tell a retiring Resource (still held or waited on) from a hidden one (AD-31). Read only; never throws
+// (a lock dir that cannot be read is idle).
+export function lockActivity(lock, { env = process.env, now = Date.now } = {}) {
+  let held = false;
+  let queued = false;
+  try { held = readOwnerOf(lock, env) !== null; } catch { /* idle */ }
+  try { queued = queueView(lock, { env, now }).length > 0; } catch { /* idle */ }
+  return { held, queued };
+}
 
 // ---- the host key (AD-47) ----
 
