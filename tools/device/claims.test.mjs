@@ -64,6 +64,8 @@ test('the library exports the whole action surface and the exit table as frozen 
     HUB_NO_MATCH: 2, HUB_POOL_CROSS_HOST: 2, HUB_REGISTRY_CONFLICT: 1, HUB_REGISTRY_FORMAT: 1,
     // Story 6.3: a take of a retired or seed-missing Resource.
     HUB_RESOURCE_RETIRED: 2,
+    // Story 6.4: the Hub API.
+    HUB_API_ALREADY_RUNNING: 1, HUB_API_NODE: 1, HUB_API_NO_HEAVY: 1, HUB_NO_ROUTE: 2, HUB_API_ERROR: 1,
   });
 });
 

@@ -55,6 +55,12 @@ export const EXIT_CODES = Object.freeze({
   HUB_RESOURCE_RETIRED: 2,
   HUB_REGISTRY_CONFLICT: 1,
   HUB_REGISTRY_FORMAT: 1,
+  // Story 6.4: the Hub API's start refusals and its generic route errors.
+  HUB_API_ALREADY_RUNNING: 1,
+  HUB_API_NODE: 1,
+  HUB_API_NO_HEAVY: 1,
+  HUB_NO_ROUTE: 2,
+  HUB_API_ERROR: 1,
 });
 export const exitCodeOf = error => (Object.hasOwn(EXIT_CODES, error?.code) ? EXIT_CODES[error.code] : EXIT_FAILURE);
 

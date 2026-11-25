@@ -57,5 +57,6 @@
   "mac": { "lan_cidr": "192.168.1.0/24", "metered_budget_mib": 150, "queue_limit_min": 15 },
   "catch_up": { "android_every_s": 120, "ios_every_s": 300, "max_failures": 3 },
   "queue": { "wait_margin_min": 2, "hold_allowance_min": { "plan": 5, "android": 15, "ios": 60 }, "grace_min": 10, "reservation_ceiling_min": 180, "deploy_target_lease_max_min": 60, "catchup_attempt_s": 5, "catchup_pending_wait_min": 30, "eta_window_days": 30, "eta_low_data_min_holds": 20 },
-  "registry": { "reachability_max_age_s": 60 }
+  "registry": { "reachability_max_age_s": 60 },
+  "api": { "hub_api_port": 8794, "host_agent_port": 8795, "stream_keepalive_s": 15, "peer_connect_timeout_s": 5 }
 }

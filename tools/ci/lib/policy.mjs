@@ -159,7 +159,7 @@ export const editionPinOf = (app, name) => app?.android?.editions?.[name] ?? nul
 export function parsePolicy(source) {
   let policy;
   try { policy = JSON.parse(source); } catch (error) { fail(`not valid JSON (${error.message})`); }
-  exact('policy', policy, ['schema', 'bump', 'event', 'manifest_schema', 'apps', 'callers', 'runners', 'devices', 'delivery', 'mac', 'catch_up', 'queue', 'registry'], ['completion', 'shared_bundle_allowlist']);
+  exact('policy', policy, ['schema', 'bump', 'event', 'manifest_schema', 'apps', 'callers', 'runners', 'devices', 'delivery', 'mac', 'catch_up', 'queue', 'registry', 'api'], ['completion', 'shared_bundle_allowlist']);
   if (policy.schema !== 1) fail('schema must be 1');
 
   exact('bump', policy.bump, ['levels', 'default']);
@@ -261,6 +261,7 @@ export function parsePolicy(source) {
 
   queueBlock(policy.queue);
   registryBlock(policy.registry);
+  apiBlock(policy.api);
 
   // What "shipped" means, for every app at once (TOWE-76): the required targets, what the gate does when a required
   // lane cannot run, and how many same-version reruns `ship` may do on its own. No per-app switch exists on purpose:
@@ -308,6 +309,20 @@ function queueBlock(queue) {
 function registryBlock(registry) {
   exact('registry', registry, ['reachability_max_age_s']);
   positive('registry.reachability_max_age_s', registry.reachability_max_age_s);
+}
+
+// The Hub API's and the Host Agent's tuning (AD-46), one strict block that each service story grows by its own keys and no others.
+// Story 6.4 adds the two loopback ports (the singleton is the port bind, AD-45; the two services never share one), how often a stream
+// sends a keepalive (at most 30 s, so a proxy or a reader never sees a silent stream long enough to drop it) and how long a peer
+// connect may take, in seconds.
+const port = (where, value) => { if (!Number.isSafeInteger(value) || value < 1 || value > 65535) fail(`${where} must be a whole number from 1 to 65535`); };
+function apiBlock(api) {
+  exact('api', api, ['hub_api_port', 'host_agent_port', 'stream_keepalive_s', 'peer_connect_timeout_s']);
+  port('api.hub_api_port', api.hub_api_port);
+  port('api.host_agent_port', api.host_agent_port);
+  if (api.hub_api_port === api.host_agent_port) fail('api.hub_api_port and api.host_agent_port must be different ports');
+  if (!Number.isSafeInteger(api.stream_keepalive_s) || api.stream_keepalive_s < 1 || api.stream_keepalive_s > 30) fail('api.stream_keepalive_s must be a whole number from 1 to 30');
+  positive('api.peer_connect_timeout_s', api.peer_connect_timeout_s);
 }
 
 export const completionDevices = Object.freeze(['lanes', 'never']);

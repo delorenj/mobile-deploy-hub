@@ -112,6 +112,12 @@ export function readRegistryFile(env = process.env) {
   } catch { return null; }
 }
 
+// What `registry.json` is right now, for a health check: 'missing', 'unreadable' (it exists and cannot be read or is not a Registry this
+// code knows) or 'ok'. Fresh from disk on every call; never throws, never writes.
+export function registryState(env = process.env) {
+  try { return loadFile(registryPath(env)).state; } catch { return 'unreadable'; }
+}
+
 // ---- diff ----
 
 // The key paths of `after` that differ from `before` (strings only, never values): top-level keys, with `capabilities.<key>` expanded
