@@ -16,7 +16,7 @@ import { loadDevices } from '../ci/lib/devices.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { hermetic } from '../ci/test-fixtures.mjs';
 import { EXIT_CODES } from '../device/claims.mjs';
-import { CONTRACT_VERSION, ROUTES, handle } from './routes.mjs';
+import { CONTRACT_VERSION, PROBLEM_EXTENSIONS, ROUTES, handle } from './routes.mjs';
 
 hermetic();
 
@@ -56,7 +56,16 @@ export function parseContract(text) {
       if (row) codes[row[1]] = Number(row[2]);
     }
   }
-  return { version, routes, shapes, shapeOf, codes };
+  const extensions = {};
+  const table2 = /^## Problem extensions\s*$/m.exec(text);
+  if (table2) {
+    for (const line of text.slice(table2.index).split('\n').slice(1)) {
+      if (/^## /.test(line)) break;
+      const row = /^\|\s*`([A-Z_]+)`\s*\|([^|]+)\|/.exec(line);
+      if (row) extensions[row[1]] = [...row[2].matchAll(/`([^`]+)`/g)].map(match => match[1]);
+    }
+  }
+  return { version, routes, shapes, shapeOf, codes, extensions };
 }
 
 // The key paths of an object's keys, sorted: objects recursed (`a.b`); an array of objects is the union of its items' paths under
@@ -99,6 +108,16 @@ const routeKey = route => `${route.method} ${route.path}`;
 
 // What each route parameter is replaced with when the test calls a route (a parameter not listed here fails the test).
 const PARAM_SAMPLES = Object.freeze({ id: 's26' });
+
+// The request body each POST route is called with (a POST route with no sample fails the test). Each call gets a fresh scratch.
+const POST_SAMPLES = Object.freeze({
+  '/registry/resources': { kind: 'phone', name: 'pixel', host: 'linux', identity: { serial: 'PX9', model: 'Pixel 9' }, capabilities: { api_level: 35 }, holder: 'contract-test' },
+});
+export function sampleBody(route, samples = POST_SAMPLES) {
+  if (!Object.hasOwn(samples, route.path)) throw new Error(`no request body sample for ${route.method} ${route.path}: add it to POST_SAMPLES`);
+  return structuredClone(samples[route.path]);
+}
+const postRoutes = () => ROUTES.filter(candidate => candidate.method === 'POST');
 export function samplePath(path, samples = PARAM_SAMPLES) {
   return path.replace(/\{([a-z_]+)\}/g, (_, name) => {
     if (!Object.hasOwn(samples, name)) throw new Error(`no sample for the route parameter {${name}} in ${path}: add it to PARAM_SAMPLES`);
@@ -152,6 +171,43 @@ test('each GET route answers with exactly the field list of its shape', async ()
   } finally { s.cleanup(); }
 });
 
+test('each POST route answers 201 with exactly the field list of its shape', async () => {
+  assert.ok(postRoutes().length > 0);
+  for (const route of postRoutes()) {
+    const s = scratch();
+    try {
+      const answer = await handle({ method: 'POST', url: samplePath(route.path), body: sampleBody(route) }, s.ctx);
+      assert.equal(answer.status, 201, routeKey(route));
+      assert.deepEqual(fieldDiff(contract.shapes[route.shape], shapeFields(route.shape, answer.body)), [], routeKey(route));
+    } finally { s.cleanup(); }
+  }
+  assert.throws(() => sampleBody({ method: 'POST', path: '/ghost' }), /no request body sample for POST \/ghost/);
+});
+
+test('the Problem extensions of the document equal PROBLEM_EXTENSIONS both ways, and the live answers carry them', async () => {
+  assert.ok(Object.keys(contract.extensions).length > 0, 'the table parsed');
+  assert.deepEqual(contract.extensions, Object.fromEntries(Object.entries(PROBLEM_EXTENSIONS).map(([code, fields]) => [code, [...fields]])));
+  for (const code of Object.keys(PROBLEM_EXTENSIONS)) assert.ok(code in contract.codes, `${code} is described as an error code`);
+  const s = scratch();
+  try {
+    const route = ROUTES.find(candidate => candidate.method === 'POST');
+    const post = body => handle({ method: 'POST', url: route.path, body }, s.ctx);
+    const base = sampleBody(route);
+    assert.equal((await post(base)).status, 201);
+    const answers = {
+      HUB_REGISTRY_CONFLICT: await post({ ...base, name: 'other', identity: { model: 'x' }, if_rev: 0 }),
+      HUB_REGISTRY_DUPLICATE: await post({ ...base, name: 'other' }),
+    };
+    assert.deepEqual(Object.keys(answers).sort(), Object.keys(PROBLEM_EXTENSIONS).sort(), 'every extension code has a live answer here');
+    for (const [code, answer] of Object.entries(answers)) {
+      assert.equal(answer.body.code, code);
+      assert.deepEqual(fieldDiff([...contract.shapes.Problem, ...contract.extensions[code]], flatten(answer.body)), [], code);
+    }
+    // The base answer of any other error is exactly Problem.
+    assert.deepEqual(fieldDiff(contract.shapes.Problem, flatten((await post({ ...base, name: 'Bad Name' })).body)), []);
+  } finally { s.cleanup(); }
+});
+
 test('flatten: arrays of objects are unions of item paths, scalar and empty arrays are leaves, open prefixes are one leaf', () => {
   assert.deepEqual(flatten({ a: 1, b: { c: 2 } }), ['a', 'b.c']);
   assert.deepEqual(flatten({ rows: [{ id: 1, tags: ['x'] }, { id: 2, extra: { deep: 1 } }] }), ['rows[].extra.deep', 'rows[].id', 'rows[].tags']);
@@ -192,6 +248,14 @@ test('every key, in the document and in a response, is snake_case', async () => 
       const body = (await handle({ method: 'GET', url: samplePath(route.path) }, s.ctx)).body;
       for (const path of shapeFields(route.shape, body)) for (const key of keysOf(path)) keys.add(key);
     }
+    for (const route of postRoutes()) {
+      const t = scratch();
+      try {
+        const body = (await handle({ method: 'POST', url: samplePath(route.path), body: sampleBody(route) }, t.ctx)).body;
+        for (const path of shapeFields(route.shape, body)) for (const key of keysOf(path)) keys.add(key);
+      } finally { t.cleanup(); }
+    }
+    for (const fields of Object.values(contract.extensions)) for (const field of fields) keys.add(field);
     for (const key of keys) assert.match(key, SNAKE, key);
     assert.ok(keys.size > 5);
   } finally { s.cleanup(); }

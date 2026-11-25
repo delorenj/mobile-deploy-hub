@@ -63,6 +63,9 @@ export const EXIT_CODES = Object.freeze({
   HUB_API_ERROR: 1,
   // Story 6.5: a Registry read of an id no reader shows.
   HUB_RESOURCE_NOT_FOUND: 2,
+  // Story 6.6: a Registry register refused for its name, or for an identity a live Resource already has.
+  HUB_REGISTRY_NAME: 2,
+  HUB_REGISTRY_DUPLICATE: 2,
 });
 export const exitCodeOf = error => (Object.hasOwn(EXIT_CODES, error?.code) ? EXIT_CODES[error.code] : EXIT_FAILURE);
 

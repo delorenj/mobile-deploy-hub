@@ -9,10 +9,11 @@
 // string is ignored for routing. A `{name}` segment in a route path is a parameter: one non-empty, URI-decoded segment, handed to the
 // handler as `request.params`; a literal route wins over a parameterised one.
 import { STATUS_CODES } from 'node:http';
-import { exitCodeOf, lockActivity } from '../device/claims.mjs';
+import { HOST_PLATFORMS, exitCodeOf, lockActivity } from '../device/claims.mjs';
 import { hubRef } from '../ci/lib/receipt.mjs';
 import { retirement } from '../registry/match.mjs';
-import { readRegistry, registryState } from '../registry/store.mjs';
+import { checkRegisterBody, planRegister } from '../registry/changes.mjs';
+import { REGISTRY_ERRORS, applySeed, readRegistry, registryState, updateRegistry } from '../registry/store.mjs';
 import { viewPools, viewRecord } from '../registry/view.mjs';
 
 export const CONTRACT_VERSION = 1;
@@ -22,7 +23,7 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 const PROBLEM_TYPE = 'application/problem+json';
 const BASE_HEADERS = Object.freeze({ 'Cache-Control': 'no-store' });
 
-// A handler returns its body (an object, status 200), or `reply(status, body)` for another success status (a 201 later).
+// A handler returns its body (an object, status 200), or `reply(status, body)` for another success status (201 for a register).
 const REPLY = Symbol('reply');
 export const reply = (status, body) => ({ [REPLY]: true, status, body });
 
@@ -32,6 +33,13 @@ const respond = (status, body, extra = {}) => ({ status, headers: { ...BASE_HEAD
 // exit; anything else is a bug in a handler: 500 HUB_API_ERROR.
 const hasStatus = error => Number.isInteger(error?.status) && error.status >= 400 && error.status <= 599;
 const oneLine = value => String(value).replace(/\s+/g, ' ').trim();
+
+// The members a code adds to the base Problem fields (`rev` of a conflict, `holder` of a duplicate). `problem()` merges the ones an error
+// carries and never overwrites a base field; docs/hub-api-contract.md's `Problem extensions` table is held equal to this by the contract test.
+export const PROBLEM_EXTENSIONS = Object.freeze({
+  HUB_REGISTRY_CONFLICT: Object.freeze(['rev']),
+  HUB_REGISTRY_DUPLICATE: Object.freeze(['holder']),
+});
 
 export function problem(error, extra = {}) {
   const known = hasStatus(error);
@@ -47,6 +55,11 @@ export function problem(error, extra = {}) {
     exit: known ? (Number.isInteger(error.exit) ? error.exit : exitCodeOf(error)) : 1,
     reason: known && typeof error.reason === 'string' && error.reason !== '' ? error.reason : (known ? code.toLowerCase() : 'internal'),
   };
+  if (known) {
+    for (const field of PROBLEM_EXTENSIONS[code] ?? []) {
+      if (error[field] !== undefined && !Object.hasOwn(body, field)) body[field] = error[field];
+    }
+  }
   return { status, headers: { ...BASE_HEADERS, 'Content-Type': PROBLEM_TYPE, ...extra }, body };
 }
 
@@ -102,12 +115,60 @@ export function listPools(ctx) {
   return { rev: registry.rev, source: registry.source, pools: viewPools(registry, ctx.policy) };
 }
 
+// POST /registry/resources: registers a Resource (FR-1). The body is checked first (a bad one writes nothing, not even the seed). A
+// missing file is the seed (AD-27): it is written first with the same inputs as at start, as its own `seed` event, then the register
+// is one more write; an `if_rev` other than 0 on a missing file is a conflict at rev 0, and 0 is accepted (the seed materialises what
+// that client read). The name, mint and duplicate checks run inside the store's queue, against the file as it is at commit time.
+// 201 `{rev, source: 'file', resource}`, the Resource with QA redaction.
+const SEED_ACTOR = Object.freeze({ holder: 'hub-api', via: 'api' });
+const SEED_TRIES = 3;
+
+async function seedFirst(ctx, env) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await applySeed({ env, devices: ctx.devices, qaDevices: ctx.qaDevices, now: ctx.now, hostId: ctx.hostId, log: ctx.log?.err, actor: { ...SEED_ACTOR } });
+    } catch (error) {
+      // A writer committed between the seed's read and its queued write: the seed reads again, and a no-op seed is not a conflict.
+      if (error?.code !== 'HUB_REGISTRY_CONFLICT' || attempt >= SEED_TRIES) throw error;
+    }
+  }
+}
+
+export async function registerResource(ctx, { body }) {
+  const env = ctx.env ?? process.env;
+  const input = checkRegisterBody(body, { hosts: HOST_PLATFORMS });
+  if (input.if_rev !== undefined && input.if_rev !== 0 && registryState(env) === 'missing') {
+    throw Object.assign(new Error(`the Registry has no file yet (rev 0), not rev ${input.if_rev}`), { code: 'HUB_REGISTRY_CONFLICT', ...REGISTRY_ERRORS.HUB_REGISTRY_CONFLICT, rev: 0 });
+  }
+  // Only a missing file is seeded here; an existing one was seeded at start, and re-seeding it per request is the start's job.
+  const seeded = registryState(env) === 'missing' ? await seedFirst(ctx, env) : { first: false };
+  let record = null;
+  const written = await updateRegistry({
+    env,
+    // The seed that was just written is what an `if_rev: 0` client read: no rev check for it.
+    if_rev: seeded.first && input.if_rev === 0 ? undefined : input.if_rev,
+    reason: 'register',
+    actor: input.actor,
+    why: input.why,
+    now: ctx.now,
+    hostId: ctx.hostId,
+    log: ctx.log?.err,
+    change: ({ resources, pools }) => {
+      const plan = planRegister({ resources }, input, { now: ctx.now });
+      record = plan.record;
+      return { resources: plan.resources, pools };
+    },
+  });
+  return reply(201, { rev: written.rev, source: 'file', resource: viewRecord(record, { audience: 'service' }) });
+}
+
 // `shape` names the `### <Shape>` section of the contract document that lists the response's fields.
 export const ROUTES = Object.freeze([
   Object.freeze({ method: 'GET', path: '/health', shape: 'Health', handler: health }),
   Object.freeze({ method: 'GET', path: '/resources', shape: 'ResourceList', handler: listResources }),
   Object.freeze({ method: 'GET', path: '/resources/{id}', shape: 'Resource', handler: getResource }),
   Object.freeze({ method: 'GET', path: '/pools', shape: 'PoolList', handler: listPools }),
+  Object.freeze({ method: 'POST', path: '/registry/resources', shape: 'Resource', handler: registerResource }),
 ]);
 
 // ---- dispatch ----

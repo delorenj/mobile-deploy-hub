@@ -26,6 +26,7 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 | GET | `/resources` | ResourceList | 6.5 |
 | GET | `/resources/{id}` | Resource | 6.5 |
 | GET | `/pools` | PoolList | 6.5 |
+| POST | `/registry/resources` | Resource | 6.6 |
 
 ## Shapes
 
@@ -62,6 +63,8 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 ### Resource
 
 `GET /resources/{id}`: one Resource, found by `id` only. An unknown id is 404 `HUB_RESOURCE_NOT_FOUND` with `reason: unknown`; a retired or seed-missing Resource that is idle is 404 with `reason: retired`.
+
+`POST /registry/resources` answers the same shape with status 201: `rev` is the Registry's revision after the register, `source` is always `file`, and `resource` is the new Resource as a reader serves it (a `dedicated_qa` Resource's `serial`, `udid` and `adb_id` are `null`). The request body is under "Request bodies".
 
 - `rev` the Registry's revision
 - `source` `file` or `seed`
@@ -100,13 +103,46 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 - `exit` the CLI exit code for this error
 - `reason` a short machine-readable reason. The service's own are `no-route`, `method`, `bad-json`, `too-large` and `internal`; a library error carries its own `reason`, and an error with none gets its `code` in lower case
 
+A code may add members to these fields (see "Problem extensions"); an extension never replaces one of them.
+
+## Problem extensions
+
+An error of these codes carries the named members besides the `Problem` fields above. The members only ever grow: a later story adds a row or a member, never removes one.
+
+| Code | Members | Meaning |
+|------|---------|---------|
+| `HUB_REGISTRY_CONFLICT` | `rev` | The Registry's current revision, so a client can read again and retry. |
+| `HUB_REGISTRY_DUPLICATE` | `holder` | The id of the live Resource that already has the serial or UDID. |
+
+## Request bodies
+
+**`POST /registry/resources`** registers a Resource. The body is a JSON object with only these keys:
+
+- `kind` (required): `phone` or `ios-lane`.
+- `name` (required): a slug of at most 28 characters (lowercase letters and digits, single dashes between). It becomes the word a Claimant says.
+- `host` (required): a host key (`linux` or `mac`). An `ios-lane` must be on `mac`.
+- `identity`: an object with only `serial`, `model`, `udid` and `profile`, each a non-empty string. A `phone` needs `model`; an `ios-lane` needs no identity.
+- `capabilities`: a flat object (default `{}`). Keys match `^[a-z][a-z0-9_]*$` and are not `allowed_users`, `id`, `name`, `kind`, `host`, `model` or `deploy_target`. A value is a string, a finite number or a boolean.
+- `if_rev`: a whole number. When present, the register is refused unless the Registry is at that revision (`HUB_REGISTRY_CONFLICT`). When absent there is no revision check: the name and identity checks run against the Registry as it is when the write commits. A missing Registry file is revision 0, and `if_rev: 0` is accepted for it.
+- `actor`: `{holder, via}`, recorded as given. When absent the actor is `{holder: <holder>, via: 'api'}`.
+- `holder`: who is registering, used when there is no `actor`. One of the two is required.
+- `why`: a string, recorded with the change.
+
+The Resource gets the id and lock `res-<name>`, or `res-<name>-<n>` (the smallest free `n` from 2) when a record, retired ones included, already has that id or lock. A missing Registry file is first written as the seed, as its own revision, then the register is the next one. Exactly one `registry-add` event is logged for the register; it names no identity.
+
+Refusals, in the order they are checked: `HUB_USAGE` 400 for the body (`bad-body`, `bad-kind`, `bad-host`, `bad-identity`, `no-model`, `bad-capabilities`, `bad-if-rev`, `bad-why`, `bad-actor`, `no-holder`); `HUB_REGISTRY_NAME` 400 for a name that is not a slug (`not-slug`) or is over 28 characters (`too-long`); `HUB_REGISTRY_CONFLICT` 409 for a stale `if_rev`; `HUB_REGISTRY_NAME` 409 for a reserved word (`reserved`), a name any Resource already has as a name, id, lock or word (`taken`), or no free `-<n>` up to 999 (`exhausted`); `HUB_REGISTRY_DUPLICATE` 409 for a serial or UDID a live Resource (neither retired nor seed-missing) has (`reason: serial` or `udid`, member `holder`). A retired or seed-missing Resource's identity is free, its name is not.
+
 ## Error codes
 
 | Code | Status | Exit | Meaning |
 |------|--------|------|---------|
 | `HUB_NO_ROUTE` | 404, 405 | 2 | No such path (`reason: no-route`), or the path exists and the method is not allowed (`reason: method`, with an `Allow` header). |
 | `HUB_RESOURCE_NOT_FOUND` | 404 | 2 | No Resource has this id (`reason: unknown`), or it is retired and idle (`reason: retired`). |
-| `HUB_USAGE` | 400, 413 | 2 | The request body is not valid JSON (`bad-json`) or is over 1 MiB (`too-large`). |
+| `HUB_USAGE` | 400, 413 | 2 | The request body is not valid JSON (`bad-json`) or is over 1 MiB (`too-large`), or a register body is wrong (`bad-body`, `bad-kind`, `bad-host`, `bad-identity`, `no-model`, `bad-capabilities`, `bad-if-rev`, `bad-why`, `bad-actor`, `no-holder`). |
+| `HUB_REGISTRY_NAME` | 400, 409 | 2 | A register's name is not a slug (`not-slug`) or is too long (`too-long`) with 400; reserved (`reserved`), already used (`taken`) or out of `-<n>` suffixes (`exhausted`) with 409. |
+| `HUB_REGISTRY_DUPLICATE` | 409 | 2 | A live Resource already has the serial (`reason: serial`) or UDID (`reason: udid`); `holder` names it. |
+| `HUB_REGISTRY_CONFLICT` | 409 | 1 | `if_rev` is not the Registry's revision; `rev` is the current one. |
+| `HUB_REGISTRY_FORMAT` | 409 | 1 | `registry.json` exists and cannot be read, or is a format this service does not know. It is never written. |
 | `HUB_API_ERROR` | 500 | 1 | A bug in the service. The detail is one line; the journal has the same line. |
 | `HUB_API_ALREADY_RUNNING` | none | 1 | Start only: the port is taken. Never an HTTP answer. |
 | `HUB_API_NODE` | none | 1 | Start only: Node is older than 24.15. |
