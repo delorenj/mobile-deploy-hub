@@ -31,7 +31,7 @@ import { sleep as realSleep } from '../ci/lib/pause.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { createAdbWire } from './adb-wire.mjs';
 import { createAsyncAdb } from './async-adb.mjs';
-import { GATE, LEASE_ID, MAX_POOL, PROFILES, doomed, emulatorStatus, exportsOf as emulatorExports, hostPool, isEmulatorLease, isEmulatorLock, provision, readRecord, reap, releaseEmulator as releaseEmulatorLease, resolveImage, slotHolding, teardownNow } from './emulator.mjs';
+import { GATE, LEASE_ID, MAX_POOL, PROFILES, doomed, emulatorStatus, exportsOf as emulatorExports, forceReleaseSlot, hostPool, isEmulatorLease, isEmulatorLock, isEmulatorSlot, provision, readRecord, reap, releaseEmulator as releaseEmulatorLease, resolveImage, slotHolding, teardownNow } from './emulator.mjs';
 import { offThread } from './emulator-thread.mjs';
 import { REACHABILITY, discover as discoverDevices, phoneReachability, present, queryAdb, readIpad, stamp } from '../registry/reachability.mjs';
 import { match, canonical, parseQuery, retirement, visibility } from '../registry/match.mjs';
@@ -43,6 +43,10 @@ import { inventory as realInventory } from './inventory.mjs';
 
 export const PHONE = 'phone';
 export const EMULATOR = 'emulator';
+// The one rule for which ids are emulator slots (`emulator-<n>`, 1 to MAX_POOL), and the one dispatch both front doors of a force-release use:
+// an id shaped like a slot (`emulator-` and digits, not the gate) goes to `forceReleaseEmulator`, which refuses one that is no slot (`bad-slot`).
+export { isEmulatorSlot };
+export const namesEmulatorSlot = id => typeof id === 'string' && id !== GATE && isEmulatorLock(id);
 
 // ---- the exit table (data, so every front door maps an error the same way) ----
 
@@ -186,6 +190,8 @@ export function createContext({ env = process.env, sleep = realSleep, now = Date
       graceMs: Number(env.HUB_EMULATOR_KILL_GRACE_MS) || 15_000,
       bootTimeoutMs: Number(env.HUB_EMULATOR_BOOT_TIMEOUT_MS) || 360_000,
       bootPollMs: Number(env.HUB_EMULATOR_POLL_MS) || 2000,
+      // How long a slot's force-release waits for another teardown's reaper lock (Story 7.8); undefined is the library's 2 min.
+      reaperWaitMs: Number(env.HUB_EMULATOR_REAPER_WAIT_MS) || undefined,
     },
   };
 }
@@ -1372,7 +1378,7 @@ export function forceReleaseLease(id, input, ctx) {
   if (typeof id === 'string' && id.startsWith('job:')) throw forceReleaseJobError({ kind: 'job', ...jobMembers(id) });
   const { env } = local;
   const emulatorSlot = typeof id === 'string' && id !== '' ? readRecord(env, id)?.slot ?? slotHolding(env, id) ?? (readOwnerOf(GATE, env)?.lease_id === id ? GATE : null) : null;
-  const refuseEmulator = slot => Object.assign(usage(`lease ${id} holds ${slot === GATE ? 'the emulator gate' : slot}, part of an emulator: force-releasing it tears the emulator down, so that is the slot's force-release (hub-device force-release ${slot === GATE ? 'emulator-<n>' : slot}), never this one`), { reason: EMULATOR });
+  const refuseEmulator = slot => Object.assign(usage(`lease ${id} holds ${slot === GATE ? 'the emulator gate' : slot}, part of an emulator: force-releasing it tears the emulator down, so that is the slot's force-release (hub-device force-release ${slot === GATE ? 'emulator-<n>' : slot}, POST /leases/${slot === GATE ? 'emulator-<n>' : slot}/force-release), never this one`), { reason: EMULATOR });
   if (emulatorSlot !== null) throw refuseEmulator(emulatorSlot);
   const found = typeof id === 'string' ? listLocks({ env, now: local.timing.now }).find(lock => lock.kind === 'lease' && lock.owner.lease_id === id) : undefined;
   if (!found) throw leaseNotFound(id, local.fleet, env);
@@ -1383,6 +1389,58 @@ export function forceReleaseLease(id, input, ctx) {
     throw Object.assign(failure('HUB_LEASE_LOST', message), { reason: result.reason === 'unknown-holder' ? 'being-taken' : 'changed-hands' });
   }
   return { lease_id: id, outcome: 'force-released', resource: resourceOf(found.name), lock: found.name, device: nameOf(local.fleet, found.name), holder: result.owner.holder ?? null, why };
+}
+
+// ---- force-release an emulator slot (Story 7.8) ----
+
+// `POST /leases/emulator-<n>/force-release` (and `hub-device force-release emulator-<n> --why`; the Host Agent's too): ends the Lease that holds the slot
+// `slot` of this host, whatever its holder, and tears its emulator down, in the order of AD-38: read the slot's owner and emulator record; under the
+// `emulator-reaper` lock the one `force-release` event (`forceRelease`, carrying the owner's `lease_id`); the emulator torn down and its record removed;
+// the reaper lock released (`forceReleaseSlot`, in emulator.mjs, owns everything from the second step). `input` is `{why, actor}` as `forceReleaseLease`'s;
+// answers the same `ForceRelease` `{lease_id, outcome: 'force-released', resource, lock: slot, device: 'emulator', holder, why}` with the forced Lease's id.
+// With `ctx.offThread` (a service: AD-44) the reaper lock, the force and the teardown run in a worker thread (`ctx.forceReleaseOffThread(args, {env, log})`
+// replaces it in a test); the CLI runs them in its own process. `ctx.afterStep(name)` (`read`, `force-release`, `teardown`) and `ctx.beforeRetire` are the tests' seams.
+//
+// Refusals, before anything is written: HUB_USAGE (an actor, `no-why` / `bad-why`, `bad-slot`: not `emulator-1` to `emulator-<MAX_POOL>`); HUB_LEASE_NOT_FOUND
+// (`unknown`: the slot holds nothing; a crash leftover record is the next acquire's reap); HUB_LEASE_LOST (`being-taken`: the lock has no owner record yet;
+// `changed-hands`: the owner changed between the read and the rename, nothing torn down); HUB_FORCE_RELEASE_JOB for a Job Hold; HUB_LOCK_TIMEOUT when another
+// teardown holds the reaper lock past the wait. A recorded process that outlived SIGKILL is HUB_EMULATOR_FAILED: the force stands (event written, slot gone),
+// the record stays and the slot stays out of the pool until the next reap stops it. A crash after the force leaves an ownerless record that the next reap tears
+// down as `orphaned` and writes no second event.
+export async function forceReleaseEmulator(slot, input, ctx) {
+  const actor = checkActor(input?.actor);
+  if (actor === null) throw usage('a force-release names its actor ({holder, via})');
+  const why = checkWhy(input?.why);
+  if (!isEmulatorSlot(slot)) throw bodyUsage('bad-slot', `force-release: "${slot}" is not an emulator slot (emulator-1 to emulator-${MAX_POOL})`);
+  const local = serviceLocal(ctx);
+  const { env } = local;
+  const owner = readOwnerOf(slot, env);
+  if (!owner) {
+    let exists = true;
+    try { statSync(join(lockDir(env), `${slot}.lock`)); } catch { exists = false; }
+    if (exists) throw Object.assign(failure('HUB_LEASE_LOST', `${slot} is being taken (its lock has no owner record yet); left alone`), { reason: 'being-taken' });
+    throw Object.assign(failure('HUB_LEASE_NOT_FOUND', `no lease holds ${slot}`), { reason: 'unknown' });
+  }
+  if (!isLease(owner)) throw forceReleaseJobError({ kind: owner.kind ?? 'job', repo: owner.repo, run: owner.run, job: owner.job, pid: owner.pid });
+  const id = owner.lease_id;
+  const record = readRecord(env, id);
+  local.log(`HUB_EMULATOR_FORCE_RELEASE ${slot} ${id} by ${actor.holder}: ${record ? `${record.pids.length} recorded process(es)` : 'no emulator record'}`);
+  await local.afterStep?.('read');
+  const args = { slot, lease_id: id, actor, why, graceMs: local.emulator.graceMs, reaperWaitMs: local.emulator.reaperWaitMs };
+  let result;
+  if (local.offThread) {
+    const run = local.forceReleaseOffThread ?? ((given, seams) => offThread('force-release', given, seams));
+    try { result = await run(args, { env, log: local.log }); } catch (error) { throw emulatorFailure(error, null); }
+  } else {
+    result = await forceReleaseSlot(slot, { ...args, env, log: local.log, sleep: local.timing.sleep, now: local.timing.now, afterStep: local.afterStep, beforeRetire: local.beforeRetire });
+  }
+  if (!result.released) {
+    if (result.reason === 'none') throw Object.assign(failure('HUB_LEASE_NOT_FOUND', `no lease holds ${slot}`), { reason: 'unknown' });
+    if (result.reason === 'unknown-holder') throw Object.assign(failure('HUB_LEASE_LOST', `${slot} is being taken (its lock has no owner record yet); left alone`), { reason: 'being-taken' });
+    throw Object.assign(failure('HUB_LEASE_LOST', `lease ${id} changed hands while ${slot} was being force-released; left alone, check \`hub-device status\``), { reason: 'changed-hands' });
+  }
+  if (result.outcome === 'stuck') throw failure('HUB_EMULATOR_FAILED', `emulator ${id}: the force-release stands (${slot} is released and its force-release event is written), but pids ${result.survivors.join(',')} would not stop; the record stays and ${slot} stays out of the pool until the next emulator acquire's reap stops them`);
+  return { lease_id: id, outcome: 'force-released', resource: resourceOf(slot), lock: slot, device: EMULATOR, holder: result.owner?.holder ?? owner.holder ?? null, why };
 }
 
 // ---- force-release a Reservation (Story 7.7) ----

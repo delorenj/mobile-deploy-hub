@@ -104,7 +104,7 @@ development_status:
   7-5-cancel-a-queued-request: done
   7-6-force-release-a-lease: done
   7-7-force-release-a-reservation: done
-  7-8-force-release-an-emulator-slot: backlog
+  7-8-force-release-an-emulator-slot: done
   7-9-ship-leases-through-the-api: backlog
   epic-7-retrospective: optional
 

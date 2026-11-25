@@ -14,7 +14,7 @@
 // handler as `request.params`; a literal route wins over a parameterised one.
 import { STATUS_CODES } from 'node:http';
 import { idMatchesSerial } from '../ci/lib/adb.mjs';
-import { HOST_PLATFORMS, cancel, checkCancelBody, checkExtendBody, checkForceReleaseBody, checkLeaseBody, checkReleaseBody, checkReservationForceReleaseBody, discover as discoverHost, exitCodeOf, findLease, forceReleaseLease, forceReleaseReservation, hostKey as realHostKey, httpAnswerOf, leaseRequestId, lockActivity, serviceExtend, serviceLease, serviceRelease } from '../device/claims.mjs';
+import { HOST_PLATFORMS, cancel, checkCancelBody, checkExtendBody, checkForceReleaseBody, checkLeaseBody, checkReleaseBody, checkReservationForceReleaseBody, discover as discoverHost, exitCodeOf, findLease, forceReleaseEmulator, forceReleaseLease, forceReleaseReservation, hostKey as realHostKey, httpAnswerOf, leaseRequestId, lockActivity, namesEmulatorSlot, serviceExtend, serviceLease, serviceRelease } from '../device/claims.mjs';
 import { hubRef } from '../ci/lib/receipt.mjs';
 import { NO_READING } from '../registry/reachability.mjs';
 import { loadQaDevices } from '../registry/seed.mjs';
@@ -268,7 +268,7 @@ function serviceContext(ctx) {
   return {
     env: ctx.env ?? process.env, policy: ctx.policy, now: ctx.now, sleep: ctx.sleep, qaDevices: ctx.qaDevices,
     log: out, warn: () => {}, readingsOf: readingsOf(ctx), ...(ctx.hostKey ? { hostKey: ctx.hostKey } : {}),
-    ...(ctx.provisionOffThread ? { provisionOffThread: ctx.provisionOffThread } : {}), ...(ctx.releaseOffThread ? { releaseOffThread: ctx.releaseOffThread } : {}),
+    ...(ctx.provisionOffThread ? { provisionOffThread: ctx.provisionOffThread } : {}), ...(ctx.releaseOffThread ? { releaseOffThread: ctx.releaseOffThread } : {}), ...(ctx.forceReleaseOffThread ? { forceReleaseOffThread: ctx.forceReleaseOffThread } : {}),
   };
 }
 
@@ -313,10 +313,12 @@ export function cancelRequestRoute(ctx, { body, params }) {
 
 // POST /leases/{id}/force-release: ends a Lease by force (Story 7.6), exactly `hub-device force-release <id> --why ...`: `forceReleaseLease` is the one function every
 // front door calls, and the status of a refusal comes from its HTTP table. The body is checked first (`checkForceReleaseBody`); the actor is the body's `actor`, else
-// `{holder, via: 'api'}`. No holder check and no confirmation (that is the page's). 200 `ForceRelease`.
+// `{holder, via: 'api'}`. No holder check and no confirmation (that is the page's). 200 `ForceRelease`. An `{id}` of `emulator-<n>` (Story 7.8) is a slot:
+// `forceReleaseEmulator` ends its Lease and tears the emulator down, in a worker thread (AD-44); every other id is a Lease id.
 export function forceReleaseLeaseRoute(ctx, { body, params }) {
   const input = checkForceReleaseBody(body);
   const actor = input.actor ?? { holder: input.holder, via: 'api' };
+  if (namesEmulatorSlot(params.id)) return forceReleaseEmulator(params.id, { why: input.why, actor }, { ...serviceContext(ctx), offThread: true });
   return forceReleaseLease(params.id, { why: input.why, actor }, serviceContext(ctx));
 }
 
