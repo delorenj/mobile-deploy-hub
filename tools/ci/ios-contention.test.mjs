@@ -12,6 +12,7 @@ import { ios, macLane, storeRecord, storeTake } from './commands/ios.mjs';
 import { guarded } from './commands/common.mjs';
 import { deviceOf, publicReceipts } from './commands/deliver.mjs';
 import { deliveriesFrom, deploymentEvent } from './lib/announce.mjs';
+import { testflightDelivery, testflightOf } from './lib/completion.mjs';
 import { loadDevices } from './lib/devices.mjs';
 import { readEvents } from './lib/events.mjs';
 import { acquireLease, listReservations, reserve } from './lib/lock.mjs';
@@ -86,6 +87,10 @@ test('the first take: a mac-ios wait that runs out fails the job with HUB_LOCK_T
   const { deliveries, failure } = deliveriesFrom({ declared: { android: false, ios: true }, devices, needs, receipts: { ios: receipt }, version: '9.9.9' });
   assert.deepEqual([failure.job, failure.stage, failure.reason], ['ios', 'preflight', publicReason(receipt)]);
   assert.deepEqual(deliveries.map(item => [item.platform, item.status]), [['ios', 'failed']]);
+  const tf = testflightOf({ testflight: true, iosLane: 'run', needs: { ios: { result: 'failure' } }, receipts: { ios: receipt }, dryRun: false });
+  assert.equal(tf.status, 'failed');
+  assert.match(tf.reason, /mac-ios busy/);
+  assert.doesNotMatch(JSON.stringify([tf, testflightDelivery(tf, { version: '9.9.9', build: null })]), /agent-a|agent-b/);
 });
 
 test('the store take: a wait that runs out after the iPad install fails only the store step, at stage deliver, and the iPad stays installed', async t => {
@@ -107,7 +112,9 @@ test('the store take: a wait that runs out after the iPad install fails only the
   assert.deepEqual(receipt.store.groups, ['Owner Testing']);
   assert.deepEqual([receipt.contention.lock, receipt.contention.reason], ['mac-ios', 'ios-lane-contention']);
   assert.deepEqual(holders(receipt), [['holder', 'agent-a'], ['ahead', 'agent-b']]);
-  assert.equal(timeouts(f).length, 1);
+  const stored = timeouts(f);
+  assert.equal(stored.length, 1);
+  assert.equal(stored[0].reason, 'ios-lane-contention');
   assert.ok(f.logs.some(line => /^HUB_IOS_LANE_BUSY store code=HUB_LOCK_TIMEOUT/.test(line)), f.logs.join('\n'));
   assert.equal(listReservations('mac-ios', { env: f.env }).length, 1, 'the Reservation is kept');
   // The iPad's own delivery stands: deviceOf and announce read stage deliver as a publishing step.
