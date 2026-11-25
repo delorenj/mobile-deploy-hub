@@ -1,5 +1,5 @@
 // Shared test fixtures (not a test file: node --test runs only *.test.mjs).
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deflateRawSync } from 'node:zlib';
@@ -29,10 +29,13 @@ export const device = (name, model, status, extra = {}) => ({ name, model, statu
 // inherits it) never writes host history. A test that builds its env from scratch still passes its own HUB_EVENT_DIR.
 const jobVariable = name => /^(GITHUB_|RUNNER_|ACTIONS_|HUB_)/.test(name) || name === 'CI' || name === 'GH_TOKEN';
 //
+// The QA file is scratched too (HUB_QA_DEVICES, an empty qa-devices.json).
+//
 // The lock directory is scratched the same way: a gate or preflight-ios under test reserves a device (Story 2.5), and a lane
 // that forgot its own HUB_LOCK_DIR must never write ~/.cache/mobile-deploy-hub/locks.
 let eventScratch = null;
 let lockScratch = null;
+let qaScratch = null;
 export function hermetic() {
   for (const name of Object.keys(process.env)) if (jobVariable(name)) delete process.env[name];
   if (!eventScratch) {
@@ -45,6 +48,13 @@ export function hermetic() {
     process.on('exit', () => { try { rmSync(lockScratch, { recursive: true, force: true }); } catch { /* temp */ } });
   }
   process.env.HUB_LOCK_DIR = lockScratch;
+  // The Registry seed reads the private QA file only through its loader; point it at an empty one so a test never opens the real path.
+  if (!qaScratch) {
+    qaScratch = mkdtempSync(join(tmpdir(), 'hub-test-qa-'));
+    writeFileSync(join(qaScratch, 'qa-devices.json'), '{"schema":1,"devices":[]}\n');
+    process.on('exit', () => { try { rmSync(qaScratch, { recursive: true, force: true }); } catch { /* temp */ } });
+  }
+  process.env.HUB_QA_DEVICES = join(qaScratch, 'qa-devices.json');
   globalThis.fetch = async input => { throw new Error(`a test reached the network (${typeof input === 'string' ? input : input?.url ?? String(input)}); inject fetchImpl instead`); };
 }
 
