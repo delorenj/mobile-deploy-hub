@@ -20,6 +20,10 @@
 //               release again, the Lease is still held and a reconnect with the old `Last-Event-ID` opens `reset` (a new boot); then the
 //               release shows in a `status` frame within 2 s and a `: keepalive` arrives while idle. `--restart` bounces the service, so a
 //               waiting caller is answered `HUB_API_RESTARTING` and requeues (Story 8.6): ask for it at release time, not on every smoke;
+//   5d. lanes   (Story 9.8, opt-in: `--lanes`) every lane another host owns (the Mac's `ios-lane`), taken through `hub-device` from here
+//               (`laneCheck`): the forwarded Lease shows in that host's own view of `status --json` with that host's `started_at`, this host
+//               wrote no lock for it, and the release frees the lane again. It holds the lane for seconds with `--no-connect --wait 0`, only
+//               when it is free, and it is opt-in because a sleeping laptop fails it and the lane is a deploy target: ask for it at release time;
 //   6. retire   the phone is retired through the API;
 //   7. gone     a new lease is refused `HUB_RESOURCE_RETIRED`, and the `phone` members and `status` no longer list it.
 // Any failure after the register releases the lease it took (and every id the holds and stream phases started) and retires the phone, and each is logged. The run prints
@@ -31,7 +35,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { sleep as realSleep } from '../ci/lib/pause.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
-import { phoneWordMembers } from '../device/claims.mjs';
+import { hostLanes, phoneWordMembers } from '../device/claims.mjs';
 import { HUB_API_CONTRACT, HUB_API_SERVICE, hubUrl } from '../hub-client.mjs';
 import { HUB_API_UNIT, releaseName } from '../hosts.mjs';
 import { ID_PATTERN, RETRY_MS } from '../hub-api/stream.mjs';
@@ -51,6 +55,8 @@ export const STATUS_WITHIN_MS = 2000;
 export const RESTART_WITHIN_MS = 30_000;
 export const KEEPALIVE_MARGIN_MS = 5000;
 export const STREAM_FOR_MS = 120_000;
+export const LANE_SHOWS_WITHIN_MS = 10_000;
+export const LANE_FOR_MS = 120_000;
 const HEALTH_RETRY_MS = 500;
 const MAX_WINDOWS = 3;
 const MAX_ITEMS = 500;
@@ -515,11 +521,138 @@ export async function streamCheck({
   }
 }
 
+// ---------------------------------------------------------------------------------------------------- Story 9.8: the lanes phase
+
+const isoTime = value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/.test(value) && Number.isFinite(Date.parse(value));
+
+// The repeatable live pair check of every spoke host's lane (Story 9.8, FR-12, FR-14), run on big-chungus after both hosts are installed. The
+// spokes are the keys of `remote_hosts` in `hub-device status --json` and their lanes are `lanesOf(spoke)` (default: the seed's lanes of that
+// host, read-only). For each lane, in order, with the lane's own name (never the iPad: `--no-connect`, so an unplugged iPad cannot fail it):
+//   1. the host's view must be `available` and the lane free (no `locks[]` or `waiters[]` row on its lock), else nothing is taken;
+//   2. `hub-device lease <device> --no-connect --wait 0 --for 2m --id <tag>-l-<device>` is forwarded and answers that id;
+//   3. within 10 s of the answer the host's own view shows a `lease` row on the lane's lock for that id with an ISO `started_at` (the host's
+//      clock), and this host's own `locks[]` has no row for the id: big-chungus wrote nothing;
+//   4. `hub-device release <id> --resource <device>` (a bare release would run here) answers `HUB_DEVICE_RELEASED`, and within 10 s the host's
+//      view has no row on the lane's lock for this id (a deploy that takes the lane right after the release is not a failed release).
+// Every wait is a bounded `for` loop (AD-19). Any failure releases the id it took (logged), then throws `HUB_SMOKE_FAILED lanes: ...` (`detail`
+// is the part after the colon). Resolves `{lanes: [{host, device, id, shownMs, freedMs, startedAt, skewMs}]}`.
+export async function laneCheck({ tag, ref, cli, lanesOf = hostLanes, now = Date.now, sleep = realSleep, log = () => {} } = {}) {
+  if (typeof tag !== 'string' || tag === '') throw new TypeError('laneCheck: a tag (the test phone) is required');
+  if (typeof ref !== 'string' || ref === '') throw new TypeError('laneCheck: a release ref is required');
+  if (typeof cli !== 'function') throw new TypeError('laneCheck: a cli is required');
+  if (typeof lanesOf !== 'function') throw new TypeError('laneCheck: lanesOf is a function');
+  const why = `hosts:smoke ${ref} lanes`;
+  const fail = detail => Object.assign(failure('lanes', detail), { detail });
+  const run = args => Promise.resolve().then(() => cli(args)).catch(error => ({ code: 127, stdout: '', stderr: error.message }));
+  const state = { taken: null };
+  const seconds = LANE_SHOWS_WITHIN_MS / 1000;
+
+  const readStatus = async () => {
+    const result = await run(['status', '--json']);
+    const body = result.code === 0 ? parseJson(result.stdout) : undefined;
+    if (!isObject(body)) throw fail(`status --json gave no document (${brief(result)})`);
+    return body;
+  };
+  const viewOf = (body, host) => (isObject(body.remote_hosts?.[host]) ? body.remote_hosts[host] : null);
+  const rowsOf = (list, lock) => (Array.isArray(list) ? list : []).filter(row => row?.lock === lock);
+
+  // Polls `status --json`, one read every WAITER_POLL_MS, until `done(body)` answers non-null or `from + LANE_SHOWS_WITHIN_MS` has come (no read
+  // after it). Resolves `{found, last}`: `last` is the last body read.
+  const poll = async (from, done) => {
+    const deadline = from + LANE_SHOWS_WITHIN_MS;
+    const tries = Math.ceil(LANE_SHOWS_WITHIN_MS / WAITER_POLL_MS) + 2;
+    let last = null;
+    for (let attempt = 1; attempt <= tries; attempt += 1) {
+      last = await readStatus();
+      const found = done(last);
+      if (found !== null) return { found, last };
+      const left = deadline - now();
+      if (left <= 0) break;
+      await sleep(Math.min(WAITER_POLL_MS, left));
+      if (now() >= deadline) break;
+    }
+    return { found: null, last };
+  };
+
+  const undo = async () => {
+    if (state.taken === null) return;
+    const { id, device } = state.taken;
+    const released = await run(['release', id, '--resource', device]);
+    log(`HUB_SMOKE cleanup: ${released.code === 0 ? `released ${id}` : `release of ${id} failed (${brief(released)})`}`);
+    if (released.code === 0) state.taken = null;
+  };
+
+  const results = [];
+  try {
+    let body = await readStatus();
+    const spokes = isObject(body.remote_hosts) ? Object.keys(body.remote_hosts) : [];
+    if (spokes.length === 0) throw fail('no other host in status (run it on big-chungus)');
+    const lanes = spokes.flatMap(host => lanesOf(host).map(lane => ({ ...lane, host })));
+    if (lanes.length === 0) throw fail(`no lane on ${spokes.join(', ')}`);
+
+    for (const [index, lane] of lanes.entries()) {
+      const { host, device } = lane;
+      const id = `${tag}-l-${device}`;
+      if (index > 0) body = await readStatus();
+
+      // 1. the host's view is available and the lane is free
+      const remote = viewOf(body, host);
+      if (remote === null || remote.state !== 'available' || !isObject(remote.view)) {
+        throw fail(`${host} is ${remote?.state ?? 'not in status'}${remote?.reason ? ` (${remote.reason})` : ''}: nothing was taken on ${device}`);
+      }
+      const holder = rowsOf(remote.view.locks, lane.lock)[0];
+      if (holder !== undefined) throw fail(`${device} (${lane.lock}) on ${host} is held (${holder.kind ?? 'a lock'}${holder.holder ? ` by ${holder.holder}` : holder.repo ? ` by ${holder.repo}` : ''}${holder.lease_id ? ` ${holder.lease_id}` : ''}): nothing was taken`);
+      const waiter = rowsOf(remote.view.waiters, lane.lock)[0];
+      if (waiter !== undefined) throw fail(`${device} (${lane.lock}) on ${host} has a waiter (${waiter.holder ?? waiter.lease_id ?? 'a request'}): nothing was taken`);
+
+      // 2. take it, forwarded, by the lane's own name
+      state.taken = { id, device };
+      const leased = await run(['lease', device, '--no-connect', '--wait', '0', '--for', `${LANE_FOR_MS / 60_000}m`, '--id', id, '--why', why, '--holder', HOLDER, '--json']);
+      const answer = leased.code === 0 ? parseJson(leased.stdout) : undefined;
+      if (answer?.lease_id !== id) throw fail(`the Lease ${id} on ${device} (${host}) was refused (${brief(leased)})`);
+      const answeredAt = now();
+
+      // 3. it shows in the host's own view with the host's clock, and this host wrote nothing
+      let wroteLocally = false;
+      const shown = await poll(answeredAt, polled => {
+        if (Array.isArray(polled.locks) && polled.locks.some(row => row?.lease_id === id)) { wroteLocally = true; return {}; }
+        const view = viewOf(polled, host);
+        if (view?.state !== 'available') return null;
+        return rowsOf(view.view?.locks, lane.lock).find(row => row.lease_id === id && row.kind === 'lease' && isoTime(row.started_at)) ?? null;
+      });
+      if (wroteLocally) throw fail(`big-chungus wrote the lane's lock: ${id} is in this host's own locks, not only in ${host}'s`);
+      if (shown.found === null) throw fail(`${device} held as ${id} was not shown in ${host}'s view within ${seconds} s (with that Lease, kind lease and an ISO started_at)`);
+      const shownMs = now() - answeredAt;
+      const startedAt = shown.found.started_at;
+      const skewMs = Date.parse(startedAt) - answeredAt;
+
+      // 4. release it by the lane's name, and the lane is free again
+      const released = await run(['release', id, '--resource', device]);
+      if (released.code !== 0 || !/^HUB_DEVICE_RELEASED\b/m.test(released.stdout ?? '')) throw fail(`the release of ${id} on ${device} did not answer HUB_DEVICE_RELEASED (${brief(released)})`);
+      state.taken = null;
+      const releasedAt = now();
+      const freed = await poll(releasedAt, polled => {
+        const view = viewOf(polled, host);
+        return view?.state === 'available' && isObject(view.view) && !rowsOf(view.view.locks, lane.lock).some(row => row.lease_id === id) ? true : null;
+      });
+      if (freed.found === null) throw fail(`${device} (${lane.lock}) on ${host} is still held in ${host}'s view ${seconds} s after the release of ${id}`);
+      const freedMs = now() - releasedAt;
+
+      log(`HUB_SMOKE lanes: ${device} on ${host} held as ${id} (${host} clock started_at ${startedAt}, ${skewMs} ms from this host), shown in ${shownMs} ms, free again in ${freedMs} ms`);
+      results.push({ host, device, id, shownMs, freedMs, startedAt, skewMs });
+    }
+    return { lanes: results };
+  } catch (error) {
+    await undo();
+    throw error.smoke ? error : fail(`unexpected: ${error.message}`);
+  }
+}
+
 // The whole check. Seams: `cli(args)` -> `{code, stdout, stderr}` (hub-device), `fetchImpl`, `now`, `sleep`, `log`, `policy`, `members()`
 // (the `phone` word's device names), `name` (the test phone's name), `holds` (`false`, the default, skips the holds phase; `true` runs it on
 // the test phone; a device word runs it on that word), `stream` (`false`, the default, skips the stream phase: see `streamCheck`) and `restart`
 // (`false`, the default; `true` needs `stream` and restarts the service through the `restartUnit` seam, which `systemctl --user restart`s the
-// unit by default). Resolves the line `HUB_SMOKE_OK ...`; rejects with
+// unit by default) and `lanes` (`false`, the default, skips the lanes phase: see `laneCheck`; `lanesOf` is its seam). Resolves the line `HUB_SMOKE_OK ...`; rejects with
 // `HUB_SMOKE_FAILED <step>: <detail>` (`code` HUB_SMOKE_FAILED, `step`, `smoke: true`) after cleaning up what it registered.
 export async function hubSmoke({
   ref,
@@ -535,6 +668,8 @@ export async function hubSmoke({
   stream = false,
   restart = false,
   restartUnit = restartHubApiUnit,
+  lanes = false,
+  lanesOf = hostLanes,
 } = {}) {
   if (typeof ref !== 'string' || ref === '') throw new TypeError('hubSmoke: a release ref is required');
   if (typeof cli !== 'function') throw new TypeError('hubSmoke: a cli (hub-device runner) is required');
@@ -542,6 +677,7 @@ export async function hubSmoke({
   if (typeof stream !== 'boolean') throw new TypeError('hubSmoke: stream is a boolean');
   if (typeof restart !== 'boolean') throw new TypeError('hubSmoke: restart is a boolean');
   if (restart && !stream) throw new TypeError('hubSmoke: restart needs stream');
+  if (typeof lanes !== 'boolean') throw new TypeError('hubSmoke: lanes is a boolean');
   const why = `hosts:smoke ${ref}`;
   const step = (label, text) => log(`HUB_SMOKE ${label}: ${text}`);
   const fail = (label, detail) => { const error = failure(label, detail); log(error.message); return error; };
@@ -649,6 +785,14 @@ export async function hubSmoke({
       if (streamed.restart !== null) step('restart', `${phone}-s held across the restart; the reconnect got reset (boot ${streamed.restart.boots[0]} -> ${streamed.restart.boots[1]})`);
     }
 
+    // 5d. lanes: every other host's lane, taken and released through hub-device from here (opt-in). It cleans up its own ids; a failure then
+    // retires the phone like any other.
+    if (lanes) {
+      try {
+        await laneCheck({ tag: phone, ref, cli, lanesOf, now, sleep, log });
+      } catch (error) { throw await stop('lanes', error.detail ?? error.message); }
+    }
+
     // 6. retire
     const retired = await cli(['registry', 'retire', state.id, '--holder', HOLDER, '--why', why]);
     if (retired.code !== 0 || !/^HUB_DEVICE_RETIRED /m.test(retired.stdout ?? '')) throw await stop('retire', `registry retire was refused (${brief(retired)})`);
@@ -684,29 +828,29 @@ function option(argv, flag) {
   return value;
 }
 
-// The entry's arguments: `{hubDevice, ref, holds, stream, restart}` (`ref` undefined when not given; `holds` true by default, a word for
-// `--holds-on`, false for `--no-holds`; `stream` true by default, false for `--no-stream`; `restart` false unless `--restart`). Throws a usage
-// Error for an unknown word, a flag without its value, both holds flags, or `--restart` with `--no-stream`.
+// The entry's arguments: `{hubDevice, ref, holds, stream, restart, lanes}` (`ref` undefined when not given; `holds` true by default, a word for
+// `--holds-on`, false for `--no-holds`; `stream` true by default, false for `--no-stream`; `restart` false unless `--restart`; `lanes` false
+// unless `--lanes`). Throws a usage Error for an unknown word, a flag without its value, both holds flags, or `--restart` with `--no-stream`.
 export function parseSmokeArgs(argv) {
   const valued = new Set(['--hub-device', '--ref', '--holds-on']);
-  const bare = new Set(['--no-holds', '--no-stream', '--restart']);
+  const bare = new Set(['--no-holds', '--no-stream', '--restart', '--lanes']);
   const stray = argv.filter((word, index) => !valued.has(word) && !bare.has(word) && !valued.has(argv[index - 1]));
-  if (stray.length > 0) throw new Error(`usage: mise run hosts:smoke [-- --hub-device <cmd>] [--ref <ref>] [--holds-on <word> | --no-holds] [--no-stream | --restart] (unknown: ${stray[0]})`);
+  if (stray.length > 0) throw new Error(`usage: mise run hosts:smoke [-- --hub-device <cmd>] [--ref <ref>] [--holds-on <word> | --no-holds] [--no-stream | --restart] [--lanes] (unknown: ${stray[0]})`);
   const on = option(argv, '--holds-on');
   const off = argv.includes('--no-holds');
   if (on !== undefined && off) throw new Error('--holds-on and --no-holds exclude each other');
   const stream = !argv.includes('--no-stream');
   const restart = argv.includes('--restart');
   if (restart && !stream) throw new Error('--restart and --no-stream exclude each other: the restart is part of the stream phase');
-  return { hubDevice: option(argv, '--hub-device') ?? 'hub-device', ref: option(argv, '--ref'), holds: off ? false : on ?? true, stream, restart };
+  return { hubDevice: option(argv, '--hub-device') ?? 'hub-device', ref: option(argv, '--ref'), holds: off ? false : on ?? true, stream, restart, lanes: argv.includes('--lanes') };
 }
 
-// The entry's body: parse the arguments, run the smoke with `holds`, `stream` and `restart` forwarded, and resolve the exit code (0, or 1 after a
+// The entry's body: parse the arguments, run the smoke with `holds`, `stream`, `restart` and `lanes` forwarded, and resolve the exit code (0, or 1 after a
 // `HUB_SMOKE_FAILED` line on stderr for a usage failure or a failure that is not the smoke's own, which logged itself).
 export async function runEntry(argv, { smoke = hubSmoke, makeCli = hubDeviceCli, defaultRef = releaseName } = {}) {
   try {
-    const { hubDevice, ref, holds, stream, restart } = parseSmokeArgs(argv);
-    await smoke({ ref: ref ?? defaultRef(), cli: makeCli(hubDevice), holds, stream, restart });
+    const { hubDevice, ref, holds, stream, restart, lanes } = parseSmokeArgs(argv);
+    await smoke({ ref: ref ?? defaultRef(), cli: makeCli(hubDevice), holds, stream, restart, lanes });
     return 0;
   } catch (error) {
     if (!error.smoke) console.error(`HUB_SMOKE_FAILED ${error.message}`);

@@ -1024,6 +1024,25 @@ test('the v1.2.53 release notes (Epic 6) say what a reader of the tag must know:
   assert.ok(readFileSync(notesPath, 'utf8').indexOf('## v1.2.53') < readFileSync(notesPath, 'utf8').indexOf('## v1.2.52'), 'newest first');
 });
 
+test('the v1.2.58 release notes (Epic 9) say what a reader of the tag must know: the Host Agent, the client, forwarding, the lane leases, the push, offline, the LaunchAgent, the rollback, the lanes smoke', () => {
+  const text = readFileSync(notesPath, 'utf8');
+  const notes = releaseNotes(text, 'v1.2.58');
+  const changes = notes?.slice(notes.indexOf('### Test changes you will see')) ?? '';
+  assert.ok(notes, 'docs/hub-releases.md has a v1.2.58 section');
+  for (const word of [
+    /Host Agent/, /`127\.0\.0\.1:8795`/, /`sh\.delo\.mobile-deploy-hub\.host-agent`/, /host-agent\.out\.log/, /`tools\/hub-client\.mjs` is the one cross-host transport/, /`X-Hub-Forwarded`/, /`HUB_WRONG_HOST`/,
+    /`lease ipad` and `lease mac` take the `ios-lane`/, /60 min/, /`--no-connect`/, /`POST \/agent\/push`/, /changes and only changes/, /no timer/, /reads `offline`/, /`host-unreachable`/, /`host-reachability`/,
+    /services agree/, /`contract` stays 1/, /Deploy jobs and the iPad catch-up are unchanged/, /HUB_MAC_BUSY/, /tools\/deploy-path\.test\.mjs/,
+    /Rolling back is `hosts:install` of `v1\.2\.57`/, /launchctl bootout/, /ssh hub-mac/, /Roll back:/, /hosts:smoke -- --lanes/, /HUB_SMOKE_OK/, /opt-in/, /Test changes you will see/,
+  ]) assert.match(notes, word);
+  for (const suite of ['v11', 'deploy-path', 'claims', 'lease-match', 'hostkey', 'hosts', 'cancel', 'contract', 'extend-release', 'force-release', 'leases', 'hub-client', 'smoke', 'forward-cli', 'forward', 'lease-lane', 'push', 'server', 'agent-push', 'unreachable', 'hub-client-forward']) {
+    assert.match(changes, new RegExp(`\\b${suite}\\b`), `the test-changes list names ${suite}`);
+  }
+  assert.doesNotMatch(notes, /`contract` (is|becomes|moves to) 2/);
+  assert.ok(notes.split('\n').every(line => !line.startsWith('## ')), 'no line of the section may look like a heading of the next release');
+  assert.ok(text.indexOf('## v1.2.58') !== -1 && text.indexOf('## v1.2.58') < text.indexOf('## v1.2.57'), 'newest first');
+});
+
 test('the v1.2.57 release notes (Epic 8) say what a reader of the tag must know: the status and the stream, the 2 s, keepalive, restart safety, the contract readback, the rollback, the smoke', () => {
   const text = readFileSync(notesPath, 'utf8');
   const notes = releaseNotes(text, 'v1.2.57');
