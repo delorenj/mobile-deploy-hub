@@ -756,7 +756,8 @@ export async function take(resolved, options, ctx) {
 }
 
 // What the Claimant exports to use what it took: `lease` prints these, `run` puts them in the child's environment.
-export function leaseExports(taken, envSerial = []) {
+// `qaIds` (see `leaseView`) nulls the adb-id-valued keys when the Lease is on a `dedicated_qa` Resource.
+export function leaseExports(taken, envSerial = [], { qaIds, resource } = {}) {
   if (taken.kind === EMULATOR) return emulatorExports(taken.record, envSerial);
   const { lease, device, phone } = taken;
   const vars = { HUB_LEASE_ID: lease.lease_id, HUB_DEVICE: phone.device };
@@ -765,6 +766,10 @@ export function leaseExports(taken, envSerial = []) {
   if (device.adb_id) {
     vars.ANDROID_SERIAL = device.adb_id;
     for (const name of envSerial) vars[name] = device.adb_id;
+  }
+  const qa = qaIds === undefined || qaIds === null ? null : new Set(qaIds);
+  if (qa !== null && qa.has(resource ?? resourceOf(phone.lock))) {
+    for (const key of Object.keys(vars)) if (key === 'ANDROID_SERIAL' || (device.adb_id && vars[key] === device.adb_id)) vars[key] = null;
   }
   return vars;
 }
@@ -815,14 +820,22 @@ export function checkLeaseBody(body) {
 // `lease --json` env). One view for every service route that answers with a Lease. A phone's carries `emulator: null`; an emulator's
 // (Story 7.4: `taken` is `{kind: 'emulator', lease, record, slot?}`) is the slot it holds, `device: 'emulator'`, the emulator's own
 // exports (`HUB_LEASE_ID`, `ANDROID_ADB_SERVER_PORT`, `ANDROID_SERIAL`) and `emulator: {slot, serial, profile, console_port, adb_server_port}`.
-export function leaseView(taken) {
+//
+// `qaIds` (a Set or array of Resource ids: the `dedicated_qa` set a service passes, AD-30/AD-41) redacts a Lease on one of those Resources the way
+// `statusView` does: keys stay, values become `null`. `env.ANDROID_SERIAL` and every other env value equal to the device's adb id (it embeds the
+// serial) is `null`. The CLI passes none and keeps today's values.
+export function leaseView(taken, { qaIds } = {}) {
   if (taken.kind === EMULATOR) return emulatorLeaseView(taken);
   const { lease, phone } = taken;
+  const resource = resourceOf(phone.lock);
   return {
-    lease_id: lease.lease_id, resource: resourceOf(phone.lock), lock: phone.lock, device: phone.device, holder: lease.holder, why: lease.why,
-    claimant_kind: lease.claimant_kind ?? 'agent', started_at: lease.started_at, expires_at: lease.expires_at, env: leaseExports(taken), emulator: null,
+    lease_id: lease.lease_id, resource, lock: phone.lock, device: phone.device, holder: lease.holder, why: lease.why,
+    claimant_kind: lease.claimant_kind ?? 'agent', started_at: lease.started_at, expires_at: lease.expires_at, env: leaseExports(taken, [], { qaIds, resource }), emulator: null,
   };
 }
+
+// The `qaIds` a service context carries (`ctx.qaIds` is a function so the Registry is read only when a Lease view is built), as the option `leaseView` takes.
+const qaOf = ctx => ({ qaIds: typeof ctx?.qaIds === 'function' ? ctx.qaIds() : undefined });
 
 // The `Lease` of a held emulator: the owner record of its slot and the emulator's record (the slot's owner carries the same facts as a
 // summary when the record is gone).
@@ -876,7 +889,7 @@ export function findLease(id, ctx) {
   const env = ctx.env ?? process.env;
   const fleet = ctx.fleet ?? loadFleet(env, { warn: ctx.warn });
   const held = heldLease(id, { ...ctx, env, fleet });
-  if (held) return leaseView(held);
+  if (held) return leaseView(held, qaOf(ctx));
   throw leaseNotFound(id, fleet, env, ctx.processStart);
 }
 
@@ -920,7 +933,7 @@ export async function serviceLease(input, ctx) {
   const local = { ...ctx, env, fleet, log: base.log, warn: base.warn, timing: ctx.timing ?? base.timing, emulator: ctx.emulator ?? base.emulator };
   if (input.id) {
     const held = heldLease(input.id, local);
-    if (held && held.lease.holder === input.holder) return leaseView(held);
+    if (held && held.lease.holder === input.holder) return leaseView(held, qaOf(ctx));
   }
   const resolved = input.match !== null ? matchTarget(input.match, { forMs: input.forMs, emulators: true }, local) : resolve(input.resource, { fleet, env, ids: false });
   const signal = ctx.signal ?? null;
@@ -937,7 +950,7 @@ export async function serviceLease(input, ctx) {
     releaseLease(taken.phone.lock, taken.lease.lease_id, { env, now: local.timing.now, reason: 'undelivered' });
     throw signal.reason;
   }
-  return leaseView(taken);
+  return leaseView(taken, qaOf(ctx));
 }
 
 // The profile's image must be there before anything is queued: an unknown profile or a missing image is HUB_NO_MATCH (404, exit 2) naming it.
@@ -1297,7 +1310,7 @@ export function serviceExtend(id, input, ctx) {
   // Built from what the extension wrote: no second read, so a committed extension is never answered as lost.
   if (isEmulatorLock(lock)) return leaseView({ kind: EMULATOR, id, lease: record, record: readRecord(local.env, id), slot: lock });
   const phone = local.fleet.find(entry => entry.lock === lock);
-  return leaseView({ kind: 'phone', phone, lease: record, device: leaseDevice(record, phone, local.env) });
+  return leaseView({ kind: 'phone', phone, lease: record, device: leaseDevice(record, phone, local.env) }, qaOf(ctx));
 }
 
 // `POST /leases/{id}/release` (and the Host Agent's): exactly `hub-device release <id>`, with the actor on its events. Idempotent: an id
@@ -1553,6 +1566,12 @@ export async function forceReleaseEmulator(slot, input, ctx) {
   }
   if (result.outcome === 'stuck') throw failure('HUB_EMULATOR_FAILED', `emulator ${id}: the force-release stands (${slot} is released and its force-release event is written), but pids ${result.survivors.join(',')} would not stop; the record stays and ${slot} stays out of the pool until the next emulator acquire's reap stops them`);
   return { lease_id: id, outcome: 'force-released', resource: resourceOf(slot), lock: slot, device: EMULATOR, holder: result.owner?.holder ?? owner.holder ?? null, why };
+}
+
+// The one force-release dispatch (`POST /leases/{id}/force-release`, the Host Agent's and `hub-device force-release`): an id that names an emulator slot
+// goes to `forceReleaseEmulator` (a promise), anything else to `forceReleaseLease` (answered at once). `ctx` is the one either takes; behaviour is theirs.
+export function serviceForceRelease(id, input, ctx) {
+  return namesEmulatorSlot(id) ? forceReleaseEmulator(id, input, ctx) : forceReleaseLease(id, input, ctx);
 }
 
 // ---- force-release a Reservation (Story 7.7) ----

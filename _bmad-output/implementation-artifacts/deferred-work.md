@@ -228,3 +228,11 @@ source_spec: `spec-10-3-utilisation-per-resource.md`
 severity: medium
 reason: tools/hub-api/utilisation.mjs advance() opens openReader at the stored position; the host-agent push (tools/host-agent/push.mjs pick()) sends the oldest differing month first, so in normal flow an earlier month is complete before a later one starts. The open case is a month the agent skipped (HUB_AGENT_REPLICA_SKIPPED: HUB_EVENT_OFFSET or HUB_EVENT_NOT_UTF8) that is pushed later, after the cache moved into a newer month. Settle it with a test: cache a replica at month M, then append to month M-1, and check whether the next /utilisation answer includes the M-1 events; if not, rebuild a host whose earlier months' sizes changed. (declared severity: medium (unverified))
 status: open
+
+### DW-19: The Host Agent redacts a Lease by what its `known` holds, so if `known` is stale it serves a QA phone's adb id.
+origin: spec-deferred e09e04da5525
+location: tools/host-agent/routes.mjs:28 (withQa); tools/host-agent/known.mjs refresh
+source_spec: `spec-10-4-freeze-the-contract-and-prove-nothing-leaks.md`
+severity: medium
+reason: `withQa` (tools/host-agent/routes.mjs) takes `knownOf(ctx).qaIds()`: the Hub API's last `GET /resources` answer, else the seed. `known.refresh` runs once after bind, and again only on a Hold request that names a Resource. `GET /leases/{id}`, and an extend with no `resource`, name none. A phone can be in the agent's seed (devices.json) as non-QA and later marked `dedicated_qa` through `POST /registry/resources/{id}`. If the boot refresh failed, or the mark came after it, a CLI Lease with a connect on that phone serves `env.ANDROID_SERIAL`. A phone missing from `known` is not in the agent's fleet, so its Lease is 404 and does not leak. The agent's `GET /status` depends on `known` the same way (pre-existing, AD-41). This cannot happen in today's deployment: the only spoke is the Mac, which has no phones. To settle it, add a Host Agent test whose `request` seam fails, plus a seed phone that the Registry marks QA. Then either refresh `known` on Lease reads or redact every phone serial while (declared severity: medium (unverified))
+status: open
