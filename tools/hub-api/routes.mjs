@@ -16,6 +16,7 @@ import { STATUS_CODES } from 'node:http';
 import { idMatchesSerial } from '../ci/lib/adb.mjs';
 import { HOST_PLATFORMS, cancel, checkCancelBody, checkExtendBody, checkForceReleaseBody, checkLeaseBody, checkReleaseBody, checkReservationForceReleaseBody, createContext, discover as discoverHost, exitCodeOf, findLease, forceReleaseEmulator, forceReleaseLease, forceReleaseReservation, hostKey as realHostKey, httpAnswerOf, leaseRequestId, loadFleet, lockActivity, namesEmulatorSlot, restartingError, serviceExtend, serviceLease, serviceRelease, statusView } from '../device/claims.mjs';
 import { hubRef } from '../ci/lib/receipt.mjs';
+import { NAMED, forwardHold, hubView, namedRecords, placeOf, unwrapCarried, wrongHost } from '../device/forward.mjs';
 import { NO_READING } from '../registry/reachability.mjs';
 import { dedicatedQaIds, loadQaDevices } from '../registry/seed.mjs';
 import { retirement, visibility } from '../registry/match.mjs';
@@ -372,6 +373,40 @@ export function forceReleaseReservationRoute(ctx, { body, params }) {
   return forceReleaseReservation(params.run_key, { why: input.why, actor, name: input.name }, serviceContext(ctx));
 }
 
+// The Hold routes behind the forwarding rule (Story 9.3, AD-48; tools/device/forward.mjs has the rules and every Hold route's naming). A Hold action runs
+// on the host its Resource lives on, so this service, which is big-chungus (`hostKey()`), either runs it here or sends it on:
+//   - a forward (the header `X-Hub-Forwarded`, `resource: {id, lock, host, rev, retired_at}`): the carried record is taken down to its `id` and re-resolved
+//     against the Registry (`registry.json`, else the seed); one that lives on another host is HUB_WRONG_HOST, nothing written, and it is never forwarded again;
+//   - a public request that names Resources on one other host is forwarded there as the door `api`, and that host's answer is relayed as it came (a
+//     far problem is this answer's problem; a host that does not answer is 503 HUB_DEVICE_AWAY, exit 75, `host-unreachable`);
+//   - anything else, and a host that does not know its key (no forwarding: v1a), runs here.
+// `route.local` is the raw handler, which the Host Agent runs behind its own forwarding wrapper.
+function hubHold(route) {
+  const key = `${route.method} ${route.path}`;
+  const named = NAMED[key];
+  return async (ctx, given) => {
+    const { door, request } = unwrapCarried(given);
+    let own;
+    try { own = (ctx.hostKey ?? realHostKey)({ env: ctx.env ?? process.env }); } catch (error) {
+      if (error?.code !== 'HUB_HOST_UNKNOWN') throw error;
+      return route.handler(ctx, request);
+    }
+    const input = named.check(request.body);
+    const view = hubView(ctx);
+    const { records, single } = namedRecords(key, input, request, view, ctx.policy);
+    if (door !== null) {
+      const foreign = records.find(record => record.host !== own);
+      if (foreign) throw wrongHost(foreign, own);
+      return route.handler(ctx, request);
+    }
+    const host = placeOf(records, own);
+    if (host === null) return route.handler(ctx, request);
+    const answer = await forwardHold({ key, request, input, place: { host, records, single }, rev: view.rev, door: 'api', ctx });
+    return answer.status === 200 ? answer.body : reply(answer.status, answer.body);
+  };
+}
+const hold = route => Object.freeze({ ...route, handler: hubHold(route), local: route.handler });
+
 // GET /stream: the Candybar SSE wire (Story 8.4, AD-43): the connection's opening (`ready`, or `reset` for an id it cannot resume) carries
 // the one `statusDocument`, then the ring's frames after its `Last-Event-ID`, then live frames. The cursor is taken before the document
 // is awaited, so a frame emitted meanwhile is replayed, never lost. An exact resume needs no document. A host that does not know its key
@@ -404,12 +439,12 @@ export const ROUTES = Object.freeze([
   Object.freeze({ method: 'POST', path: '/registry/resources/{id}', shape: 'Resource', handler: editResource }),
   Object.freeze({ method: 'POST', path: '/registry/resources/{id}/retire', shape: 'Retirement', handler: retireResource }),
   // `requestId` names the id a route echoes in `X-Request-Id` (from the request and its answer; the answer is null for an error).
-  Object.freeze({ method: 'POST', path: '/leases', shape: 'Lease', handler: takeLease, requestId: ({ body }, view) => leaseRequestId(body, view) }),
-  Object.freeze({ method: 'GET', path: '/leases/{id}', shape: 'Lease', handler: getLease }),
-  Object.freeze({ method: 'POST', path: '/leases/{id}/extend', shape: 'Lease', handler: extendLeaseRoute }),
-  Object.freeze({ method: 'POST', path: '/leases/{id}/release', shape: 'Release', handler: releaseLeaseRoute }),
-  Object.freeze({ method: 'POST', path: '/leases/{id}/force-release', shape: 'ForceRelease', handler: forceReleaseLeaseRoute }),
-  Object.freeze({ method: 'POST', path: '/requests/{id}/cancel', shape: 'Cancel', handler: cancelRequestRoute }),
+  hold({ method: 'POST', path: '/leases', shape: 'Lease', handler: takeLease, requestId: ({ body }, view) => leaseRequestId(body, view) }),
+  hold({ method: 'GET', path: '/leases/{id}', shape: 'Lease', handler: getLease }),
+  hold({ method: 'POST', path: '/leases/{id}/extend', shape: 'Lease', handler: extendLeaseRoute }),
+  hold({ method: 'POST', path: '/leases/{id}/release', shape: 'Release', handler: releaseLeaseRoute }),
+  hold({ method: 'POST', path: '/leases/{id}/force-release', shape: 'ForceRelease', handler: forceReleaseLeaseRoute }),
+  hold({ method: 'POST', path: '/requests/{id}/cancel', shape: 'Cancel', handler: cancelRequestRoute }),
   Object.freeze({ method: 'POST', path: '/reservations/{run_key}/force-release', shape: 'ReservationForceRelease', handler: forceReleaseReservationRoute }),
 ]);
 

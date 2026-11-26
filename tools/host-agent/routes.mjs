@@ -1,18 +1,17 @@
-// The Host Agent's routes (Story 9.2, AD-25, AD-41): the Hub API's route table and pure `handle()` (tools/hub-api/routes.mjs) over a smaller
+// The Host Agent's routes (Story 9.2, 9.3, AD-25, AD-41): the Hub API's route table and pure `handle()` (tools/hub-api/routes.mjs) over a smaller
 // table. `GET /health`, `GET /status` (this host's own view, `statusView(<own key>, {audience: 'service', qa_ids})`, rendered here from
-// this host's lock dir and clock) and the seven Hold routes, each behind the host gate. The agent is keyed by `hostKey()`, never by a
+// this host's lock dir and clock) and the seven Hold routes, each behind forwarding (below) or the host gate. The agent is keyed by `hostKey()`, never by a
 // literal `mac`, so it is the front door of any spoke host.
 //
-// The host gate (AD-47): a Hold route runs only for a Resource that lives on this host. After the route's own body check (so a bad body
-// is still the 400), the Resource the request names is found in what the agent knows (`known.mjs`: the Hub API's last answer, else the
-// seed) and one on another host is `HUB_WRONG_HOST` (409, exit 2) with nothing written. A name nothing knows passes to the handler, which
-// refuses it as it always does. The handler then runs with `ctx.fleet` set to this host's phones. There are no `/registry/*`,
-// `/resources`, `/discovery` or `/stream` routes here: those are the Hub API's.
+// Forwarding (AD-47, AD-48): a Hold route runs here only for a Resource that lives on this host. A request that names one on another host is sent
+// there (Story 9.3), and a forward that names one is HUB_WRONG_HOST; the rules are written once in tools/device/forward.mjs and explained at `forwarding`
+// below. What the agent knows of the Registry (`known.mjs`) is the Hub API's last answer, else the seed. The handler then runs with `ctx.fleet` set to
+// this host's phones and the Resource the request names. There are no `/registry/*`, `/resources`, `/discovery` or `/stream` routes here: those are the Hub API's.
 import { HOST_AGENT_SERVICE, HUB_API_CONTRACT } from '../hub-client.mjs';
 import { hubRef } from '../ci/lib/receipt.mjs';
-import { checkCancelBody, checkForceReleaseBody, checkLeaseBody, checkReservationForceReleaseBody, createContext, exitCodeOf, hostKey as realHostKey, isLocal, namesEmulatorSlot, phonesOf, statusView } from '../device/claims.mjs';
-import { match, parseQuery } from '../registry/match.mjs';
-import { ROUTES } from '../hub-api/routes.mjs';
+import { createContext, hostKey as realHostKey, isLocal, phonesOf, statusView } from '../device/claims.mjs';
+import { NAMED, forwardHold, namedRecords, placeOf, retiredCarried, unseeded, unwrapCarried, withPlace, wrongHost } from '../device/forward.mjs';
+import { ROUTES, reply } from '../hub-api/routes.mjs';
 import { createKnown } from './known.mjs';
 
 export const SERVICE = HOST_AGENT_SERVICE;
@@ -56,69 +55,88 @@ export function agentStatus(ctx) {
   return statusView(key, { audience: 'service', qa_ids: known.qaIds() }, statusCtx);
 }
 
-// ---- the host gate ----
+// ---- forwarding (Story 9.3) ----
 
-const wrongHost = (record, own) => Object.assign(
-  new Error(`${record.id} is on host ${record.host}; this is host ${own}, and a host acts only on its own Resources`),
-  { code: 'HUB_WRONG_HOST', exit: exitCodeOf({ code: 'HUB_WRONG_HOST' }) },
-);
-
-// The Resources a device word stands for: by id, name or lock, then by a seed word (`ipad`), then a Pool word (its members, or its gate's Resource).
-function resourcesOfWord(word, view) {
-  const { resources, pools, words } = view;
-  const direct = resources.find(record => record.id === word) ?? resources.find(record => record.name === word) ?? resources.find(record => record.lock === word);
-  if (direct) return [direct];
-  const wordId = words.find(entry => entry.words.includes(word))?.id;
-  const worded = wordId === undefined ? undefined : resources.find(record => record.id === wordId);
-  if (worded) return [worded];
-  const pool = Object.hasOwn(pools, word) ? pools[word] : undefined;
-  if (Array.isArray(pool?.members)) return pool.members.map(id => resources.find(record => record.id === id)).filter(Boolean);
-  if (typeof pool?.gate === 'string') return resources.filter(record => record.lock === pool.gate);
-  return [];
-}
-
-// The Resources a `match` query stands for: the emulator Pool for a `profile=` clause, else the matcher's members over what the agent knows.
-// A query that does not parse or matches nothing names none: the handler refuses it as it always does.
-function resourcesOfMatch(text, view, policy) {
-  let clauses;
-  try { clauses = parseQuery(text); } catch { return []; }
-  if (clauses.some(clause => clause.key === 'profile')) return view.resources.filter(record => record.kind === 'emulator-pool');
-  try { return match({ resources: view.resources, pools: view.pools }, { query: clauses }, policy).members; } catch { return []; }
-}
-
-// One gate per Hold route: `check` is the route's own pure body check, `names(input, request)` the Resources the request names.
-const wordNamed = word => (typeof word === 'string' && word !== '' ? [{ word }] : []);
-const GATES = Object.freeze({
-  'POST /leases': { check: checkLeaseBody, names: input => (input.match !== null ? [{ match: input.match }] : wordNamed(input.resource)) },
-  'POST /leases/{id}/force-release': { check: checkForceReleaseBody, names: (_, { params }) => (namesEmulatorSlot(params.id) ? [{ word: 'emulator' }] : []) },
-  'POST /requests/{id}/cancel': { check: checkCancelBody, names: input => [...wordNamed(input.resource), ...wordNamed(input.pool)] },
-  'POST /reservations/{run_key}/force-release': { check: checkReservationForceReleaseBody, names: input => wordNamed(input.name) },
-});
-
+// A Hold route runs here for a Resource of this host and goes to the host it lives on for any other (tools/device/forward.mjs has the rules; the Hub
+// API's `hubHold` is the same wrapper for big-chungus). After the route's own body check (so a bad body is still the 400):
+//   - a forward (header `X-Hub-Forwarded`, `resource: {id, lock, host, rev, retired_at}`) is acted on as carried: its host must be this one
+//     (HUB_WRONG_HOST), `rev: 0` (the sender had only its seed) only for a Resource this agent's own seed has (400 `unseeded`), a take of a
+//     retired one is 409 HUB_RESOURCE_RETIRED, and then the route's handler runs with the carried lock in its fleet. A forward that names a Resource
+//     of another host is HUB_WRONG_HOST and is never forwarded again;
+//   - a public request that names something first asks the Hub API for its Resources (`known.refresh` through `ctx.request`; with it down the seed
+//     answers at `rev: 0`); Resources on one other host are forwarded there as the door `host-agent` and its answer is relayed as it came;
+//     a Resource of this host runs here (a take of a retired one is refused), and one that names nothing known passes to the handler, which refuses it.
+// The handler runs with `ctx.fleet` set to this host's phones plus the Resource the request names. A Reservation's force-release is never forwarded:
+// it is gated by its `name`, and a Reservation on another host is HUB_WRONG_HOST. There are no `/registry/*`, `/resources`, `/discovery` or
+// `/stream` routes here: those are the Hub API's.
 const keyOfRoute = route => `${route.method} ${route.path}`;
+const relayed = answer => (answer.status === 200 ? answer.body : reply(answer.status, answer.body));
 
-// The route's handler behind the gate: body check, key, the named Resources (any on another host is HUB_WRONG_HOST), then the handler
-// with this host's phones as its fleet. A route with nothing to name (extend, release, `GET /leases/{id}`) only gets the fleet.
-function gated(route) {
-  const gate = GATES[keyOfRoute(route)];
-  return (ctx, request) => {
-    const input = gate?.check(request.body);
-    const key = ownKey(ctx);
-    const view = knownOf(ctx).current();
-    for (const named of gate?.names(input, request) ?? []) {
-      const records = named.match !== undefined ? resourcesOfMatch(named.match, view, ctx.policy) : resourcesOfWord(named.word, view);
-      const foreign = records.find(record => record.host !== key);
-      if (foreign) throw wrongHost(foreign, key);
+// The fleet with the Resource a request names in it, and the request naming it by the word the Claims library finds it by (its `device`): a word like
+// `ipad` or a carried id is the same Resource, whatever it was called.
+function placed(fleet, record, request, view, policy) {
+  const entries = withPlace(fleet, record, view, policy);
+  const device = entries.find(phone => phone.lock === record.lock)?.device ?? record.id;
+  const named = typeof request.body?.resource === 'string' && request.body.resource !== device ? { ...request, body: { ...request.body, resource: device } } : request;
+  return { fleet: entries, request: named };
+}
+
+function forwarding(route) {
+  const key = keyOfRoute(route);
+  const named = NAMED[key];
+  const local = route.local ?? route.handler;
+  return async (ctx, given) => {
+    const own = ownKey(ctx);
+    const { door, carried, request } = unwrapCarried(given);
+    const input = named.check(request.body);
+    const known = knownOf(ctx);
+    const policy = ctx.policy ?? null;
+    if (door !== null) {
+      const view = known.current();
+      if (carried !== null) {
+        if (carried.host !== own) throw wrongHost(carried, own);
+        if (carried.rev === 0 && !view.seeded.includes(carried.id)) throw unseeded(carried);
+        if (carried.retired_at !== null && key === 'POST /leases') throw retiredCarried(carried);
+        const at = placed(fleetOf(view, own), carried, request, view, policy);
+        return local({ ...ctx, fleet: at.fleet }, at.request);
+      }
+      const foreign = namedRecords(key, input, request, view, policy).records.find(record => record.host !== own);
+      if (foreign) throw wrongHost(foreign, own);
+      return local({ ...ctx, fleet: fleetOf(view, own) }, request);
     }
-    return route.handler({ ...ctx, fleet: fleetOf(view, key) }, request);
+    if (ctx.request && named.names(input, request).length > 0) await known.refresh({ request: ctx.request });
+    const view = known.current();
+    const { records, single } = namedRecords(key, input, request, view, policy);
+    const host = placeOf(records, own);
+    if (host !== null) return relayed(await forwardHold({ key, request, input, place: { host, records, single }, rev: view.rev, door: 'host-agent', ctx }));
+    if (single && key === 'POST /leases' && single.retired_at) throw retiredCarried(single);
+    if (single) {
+      const at = placed(fleetOf(view, own), single, request, view, policy);
+      return local({ ...ctx, fleet: at.fleet }, at.request);
+    }
+    return local({ ...ctx, fleet: fleetOf(view, own) }, request);
   };
 }
 
-// The Hub API's Hold routes (the same method, path and shape), behind the gate.
-const HOLD_ROUTES = Object.freeze(['POST /leases', 'GET /leases/{id}', 'POST /leases/{id}/extend', 'POST /leases/{id}/release', 'POST /leases/{id}/force-release', 'POST /requests/{id}/cancel', 'POST /reservations/{run_key}/force-release']);
+// The gate of a route that is never forwarded: a Resource on another host is HUB_WRONG_HOST, nothing written.
+function gated(route) {
+  const key = keyOfRoute(route);
+  const named = NAMED[key];
+  return (ctx, request) => {
+    const input = named.check(request.body);
+    const own = ownKey(ctx);
+    const view = knownOf(ctx).current();
+    const foreign = namedRecords(key, input, request, view, ctx.policy ?? null).records.find(record => record.host !== own);
+    if (foreign) throw wrongHost(foreign, own);
+    return route.handler({ ...ctx, fleet: fleetOf(view, own) }, request);
+  };
+}
+
+// The Hub API's Hold routes (the same method, path and shape), behind forwarding or the gate.
+const HOLD_ROUTES = Object.freeze(Object.keys(NAMED));
 
 export const AGENT_ROUTES = Object.freeze([
   Object.freeze({ method: 'GET', path: '/health', shape: 'AgentHealth', handler: agentHealth }),
   Object.freeze({ method: 'GET', path: '/status', shape: 'HostView', handler: agentStatus }),
-  ...ROUTES.filter(route => HOLD_ROUTES.includes(keyOfRoute(route))).map(route => Object.freeze({ ...route, handler: gated(route) })),
+  ...ROUTES.filter(route => HOLD_ROUTES.includes(keyOfRoute(route))).map(route => Object.freeze({ ...route, handler: NAMED[keyOfRoute(route)].forward ? forwarding(route) : gated(route) })),
 ]);

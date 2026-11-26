@@ -258,13 +258,14 @@ test('a bad body is 400 HUB_USAGE with its reason, before anything is read', asy
   try {
     await s.take();
     const bad = [
-      [null, 'bad-body'], [[], 'bad-body'], [{ why: 'x', holder: 'ops', extra: 1 }, 'bad-body'], [{ why: 'x', holder: 'ops', resource: 's24' }, 'bad-body'],
+      [null, 'bad-body'], [[], 'bad-body'], [{ why: 'x', holder: 'ops', extra: 1 }, 'bad-body'], [{ why: 'x', holder: 'ops', resource: 7 }, 'bad-resource'], [{ why: 'x', holder: 'ops', resource: ' ' }, 'bad-resource'],
       [{ actor: { holder: 'x', via: 'telepathy' }, why: 'x' }, 'bad-actor'], [{ why: 'x', actor: 'ops' }, 'bad-actor'],
       [{ why: 'x' }, 'no-holder'], [{ why: 'x', holder: ' ' }, 'no-holder'], [{ why: 'x', holder: 7 }, 'no-holder'],
     ];
     for (const [body, reason] of bad) assert.deepEqual(problemOf(await s.api('a-1', body)), [400, 'HUB_USAGE', 2, reason], JSON.stringify(body));
     assert.equal(s.owner('s24').lease_id, 'a-1');
     assert.deepEqual(checkForceReleaseBody({ why: 'x', holder: 'ops' }), { why: 'x', holder: 'ops', actor: null });
+    assert.deepEqual(checkForceReleaseBody({ why: 'x', holder: 'ops', resource: 's24' }), { why: 'x', holder: 'ops', actor: null, resource: 's24' });
     assert.deepEqual(checkForceReleaseBody({ why: 'x', actor: { holder: 'h', via: 'cli' } }), { why: 'x', holder: null, actor: { holder: 'h', via: 'cli' } });
   } finally { s.cleanup(); }
 });

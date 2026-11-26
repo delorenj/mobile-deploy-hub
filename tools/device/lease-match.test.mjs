@@ -223,7 +223,6 @@ test('an unknown reading drops nothing: no adb server, a wire that fails, a host
     ['no adb server', { inventory: serverDown }],
     ['a wire that fails', { wire: fakeWire({ fail: 'devices' }) }],
     ['no host key', { hostKey: () => { throw Object.assign(new Error('no key'), { code: 'HUB_HOST_UNKNOWN' }); } }],
-    ['a Mac key', { hostKey: () => 'mac' }],
   ];
   for (const [label, seams] of cases) {
     const wire = seams.wire ?? fakeWire({ listed: [] });
@@ -236,7 +235,7 @@ test('an unknown reading drops nothing: no adb server, a wire that fails, a host
       assert.deepEqual(names(s.events()), ['request', 'acquire', 'release', 'timeout'], label);
       assert.equal(s.events()[0].pool, 'match:kind=phone');
       if (label === 'no adb server') assert.deepEqual(s.wire.requests, [], 'no server running: no wire was opened');
-      if (label === 'a Mac key' || label === 'no host key') assert.deepEqual(s.wire.requests, [], label);
+      if (label === 'no host key') assert.deepEqual(s.wire.requests, [], label);
     } finally { s.cleanup(); }
   }
 });
