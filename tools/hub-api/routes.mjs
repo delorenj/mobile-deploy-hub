@@ -16,13 +16,14 @@ import { STATUS_CODES } from 'node:http';
 import { idMatchesSerial } from '../ci/lib/adb.mjs';
 import { HOST_PLATFORMS, cancel, checkCancelBody, checkExtendBody, checkForceReleaseBody, checkLeaseBody, checkReleaseBody, checkReservationForceReleaseBody, createContext, discover as discoverHost, exitCodeOf, findLease, forceReleaseEmulator, forceReleaseLease, forceReleaseReservation, hostKey as realHostKey, httpAnswerOf, leaseRequestId, loadFleet, lockActivity, namesEmulatorSlot, restartingError, serviceExtend, serviceLease, serviceRelease, statusView } from '../device/claims.mjs';
 import { hubRef } from '../ci/lib/receipt.mjs';
-import { NAMED, forwardHold, hubView, namedRecords, placeOf, unwrapCarried, wrongHost } from '../device/forward.mjs';
+import { NAMED, forwardHold, hubView, namedRecords, placeOf, transportOf, unwrapCarried, wrongHost } from '../device/forward.mjs';
 import { NO_READING, serve as serveReading } from '../registry/reachability.mjs';
 import { dedicatedQaIds, loadQaDevices } from '../registry/seed.mjs';
 import { retirement, visibility } from '../registry/match.mjs';
 import { checkEditBody, checkRegisterBody, checkRetireBody, planEdit, planRegister, planRetire } from '../registry/changes.mjs';
 import { REGISTRY_ERRORS, applySeed, readRegistry, registryState, updateRegistry } from '../registry/store.mjs';
 import { viewPools, viewRecord } from '../registry/view.mjs';
+import { createHistory, queryHistory } from './history.mjs';
 import { createPeers, failureReason, isContact, isUnreached, offlineView } from './peers.mjs';
 import { deviceCtx } from './readings.mjs';
 import { checkPushBody, createRemotes } from './remotes.mjs';
@@ -267,6 +268,35 @@ function noteContact(ctx, host, { at, reason }) {
 function noteFailure(ctx, host, { at, reason }) {
   peersOf(ctx).failed(host, { at, reason });
   pokePeers(ctx);
+}
+
+// The state `/history` keeps (Story 10.2: the send time of each peer's last synced `/agent/sync`): the context's `history` (the service's), or,
+// for a bare `handle()` with none, one per context.
+const fallbackHistory = new WeakMap();
+function historyOf(ctx) {
+  if (ctx.history) return ctx.history;
+  if (!fallbackHistory.has(ctx)) fallbackHistory.set(ctx, createHistory());
+  return fallbackHistory.get(ctx);
+}
+
+// GET /history?resource&pool&claimant&repo&from&to&cursor&limit (Story 10.2, FR-18, UJ-4, AD-40): this host's Event Log and each peer's replica,
+// filtered, merged by `ts` for display (`cross_host_order: 'display-only'`) and paged by an opaque per-host cursor. A peer whose replica may lack
+// the window is asked to push first (`POST /agent/sync`, behind the peers' gate: a marked host fails at once); a window the replica still cannot be
+// shown to cover answers `partial: true` with `synced_through` and `unreachable_ranges`. Reads only: the one side effect is a peer's mark
+// (Story 9.6, `noteContact`/`noteFailure`) and the agent's own pushes. The query is checked first (400 HUB_USAGE) and reads nothing; a host that
+// does not know its key is 503 HUB_HOST_UNKNOWN. The logic is tools/registry/history.mjs and tools/hub-api/history.mjs.
+export async function historyRoute(ctx, { query, signal } = {}) {
+  const env = ctx.env ?? process.env;
+  let own;
+  try { own = (ctx.hostKey ?? realHostKey)({ env }); } catch (error) {
+    throw error?.code === 'HUB_HOST_UNKNOWN' ? HOST_UNKNOWN(oneLine(error.message)) : error;
+  }
+  return queryHistory({
+    query, own, env, registry: () => readIt(ctx), hostId: ctx.hostId, now: ctx.now ?? Date.now, signal,
+    peers: peersOf(ctx), replicas: replicasOf(ctx), history: historyOf(ctx), transport: transportOf(ctx),
+    contact: (host, at) => noteContact(ctx, host, at), failure: (host, at) => noteFailure(ctx, host, at),
+    log: line => { try { ctx.log?.err?.(line); } catch { /* a broken log seam never changes the answer */ } },
+  });
 }
 
 // POST /agent/push (Story 9.5, AD-49; the `events` replication is Story 10.1): a spoke host's Host Agent pushes its view when
@@ -559,6 +589,7 @@ export const ROUTES = Object.freeze([
   Object.freeze({ method: 'GET', path: '/discovery', shape: 'Discovery', handler: discovery }),
   Object.freeze({ method: 'GET', path: '/status', shape: 'Status', handler: statusDocument }),
   Object.freeze({ method: 'GET', path: '/stream', shape: 'StreamFrame', handler: streamRoute, stream: true }),
+  Object.freeze({ method: 'GET', path: '/history', shape: 'History', handler: historyRoute }),
   Object.freeze({ method: 'POST', path: '/agent/push', shape: 'AgentPushAck', handler: agentPush }),
   Object.freeze({ method: 'POST', path: '/registry/resources', shape: 'Resource', handler: registerResource }),
   Object.freeze({ method: 'POST', path: '/registry/resources/{id}', shape: 'Resource', handler: editResource }),
