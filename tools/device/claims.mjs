@@ -78,6 +78,8 @@ export const EXIT_CODES = Object.freeze({
   HUB_FORCE_RELEASE_JOB: 2,
   // Story 7.7: a force-release of a run's Reservation that no longer exists (already released, never reserved).
   HUB_RESERVATION_NOT_FOUND: 2,
+  // Story 10.1: a push whose events do not continue the host's replica at its settled size (the member `size` says where to push from).
+  HUB_REPLICA_GAP: 1,
   // Story 7.4: an emulator that would not boot (or whose teardown would not finish) through a service: the host's trouble, the busy exit's opposite.
   HUB_EMULATOR_FAILED: 1,
   HUB_HOST_UNKNOWN: 1,

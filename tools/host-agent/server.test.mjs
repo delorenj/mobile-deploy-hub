@@ -79,7 +79,7 @@ function scratch({ busy = false, qaList = [], key = 'mac', devicectl } = {}) {
     forwards.push(args);
     return new Response(JSON.stringify({ forwarded_to: args.host }), { status: 200, headers: { 'content-type': 'application/json' } });
   };
-  const ctx = (more = {}) => ({ env, policy, routes: AGENT_ROUTES, now: () => clock.t, devices, qaDevices: () => qaList, hostKey: () => key, devicectl: fakeDevicectl, inventory: noServer, log, known, request: send, ...more });
+  const ctx = (more = {}) => ({ env, policy, routes: AGENT_ROUTES, now: () => clock.t, devices, qaDevices: () => qaList, hostKey: () => key, devicectl: fakeDevicectl, inventory: noServer, log, known, request: send, sync: async replica => ({ pushed: true, synced: true, replica }), ...more });
   const s = {
     root, env, out, err, servers, requests, forwards, calls, clock, signals, known, devices, ctx, seams, log,
     start: (more = {}) => startHostAgent({ ...seams, log, ...more }),
@@ -423,10 +423,11 @@ test('the Registry and every other Hub API route are 404 HUB_NO_ROUTE', async ()
 
 test('the route table is the Hub API\'s Hold routes plus Health and Status, and every route answers on a Mac with no 500', async () => {
   assert.deepEqual(AGENT_ROUTES.map(route => `${route.method} ${route.path} ${route.shape}`), [
-    'GET /health AgentHealth', 'GET /status HostView', 'POST /leases Lease', 'GET /leases/{id} Lease', 'POST /leases/{id}/extend Lease', 'POST /leases/{id}/release Release',
+    'GET /health AgentHealth', 'GET /status HostView', 'POST /agent/sync AgentSync', 'POST /leases Lease', 'GET /leases/{id} Lease', 'POST /leases/{id}/extend Lease', 'POST /leases/{id}/release Release',
     'POST /leases/{id}/force-release ForceRelease', 'POST /requests/{id}/cancel Cancel', 'POST /reservations/{run_key}/force-release ReservationForceRelease',
   ]);
   const bodies = {
+    '/agent/sync': [{}, { replica: {} }, { replica: { '2026-11': 120 } }, { replica: { '2026-13': 1 } }],
     '/leases': [{}, { resource: 'mac-ios', for_ms: 60_000, holder: 'a', why: 'x' }, { resource: 's26', for_ms: 60_000, holder: 'a', why: 'x' }, { match: 'kind=ios-lane', for_ms: 60_000, holder: 'a', why: 'x' }],
     '/leases/{id}/extend': [{}, { for_ms: 60_000, holder: 'a' }],
     '/leases/{id}/release': [{}, { holder: 'a' }],

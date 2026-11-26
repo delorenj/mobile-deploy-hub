@@ -31,7 +31,13 @@ const FAR = Date.parse('2031-06-01T00:00:00Z');
 const iso = ms => new Date(ms).toISOString();
 const BOOT = 'a1b2c3d4e5f6';
 const noServer = () => ({ adb_servers: [], emulators: [], xvfb: [] });
-const flush = async (rounds = 25) => { for (let round = 0; round < rounds; round += 1) await new Promise(done => setImmediate(done)); };
+// Enough loop turns for a push's whole chain, the Hub API's replica append (async fs) included.
+const flush = async (rounds = 250) => { for (let round = 0; round < rounds; round += 1) await new Promise(done => setImmediate(done)); };
+// A hub-side effect (the pokes, a stored view) lands when the push's chain has crossed the bridge: wait for it, never guess.
+const until = async (check, what) => {
+  for (let tries = 0; tries < 500; tries += 1) { if (await check()) return; await new Promise(done => setImmediate(done)); }
+  throw new Error(`never happened: ${what}`);
+};
 
 class FakeServer extends EventEmitter {
   constructor(listener) { super(); this.listener = listener; }
@@ -424,6 +430,7 @@ test('end to end: a Lease on the Mac reaches /status.hosts.mac within 250 ms wit
   const hubGet = url => handle({ method: 'GET', url }, hubCtx);
   try {
     await s.settle();
+    await until(async () => Object.keys((await hubGet('/status')).body.hosts).includes('mac'), 'the start push reached the Hub API');
     let status = await hubGet('/status');
     assert.deepEqual(Object.keys(status.body.hosts), ['linux', 'mac']);
     assert.deepEqual(status.body.hosts.mac.locks, []);
@@ -435,7 +442,7 @@ test('end to end: a Lease on the Mac reaches /status.hosts.mac within 250 ms wit
     s.watcher.fire(s.env.HUB_LOCK_DIR);
     mock.timers.tick(CHANGE_DEBOUNCE_MS);
     await flush();
-    assert.equal(pokes.length, 2, 'each applied push poked the change feed');
+    await until(() => pokes.length === 2, 'each applied push poked the change feed');
     status = await hubGet('/status');
     const [row] = status.body.hosts.mac.locks;
     assert.equal(row.lock, 'mac-ios');
