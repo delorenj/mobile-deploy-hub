@@ -219,6 +219,47 @@ export const fleetOf = devices => phonesOf(seed(devices, { qaDevices: () => [] }
 // failure, named like any other. The QA file is never read.
 export const loadFleet = (env, { warn } = {}) => phonesOf(readRegistry({ env, qaDevices: () => [], warn }).resources);
 
+// ---- lanes (Story 9.4) ----
+
+// A lane is a Resource that is not a phone and holds one lock on its host: today the iPad lane (`ios-lane`, lock `mac-ios`, on the Mac). It
+// is a fleet entry of its own host, so every Hold verb finds its lock by the same calls a phone's go through, but its take never touches adb
+// and its exports have no `ANDROID_*` key. This is where every rule about lanes lives (AD-24): `hub-device`, the forwarder and the services only call it.
+export const LANE_KINDS = Object.freeze(['ios-lane']);
+// The words of a lane that need its device to be reachable (`reachable` on the host that owns it) unless the take says `--no-connect`. Every
+// other word of the lane (`mac`, its id) needs only the host.
+export const LANE_DEVICE_WORDS = Object.freeze({ 'ios-lane': Object.freeze(['ipad']) });
+export const isLane = record => LANE_KINDS.includes(record?.kind);
+
+// The fleet entry of a lane's Registry record (`words` as the seed carries them; a served record has none): `{device, lock, deploy, name,
+// serial, model, kind, words}`. `deploy` is the record's `deploy_target`, else the policy's own deploy locks, so a take gets the deploy cap.
+export function laneEntry(record, policy = null) {
+  const name = record.name ?? record.id;
+  return {
+    device: name, lock: record.lock, deploy: record.deploy_target === true || deployTargetCapMs(record.lock, { policy }) !== null,
+    name: record.display_name ?? name, serial: null, model: record.identity?.model ?? null, kind: record.kind, words: [...(record.words ?? [])],
+  };
+}
+
+// The lanes of a list of Registry records that live on host `key`, as fleet entries.
+export const lanesOf = (resources, key, policy = null) => resources.filter(record => isLane(record) && isLocal(record, { hostKey: () => key })).map(record => laneEntry(record, policy));
+
+// The lanes host `key` owns, from the seed of devices.json (the one derivation; the QA file is never read): `[]` for a host with none or no key.
+export const hostLanes = (key, { env = process.env, policy = null } = {}) => (typeof key === 'string' && key !== '' ? lanesOf(seed(loadDevices(env), { qaDevices: () => [] }).resources, key, policy) : []);
+
+// Whether a take by `word` of `entry` needs the device itself reachable (a lane's device word, and not `--no-connect`).
+export const needsDevice = (word, entry, { noConnect = false } = {}) => noConnect !== true && isLane(entry) && (LANE_DEVICE_WORDS[resourceOf(entry.lock)] ?? []).includes(word);
+
+// The iPad's Reachability, read now through devicectl (`list devices`, the context's `devicectl` seam) with the udid and model of devices.json.
+// Read only; a read that cannot be made (no devices.json, devicectl failing) is `unknown`, never a throw.
+export async function laneReachability(ctx) {
+  const { env } = ctx;
+  try {
+    const { udid, model } = loadDevices(env).ios;
+    const devicectl = ctx.devicectl ?? createDevicectl({ env });
+    return await readIpad({ list: () => devicectl(['list', 'devices'], 10), udid, model });
+  } catch { return REACHABILITY.unknown; }
+}
+
 export const nameOf = (fleet, lock) => (isEmulatorLock(lock) ? EMULATOR : fleet.find(phone => phone.lock === lock)?.device ?? null);
 
 // The exact id formats: `l-<12hex>` a phone lease, `e-<12hex>` an emulator lease, `run-<pid>-<8hex>` a `run`'s own.
@@ -393,8 +434,9 @@ export function resolve(target, { fleet, env = process.env, words = true, ids = 
   if (target === PHONE) return { kind: 'pool', by: 'word', pool: PHONE, members: phoneMembers(fleet, env) };
   refuseRetired(target, { env });
   // A Resource id first, then the device word (a name is never reused, so the two cannot name different phones).
-  const entry = fleet.find(phone => resourceOf(phone.lock) === target) ?? fleet.find(phone => phone.device === target);
-  if (!entry) throw usage(`unknown device "${target ?? ''}" (known: ${[...fleet.map(phone => phone.device), PHONE, EMULATOR].join(', ')})`);
+  // A lane's words (`ipad`, `mac`) come last: they name the lane, and never a phone.
+  const entry = fleet.find(phone => resourceOf(phone.lock) === target) ?? fleet.find(phone => phone.device === target) ?? fleet.find(lane => lane.words?.includes(target));
+  if (!entry) throw usage(`unknown device "${target ?? ''}" (known: ${[...fleet.flatMap(phone => [phone.device, ...(phone.words ?? [])]), PHONE, EMULATOR].join(', ')})`);
   return { kind: 'phone', by: 'word', entry };
 }
 
@@ -646,13 +688,24 @@ async function reachableMembers(members, ctx, statesOf = null) {
   throw Object.assign(failure('HUB_DEVICE_AWAY', `no phone that matches is reachable: ${reason}`), { reason });
 }
 
+// `options.requireReachable` (a take that needs its one Resource's device reachable): the lane is read now through devicectl (`laneReachability`), a
+// phone through the service's own cache (`options.readingsOf`, no adb on a request path; without one it reads `unknown`). Anything but `reachable`
+// is HUB_DEVICE_AWAY (503, exit 75) with `reason` the state, before anything is written.
+async function mustBeReachable(entry, options, ctx) {
+  let state;
+  if (isLane(entry)) state = await laneReachability(ctx);
+  else state = (options.readingsOf ? (await options.readingsOf([entry]))?.get?.(entry.device) : null) ?? REACHABILITY.unknown;
+  if (state === REACHABILITY.reachable) return;
+  throw Object.assign(failure('HUB_DEVICE_AWAY', `${entry.device} reads ${state}: this take needs it reachable (without require_reachable, --no-connect on the CLI, it takes the lock only)`), { status: 503, reason: state });
+}
+
 // One take for every kind of target: a phone, the `phone` Pool (an ordered try under one Pool request) or an emulator.
 // A library caller gets the refusals the CLI makes, in the CLI's order: an unknown target, an id that is already taken,
 // --for's bounds (the Pool is narrowed to the phones whose cap allows it), --why, --wait, --pid, and an emulator's profile and
 // pool. The CLI checks the same rules earlier, for its message order.
 // options: holder, why, forMs, waitMs, id, holderPid, noConnect, phoneWaitMs, signal (and profile, pool for an emulator), claimantKind
 // (`agent`, or `person`), actor ({holder, via}, recorded on the take's events; an emulator's go on its Pool request and acquires too),
-// `service` and `offThread` (a service's emulator take: the Pool size ignores $HUB_EMULATOR_POOL, and the boot runs in a worker) and readingsOf (a `--match` Pool's away filter over a
+// `requireReachable` (a single Resource's take that needs its device reachable; see mustBeReachable), `service` and `offThread` (a service's emulator take: the Pool size ignores $HUB_EMULATOR_POOL, and the boot runs in a worker) and readingsOf (a `--match` Pool's away filter over a
 // service's cached states, run even for a noConnect take; see reachableMembers) and flag (what the duration is called in a bounds
 // message: `--for` by default).
 export async function take(resolved, options, ctx) {
@@ -664,7 +717,12 @@ export async function take(resolved, options, ctx) {
   checkPid(options.holderPid);
   const target = withoutRetired(bounded, ctx.env);
   switch (target.kind) {
-    case 'phone': return takePhone(target.entry, options, ctx);
+    case 'phone': {
+      const { entry } = target;
+      // The device is read before any ticket, lock or event is written; a lane's take is the lock only.
+      if (options.requireReachable) await mustBeReachable(entry, options, ctx);
+      return takePhone(entry, isLane(entry) ? { ...options, noConnect: true } : options, ctx);
+    }
     case 'pool': return takeAnyPhone(target.by === 'match' && (!options.noConnect || options.readingsOf) ? await reachableMembers(target.members, ctx, options.readingsOf ?? null) : target.members, options, ctx, target.pool ?? PHONE);
     case EMULATOR: return takeEmulator({ ...options, ...emulatorBounds({ ...options, service: options.service === true }, ctx.env) }, ctx);
     default: throw usage(`cannot take a ${target.kind}`);
@@ -676,6 +734,7 @@ export function leaseExports(taken, envSerial = []) {
   if (taken.kind === EMULATOR) return emulatorExports(taken.record, envSerial);
   const { lease, device, phone } = taken;
   const vars = { HUB_LEASE_ID: lease.lease_id, HUB_DEVICE: phone.device };
+  if (isLane(phone)) return vars;
   vars.ANDROID_ADB_SERVER_PORT = String(device.adb_port);
   if (device.adb_id) {
     vars.ANDROID_SERIAL = device.adb_id;
@@ -690,15 +749,15 @@ export function leaseExports(taken, envSerial = []) {
 // attempt, job) from its environment, and a service belongs to no run; whatever deploy identity leaked into its environment is dropped.
 export const withoutDeployIdentity = env => Object.fromEntries(Object.entries(env ?? {}).filter(([key]) => !key.startsWith('GITHUB_')));
 
-const LEASE_BODY_KEYS = Object.freeze(['resource', 'match', 'for_ms', 'wait_ms', 'holder', 'why', 'claimant_kind', 'id', 'actor']);
+const LEASE_BODY_KEYS = Object.freeze(['resource', 'match', 'for_ms', 'wait_ms', 'holder', 'why', 'claimant_kind', 'id', 'actor', 'require_reachable']);
 const bodyUsage = (reason, message) => Object.assign(usage(message), { reason });
 const isText = value => typeof value === 'string' && value.trim() !== '';
 
-// Checks the body of a service's take into `{resource, match, forMs, waitMs, holder, why, claimantKind, id, actor}` (`resource`, `match`,
-// `id` and `actor` null when absent, `waitMs` 0; `actor` as `checkActor` writes it, the caller defaults it). HUB_USAGE with a `reason`,
+// Checks the body of a service's take into `{resource, match, forMs, waitMs, holder, why, claimantKind, id, actor, requireReachable}` (`resource`, `match`,
+// `id` and `actor` null when absent, `waitMs` 0, `requireReachable` false; `actor` as `checkActor` writes it, the caller defaults it). HUB_USAGE with a `reason`,
 // checked in this order and before anything is read: bad-body (not an object, or a key outside the list), bad-target (exactly one of
 // `resource` and `match`, a non-empty string), bad-for (`for_ms` a whole number of ms, more than 0), bad-wait (`wait_ms` a whole number
-// of ms, 0 or more), bad-claimant-kind, bad-id (a lease id: lowercase letters, digits and dashes), no-id (a wait names its id: the client
+// of ms, 0 or more), bad-claimant-kind, bad-reachable (`require_reachable` is a boolean, and true only with a `resource`: Story 9.4), bad-id (a lease id: lowercase letters, digits and dashes), no-id (a wait names its id: the client
 // mints it, so a lost answer can be asked for again, AD-37), bad-actor, no-holder, bad-why. The caps (48 h, and 60 min on a deploy
 // target) are `take`'s own.
 export function checkLeaseBody(body) {
@@ -712,6 +771,8 @@ export function checkLeaseBody(body) {
   if (body.wait_ms !== undefined && (!Number.isSafeInteger(body.wait_ms) || body.wait_ms < 0)) throw bodyUsage('bad-wait', 'wait_ms must be a whole number of milliseconds, 0 or more');
   const claimantKind = body.claimant_kind ?? 'agent';
   if (!CLAIMANT_KINDS.includes(claimantKind)) throw bodyUsage('bad-claimant-kind', `claimant_kind is one of ${CLAIMANT_KINDS.join(', ')}`);
+  if (body.require_reachable !== undefined && typeof body.require_reachable !== 'boolean') throw bodyUsage('bad-reachable', 'require_reachable must be true or false');
+  if (body.require_reachable === true && hasMatch) throw bodyUsage('bad-reachable', 'require_reachable names one Resource (a resource), never a match');
   if (body.id !== undefined && (typeof body.id !== 'string' || !LEASE_ID.test(body.id))) throw bodyUsage('bad-id', 'id must be a lease id (lowercase letters, digits and dashes, at most 64)');
   if (body.wait_ms > 0 && body.id === undefined) throw bodyUsage('no-id', 'a wait names its id: mint one (lowercase letters, digits and dashes) so the request can be asked for again');
   let actor = null;
@@ -721,7 +782,7 @@ export function checkLeaseBody(body) {
   }
   if (!isText(body.holder)) throw bodyUsage('no-holder', 'say who holds the lease: a holder');
   if (!isText(body.why)) throw bodyUsage('bad-why', 'why is required: say what the lease is for');
-  return { resource: hasResource ? body.resource : null, match: hasMatch ? body.match : null, forMs: body.for_ms, waitMs: body.wait_ms ?? 0, holder: body.holder, why: body.why, claimantKind, id: body.id ?? null, actor };
+  return { resource: hasResource ? body.resource : null, match: hasMatch ? body.match : null, forMs: body.for_ms, waitMs: body.wait_ms ?? 0, holder: body.holder, why: body.why, claimantKind, id: body.id ?? null, actor, requireReachable: body.require_reachable === true };
 }
 
 // A taken Lease as a service answers it: the Lease, the Resource and device it is on, and what the Claimant exports to use it (the CLI's
@@ -837,10 +898,13 @@ export async function serviceLease(input, ctx) {
   }
   const resolved = input.match !== null ? matchTarget(input.match, { forMs: input.forMs, emulators: true }, local) : resolve(input.resource, { fleet, env, ids: false });
   const signal = ctx.signal ?? null;
+  // `require_reachable` names one Resource: a Pool word, a `match` and the emulator are refused before anything is read or written.
+  if (input.requireReachable === true && resolved.kind !== 'phone') throw bodyUsage('bad-reachable', `require_reachable names one Resource, not ${resolved.kind === EMULATOR ? 'the emulator' : 'a Pool'}`);
   if (resolved.kind === EMULATOR) return serviceEmulator(input, resolved, local, signal);
   const taken = await take(resolved, {
     holder: input.holder, why: input.why, forMs: input.forMs, waitMs: input.waitMs ?? 0, id: input.id, holderPid: null, noConnect: true,
     claimantKind: input.claimantKind, actor: input.actor, readingsOf: ctx.readingsOf, flag: 'for_ms',
+    ...(input.requireReachable === true ? { requireReachable: true } : {}),
     ...(signal ? { signal } : {}), ...(ctx.processStart ? { processStart: ctx.processStart } : {}),
   }, local);
   if (signal?.aborted) {
@@ -1047,6 +1111,8 @@ export function releaseAny(ctx, actor = null) {
   const { env, fleet } = ctx;
   let refusal = null;
   for (const phone of fleet) {
+    // --any is "whichever lease holds a phone": a lane's Lease is released by its id.
+    if (isLane(phone)) continue;
     const result = releaseLease(phone.lock, null, { env, actor });
     switch (result.reason) {
       case 'released': return { kind: 'phone', outcome: 'released', device: phone.device, lock: phone.lock, leaseId: result.owner.lease_id, notes: [] };
@@ -1275,7 +1341,7 @@ export function requestLocks(resource, ctx) {
   const env = ctx.env ?? process.env;
   if (resource === EMULATOR) return [GATE];
   const fleet = ctx.fleet ?? loadFleet(env, { warn: ctx.warn });
-  if (resource === PHONE) return fleet.map(phone => phone.lock);
+  if (resource === PHONE) return fleet.filter(phone => !isLane(phone)).map(phone => phone.lock);
   const phone = fleet.find(entry => entry.lock === resource || resourceOf(entry.lock) === resource || entry.device === resource);
   if (phone) return [phone.lock];
   const record = readRegistry({ env, qaDevices: () => [], warn: ctx.warn }).resources
@@ -1708,12 +1774,7 @@ export async function statusView(key, options, ctx) {
     }
   }
   if (key === 'mac' && rowsOf.some(([rows]) => rows.some(row => row.resource === 'ios-lane'))) {
-    let state = REACHABILITY.unknown;
-    try {
-      const { udid, model } = loadDevices(env).ios;
-      const devicectl = ctx.devicectl ?? createDevicectl({ env });
-      state = await readIpad({ list: () => devicectl(['list', 'devices'], 10), udid, model });
-    } catch { /* an iPad nobody could ask is unknown */ }
+    const state = await laneReachability(ctx);
     const readAt = timing.now();
     readings.set('ios-lane', stamp(state, { checkedAt: readAt, receivedAt: readAt }));
   }

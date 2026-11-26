@@ -98,6 +98,28 @@ test('AC1: a linux Hub API forwards an iPad take and release to the Mac agent; t
   } finally { w.cleanup(); }
 });
 
+test('the Hub API forwards require_reachable to the Mac agent, which reads the iPad: offline is 503 HUB_DEVICE_AWAY with reason offline and nothing written; reachable takes mac-ios', async () => {
+  const w = world();
+  try {
+    const { udid, model } = loadDevices({}).ios;
+    const ipad = bootState => ({ result: { devices: [{ identifier: 'IPAD', hardwareProperties: { udid, reality: 'physical', productType: model }, connectionProperties: { pairingState: 'paired', tunnelState: 'connected', transportType: 'wired' }, deviceProperties: { name: 'iPad', developerModeStatus: 'enabled', bootState } }] } });
+    w.mac.devicectl = () => ipad('shutdown');
+    const away = await w.api('/leases', { ...LEASE, resource: 'ipad', id: 'l-vvvvvvvvvvvv', require_reachable: true });
+    assert.deepEqual(problemOf(away), [503, 'HUB_DEVICE_AWAY', 75, 'offline']);
+    assert.equal(w.reachedMac[0].body.require_reachable, true);
+    assert.equal(w.reachedMac[0].forwarded, 'api');
+    assert.equal(existsSync(w.mac.env.HUB_LOCK_DIR), false, 'nothing written on the Mac');
+    assert.equal(existsSync(w.linux.env.HUB_LOCK_DIR), false);
+    assert.equal(w.events(w.mac, 'acquire').length, 0);
+
+    w.mac.devicectl = () => ipad('booted');
+    const taken = await w.api('/leases', { ...LEASE, resource: 'ipad', id: 'l-vvvvvvvvvvvv', require_reachable: true });
+    assert.equal(taken.status, 200, JSON.stringify(taken.body));
+    assert.equal(w.lock(w.mac, 'mac-ios'), true);
+    assert.equal(existsSync(w.linux.env.HUB_LOCK_DIR), false);
+  } finally { w.cleanup(); }
+});
+
 test('the same forwarded id and holder twice: one acquire event, both answers name the same lease_id', async () => {
   const w = world();
   try {
