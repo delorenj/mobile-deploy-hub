@@ -25,7 +25,7 @@ import { pause, sleep as realSleep } from './ci/lib/pause.mjs';
 import { loadPolicy } from './ci/lib/policy.mjs';
 import { createS3, readObject, writerCredentials } from './ci/lib/s3.mjs';
 import { HOST_KEY_FILE, HOST_PLATFORMS } from './device/claims.mjs';
-import { HUB_API_SERVICE } from './hub-client.mjs';
+import { HUB_API_CONTRACT, HUB_API_SERVICE } from './hub-client.mjs';
 
 const hubRoot = fileURLToPath(new URL('..', import.meta.url));
 const ssh = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20'];
@@ -86,7 +86,7 @@ const READBACK_RETRY_MS = 500;
 const releasesDir = home => join(home, '.local/share/mobile-deploy-hub/releases');
 
 // The Hub API on this host (Story 6.11): the units installer from the release copy (rendered unit + daemon-reload only), then
-// enable, restart, and a bounded readback of /health: ok, service HUB_API_SERVICE (the name the server answers with) and hub_version equal to `ref` (the service runs from
+// enable, restart, and a bounded readback of /health: ok, service HUB_API_SERVICE (the name the server answers with) and hub_version equal to `ref` and `contract` equal to HUB_API_CONTRACT (the service runs from
 // releases/<ref>, so its answer names the release). The retry is one loop in this call, within READBACK_MS by the injected clock
 // (AD-19: no timer outlives it); no attempt starts after the deadline. Returns a one-line summary or throws.
 export async function installHubApi({ ref, run = sh, fetchImpl = fetch, sleep = realSleep, now = Date.now, home = homedir(), port, log = () => {} } = {}) {
@@ -104,8 +104,8 @@ export async function installHubApi({ ref, run = sh, fetchImpl = fetch, sleep = 
     try {
       const response = await fetchImpl(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(Math.max(1, Math.min(2000, deadline - now()))), headers: { 'Cache-Control': 'no-cache' } });
       const body = response.ok ? await response.json() : null;
-      if (body?.ok === true && body.service === HUB_API_SERVICE && body.hub_version === ref) return `${ref} serves 127.0.0.1:${port} (${installed.out.split('\n').slice(-1)[0]})`;
-      last = body ? `hub_version ${body.hub_version ?? 'missing'}, service ${body.service ?? 'missing'}` : `HTTP ${response.status}`;
+      if (body?.ok === true && body.service === HUB_API_SERVICE && body.hub_version === ref && body.contract === HUB_API_CONTRACT) return `${ref} serves 127.0.0.1:${port}, contract ${body.contract} (${installed.out.split('\n').slice(-1)[0]})`;
+      last = body ? `hub_version ${body.hub_version ?? 'missing'}, service ${body.service ?? 'missing'}, contract ${body.contract ?? 'missing'}` : `HTTP ${response.status}`;
     } catch (error) {
       last = String(error?.cause?.code ?? error?.message ?? error).split('\n')[0];
     }

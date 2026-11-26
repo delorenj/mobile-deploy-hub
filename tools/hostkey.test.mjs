@@ -9,7 +9,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import * as claims from './device/claims.mjs';
 import { hostKeyScript, hostsInstall } from './hosts.mjs';
-import { HUB_API_SERVICE } from './hub-client.mjs';
+import { HUB_API_CONTRACT, HUB_API_SERVICE } from './hub-client.mjs';
 import { hermetic } from './ci/test-fixtures.mjs';
 
 hermetic();
@@ -180,7 +180,7 @@ test('hostKeyScript refuses a key for the wrong platform, writing nothing, and a
 // No network, except the Hub API's own /health (Story 6.11): the fake run answers every other step `ok`, so that step needs an answer
 // for the ref the fake git gives (`main-ok`) to pass, and these tests are about the build directory and the host keys.
 const offline = async url => {
-  if (String(url).endsWith('/health')) return new Response(JSON.stringify({ ok: true, service: HUB_API_SERVICE, hub_version: 'main-ok' }), { status: 200 });
+  if (String(url).endsWith('/health')) return new Response(JSON.stringify({ ok: true, service: HUB_API_SERVICE, contract: HUB_API_CONTRACT, hub_version: 'main-ok' }), { status: 200 });
   throw new Error('offline');
 };
 

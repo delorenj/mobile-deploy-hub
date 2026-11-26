@@ -14,9 +14,15 @@
 //               traces required equal (`holdParity`): take A, B waits first in line, extend A refused while B waits, force-release A and
 //               B is granted, extend B by exactly 1 min, release B and the target is free. Holder `hosts:smoke`; it needs the target
 //               free with nobody waiting (nothing is taken otherwise). Default target: the test phone, so it touches no real device;
+//   5c. stream  (Story 8.7, default on; `--no-stream` skips it, `--restart` adds the restart half) the live status of the installed service on
+//               the test phone (`streamCheck`): `GET /stream` opens (`retry: 3000`, then `ready`), a `hub-device` Lease `<phone>-s` shows in a
+//               `status` frame within 2 s, then, with `--restart`, the unit is restarted: the old stream ends, `/health` answers as the
+//               release again, the Lease is still held and a reconnect with the old `Last-Event-ID` opens `reset` (a new boot); then the
+//               release shows in a `status` frame within 2 s and a `: keepalive` arrives while idle. `--restart` bounces the service, so a
+//               waiting caller is answered `HUB_API_RESTARTING` and requeues (Story 8.6): ask for it at release time, not on every smoke;
 //   6. retire   the phone is retired through the API;
 //   7. gone     a new lease is refused `HUB_RESOURCE_RETIRED`, and the `phone` members and `status` no longer list it.
-// Any failure after the register releases the lease it took (and every id the holds phase started) and retires the phone, and each is logged. The run prints
+// Any failure after the register releases the lease it took (and every id the holds and stream phases started) and retires the phone, and each is logged. The run prints
 // `HUB_SMOKE <step>: ...` lines and ends `HUB_SMOKE_OK <ref> <id> leasable after <n> ms` (exit 0) or `HUB_SMOKE_FAILED <step>: ...`
 // (exit 1). It is never part of hosts:install: names and ids are never reused (AD-28), so every run leaves one retired record in
 // registry.json, which is the price of asking for the check and not of every install.
@@ -26,8 +32,9 @@ import { fileURLToPath } from 'node:url';
 import { sleep as realSleep } from '../ci/lib/pause.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { phoneWordMembers } from '../device/claims.mjs';
-import { HUB_API_SERVICE, hubUrl } from '../hub-client.mjs';
-import { releaseName } from '../hosts.mjs';
+import { HUB_API_CONTRACT, HUB_API_SERVICE, hubUrl } from '../hub-client.mjs';
+import { HUB_API_UNIT, releaseName } from '../hosts.mjs';
+import { ID_PATTERN, RETRY_MS } from '../hub-api/stream.mjs';
 
 export const LEASABLE_WITHIN_MS = 60_000;
 export const TRY_EVERY_MS = 2000;
@@ -40,6 +47,13 @@ export const HOLD_WAIT_MS = 30_000;
 export const WAITER_SHOWS_WITHIN_MS = 10_000;
 export const WAITER_POLL_MS = 500;
 const API_CALL_MARGIN_MS = 30_000;
+export const STATUS_WITHIN_MS = 2000;
+export const RESTART_WITHIN_MS = 30_000;
+export const KEEPALIVE_MARGIN_MS = 5000;
+export const STREAM_FOR_MS = 120_000;
+const HEALTH_RETRY_MS = 500;
+const MAX_WINDOWS = 3;
+const MAX_ITEMS = 500;
 
 const failure = (step, detail) => Object.assign(new Error(`HUB_SMOKE_FAILED ${step}: ${detail}`), { code: 'HUB_SMOKE_FAILED', step, smoke: true });
 const brief = result => `exit ${result.code}: ${`${result.stderr ?? ''}${result.stdout ?? ''}`.trim().split('\n')[0] || 'no output'}`.slice(0, 300);
@@ -242,9 +256,270 @@ export async function holdParity({ target, tag, ref, cli, api, now = Date.now, s
   }
 }
 
+// ---------------------------------------------------------------------------------------------------- Story 8.7: the stream phase
+
+const TIMEOUT = Symbol('timeout');
+const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+// The default restart seam: `systemctl --user restart <unit>`, resolving `{code, stderr}` and never rejecting.
+export function restartHubApiUnit({ unit = HUB_API_UNIT, timeout = 120_000 } = {}) {
+  return new Promise(done => {
+    execFile('systemctl', ['--user', 'restart', unit], { timeout, encoding: 'utf8' }, (error, _stdout, stderr) => {
+      done({ code: error ? (typeof error.code === 'number' ? error.code : 127) : 0, stderr: `${stderr ?? ''}${error && typeof error.code !== 'number' ? error.message : ''}` });
+    });
+  });
+}
+
+// A reader over an SSE response body (`response.body`): blocks end at a blank line; `retry:`, a `:` comment, and `id:`/`event:`/`data:` fields
+// become `{kind: 'retry', ms}`, `{kind: 'comment', text}` and `{kind: 'frame', id, type, data}` (`data` is the parsed JSON, undefined when it
+// is not). `next(ms)` resolves the next item, `{kind: 'end'}` when the stream is over (or its read failed: `error`), or `{kind: 'timeout'}`.
+// One read is kept pending across calls (`race` bounds the wait), so a chunk that arrives after a timeout is not lost.
+export function sseReader(body, { race, now }) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const items = [];
+  let buffer = '';
+  let ended = null;
+  let reading = null;
+  const parse = block => {
+    const fields = {};
+    const comments = [];
+    for (const line of block.split('\n')) {
+      if (line === '') continue;
+      if (line.startsWith(':')) { comments.push(line.slice(1).trim()); continue; }
+      const cut = line.indexOf(':');
+      const name = cut === -1 ? line : line.slice(0, cut);
+      const value = cut === -1 ? '' : line.slice(cut + 1).replace(/^ /, '');
+      fields[name] = name === 'data' && fields.data !== undefined ? `${fields.data}\n${value}` : value;
+    }
+    if (fields.event !== undefined || fields.data !== undefined || fields.id !== undefined) return { kind: 'frame', id: fields.id ?? null, type: fields.event ?? 'message', data: parseJson(fields.data ?? '') };
+    if (fields.retry !== undefined) return { kind: 'retry', ms: Number(fields.retry) };
+    return comments.length > 0 ? { kind: 'comment', text: comments.join(' ') } : null;
+  };
+  const feed = text => {
+    buffer += text.replace(/\r\n/g, '\n');
+    for (let cut = buffer.indexOf('\n\n'); cut !== -1; cut = buffer.indexOf('\n\n')) {
+      const item = parse(buffer.slice(0, cut));
+      buffer = buffer.slice(cut + 2);
+      if (item !== null) items.push(item);
+    }
+  };
+  return {
+    async next(ms) {
+      const deadline = now() + ms;
+      for (let spin = 0; spin < 10_000; spin += 1) {
+        if (items.length > 0) return items.shift();
+        if (ended !== null) return ended;
+        const left = deadline - now();
+        if (left <= 0) return { kind: 'timeout' };
+        reading ??= reader.read().then(result => result, error => ({ done: true, error }));
+        const got = await race(reading, left);
+        if (got === TIMEOUT) return { kind: 'timeout' };
+        reading = null;
+        if (got.done) { ended = { kind: 'end', ...(got.error ? { error: got.error.message ?? String(got.error) } : {}) }; continue; }
+        feed(decoder.decode(got.value, { stream: true }));
+      }
+      return { kind: 'timeout' };
+    },
+    cancel() { reader.cancel().catch(() => {}); },
+  };
+}
+
+const describeItem = item => {
+  if (item.kind === 'retry') return `retry: ${item.ms}`;
+  if (item.kind === 'comment') return `the comment "${item.text}"`;
+  if (item.kind === 'frame') return `a ${item.type} frame ${item.id ?? '(no id)'}`;
+  if (item.kind === 'end') return `the end of the stream${item.error ? ` (${item.error})` : ''}`;
+  return 'nothing';
+};
+
+// The live status of the installed service (Story 8.7, FR-14, FR-21, FR-23): the Acceptance check of the stream as one sequence, on the
+// smoke's test phone (`tag` is its name), against `GET /stream` and `hub-device`. Lease id `<tag>-s`, holder `hosts:smoke`.
+//   1. `GET /stream` opens (200, `text/event-stream`), sends `retry: 3000` and then a `ready` frame (id `<boot>-<n>`, document with
+//      `status.hosts`), within 5 s;
+//   2. `hub-device lease` (another process: the change reaches the service through the disk): a `status` frame that lists the phone with
+//      that lease arrives within 2 s of the CLI's answer;
+//   3. with `restart`: `restartUnit()` restarts the service, the old stream ends, `/health` answers as `ref` and the contract again, the
+//      Lease is still held (`hub-device status`), and a new `GET /stream` with `Last-Event-ID` = the last frame id seen opens `reset` of a
+//      different boot (all within 30 s each);
+//   4. `hub-device release`: a `status` frame that shows the phone without that lease arrives within 2 s;
+//   5. idle: a `: keepalive` arrives within keepalive + 5 s of the last item (a frame restarts the window, at most 3 windows).
+// Every wait is a bounded `for` loop and a race against `sleep` (AD-19: no timer outlives it). Any failure aborts the stream, releases the
+// Lease if it was taken (logged), then throws `HUB_SMOKE_FAILED stream: ...` (`restart: ...` from step 3; `detail` is the part after the
+// colon). Resolves `{statusMs, keepaliveMs, restart: null | {boots: [first, second]}}`.
+export async function streamCheck({
+  tag, ref, cli, fetchImpl = globalThis.fetch, policy = loadPolicy().policy, restart = false, restartUnit = restartHubApiUnit,
+  now = Date.now, sleep = realSleep, log = () => {},
+} = {}) {
+  if (typeof tag !== 'string' || tag === '') throw new TypeError('streamCheck: a tag (the test phone) is required');
+  if (typeof ref !== 'string' || ref === '') throw new TypeError('streamCheck: a release ref is required');
+  if (typeof cli !== 'function') throw new TypeError('streamCheck: a cli is required');
+  const leaseId = `${tag}-s`;
+  const why = `hosts:smoke ${ref} stream`;
+  const state = { phase: 'stream', leaseTaken: false, conn: null, lastId: null, lastAt: now() };
+  const fail = detail => Object.assign(failure(state.phase, detail), { detail });
+  const keepaliveS = policy?.api?.stream_keepalive_s;
+  if (!(Number.isFinite(keepaliveS) && keepaliveS > 0)) throw fail('policy.api.stream_keepalive_s is not a positive number');
+  const windowMs = keepaliveS * 1000 + KEEPALIVE_MARGIN_MS;
+
+  const race = async (work, ms) => {
+    const stop = new AbortController();
+    try { return await Promise.race([work, Promise.resolve(sleep(ms, stop.signal)).then(() => TIMEOUT)]); } finally { stop.abort(); }
+  };
+  const note = item => {
+    if (item.kind === 'timeout' || item.kind === 'end') return;
+    state.lastAt = now();
+    if (item.kind === 'frame' && ID_PATTERN.test(item.id ?? '')) state.lastId = item.id;
+  };
+  const read = async ms => { const item = await state.conn.reader.next(ms); note(item); return item; };
+  const close = conn => { if (conn) { try { conn.controller.abort(); } catch { /* already aborted */ } conn.reader?.cancel(); } };
+
+  // Opens `GET /stream` (with a `Last-Event-ID` for a reconnect) and reads its first two items, `retry: 3000` and the opening frame.
+  const open = async lastEventId => {
+    const controller = new AbortController();
+    const conn = { controller, reader: null };
+    state.conn = conn;
+    const label = lastEventId === undefined ? '/stream' : 'the reconnect';
+    const expected = lastEventId === undefined ? 'ready' : 'reset';
+    let response;
+    try {
+      response = await race(Promise.resolve(fetchImpl(`${hubUrl(policy)}/stream`, { method: 'GET', headers: { accept: 'text/event-stream', ...(lastEventId === undefined ? {} : { 'Last-Event-ID': lastEventId }) }, signal: controller.signal })), HEALTH_TIMEOUT_MS);
+    } catch (error) { throw fail(`${label} did not answer (${error.message})`); }
+    if (response === TIMEOUT) throw fail(`${label} did not answer within ${HEALTH_TIMEOUT_MS / 1000} s`);
+    if (response.status !== 200) throw fail(`${label} answered ${response.status}, not 200`);
+    const type = response.headers?.get?.('content-type') ?? '';
+    if (!type.toLowerCase().startsWith('text/event-stream')) throw fail(`${label} answered content-type ${type === '' ? '(none)' : type}, not text/event-stream`);
+    if (response.body === null || response.body === undefined) throw fail(`${label} answered without a body`);
+    conn.reader = sseReader(response.body, { race, now });
+
+    const deadline = now() + HEALTH_TIMEOUT_MS;
+    const first = await read(HEALTH_TIMEOUT_MS);
+    if (first.kind !== 'retry' || first.ms !== RETRY_MS) throw fail(`${label} did not open with retry: ${RETRY_MS} (it sent ${describeItem(first)})`);
+    const second = await read(Math.max(1, deadline - now()));
+    if (second.kind !== 'frame' || second.type !== expected) throw fail(`${label} opened with ${describeItem(second)}, not a ${expected} frame`);
+    if (!ID_PATTERN.test(second.id ?? '')) throw fail(`the ${expected} frame has the id ${second.id ?? '(none)'}, not <boot>-<n>`);
+    if (!isObject(second.data?.status?.hosts)) throw fail(`the ${expected} frame carries no status.hosts document`);
+    if (expected === 'reset' && second.data.reason !== 'unresumable') throw fail(`the reset frame says reason ${second.data.reason ?? '(none)'}, not unresumable`);
+    return { id: second.id, boot: second.id.slice(0, second.id.indexOf('-')) };
+  };
+
+  const rowsOf = document => Object.values(isObject(document?.hosts) ? document.hosts : {}).flatMap(view => (Array.isArray(view?.phones) ? view.phones : [])).filter(row => row.device === tag);
+  // Reads `status` frames (an `event` frame is skipped) until `shows(rows)`, within STATUS_WITHIN_MS of `from`.
+  const awaitStatus = async (what, shows, from) => {
+    const deadline = from + STATUS_WITHIN_MS;
+    for (let spin = 0; spin < MAX_ITEMS; spin += 1) {
+      const left = deadline - now();
+      if (left <= 0) break;
+      const item = await read(left);
+      if (item.kind === 'timeout') break;
+      if (item.kind === 'end') throw fail(`the stream ended while waiting for a status frame that shows ${what}`);
+      if (item.kind === 'frame' && item.type === 'status' && shows(rowsOf(item.data?.status))) return now() - from;
+    }
+    throw fail(`no status frame showed ${what} within ${STATUS_WITHIN_MS / 1000} s`);
+  };
+
+  const undo = async () => {
+    close(state.conn);
+    if (state.leaseTaken) {
+      const released = await Promise.resolve().then(() => cli(['release', leaseId])).catch(error => ({ code: 127, stderr: error.message }));
+      log(`HUB_SMOKE cleanup: ${released.code === 0 ? `released ${leaseId}` : `release of ${leaseId} failed (${brief(released)})`}`);
+      if (released.code === 0) state.leaseTaken = false;
+    }
+  };
+
+  try {
+    // 1. open
+    const opened = await open(undefined);
+
+    // 2. a Lease through the CLI shows in a status frame within 2 s
+    state.leaseTaken = true;
+    const leased = await cli(['lease', tag, '--no-connect', '--wait', '0', '--for', `${STREAM_FOR_MS / 60_000}m`, '--why', why, '--holder', HOLDER, '--id', leaseId, '--json']);
+    if (typeof (leased.code === 0 ? parseJson(leased.stdout) : undefined)?.lease_id !== 'string') throw fail(`the Lease ${leaseId} on ${tag} was refused (${brief(leased)})`);
+    const statusMs = await awaitStatus(leaseId, rows => rows.some(row => row.lease_id === leaseId), now());
+
+    // 3. restart: the Lease survives, the reconnect gets reset
+    let restarted = null;
+    if (restart) {
+      state.phase = 'restart';
+      const stopped = await Promise.resolve().then(() => restartUnit()).catch(error => ({ code: 127, stderr: error.message }));
+      if (stopped.code !== 0) throw fail(`restarting ${HUB_API_UNIT} failed (${brief(stopped)})`);
+      const old = state.conn;
+      let over = false;
+      const endBy = now() + RESTART_WITHIN_MS;
+      for (let spin = 0; spin < MAX_ITEMS && !over; spin += 1) {
+        const left = endBy - now();
+        if (left <= 0) break;
+        over = (await read(left)).kind === 'end';
+      }
+      if (!over) throw fail(`the old stream did not end within ${RESTART_WITHIN_MS / 1000} s of the restart`);
+      close(old);
+
+      const healthBy = now() + RESTART_WITHIN_MS;
+      let seen = 'no answer';
+      let healthy = false;
+      for (let attempt = 1; attempt <= Math.ceil(RESTART_WITHIN_MS / HEALTH_RETRY_MS) + 2 && !healthy; attempt += 1) {
+        try {
+          const response = await fetchImpl(`${hubUrl(policy)}/health`, { method: 'GET', headers: { accept: 'application/json' }, signal: AbortSignal.timeout(Math.max(1, Math.min(2000, healthBy - now()))) });
+          const text = typeof response.text === 'function' ? await response.text() : JSON.stringify(await response.json());
+          const body = response.status === 200 ? parseJson(text) : undefined;
+          healthy = body?.ok === true && body.service === HUB_API_SERVICE && body.hub_version === ref && body.contract === HUB_API_CONTRACT;
+          seen = isObject(body) ? `hub_version ${body.hub_version ?? 'missing'}, service ${body.service ?? 'missing'}, contract ${body.contract ?? 'missing'}` : `HTTP ${response.status}`;
+        } catch (error) { seen = String(error?.cause?.code ?? error?.message ?? error).split('\n')[0]; }
+        if (healthy) break;
+        const left = healthBy - now();
+        if (left <= 0) break;
+        await sleep(Math.min(HEALTH_RETRY_MS, left));
+        if (now() >= healthBy) break;
+      }
+      if (!healthy) throw fail(`/health did not answer as ${HUB_API_SERVICE} ${ref}, contract ${HUB_API_CONTRACT} within ${RESTART_WITHIN_MS / 1000} s of the restart (last: ${seen})`);
+
+      const status = await cli(['status', '--json']);
+      const body = status.code === 0 ? parseJson(status.stdout) : undefined;
+      if (!Array.isArray(body?.phones)) throw fail(`status --json gave no phones after the restart (${brief(status)})`);
+      const row = body.phones.find(entry => entry.device === tag);
+      if (row?.held !== 'lease' || row.lease_id !== leaseId) throw fail(`${leaseId} did not survive the restart: status shows ${tag} ${row === undefined ? 'missing' : `held ${row.held ?? 'free'}${row.lease_id ? ` by ${row.lease_id}` : ''}`}`);
+
+      const again = await open(state.lastId);
+      if (again.boot === opened.boot) throw fail(`the reconnect got reset, but its boot is still ${opened.boot}: the service did not restart`);
+      restarted = { boots: [opened.boot, again.boot] };
+      state.phase = 'stream';
+    }
+
+    // 4. release: a status frame shows the phone without the Lease
+    const released = await cli(['release', leaseId]);
+    if (released.code !== 0) throw fail(`release of ${leaseId} failed (${brief(released)})`);
+    state.leaseTaken = false;
+    await awaitStatus(`${tag} without ${leaseId}`, rows => rows.length > 0 && rows.every(row => row.lease_id === null || row.lease_id === undefined), now());
+
+    // 5. idle: a keepalive within keepalive + 5 s of the last item; a frame restarts the window, at most 3 windows
+    let keepaliveMs = null;
+    for (let windowNo = 1; windowNo <= MAX_WINDOWS && keepaliveMs === null; windowNo += 1) {
+      const from = state.lastAt;
+      for (let spin = 0; spin < MAX_ITEMS; spin += 1) {
+        const left = from + windowMs - now();
+        if (left <= 0) throw fail(`no keepalive arrived within ${windowMs / 1000} s of the last item`);
+        const item = await read(left);
+        if (item.kind === 'timeout') throw fail(`no keepalive arrived within ${windowMs / 1000} s of the last item`);
+        if (item.kind === 'end') throw fail('the stream ended while waiting for a keepalive');
+        if (item.kind === 'comment' && /^keepalive$/.test(item.text)) { keepaliveMs = now() - from; break; }
+        if (item.kind === 'frame') break;
+      }
+    }
+    if (keepaliveMs === null) throw fail(`the stream was never idle: a frame arrived in each of ${MAX_WINDOWS} windows of ${windowMs / 1000} s`);
+
+    close(state.conn);
+    return { statusMs, keepaliveMs, restart: restarted };
+  } catch (error) {
+    await undo();
+    throw error.smoke ? error : fail(`unexpected: ${error.message}`);
+  }
+}
+
 // The whole check. Seams: `cli(args)` -> `{code, stdout, stderr}` (hub-device), `fetchImpl`, `now`, `sleep`, `log`, `policy`, `members()`
 // (the `phone` word's device names), `name` (the test phone's name), `holds` (`false`, the default, skips the holds phase; `true` runs it on
-// the test phone; a device word runs it on that word). Resolves the line `HUB_SMOKE_OK ...`; rejects with
+// the test phone; a device word runs it on that word), `stream` (`false`, the default, skips the stream phase: see `streamCheck`) and `restart`
+// (`false`, the default; `true` needs `stream` and restarts the service through the `restartUnit` seam, which `systemctl --user restart`s the
+// unit by default). Resolves the line `HUB_SMOKE_OK ...`; rejects with
 // `HUB_SMOKE_FAILED <step>: <detail>` (`code` HUB_SMOKE_FAILED, `step`, `smoke: true`) after cleaning up what it registered.
 export async function hubSmoke({
   ref,
@@ -257,10 +532,16 @@ export async function hubSmoke({
   members: readMembers = () => phoneWordMembers(),
   name = null,
   holds = false,
+  stream = false,
+  restart = false,
+  restartUnit = restartHubApiUnit,
 } = {}) {
   if (typeof ref !== 'string' || ref === '') throw new TypeError('hubSmoke: a release ref is required');
   if (typeof cli !== 'function') throw new TypeError('hubSmoke: a cli (hub-device runner) is required');
   if (typeof holds !== 'boolean' && (typeof holds !== 'string' || holds === '')) throw new TypeError('hubSmoke: holds is a boolean or a device word');
+  if (typeof stream !== 'boolean') throw new TypeError('hubSmoke: stream is a boolean');
+  if (typeof restart !== 'boolean') throw new TypeError('hubSmoke: restart is a boolean');
+  if (restart && !stream) throw new TypeError('hubSmoke: restart needs stream');
   const why = `hosts:smoke ${ref}`;
   const step = (label, text) => log(`HUB_SMOKE ${label}: ${text}`);
   const fail = (label, detail) => { const error = failure(label, detail); log(error.message); return error; };
@@ -278,6 +559,7 @@ export async function hubSmoke({
   if (health.service !== HUB_API_SERVICE) throw fail('health', `/health is ${health.service ?? 'not the Hub API'}, not ${HUB_API_SERVICE}`);
   if (health.hub_version !== ref) throw fail('health', `the Hub API runs ${health.hub_version ?? 'an unknown version'}, not ${ref}`);
   if (health.ok !== true) throw fail('health', '/health does not say ok');
+  if (health.contract !== HUB_API_CONTRACT) throw fail('health', `the Hub API speaks contract ${health.contract ?? 'unknown'}, not ${HUB_API_CONTRACT}`);
   if (health.registry !== 'ok') throw fail('health', `the Registry is ${health.registry ?? 'not reported'}`);
   step('health', `${HUB_API_SERVICE} ${health.hub_version}, contract ${health.contract ?? '?'}, registry ${health.registry}`);
 
@@ -356,6 +638,17 @@ export async function hubSmoke({
       step('holds', `api and cli match on ${held.target} (${held.traces.api.length} steps: ${held.traces.api.map(entry => entry.step).join(', ')})`);
     }
 
+    // 5c. stream: the live status on the test phone (and the restart half, when asked). It cleans up its own Lease; a failure then retires
+    // the phone like any other.
+    if (stream) {
+      let streamed;
+      try {
+        streamed = await streamCheck({ tag: phone, ref, cli, fetchImpl, policy, restart, restartUnit, now, sleep, log });
+      } catch (error) { throw await stop(error.step ?? 'stream', error.detail ?? error.message); }
+      step('stream', `status frame ${streamed.statusMs} ms after the lease, keepalive after ${streamed.keepaliveMs} ms idle`);
+      if (streamed.restart !== null) step('restart', `${phone}-s held across the restart; the reconnect got reset (boot ${streamed.restart.boots[0]} -> ${streamed.restart.boots[1]})`);
+    }
+
     // 6. retire
     const retired = await cli(['registry', 'retire', state.id, '--holder', HOLDER, '--why', why]);
     if (retired.code !== 0 || !/^HUB_DEVICE_RETIRED /m.test(retired.stdout ?? '')) throw await stop('retire', `registry retire was refused (${brief(retired)})`);
@@ -391,24 +684,29 @@ function option(argv, flag) {
   return value;
 }
 
-// The entry's arguments: `{hubDevice, ref, holds}` (`ref` undefined when not given; `holds` true by default, a word for `--holds-on`, false
-// for `--no-holds`). Throws a usage Error for an unknown word, a flag without its value, or both holds flags.
+// The entry's arguments: `{hubDevice, ref, holds, stream, restart}` (`ref` undefined when not given; `holds` true by default, a word for
+// `--holds-on`, false for `--no-holds`; `stream` true by default, false for `--no-stream`; `restart` false unless `--restart`). Throws a usage
+// Error for an unknown word, a flag without its value, both holds flags, or `--restart` with `--no-stream`.
 export function parseSmokeArgs(argv) {
   const valued = new Set(['--hub-device', '--ref', '--holds-on']);
-  const stray = argv.filter((word, index) => !valued.has(word) && word !== '--no-holds' && !valued.has(argv[index - 1]));
-  if (stray.length > 0) throw new Error(`usage: mise run hosts:smoke [-- --hub-device <cmd>] [--ref <ref>] [--holds-on <word> | --no-holds] (unknown: ${stray[0]})`);
+  const bare = new Set(['--no-holds', '--no-stream', '--restart']);
+  const stray = argv.filter((word, index) => !valued.has(word) && !bare.has(word) && !valued.has(argv[index - 1]));
+  if (stray.length > 0) throw new Error(`usage: mise run hosts:smoke [-- --hub-device <cmd>] [--ref <ref>] [--holds-on <word> | --no-holds] [--no-stream | --restart] (unknown: ${stray[0]})`);
   const on = option(argv, '--holds-on');
   const off = argv.includes('--no-holds');
   if (on !== undefined && off) throw new Error('--holds-on and --no-holds exclude each other');
-  return { hubDevice: option(argv, '--hub-device') ?? 'hub-device', ref: option(argv, '--ref'), holds: off ? false : on ?? true };
+  const stream = !argv.includes('--no-stream');
+  const restart = argv.includes('--restart');
+  if (restart && !stream) throw new Error('--restart and --no-stream exclude each other: the restart is part of the stream phase');
+  return { hubDevice: option(argv, '--hub-device') ?? 'hub-device', ref: option(argv, '--ref'), holds: off ? false : on ?? true, stream, restart };
 }
 
-// The entry's body: parse the arguments, run the smoke with `holds` forwarded, and resolve the exit code (0, or 1 after a
+// The entry's body: parse the arguments, run the smoke with `holds`, `stream` and `restart` forwarded, and resolve the exit code (0, or 1 after a
 // `HUB_SMOKE_FAILED` line on stderr for a usage failure or a failure that is not the smoke's own, which logged itself).
 export async function runEntry(argv, { smoke = hubSmoke, makeCli = hubDeviceCli, defaultRef = releaseName } = {}) {
   try {
-    const { hubDevice, ref, holds } = parseSmokeArgs(argv);
-    await smoke({ ref: ref ?? defaultRef(), cli: makeCli(hubDevice), holds });
+    const { hubDevice, ref, holds, stream, restart } = parseSmokeArgs(argv);
+    await smoke({ ref: ref ?? defaultRef(), cli: makeCli(hubDevice), holds, stream, restart });
     return 0;
   } catch (error) {
     if (!error.smoke) console.error(`HUB_SMOKE_FAILED ${error.message}`);

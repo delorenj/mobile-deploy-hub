@@ -972,6 +972,23 @@ test('the v1.2.53 release notes (Epic 6) say what a reader of the tag must know:
   assert.ok(readFileSync(notesPath, 'utf8').indexOf('## v1.2.53') < readFileSync(notesPath, 'utf8').indexOf('## v1.2.52'), 'newest first');
 });
 
+test('the v1.2.57 release notes (Epic 8) say what a reader of the tag must know: the status and the stream, the 2 s, keepalive, restart safety, the contract readback, the rollback, the smoke', () => {
+  const text = readFileSync(notesPath, 'utf8');
+  const notes = releaseNotes(text, 'v1.2.57');
+  assert.ok(notes, 'docs/hub-releases.md has a v1.2.57 section');
+  for (const word of [
+    /`GET \/status`/, /`GET \/stream`/, /within 2 s/, /`retry: 3000`/, /`ready`/, /`reset`/, /`: keepalive`/, /`api\.stream_keepalive_s` \(15 s\)/,
+    /HUB_API_RESTARTING/, /`retry: requeue`/, /emulators the service started keep running/, /worker thread/, /track-devices-l/,
+    /`contract` stays 1/, /hosts:install` now reads `contract` back/, /HUB_API_CONTRACT/, /No service unit is added/,
+    /Rolling back is `hosts:install` of `v1\.2\.56`/, /hosts:smoke -- --restart/, /--no-stream/, /Test changes you will see/,
+    /eta\.test\.mjs/, /clock\.test\.mjs/, /claims\.test\.mjs/, /hub-device\.test\.mjs/, /status-view\.test\.mjs/, /contract\.test\.mjs/, /hub-client\.test\.mjs/,
+    /hosts\.test\.mjs/, /hostkey\.test\.mjs/, /smoke\.test\.mjs/, /snapshot/, /event-loop/, /changes/, /restart\.test\.mjs|restart\}\.test\.mjs/, /HUB_SMOKE_OK/, /Roll back:/,
+  ]) assert.match(notes, word);
+  assert.doesNotMatch(notes, /`contract` (is|becomes|moves to) 2/);
+  assert.ok(notes.split('\n').every(line => !line.startsWith('## ')), 'no line of the section may look like a heading of the next release');
+  assert.ok(text.indexOf('## v1.2.57') !== -1 && text.indexOf('## v1.2.57') < text.indexOf('## v1.2.56'), 'newest first');
+});
+
 test('the v1.2.56 release notes (Epic 7) say what a reader of the tag must know: Job Holds, the caps, the rollback, the routes and verbs, the smoke', () => {
   const text = readFileSync(notesPath, 'utf8');
   const notes = releaseNotes(text, 'v1.2.56');

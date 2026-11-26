@@ -115,7 +115,7 @@ development_status:
   8-4-one-stream-on-the-candybar-wire: done
   8-5-a-change-reaches-subscribers-within-two-seconds: done
   8-6-a-restart-loses-nothing: done
-  8-7-ship-the-live-status: backlog
+  8-7-ship-the-live-status: awaiting-operator
   epic-8-retrospective: optional
 
   epic-9: backlog

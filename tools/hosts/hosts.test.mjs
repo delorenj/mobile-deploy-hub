@@ -13,7 +13,7 @@ import { inHeavy, onPath, which } from '../ci/lib/heavy.mjs';
 import { bootCommand } from '../device/emulator.mjs';
 import { onPath as serverOnPath } from '../hub-api/server.mjs';
 import { HUB_API_UNIT, hostsInstall, installHubApi } from '../hosts.mjs';
-import { HUB_API_SERVICE } from '../hub-client.mjs';
+import { HUB_API_CONTRACT, HUB_API_SERVICE } from '../hub-client.mjs';
 
 hermetic();
 
@@ -187,7 +187,7 @@ test('units install renders every *.service in its directory (the Host Agent\'s 
 // ---- hosts:install ----
 
 const jsonResponse = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
-const health = (ref, extra = {}) => ({ ok: true, service: HUB_API_SERVICE, contract: '1', hub_version: ref, ...extra });
+const health = (ref, extra = {}) => ({ ok: true, service: HUB_API_SERVICE, contract: 1, hub_version: ref, ...extra });
 
 function clock() {
   const c = { t: 1_000_000, sleeps: [] };
@@ -241,6 +241,20 @@ test('installHubApi: a /health that is ok but another service, or not ok, is not
   const bodies = [jsonResponse(health('t1', { service: 'host-agent' })), jsonResponse(health('t1', { ok: false })), jsonResponse({}, 500), jsonResponse(health('t1'))];
   await installHubApi({ ref: 't1', run: () => ({ ok: true, out: '' }), fetchImpl: async () => bodies.shift(), sleep: c.sleep, now: c.now, home: HOME, port: 1 });
   assert.equal(bodies.length, 0);
+});
+
+test('installHubApi: /health must report the contract too: another number, none or text is not an answer, and the line prints both', async () => {
+  const c = clock();
+  const bodies = [jsonResponse(health('t1', { contract: 2 })), jsonResponse(health('t1', { contract: undefined })), jsonResponse(health('t1', { contract: '1' })), jsonResponse(health('t1'))];
+  const logs = [];
+  const summary = await installHubApi({ ref: 't1', run: () => ({ ok: true, out: 'units ok' }), fetchImpl: async () => bodies.shift(), sleep: c.sleep, now: c.now, home: HOME, port: 8794, log: line => logs.push(line) });
+  assert.equal(bodies.length, 0);
+  assert.equal(summary, `t1 serves 127.0.0.1:8794, contract ${HUB_API_CONTRACT} (units ok)`);
+  assert.match(logs[0], /contract 2/);
+  assert.match(logs[1], /contract missing/);
+  assert.match(logs[2], /contract 1/);
+  const never = clock();
+  await assert.rejects(installHubApi({ ref: 't1', run: () => ({ ok: true, out: '' }), fetchImpl: async () => jsonResponse(health('t1', { contract: 2 })), sleep: never.sleep, now: never.now, home: HOME, port: 8794 }), /did not report mobile-deploy-hub-api t1 within 10s \(last: hub_version t1, service mobile-deploy-hub-api, contract 2\)/);
 });
 
 test('installHubApi: no answer for 10 s fails, and no attempt starts after the deadline', async () => {
