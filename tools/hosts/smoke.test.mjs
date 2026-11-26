@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hermetic } from '../ci/test-fixtures.mjs';
-import { HOLD_EXTEND_MS, LEASABLE_WITHIN_MS, RESTART_WITHIN_MS, STATUS_WITHIN_MS, TRY_EVERY_MS, WAITER_SHOWS_WITHIN_MS, apiCaller, holdParity, hubDeviceCli, hubSmoke, parseSmokeArgs, runEntry, sseReader, streamCheck } from './smoke.mjs';
+import { HOLD_EXTEND_MS, LANE_SHOWS_WITHIN_MS, LEASABLE_WITHIN_MS, RESTART_WITHIN_MS, STATUS_WITHIN_MS, TRY_EVERY_MS, WAITER_SHOWS_WITHIN_MS, apiCaller, holdParity, hubDeviceCli, hubSmoke, laneCheck, parseSmokeArgs, runEntry, sseReader, streamCheck } from './smoke.mjs';
 import { ID_PATTERN, createStream } from '../hub-api/stream.mjs';
 import { phoneWordMembers } from '../device/claims.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
@@ -547,10 +547,10 @@ test('apiCaller: posts JSON to the policy port, answers {status, body}, never re
 });
 
 test('the CLI arguments: --holds-on takes a word, --no-holds turns the phase off, the default is on, a bad combination is a usage failure', () => {
-  assert.deepEqual(parseSmokeArgs([]), { hubDevice: 'hub-device', ref: undefined, holds: true, stream: true, restart: false });
+  assert.deepEqual(parseSmokeArgs([]), { hubDevice: 'hub-device', ref: undefined, holds: true, stream: true, restart: false, lanes: false });
   assert.equal(parseSmokeArgs(['--holds-on', 's24']).holds, 's24');
   assert.equal(parseSmokeArgs(['--no-holds']).holds, false);
-  assert.deepEqual(parseSmokeArgs(['--hub-device', 'node x.mjs', '--ref', 'v1.2.56', '--no-holds']), { hubDevice: 'node x.mjs', ref: 'v1.2.56', holds: false, stream: true, restart: false });
+  assert.deepEqual(parseSmokeArgs(['--hub-device', 'node x.mjs', '--ref', 'v1.2.56', '--no-holds']), { hubDevice: 'node x.mjs', ref: 'v1.2.56', holds: false, stream: true, restart: false, lanes: false });
   assert.throws(() => parseSmokeArgs(['--holds-on']), /--holds-on takes a value/);
   assert.throws(() => parseSmokeArgs(['--holds-on', '--no-holds']), /--holds-on takes a value/);
   assert.throws(() => parseSmokeArgs(['--holds-on', 's24', '--no-holds']), /exclude each other/);
@@ -582,9 +582,9 @@ test('runEntry forwards holds (true by default, a word, false), the ref and the 
   assert.equal(await runEntry(['--holds-on', 's24', '--ref', 'v1.2.56', '--hub-device', 'node x.mjs'], seams()), 0);
   assert.equal(await runEntry(['--no-holds'], seams()), 0);
   assert.deepEqual(calls, [
-    { ref: 'v-default', cli: 'cli:hub-device', holds: true, stream: true, restart: false },
-    { ref: 'v1.2.56', cli: 'cli:node x.mjs', holds: 's24', stream: true, restart: false },
-    { ref: 'v-default', cli: 'cli:hub-device', holds: false, stream: true, restart: false },
+    { ref: 'v-default', cli: 'cli:hub-device', holds: true, stream: true, restart: false, lanes: false },
+    { ref: 'v1.2.56', cli: 'cli:node x.mjs', holds: 's24', stream: true, restart: false, lanes: false },
+    { ref: 'v-default', cli: 'cli:hub-device', holds: false, stream: true, restart: false, lanes: false },
   ]);
   assert.deepEqual(makes, ['hub-device', 'node x.mjs', 'hub-device']);
   const before = calls.length;
@@ -910,9 +910,9 @@ test('stream, arguments: restart needs stream, both are booleans; the default se
 });
 
 test('the CLI arguments: the stream phase is on by default, --no-stream skips it, --restart turns the restart on, both together are a usage failure', () => {
-  assert.deepEqual(parseSmokeArgs(['--no-stream']), { hubDevice: 'hub-device', ref: undefined, holds: true, stream: false, restart: false });
-  assert.deepEqual(parseSmokeArgs(['--restart']), { hubDevice: 'hub-device', ref: undefined, holds: true, stream: true, restart: true });
-  assert.deepEqual(parseSmokeArgs(['--no-holds', '--restart', '--ref', 'v1.2.57']), { hubDevice: 'hub-device', ref: 'v1.2.57', holds: false, stream: true, restart: true });
+  assert.deepEqual(parseSmokeArgs(['--no-stream']), { hubDevice: 'hub-device', ref: undefined, holds: true, stream: false, restart: false, lanes: false });
+  assert.deepEqual(parseSmokeArgs(['--restart']), { hubDevice: 'hub-device', ref: undefined, holds: true, stream: true, restart: true, lanes: false });
+  assert.deepEqual(parseSmokeArgs(['--no-holds', '--restart', '--ref', 'v1.2.57']), { hubDevice: 'hub-device', ref: 'v1.2.57', holds: false, stream: true, restart: true, lanes: false });
   assert.throws(() => parseSmokeArgs(['--restart', '--no-stream']), /--restart and --no-stream exclude each other/);
   assert.throws(() => parseSmokeArgs(['--no-stream', '--restart']), /exclude each other/);
   assert.throws(() => parseSmokeArgs(['--stream']), /unknown: --stream/);
@@ -963,4 +963,294 @@ test('sseReader reads what the real createStream writes: retry 3000, ready, a st
   assert.deepEqual([items[2].type, ID_PATTERN.test(items[2].id), items[2].data.status.hosts.linux.phones[0].device], ['status', true, NAME]);
   assert.equal(items[3].text, 'keepalive');
   assert.equal((await reader.next(1000)).kind, 'end');
+});
+
+// ---------------------------------------------------------------------------------------------------- Story 9.8: the lanes phase
+
+const LANE_ID = `${NAME}-l-ios-lane`;
+const MAC_LANES = host => (host === 'mac' ? [{ device: 'ios-lane', lock: 'mac-ios', words: ['ipad', 'mac'] }] : []);
+const jobRow = { lock: 'mac-ios', device: 'ios-lane', kind: 'job', stale: false, lease_id: null, holder: null, repo: 'o/r', run: '1', started_at: '2026-11-26T15:00:00.000Z' };
+
+// A fake pair: `hub-device status --json` on big-chungus (its own phones and `locks`, plus `remote_hosts.mac.view`, the Mac's own), a forwarded
+// `lease ios-lane` and `release <id> --resource ios-lane`. The Mac's clock runs `skewMs` ahead of the fake clock; the lane shows after
+// `showAfterMs` and frees `freeAfterMs` after the release, each seen at the next 500 ms read.
+function laneWorld(knobs = {}) {
+  const {
+    remote = null, busy = null, waiter = null, leaseAnswer = null, showAfterMs = 0, freeAfterMs = 0, neverShown = false, localWrite = false,
+    neverFreed = false, releaseAnswer = null, skewMs = 120, startedAt = undefined, otherId = null, lanes = [{ device: 'ios-lane', lock: 'mac-ios' }],
+    shownAs = null, takenAfter = null,
+  } = knobs;
+  // One state per lane; `srv` is the first lane's (and carries the status reads).
+  const by = Object.fromEntries(lanes.map(lane => [lane.device, { held: null, answeredAt: null, releasedAt: null, seen: null }]));
+  const srv = Object.assign(by[lanes[0].device], { reads: [], by });
+  const view = () => {
+    const locks = busy ? [busy] : [];
+    for (const lane of lanes) {
+      const st = by[lane.device];
+      const shownNow = st.held !== null && !neverShown && w.clock >= st.answeredAt + showAfterMs;
+      const lingering = st.held === null && st.releasedAt !== null && (neverFreed || w.clock < st.releasedAt + freeAfterMs);
+      if (shownNow || lingering) {
+        locks.push({ lock: lane.lock, device: lane.device, kind: 'lease', stale: false, lease_id: st.seen, holder: HOLDER_NAME, why: 'x', started_at: startedAt === undefined ? new Date(st.answeredAt + skewMs).toISOString() : startedAt, ...(shownNow ? shownAs ?? {} : {}) });
+      } else if (st.held === null && st.releasedAt !== null && takenAfter) locks.push({ ...takenAfter, lock: lane.lock });
+    }
+    return { phones: [], locks, waiters: waiter ? [waiter] : [], reservations: [] };
+  };
+  const w = world({
+    status: wd => {
+      if (srv.answeredAt !== null) srv.reads.push(wd.clock);
+      return out(0, JSON.stringify({
+        phones: [{ device: 's24' }, ...(wd.registered && !wd.retired ? [{ device: NAME }] : [])],
+        locks: localWrite ? Object.values(by).filter(st => st.held !== null).map(st => ({ lock: 'mac-ios', kind: 'lease', lease_id: st.held })) : [],
+        waiters: [],
+        remote_hosts: remote ?? { mac: { state: 'available', reason: null, view: view(), stale: null } },
+      }));
+    },
+  });
+  w.srv = srv;
+  const base = w.cli;
+  w.cli = async args => {
+    if (args[0] === 'lease' && args.includes('--id')) {
+      w.log.push(args);
+      const refused = leaseAnswer?.(args[1]);
+      if (refused) return refused;
+      const st = by[args[1]];
+      st.held = args[args.indexOf('--id') + 1];
+      st.seen = st.held;
+      st.answeredAt = w.clock;
+      return out(0, JSON.stringify({ lease_id: otherId ?? st.held, device: args[1], holder: 'hosts:smoke', why: 'x', expires_at: 'x', env: {} }));
+    }
+    if (args[0] === 'release' && args.includes('--resource')) {
+      w.log.push(args);
+      if (releaseAnswer) return releaseAnswer();
+      const st = by[args[args.indexOf('--resource') + 1]];
+      st.held = null;
+      st.releasedAt = w.clock;
+      return out(0, `HUB_DEVICE_RELEASED ${args[args.indexOf('--resource') + 1]} ${args[1]}\n`);
+    }
+    return base(args);
+  };
+  w.runLanes = (extra = {}) => w.run({ lanes: true, lanesOf: MAC_LANES, ...extra });
+  w.check = (extra = {}) => laneCheck({ tag: NAME, ref: 'v1.2.53', cli: w.cli, lanesOf: MAC_LANES, now: w.now, sleep: w.sleep, log: line => w.lines.push(line), ...extra });
+  return w;
+}
+const HOLDER_NAME = 'hosts:smoke';
+const laneCalls = w => w.log.filter(args => args.includes('--id') || args.includes('--resource'));
+const laneLines = w => w.lines.filter(line => /^HUB_SMOKE lanes:/.test(line));
+
+test('lanes, happy: the forwarded Lease shows in the Mac view with the Mac clock, nothing local, the release frees it; the line, then retire and the unchanged OK line', async () => {
+  const w = laneWorld({ showAfterMs: 800, freeAfterMs: 400 });
+  const line = await w.runLanes();
+  assert.equal(line, 'HUB_SMOKE_OK v1.2.53 res-smoke-x leasable after 0 ms');
+  assert.deepEqual(laneLines(w), [`HUB_SMOKE lanes: ios-lane on mac held as ${LANE_ID} (mac clock started_at ${new Date(w.srv.answeredAt + 120).toISOString()}, 120 ms from this host), shown in 1000 ms, free again in 500 ms`]);
+  assert.deepEqual(laneCalls(w), [
+    ['lease', 'ios-lane', '--no-connect', '--wait', '0', '--for', '2m', '--id', LANE_ID, '--why', 'hosts:smoke v1.2.53 lanes', '--holder', 'hosts:smoke', '--json'],
+    ['release', LANE_ID, '--resource', 'ios-lane'],
+  ]);
+  assert.deepEqual(verbs(w).filter(verb => verb !== 'status'), ['registry list', 'registry add', 'lease', 'release', 'lease', 'release', 'registry retire', 'lease']);
+  const at = text => w.lines.findIndex(entry => entry.startsWith(text));
+  assert.ok(at('HUB_SMOKE lanes:') > at('HUB_SMOKE release:') && at('HUB_SMOKE lanes:') < at('HUB_SMOKE retire:'), 'between release and retire');
+  assert.equal(w.lines.at(-1), line);
+  assert.ok(w.retired && w.srv.held === null);
+});
+
+test('lanes: false is the 8.7 world: the exact existing call list, no lane lease and no extra status', async () => {
+  const w = laneWorld();
+  await w.run({ lanesOf: MAC_LANES });
+  assert.deepEqual(verbs(w), ['registry list', 'registry add', 'lease', 'status', 'release', 'registry retire', 'lease', 'status']);
+  assert.deepEqual(laneCalls(w), []);
+  assert.deepEqual(laneLines(w), []);
+});
+
+test('lanes, no other host in status: fails, nothing is taken, the phone is retired', async () => {
+  const w = laneWorld({ remote: {} });
+  await assert.rejects(w.runLanes(), error => error.step === 'lanes' && /^HUB_SMOKE_FAILED lanes: no other host in status \(run it on big-chungus\)$/.test(error.message));
+  assert.deepEqual(laneCalls(w), []);
+  assert.ok(w.retired);
+  const bare = laneWorld();
+  bare.cli = async args => (args[0] === 'status' ? out(0, JSON.stringify({ phones: [] })) : out(0));
+  await assert.rejects(bare.check(), /HUB_SMOKE_FAILED lanes: no other host in status/);
+});
+
+test('lanes, a spoke with no lane: fails naming the hosts, nothing is taken', async () => {
+  const w = laneWorld();
+  await assert.rejects(w.runLanes({ lanesOf: () => [] }), error => /^HUB_SMOKE_FAILED lanes: no lane on mac$/.test(error.message));
+  assert.deepEqual(laneCalls(w), []);
+  assert.ok(w.retired);
+});
+
+test('lanes, the Mac is unavailable: fails naming the state and reason, nothing is taken, the phone is retired', async () => {
+  const w = laneWorld({ remote: { mac: { state: 'unavailable', reason: 'not-served', view: null, stale: null } } });
+  await assert.rejects(w.runLanes(), error => /^HUB_SMOKE_FAILED lanes: mac is unavailable \(not-served\): nothing was taken on ios-lane$/.test(error.message));
+  assert.deepEqual(laneCalls(w), []);
+  assert.ok(w.retired);
+});
+
+test('lanes, the lane is busy (a deploy lock) or has a waiter: fails naming it, nothing is taken, the phone is retired', async () => {
+  const busy = laneWorld({ busy: jobRow });
+  await assert.rejects(busy.runLanes(), error => /^HUB_SMOKE_FAILED lanes: ios-lane \(mac-ios\) on mac is held \(job by o\/r\): nothing was taken$/.test(error.message));
+  assert.deepEqual(laneCalls(busy), []);
+  assert.ok(busy.retired);
+  const queued = laneWorld({ waiter: { lock: 'mac-ios', device: 'ios-lane', holder: 'deploy-x', lease_id: 'l-9', position: 1 } });
+  await assert.rejects(queued.runLanes(), error => /^HUB_SMOKE_FAILED lanes: ios-lane \(mac-ios\) on mac has a waiter \(deploy-x\): nothing was taken$/.test(error.message));
+  assert.deepEqual(laneCalls(queued), []);
+  assert.ok(queued.retired);
+});
+
+test('lanes, the take is refused (the Mac is away): fails with what the CLI said, the id is released anyway and logged, the phone is retired', async () => {
+  const w = laneWorld({ leaseAnswer: () => out(75, '', 'HUB_DEVICE_AWAY mac host-unreachable: ssh timed out') });
+  await assert.rejects(w.runLanes(), error => /^HUB_SMOKE_FAILED lanes: the Lease smoke-x-l-ios-lane on ios-lane \(mac\) was refused \(exit 75: HUB_DEVICE_AWAY mac host-unreachable/.test(error.message));
+  assert.deepEqual(laneCalls(w).map(args => args[0]), ['lease', 'release']);
+  assert.deepEqual(laneCalls(w)[1], ['release', LANE_ID, '--resource', 'ios-lane']);
+  assert.ok(w.lines.includes(`HUB_SMOKE cleanup: released ${LANE_ID}`));
+  assert.ok(w.retired);
+});
+
+test('lanes, the CLI answers another lease id: refused, and released', async () => {
+  const w = laneWorld({ otherId: 'l-other' });
+  await assert.rejects(w.runLanes(), /HUB_SMOKE_FAILED lanes: the Lease smoke-x-l-ios-lane on ios-lane \(mac\) was refused/);
+  assert.ok(w.lines.includes(`HUB_SMOKE cleanup: released ${LANE_ID}`));
+});
+
+test('lanes, never shown in the Mac view: fails at 10 s by the fake clock, no read after the deadline, released and logged, the phone is retired', async () => {
+  const w = laneWorld({ neverShown: true });
+  await assert.rejects(w.runLanes(), error => /^HUB_SMOKE_FAILED lanes: ios-lane held as smoke-x-l-ios-lane was not shown in mac's view within 10 s/.test(error.message));
+  const from = w.srv.answeredAt;
+  assert.ok(w.srv.reads.length > 1 && w.srv.reads.length <= LANE_SHOWS_WITHIN_MS / 500 + 3, 'bounded');
+  assert.ok(w.srv.reads.every(at => at < from + LANE_SHOWS_WITHIN_MS), 'no read at or after the deadline');
+  assert.ok(w.clock >= from + LANE_SHOWS_WITHIN_MS);
+  assert.deepEqual(laneCalls(w).at(-1), ['release', LANE_ID, '--resource', 'ios-lane']);
+  assert.ok(w.lines.includes(`HUB_SMOKE cleanup: released ${LANE_ID}`));
+  assert.ok(w.retired);
+});
+
+test('lanes, shown later than 10 s after the answer is too late; a row without an ISO started_at is not the row', async () => {
+  const late = laneWorld({ showAfterMs: 10_000 });
+  await assert.rejects(late.runLanes(), /was not shown in mac's view within 10 s/);
+  const bad = laneWorld({ startedAt: 'yesterday' });
+  await assert.rejects(bad.runLanes(), /was not shown in mac's view within 10 s/);
+  const none = laneWorld({ startedAt: null });
+  await assert.rejects(none.runLanes(), /was not shown in mac's view within 10 s/);
+});
+
+test('lanes, big-chungus wrote the lane lock: fails, released', async () => {
+  const w = laneWorld({ localWrite: true });
+  await assert.rejects(w.runLanes(), error => /^HUB_SMOKE_FAILED lanes: big-chungus wrote the lane's lock/.test(error.message));
+  assert.ok(w.lines.includes(`HUB_SMOKE cleanup: released ${LANE_ID}`));
+  assert.ok(w.retired);
+});
+
+test('lanes, a release that does not answer HUB_DEVICE_RELEASED fails, and the cleanup releases again (logged, a failure too)', async () => {
+  const w = laneWorld({ releaseAnswer: () => out(0, 'HUB_DEVICE_NOT_HELD ios-lane x\n') });
+  await assert.rejects(w.runLanes(), /HUB_SMOKE_FAILED lanes: the release of smoke-x-l-ios-lane on ios-lane did not answer HUB_DEVICE_RELEASED/);
+  assert.equal(laneCalls(w).filter(args => args[0] === 'release').length, 2);
+  assert.ok(w.lines.includes(`HUB_SMOKE cleanup: released ${LANE_ID}`));
+  const stuck = laneWorld({ releaseAnswer: () => out(1, '', 'HUB_DEVICE_AWAY mac host-unreachable') });
+  await assert.rejects(stuck.runLanes(), /did not answer HUB_DEVICE_RELEASED \(exit 1: HUB_DEVICE_AWAY mac host-unreachable\)/);
+  assert.ok(stuck.lines.some(line => line.startsWith(`HUB_SMOKE cleanup: release of ${LANE_ID} failed (exit 1: HUB_DEVICE_AWAY`)));
+});
+
+test('lanes, never freed: the row stays for 10 s after the release: fails, no read after the deadline, the id is not released twice', async () => {
+  const w = laneWorld({ neverFreed: true });
+  await assert.rejects(w.runLanes(), error => /^HUB_SMOKE_FAILED lanes: ios-lane \(mac-ios\) on mac is still held in mac's view 10 s after the release of smoke-x-l-ios-lane$/.test(error.message));
+  assert.equal(laneCalls(w).filter(args => args[0] === 'release').length, 1);
+  assert.ok(w.srv.reads.at(-1) < w.srv.releasedAt + LANE_SHOWS_WITHIN_MS, 'no read at or after the deadline');
+  assert.ok(w.clock >= w.srv.releasedAt + LANE_SHOWS_WITHIN_MS);
+  assert.ok(w.retired);
+});
+
+test('lanes, a clock that never advances still ends (bounded reads), and a view that goes away never counts as shown or free', async () => {
+  const w = laneWorld({ neverShown: true });
+  await assert.rejects(w.runLanes({ sleep: async () => {} }), /was not shown in mac's view/);
+  assert.ok(w.srv.reads.length <= LANE_SHOWS_WITHIN_MS / 500 + 3);
+  const gone = laneWorld();
+  gone.cli = (inner => async args => {
+    const result = await inner(args);
+    if (args[0] !== 'status' || gone.srv.answeredAt === null) return result;
+    const body = JSON.parse(result.stdout);
+    body.remote_hosts.mac = { state: 'unavailable', reason: 'api-down', view: null, stale: null };
+    return out(0, JSON.stringify(body));
+  })(gone.cli);
+  await assert.rejects(gone.runLanes(), /was not shown in mac's view within 10 s/);
+});
+
+test('lanes, a status that gives no document is a failure of lanes', async () => {
+  const broken = laneWorld();
+  broken.cli = async () => out(1, '', 'HUB_API_DOWN nope');
+  await assert.rejects(broken.check(), /HUB_SMOKE_FAILED lanes: status --json gave no document \(exit 1: HUB_API_DOWN nope\)/);
+});
+
+test('lanes, the default lanesOf is the seed: the Mac owns the ios-lane (mac-ios)', async () => {
+  const w = laneWorld({ remote: { mac: { state: 'unavailable', reason: 'not-served', view: null, stale: null } } });
+  await assert.rejects(w.check({ lanesOf: undefined }), /HUB_SMOKE_FAILED lanes: mac is unavailable \(not-served\): nothing was taken on ios-lane$/);
+});
+
+test('lanes, arguments are checked: laneCheck wants a tag, a ref, a cli and a lanesOf function; hubSmoke wants a boolean', async () => {
+  await assert.rejects(laneCheck({ ref: 'v1', cli: async () => out(0) }), TypeError);
+  await assert.rejects(laneCheck({ tag: 'x', cli: async () => out(0) }), TypeError);
+  await assert.rejects(laneCheck({ tag: 'x', ref: 'v1' }), TypeError);
+  await assert.rejects(laneCheck({ tag: 'x', ref: 'v1', cli: async () => out(0), lanesOf: 'mac' }), TypeError);
+  await assert.rejects(hubSmoke({ ref: 'v1', cli: async () => out(0), lanes: 'yes' }), TypeError);
+  await assert.rejects(hubSmoke({ ref: 'v1', cli: async () => out(0), lanes: 1 }), TypeError);
+});
+
+test('the CLI arguments: --lanes turns the lanes phase on, the default is off, and it combines with the other flags', () => {
+  assert.equal(parseSmokeArgs([]).lanes, false);
+  assert.equal(parseSmokeArgs(['--lanes']).lanes, true);
+  assert.deepEqual(parseSmokeArgs(['--lanes', '--restart', '--no-holds', '--ref', 'v1.2.58']), { hubDevice: 'hub-device', ref: 'v1.2.58', holds: false, stream: true, restart: true, lanes: true });
+  assert.throws(() => parseSmokeArgs(['--lane']), /\[--lanes\] \(unknown: --lane\)/);
+});
+
+test('runEntry forwards lanes to hubSmoke (false by default)', async () => {
+  const calls = [];
+  const seams = { smoke: async options => { calls.push(options); }, makeCli: command => `cli:${command}`, defaultRef: () => 'v-default' };
+  assert.equal(await runEntry([], seams), 0);
+  assert.equal(await runEntry(['--lanes'], seams), 0);
+  assert.deepEqual(calls.map(({ lanes }) => lanes), [false, true]);
+});
+
+const TWO_LANES = [{ device: 'ios-lane', lock: 'mac-ios' }, { device: 'x-lane', lock: 'mac-x' }];
+const TWO_ON_MAC = host => (host === 'mac' ? TWO_LANES.map(lane => ({ ...lane, words: [] })) : []);
+const X_ID = `${NAME}-l-x-lane`;
+
+test('lanes, a freed lane that a deploy takes right after the release still passes: only a row with this run\'s id counts as held', async () => {
+  const w = laneWorld({ takenAfter: { ...jobRow, device: 'ios-lane' } });
+  assert.equal(await w.runLanes(), 'HUB_SMOKE_OK v1.2.53 res-smoke-x leasable after 0 ms');
+  assert.equal(laneLines(w).length, 1);
+  const other = laneWorld({ takenAfter: { lock: 'mac-ios', device: 'ios-lane', kind: 'lease', lease_id: 'l-someone-else', holder: 'deploy-x', started_at: '2026-11-26T15:00:00.000Z' } });
+  await other.runLanes();
+  assert.equal(laneLines(other).length, 1);
+});
+
+test('lanes, two lanes: both are taken and released in order, two lines, ids per lane', async () => {
+  const w = laneWorld({ lanes: TWO_LANES });
+  const { lanes } = await w.check({ lanesOf: TWO_ON_MAC });
+  assert.deepEqual(lanes.map(({ host, device, id }) => [host, device, id]), [['mac', 'ios-lane', LANE_ID], ['mac', 'x-lane', X_ID]]);
+  assert.deepEqual(laneCalls(w).map(args => [args[0], args[0] === 'lease' ? args[args.indexOf('--id') + 1] : args[1], args[1] === 'x-lane' || args.at(-1) === 'x-lane' ? 'x-lane' : 'ios-lane']), [
+    ['lease', LANE_ID, 'ios-lane'], ['release', LANE_ID, 'ios-lane'], ['lease', X_ID, 'x-lane'], ['release', X_ID, 'x-lane'],
+  ]);
+  assert.equal(laneLines(w).length, 2);
+  assert.match(laneLines(w)[0], new RegExp(`^HUB_SMOKE lanes: ios-lane on mac held as ${LANE_ID} `));
+  assert.match(laneLines(w)[1], new RegExp(`^HUB_SMOKE lanes: x-lane on mac held as ${X_ID} `));
+  assert.ok(Object.values(w.srv.by).every(st => st.held === null));
+});
+
+test('lanes, lane 2 fails after lane 1 passed: only lane 2\'s id is released by the cleanup, lane 1 is not touched again', async () => {
+  const w = laneWorld({ lanes: TWO_LANES, leaseAnswer: device => (device === 'x-lane' ? out(75, '', 'HUB_DEVICE_AWAY mac host-unreachable') : null) });
+  await assert.rejects(w.runLanes({ lanesOf: TWO_ON_MAC }), error => new RegExp(`^HUB_SMOKE_FAILED lanes: the Lease ${X_ID} on x-lane \\(mac\\) was refused`).test(error.message));
+  assert.equal(laneLines(w).length, 1, 'lane 1 passed');
+  const releases = laneCalls(w).filter(args => args[0] === 'release').map(args => args[1]);
+  assert.deepEqual(releases, [LANE_ID, X_ID], 'lane 1 once (its own release), then lane 2 by the cleanup');
+  assert.deepEqual(w.lines.filter(line => line.startsWith('HUB_SMOKE cleanup: ') && /ios-lane|x-lane/.test(line)), [`HUB_SMOKE cleanup: released ${X_ID}`]);
+  assert.ok(w.retired);
+});
+
+test('lanes, a foreign row on the lane is not the Lease: another lease id, or a row that is not a lease, with a valid started_at, is never shown', async () => {
+  const foreign = laneWorld({ shownAs: { lease_id: 'l-someone-else' } });
+  await assert.rejects(foreign.runLanes(), /was not shown in mac's view within 10 s/);
+  const job = laneWorld({ shownAs: { kind: 'job' } });
+  await assert.rejects(job.runLanes(), /was not shown in mac's view within 10 s/);
+  for (const w of [foreign, job]) {
+    assert.ok(w.lines.includes(`HUB_SMOKE cleanup: released ${LANE_ID}`));
+    assert.ok(w.retired);
+  }
 });
