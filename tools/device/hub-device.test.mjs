@@ -1285,7 +1285,8 @@ test('install.sh installs a hub-device wrapper into ~/.local/bin without touchin
 });
 
 // Story 6.8: a stopped Hub API only disables Registry writes. A lease, a status and a release never reach the API client, so with a
-// fetchImpl that fails the test when called they all work, and the Lease is there for the readers the API itself uses.
+// fetchImpl that fails the test when called they all work, and the Lease is there for the readers the API itself uses. (Story 8.1: `status` on a
+// host whose key is `linux` reads `GET /status` for REMOTE HOSTS and says `unavailable` when the API is down; this fixture has no host key, so it calls nothing.)
 test('lease, status and release work with the Hub API down: none of them calls the client', async () => {
   const f = fixture();
   try {

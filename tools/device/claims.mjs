@@ -24,7 +24,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { findPhone, idMatchesSerial } from '../ci/lib/adb.mjs';
 import { createDevicectl } from '../ci/lib/devicectl.mjs';
-import { earliest } from '../ci/lib/eta.mjs';
+import { earliest, expectedEnd } from '../ci/lib/eta.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
 import { CLAIMANT_KINDS, MAX_LEASE_MS, RESERVABLE, SEED_RESOURCES, acquireLease, acquirePool, cachedProcessStart, cancelRequest, capText, checkActor, deployTargetCapMs, etaHistory, extendLease, forceRelease, forceReleaseJobError, heldText, isLease, listLocks, lockDir, newLeaseId as newLockLeaseId, queueView, readOwner, releaseLease, releaseReservation, resourceOf, updateLease, waiterEtas } from '../ci/lib/lock.mjs';
 import { sleep as realSleep } from '../ci/lib/pause.mjs';
@@ -1564,7 +1564,8 @@ export async function statusView(key, options, ctx) {
   if (!AUDIENCES.includes(audience)) throw usage(`status audience is one of ${AUDIENCES.join(', ')}, not "${audience}"`);
   const { env, timing, fleet } = ctx;
   const nowMs = timing.now();
-  const locks = listLocks({ env, now: timing.now }).map(entry => {
+  const listed = listLocks({ env, now: timing.now });
+  const locks = listed.map(entry => {
     const owner = entry.owner ?? {};
     const lease = isLease(owner);
     return {
@@ -1585,8 +1586,8 @@ export async function statusView(key, options, ctx) {
     if (!policyRead) { policyRead = true; try { settings = ctx.policy ?? loadPolicy().policy; } catch { settings = null; } }
     return settings;
   };
-  // The ETAs come from one windowed read of the Event Log and one policy, shared by every waiter and read only when a live waiter
-  // exists; a failure of either leaves those waiters with `eta: null` (`eta=?`) and never fails status.
+  // The ETAs come from one windowed read of the Event Log and one policy, shared by every waiter and every Hold and read only when a
+  // live waiter or a live Hold exists; a failure of either leaves those waiters with `eta: null` (`eta=?`) and never fails status.
   let history = null;
   const loadEtaInputs = () => {
     if (history !== null) return;
@@ -1690,6 +1691,16 @@ export async function statusView(key, options, ctx) {
   for (const [rows] of rowsOf) {
     for (const row of rows) row.reachability = row.resource === null ? null : present(readings.get(row.resource) ?? null, { now: at, maxAgeS });
   }
+  // A Hold's expected end (Story 8.1): derived from `now` and the one ETA, never stored. Null for a stale Hold, an unknown upper bound or a
+  // policy or history that fails; a Lease never ends later than its `expires_at`.
+  locks.forEach((row, index) => {
+    let end = null;
+    if (!row.stale) {
+      loadEtaInputs();
+      try { end = history ? expectedEnd(listed[index].owner ?? null, history, settings, nowMs) : null; } catch { /* an ETA never fails a read */ }
+    }
+    row.expected_end = end === null || !Number.isFinite(end) ? null : new Date(end).toISOString();
+  });
   if (audience === 'service') {
     const qa = new Set(Array.isArray(qaIds) ? qaIds : []);
     for (const [rows] of rowsOf) for (const row of rows) if (row.resource !== null && qa.has(row.resource)) redact(row);

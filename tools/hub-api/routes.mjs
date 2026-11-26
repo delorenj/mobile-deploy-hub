@@ -14,10 +14,10 @@
 // handler as `request.params`; a literal route wins over a parameterised one.
 import { STATUS_CODES } from 'node:http';
 import { idMatchesSerial } from '../ci/lib/adb.mjs';
-import { HOST_PLATFORMS, cancel, checkCancelBody, checkExtendBody, checkForceReleaseBody, checkLeaseBody, checkReleaseBody, checkReservationForceReleaseBody, discover as discoverHost, exitCodeOf, findLease, forceReleaseEmulator, forceReleaseLease, forceReleaseReservation, hostKey as realHostKey, httpAnswerOf, leaseRequestId, lockActivity, namesEmulatorSlot, serviceExtend, serviceLease, serviceRelease } from '../device/claims.mjs';
+import { HOST_PLATFORMS, cancel, checkCancelBody, checkExtendBody, checkForceReleaseBody, checkLeaseBody, checkReleaseBody, checkReservationForceReleaseBody, createContext, discover as discoverHost, exitCodeOf, findLease, forceReleaseEmulator, forceReleaseLease, forceReleaseReservation, hostKey as realHostKey, httpAnswerOf, leaseRequestId, loadFleet, lockActivity, namesEmulatorSlot, serviceExtend, serviceLease, serviceRelease, statusView } from '../device/claims.mjs';
 import { hubRef } from '../ci/lib/receipt.mjs';
 import { NO_READING } from '../registry/reachability.mjs';
-import { loadQaDevices } from '../registry/seed.mjs';
+import { dedicatedQaIds, loadQaDevices } from '../registry/seed.mjs';
 import { retirement, visibility } from '../registry/match.mjs';
 import { checkEditBody, checkRegisterBody, checkRetireBody, planEdit, planRegister, planRetire } from '../registry/changes.mjs';
 import { REGISTRY_ERRORS, applySeed, readRegistry, registryState, updateRegistry } from '../registry/store.mjs';
@@ -160,6 +160,36 @@ export async function discovery(ctx) {
   return {
     format: document.format, host: document.host, via: document.via, port: document.port, note: document.note,
     devices: document.devices.filter(device => !named(device)).map(({ serial, model, id, state }) => ({ serial, model, id, state })),
+  };
+}
+
+// GET /status: the one status document (Story 8.1, AD-41): `{format, contract, hosts: {<host key>: <view>}, registry, stale, checked_at}`. A host's
+// view is `claims.statusView(key, {audience: 'service', qa_ids})` embedded unchanged: the queue positions, ETAs, Pool fold and QA redaction
+// are the library's, never recomputed here. Only this host's key is in `hosts` today (Epic 9 adds the Mac's); `registry` is the one place the
+// Registry's own fields (names, Capabilities, retired and seed-missing visibility) appear, each Resource as `GET /resources` serves it but
+// with no `reachability`. `stale` is keyed by host key, `{since}` for a view the service last had and no longer can refresh; this host's own
+// view is read fresh, so it is `{}` (Story 9.6 fills it). Nothing is cached: every field that passes with time is derived from `now` here.
+// Story 8.4's stream frames and 8.5's re-read call this same function. A host that does not know its key is 503 HUB_HOST_UNKNOWN.
+export async function statusDocument(ctx) {
+  const env = ctx.env ?? process.env;
+  let key;
+  try { key = (ctx.hostKey ?? realHostKey)({ env }); } catch (error) {
+    throw error?.code === 'HUB_HOST_UNKNOWN' ? HOST_UNKNOWN(oneLine(error.message)) : error;
+  }
+  const registry = readIt(ctx);
+  const statusCtx = createContext({
+    env, now: ctx.now, sleep: ctx.sleep, adbWire: ctx.adbWire, devicectl: ctx.devicectl, inventory: ctx.inventory, policy: ctx.policy, hostKey: ctx.hostKey,
+    fleet: loadFleet(env, { warn: () => {} }),
+  });
+  const checkedAt = statusCtx.timing.now();
+  const view = await statusView(key, { audience: 'service', qa_ids: dedicatedQaIds(registry) }, statusCtx);
+  return {
+    format: 1,
+    contract: CONTRACT_VERSION,
+    hosts: { [key]: view },
+    registry: { rev: registry.rev, source: registry.source, resources: registry.resources.map(record => serve(ctx, record)).filter(resource => resource !== null) },
+    stale: {},
+    checked_at: new Date(checkedAt).toISOString(),
   };
 }
 
@@ -338,6 +368,7 @@ export const ROUTES = Object.freeze([
   Object.freeze({ method: 'GET', path: '/resources/{id}', shape: 'Resource', handler: getResource }),
   Object.freeze({ method: 'GET', path: '/pools', shape: 'PoolList', handler: listPools }),
   Object.freeze({ method: 'GET', path: '/discovery', shape: 'Discovery', handler: discovery }),
+  Object.freeze({ method: 'GET', path: '/status', shape: 'Status', handler: statusDocument }),
   Object.freeze({ method: 'POST', path: '/registry/resources', shape: 'Resource', handler: registerResource }),
   Object.freeze({ method: 'POST', path: '/registry/resources/{id}', shape: 'Resource', handler: editResource }),
   Object.freeze({ method: 'POST', path: '/registry/resources/{id}/retire', shape: 'Retirement', handler: retireResource }),

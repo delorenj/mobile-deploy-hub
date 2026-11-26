@@ -152,6 +152,21 @@ export function eta(queue, events, policy, now) {
   return { lo_ms: lo, hi_ms: hi, low_data: low };
 }
 
+// When a Hold is expected to end (Story 8.1), in ms since the epoch, or null when that is unknown: the one ETA of the lock's owner with
+// nobody ahead of it (`eta({owner, view: [], file: null})`), its upper bound added to `now`. A Lease never ends later than its
+// `expires_at`, so the answer is clipped there. An unknown upper bound (a job past its allowance, one with none) is null. Pure; throws
+// what `eta` throws (a bad policy or clock), and a caller that must not fail catches it.
+export function expectedEnd(owner, events, policy, now) {
+  // No owner record (a lock mid-creation, or an unreadable owner.json): nobody's end is known, and `eta` would say 0 (now).
+  if (!owner || typeof owner !== 'object') return null;
+  const { hi_ms: hi } = eta({ owner, view: [], file: null }, events, policy, now);
+  if (hi === null) return null;
+  const end = now + hi;
+  if (owner?.kind !== 'lease') return end;
+  const expires = Date.parse(owner.expires_at);
+  return Number.isFinite(expires) ? Math.min(end, expires) : end;
+}
+
 // One bound as text: under 60 s `<s>s`, under 60 min `<m>m`, otherwise `<h>h<mm>m`; whole units, rounded to the nearest.
 function duration(value) {
   const seconds = Math.round(value / 1000);

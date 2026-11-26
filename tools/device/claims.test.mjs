@@ -425,7 +425,10 @@ test('status data writes nothing to the lock dir or the Event Log', async () => 
     assert.equal(existsSync(s.env.HUB_EVENT_DIR), false);
     const json = await s.cli(['status', '--json']);
     assert.equal(json.code, 0);
-    assert.deepEqual(JSON.parse(json.out.join('\n')), JSON.parse(JSON.stringify(data)));
+    // `--json` is the builder's data plus the Story 8.1 `remote_hosts` (empty: this host has no key, so it asks the API for nothing).
+    const { remote_hosts: remote, ...rest } = JSON.parse(json.out.join('\n'));
+    assert.deepEqual(remote, {});
+    assert.deepEqual(rest, JSON.parse(JSON.stringify(data)));
   } finally { s.cleanup(); }
 });
 

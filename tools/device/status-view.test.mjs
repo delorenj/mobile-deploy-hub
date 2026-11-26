@@ -10,6 +10,8 @@ import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadDevices } from '../ci/lib/devices.mjs';
+import { eta } from '../ci/lib/eta.mjs';
+import { appendEvent } from '../ci/lib/events.mjs';
 import { acquireLease, buildTicket, reserve } from '../ci/lib/lock.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { hermetic } from '../ci/test-fixtures.mjs';
@@ -55,7 +57,7 @@ function side({ wire = fakeWire({ listed: bothUp }), inventory = serverUp, devic
   const factoryCalls = [];
   const adbFactory = (...args) => { factoryCalls.push(args); throw new Error('status must never build an adb client'); };
   const ctx = claims.createContext({ env, now: () => T0, sleep, adbFactory, adbWire: wire, devicectl, inventory, policy: settings, fleet: claims.loadFleet(env) });
-  const cli = (argv, extra = {}) => runCli(env, argv, { adbFactory, adbWire: wire, devicectl, inventory, policy: settings, sleep, now: () => T0, hostKey: () => 'linux', ...extra });
+  const cli = (argv, extra = {}) => runCli(env, argv, { adbFactory, adbWire: wire, devicectl, inventory, policy: settings, sleep, now: () => T0, hostKey: () => 'linux', fetchImpl: apiDown, ...extra });
   const rows = (view, list) => Object.fromEntries(view[list].map(row => [row.device ?? row.lock, row]));
   return {
     root, env, ctx, wire, cli, rows, sleep, adbFactory, factoryCalls,
@@ -64,6 +66,9 @@ function side({ wire = fakeWire({ listed: bothUp }), inventory = serverUp, devic
     cleanup: () => rmSync(root, { recursive: true, force: true }),
   };
 }
+
+// The Hub API is not running: the connect is refused (`hub-client` answers HUB_API_DOWN), so a linux `status` lists the Mac `unavailable`.
+const apiDown = async () => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } }); };
 
 async function runCli(env, argv, seams) {
   const out = [];
@@ -99,7 +104,7 @@ test('statusView keeps today\'s root keys and every v1a key in place, then adds 
     };
     for (const [list, keys] of Object.entries(v1a)) {
       assert.ok(view[list].length > 0, `${list} has a row to check`);
-      for (const row of view[list]) assert.deepEqual(Object.keys(row), [...keys, 'resource', 'deploy_target', 'reachability'], `${list} row keys`);
+      for (const row of view[list]) assert.deepEqual(Object.keys(row), [...keys, 'resource', 'deploy_target', 'reachability', ...(list === 'locks' ? ['expected_end'] : [])], `${list} row keys`);
     }
     const strip = ({ resource, deploy_target, reachability, ...rest }) => rest;
     const [s24, s26] = view.phones;
@@ -513,10 +518,175 @@ test('the text status is byte-identical whatever the host key says', async () =>
     const known = await s.cli(['status'], { hostKey: () => 'linux' });
     const unknown = await s.cli(['status'], { hostKey: () => { throw Object.assign(new Error('x'), { code: 'HUB_HOST_UNKNOWN' }); } });
     assert.equal(known.code, 0);
-    assert.deepEqual(known.out, unknown.out);
+    // The one difference is the linux host's REMOTE HOSTS block (Story 8.1), which is its last block.
+    const at = known.out.findIndex(line => line.startsWith('REMOTE HOSTS'));
+    assert.ok(at > 0, 'the linux run has the REMOTE HOSTS block');
+    assert.deepEqual(known.out.slice(0, at), unknown.out);
+    assert.ok(!unknown.out.some(line => line.startsWith('REMOTE HOSTS')));
     assert.equal(known.out[0], 'PHONES (read only; adb is queried, never connected)');
     assert.match(known.out[1], /^ {2}s24 {2}free {2}reachable {2}SM-S928U {2}serial R5CX31AEJDA {2}lock s24$/);
     assert.ok(!known.out.join('\n').includes('reachability'), 'the text output has no new fields');
+  } finally { s.cleanup(); }
+});
+
+// ---- Story 8.1: remote hosts and expected_end ----
+
+const statusBody = (hosts, extra = {}) => ({ format: 1, contract: 1, hosts, registry: { rev: 0, source: 'seed', resources: [] }, stale: {}, checked_at: iso(T0), ...extra });
+const hubView = { phones: [], locks: [{ lock: 'mac-ios' }], waiters: [{ lock: 'mac-ios' }, { lock: 'mac-ios' }], reservations: [], inventory: {}, emulators: [] };
+
+// A fake Hub API: `/health` is the service, `/status` answers `status` (a function of the call count, or a body), and every call is recorded.
+function fakeApi(status) {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    const path = new URL(url).pathname;
+    calls.push({ path, method: init.method ?? 'GET' });
+    const json = (code, body) => ({ status: code, headers: { get: () => 'application/json; charset=utf-8' }, text: async () => JSON.stringify(body) });
+    if (path === '/health') return json(200, { ok: true, service: 'mobile-deploy-hub-api', contract: 1 });
+    if (path === '/status') return typeof status === 'function' ? status() : json(200, status);
+    return json(404, {});
+  };
+  return { fetchImpl, calls };
+}
+
+test('hub-device status on linux with the Hub API down lists the Mac unavailable (api-down), exits 0 and writes nothing', async () => {
+  const s = side();
+  try {
+    await acquireLease('adb', { holder: 'agent-a', why: 'device proof', forMs: 3_600_000, id: 'held', env: s.env, log: () => {}, now: () => T0 });
+    const before = digest(s.env.HUB_LOCK_DIR, s.env.HUB_EVENT_DIR);
+    const json = await s.cli(['status', '--json']);
+    assert.equal(json.code, 0, json.err.join('\n'));
+    const body = JSON.parse(json.out.join('\n'));
+    assert.deepEqual(body.remote_hosts, { mac: { state: 'unavailable', reason: 'api-down', view: null, stale: null } });
+    assert.deepEqual(Object.keys(body).slice(0, 6), ['phones', 'locks', 'waiters', 'reservations', 'inventory', 'emulators'], 'every v1a key stays in place');
+    const text = await s.cli(['status']);
+    assert.equal(text.code, 0);
+    assert.ok(text.out.includes('REMOTE HOSTS (from the Hub API)'));
+    assert.ok(text.out.includes('  mac  unavailable (the Hub API is not answering)'));
+    assert.equal(digest(s.env.HUB_LOCK_DIR, s.env.HUB_EVENT_DIR), before, 'status stays read only');
+  } finally { s.cleanup(); }
+});
+
+test('hub-device status on linux takes the Mac from /status: its view and stale, never its own host, with not-served and bad-answer as reasons', async () => {
+  const s = side();
+  try {
+    const up = fakeApi(statusBody({ linux: { phones: [] }, mac: hubView }, { stale: { mac: { since: iso(T0 - 60_000) } } }));
+    const json = await s.cli(['status', '--json'], { fetchImpl: up.fetchImpl });
+    const body = JSON.parse(json.out.join('\n'));
+    assert.deepEqual(Object.keys(body.remote_hosts), ['mac'], 'the own host is not listed');
+    assert.deepEqual(body.remote_hosts.mac, { state: 'available', reason: null, view: hubView, stale: { since: iso(T0 - 60_000) } });
+    assert.deepEqual(up.calls.map(call => `${call.method} ${call.path}`), ['GET /health', 'GET /status'], 'one read-only GET behind the health probe');
+    const text = await s.cli(['status'], { fetchImpl: up.fetchImpl });
+    assert.ok(text.out.includes(`  mac  1 held, 2 waiting (from the Hub API)  [stale since ${iso(T0 - 60_000)}]`), text.out.join('\n'));
+    const fresh = await s.cli(['status'], { fetchImpl: fakeApi(statusBody({ linux: {}, mac: hubView })).fetchImpl });
+    assert.ok(fresh.out.includes('  mac  1 held, 2 waiting (from the Hub API)'));
+    const missing = JSON.parse((await s.cli(['status', '--json'], { fetchImpl: fakeApi(statusBody({ linux: {} })).fetchImpl })).out.join('\n'));
+    assert.deepEqual(missing.remote_hosts.mac, { state: 'unavailable', reason: 'not-served', view: null, stale: null });
+    for (const bad of [{ nope: 1 }, [], 'x', { hosts: [] }, { format: 2, hosts: { mac: {} }, stale: {} }, { format: 1, hosts: {}, stale: [] }]) {
+      const answer = JSON.parse((await s.cli(['status', '--json'], { fetchImpl: fakeApi(bad).fetchImpl })).out.join('\n'));
+      assert.deepEqual(answer.remote_hosts.mac, { state: 'unavailable', reason: 'bad-answer', view: null, stale: null }, JSON.stringify(bad));
+    }
+  } finally { s.cleanup(); }
+});
+
+test('hub-device status on linux gives up on a /status that never answers: exit 0, the Mac unavailable (api-down)', async () => {
+  const s = side();
+  try {
+    const hung = async (url, init = {}) => {
+      if (new URL(url).pathname === '/health') return { status: 200, headers: { get: () => 'application/json' }, text: async () => JSON.stringify({ ok: true, service: 'mobile-deploy-hub-api', contract: 1 }) };
+      return new Promise((_, reject) => { init.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true }); });
+    };
+    // The seam stands in for the default 5 s cap: the exchange is aborted by its signal, never waited out.
+    const timeout = () => AbortSignal.timeout(20);
+    const result = await s.cli(['status', '--json'], { fetchImpl: hung, timeout });
+    assert.equal(result.code, 0, result.err.join('\n'));
+    assert.deepEqual(JSON.parse(result.out.join('\n')).remote_hosts.mac, { state: 'unavailable', reason: 'api-down', view: null, stale: null });
+  } finally { s.cleanup(); }
+});
+
+test('hub-device status on linux caps its /status exchange at 5 s by default (no timeout seam): never the client\'s 30 s margin', async () => {
+  const s = side();
+  const real = AbortSignal.timeout;
+  const asked = [];
+  // Record every bound the default asks for; hand back a signal that never fires, so the test waits on nothing.
+  AbortSignal.timeout = ms => { asked.push(ms); return new AbortController().signal; };
+  try {
+    const api = fakeApi(statusBody({ linux: hubView }));
+    const result = await s.cli(['status', '--json'], { fetchImpl: api.fetchImpl });
+    assert.equal(result.code, 0, result.err.join('\n'));
+    assert.deepEqual(api.calls.map(call => call.path), ['/health', '/status']);
+    assert.equal(asked.length, 2, `${asked}`);
+    assert.ok(asked.every(ms => ms > 0 && ms <= 5000), `every exchange is bounded at 5 s or less: ${asked}`);
+  } finally { AbortSignal.timeout = real; s.cleanup(); }
+});
+
+test('the REMOTE HOSTS counts leave stale Holds and stale tickets out, and a non-object stale marks the host [stale]', async () => {
+  const s = side();
+  try {
+    const view = { ...hubView, locks: [{ lock: 'mac-ios', stale: false }, { lock: 'old', stale: true }], waiters: [{ lock: 'mac-ios' }, { lock: 'mac-ios', stale: true }] };
+    const text = await s.cli(['status'], { fetchImpl: fakeApi(statusBody({ linux: {}, mac: view }, { stale: { mac: true } })).fetchImpl });
+    assert.ok(text.out.includes('  mac  1 held, 1 waiting (from the Hub API)  [stale]'), text.out.join('\n'));
+  } finally { s.cleanup(); }
+});
+
+test('a job Hold has an expected_end from the same ETA: live inside its allowance, null when stale', async () => {
+  const s = side();
+  try {
+    const jobEnv = { ...s.env, GITHUB_REPOSITORY: 'delorenj/gruvato', GITHUB_RUN_ID: '77', GITHUB_RUN_ATTEMPT: '1', GITHUB_JOB: 'android' };
+    const lockOf = name => join(s.env.HUB_LOCK_DIR, `${name}.lock`);
+    const own = (name, owner) => { mkdirSync(lockOf(name), { recursive: true }); writeFileSync(join(lockOf(name), 'owner.json'), JSON.stringify(owner)); };
+    const owner = started => ({ pid: process.pid, host: hostname(), host_id: null, repo: 'delorenj/gruvato', run: '77', attempt: '1', job: 'android', started_at: iso(started) });
+    const started = T0 - 120_000;
+    own('adb', owner(started));
+    const lock = (await s.view()).locks.find(entry => entry.lock === 'adb');
+    assert.equal(lock.kind, 'lock');
+    const hi = eta({ owner: { ...owner(started), kind: 'job' }, view: [], file: null }, [], policy(), T0).hi_ms;
+    assert.ok(Number.isFinite(hi) && hi > 0, 'the job has a known allowance');
+    assert.equal(lock.stale, false);
+    assert.equal(lock.expected_end, new Date(T0 + hi).toISOString());
+    // A job lock whose process is gone is stale: no end.
+    own('adb', { ...owner(started), pid: 2_147_483_000 });
+    const gone = (await s.view()).locks.find(entry => entry.lock === 'adb');
+    assert.deepEqual([gone.stale, gone.expected_end], [true, null]);
+  } finally { s.cleanup(); }
+});
+
+test('hub-device status makes no Hub API call and prints no REMOTE HOSTS block when the host key is null or mac', async () => {
+  const s = side();
+  try {
+    for (const hostKey of [() => null, () => 'mac', () => { throw Object.assign(new Error('x'), { code: 'HUB_HOST_UNKNOWN' }); }]) {
+      const api = fakeApi(statusBody({ linux: {}, mac: hubView }));
+      const json = await s.cli(['status', '--json'], { hostKey, fetchImpl: api.fetchImpl, devicectl: async () => ({ result: { devices: [] } }) });
+      assert.equal(json.code, 0, json.err.join('\n'));
+      assert.deepEqual(JSON.parse(json.out.join('\n')).remote_hosts, {});
+      const text = await s.cli(['status'], { hostKey, fetchImpl: api.fetchImpl, devicectl: async () => ({ result: { devices: [] } }) });
+      assert.ok(!text.out.some(line => line.includes('REMOTE HOSTS')));
+      assert.deepEqual(api.calls, [], 'no call at all');
+    }
+  } finally { s.cleanup(); }
+});
+
+test('a Hold carries expected_end: the Lease\'s end from the one ETA, never past expires_at, null when stale or unknown', async () => {
+  const s = side();
+  try {
+    await acquireLease('adb', { holder: 'agent-a', why: 'device proof', forMs: 3_600_000, id: 'held', env: s.env, log: () => {}, now: () => T0 });
+    const bare = (await s.view()).locks.find(entry => entry.lock === 'adb');
+    assert.equal(bare.expected_end, bare.expires_at, 'with no history the stated duration is the answer');
+    // A history of agent Leases that used half their time: the end is before the expiry.
+    const low = { ...policy(), queue: { ...policy().queue, eta_low_data_min_holds: 1 } };
+    const history = side({ settings: low });
+    try {
+      await acquireLease('adb', { holder: 'agent-a', why: 'device proof', forMs: 3_600_000, id: 'held', env: history.env, log: () => {}, now: () => T0 });
+      appendEvent({ event: 'release', hold_kind: 'lease', held_ms: 1_800_000, for_ms: 3_600_000, claimant: { kind: 'agent' } }, { env: history.env, now: () => T0 - 60_000, log: () => {} });
+      const lock = (await history.view()).locks.find(entry => entry.lock === 'adb');
+      assert.ok(Date.parse(lock.expected_end) < Date.parse(lock.expires_at), `${lock.expected_end} is before ${lock.expires_at}`);
+      assert.ok(Date.parse(lock.expected_end) > T0);
+    } finally { history.cleanup(); }
+    // A broken policy: the ETA fails, the row stays and says null.
+    const broken = side({ settings: { queue: {} } });
+    try {
+      await acquireLease('adb', { holder: 'agent-a', why: 'x', forMs: 3_600_000, id: 'held', env: broken.env, log: () => {}, now: () => T0 });
+      assert.equal((await broken.view()).locks.find(entry => entry.lock === 'adb').expected_end, null);
+    } finally { broken.cleanup(); }
   } finally { s.cleanup(); }
 });
 
