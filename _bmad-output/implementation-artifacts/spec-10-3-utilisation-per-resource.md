@@ -5,7 +5,7 @@ created: '2026-11-26'
 status: 'done'
 baseline_revision: '5795452885fd91469ccec587463f00e7e3583628'
 review_loop_iteration: 0
-followup_review_recommended: true
+followup_review_recommended: false
 context:
   - '{project-root}/_bmad-output/implementation-artifacts/epic-10-context.md'
   - '{project-root}/docs/hub-api-contract.md'
@@ -127,6 +127,41 @@ deferred:
   - `[false]` `[reject]` Intent: extras (options argument, partial/slots/synced_through fields, contract doc edits) — additive: the four-argument call still works (options defaults), and the contract doc must change with the route because contract.test.mjs holds them equal.
   - `[false]` `[reject]` Intent: the operator-action reading — no AC needs a human outside the repo, so no operator_actions; the run ends `done`.
 
+### 2026-11-26 — Review pass (follow-up)
+- verdicts: 31 findings — high 0, medium 1, low 21, false 8, maybe-false 1
+- findings:
+  - `[low]` `[reject]` Blind: cost grows with all history (first fold reads every month; merge and classify walk every interval; nothing is pruned) — carried: same as the first pass's per-request-cost row; the I/O is incremental and hub volume is small.
+  - `[false]` `[reject]` Blind: a log rewritten to the same or a larger size is not detected — carried: the Event Log is append-only and a replica mirrors it byte for byte.
+  - `[low]` `[patch]` Blind: the contract's Classes table says `unknown` is checked first, including "no reading", but a Hold or Reservation with no reading reads `held`/`idle_while_reserved` — patched: docs/hub-api-contract.md now splits `unknown` into a first row (not synced) and a last row (no reading), and the note says a Hold or Reservation wins over having no reading.
+  - `[false]` `[reject]` Blind: emulator slots, and time before a host's log began, read `idle` while phones read `unknown` — the intent contract says "an emulator slot has no readings: its free time is `idle`", and this host's `synced_through` is the request time by the 10.2 coverage rule.
+  - `[low]` `[reject]` Blind: time after a Resource's retirement inside the window is still classified, and a seed-missing record is hidden — carried: same as the first pass's retirement and seed_missing rows.
+  - `[false]` `[reject]` Blind: a `track` reading holds forever if the tracker dies without a `track-lost`, and an open job Hold has no expiry — the intent contract says a track reading holds until the Resource's next reachability event; the open job Hold half is carried from the first pass (lock.mjs logs a `reclaim` when it retires a stale job lock).
+  - `[false]` `[reject]` Blind: Hold closes are not matched by lease_id, so a late reclaim/force-release for lease A closes B's Hold — carried: releaseLease refuses a lease_id that is not the owner's and reclaim retires the current owner (lock.mjs:569); the append-order variant is the Intent row below.
+  - `[low]` `[reject]` Blind: `advance` folds the cached timeline in place, so a request waiting on another host can read events newer than its own `at` — real, but the fold is synchronous per chunk (a consistent prefix), events after `to` are clipped by the window, and a Mac event past `synced_through` reads `unknown` anyway; copy-and-swap adds complexity for an answer no worse than one taken a moment later.
+  - `[low]` `[reject]` Blind: the abort signal is not passed into the refresh — carried: the fold is cached and reused by the next request.
+  - `[low]` `[reject]` Blind: untested chunk boundary, replica torn tail, partial for an older replica with a successful sync, the abort path, HUB_REGISTRY_FORMAT from registry() — test gaps, no defect shown; openReader's chunking is covered by history.test.mjs (chunkBytes 8192) and the coverage step by the /history suite.
+  - `[low]` `[reject]` Blind: `DEFAULT_MAX_AGE_S = 60` duplicates a policy value as a fallback — policy.mjs:310-311 requires `registry.reachability_max_age_s` (strict, positive), so the route's fallback never applies in service; the pure function's option default is documented.
+  - `[low]` `[reject]` Blind: the contract leaves out the VALUE_MAX `bad-query`, HUB_REGISTRY_FORMAT for /utilisation, the HUB_API_UTILISATION_POOL line and the pool-less slot fallback — the HUB_REGISTRY_FORMAT row names no routes (it applies to any Registry read); the over-length refusal is worded the same as /history's; the log line and the fallback are internal; cosmetic.
+  - `[low]` `[reject]` Blind: a bad Pool file logs HUB_API_UTILISATION_POOL on every request — only a malformed Pool size triggers it (hostPool refuses outside 1 to 8), and one line per request is the visible signal the spec chose.
+  - `[low]` `[reject]` Edge: one host's refresh throwing makes the whole answer 500 — the intended, tested behaviour from the first pass (month file replaced by a directory: 500, host forgotten, next request rebuilds); only a non-vanished read error triggers it, and a partial answer would add branches.
+  - `[maybe-false]` `[defer]` Edge: bytes appended to an earlier month than the cached position are never folded — carried: already in the deferred list (medium, unverified); not deferred again.
+  - `[false]` `[reject]` Edge: a huge Pool size builds millions of slot rows — emulatorPool goes through hostPool, which refuses a pool outside 1 to MAX_POOL (8) (emulator.mjs:79), and the route then falls back to the slots seen.
+  - `[low]` `[reject]` Edge: an emulator Pool retired before `from` leaves slots[] pointing at a Resource absent from resources[] — the Pool is a runtime Resource that is not retired in practice, and the slot rows then name `emulator`, its id.
+  - `[low]` `[reject]` Edge: readings lists are never pruned — carried: same as the first pass's memory/per-request-cost row.
+  - `[false]` `[reject]` Edge: a claim with an unparsable expires_at stays open forever — readReservation (lock.mjs:823-834) refuses a record without a finite expires_at, so every logged claim carries one.
+  - `[low]` `[reject]` Edge: per-request CPU scales with all history — carried: same root as the per-request-cost row.
+  - `[low]` `[reject]` Edge (claim): any non-vanished read error forces a full re-fold — carried: correct behaviour, rare trigger.
+  - `[low]` `[reject]` Edge (claim): "never walks the whole log per request" holds for I/O only — carried: same root as the per-request-cost row.
+  - `[low]` `[patch]` VG: a seed-missing record's exclusion is not pinned by a test — patched: the retired-resources test in tools/registry/utilisation.test.mjs now includes a `seed_missing: true` record with no retired_at and asserts it has no row.
+  - `[low]` `[reject]` VG: the abort path of /utilisation is untested — server.mjs:100 already drops an answer once its signal aborted, so no client sees a difference; /history has the same untested guard.
+  - `[medium]` `[patch]` Intent: the route folds in log order while utilisation() sorts by ts, and they disagree when a lock's events are out of ts order — verified: retire() in lock.mjs removes the lock (rmSync) before it logs the close, so the next holder's `acquire` can be appended first; folding `acquire B`, then `release A` closed B's open Hold at a time before its start, which dropped B's whole Hold (read as idle). Patched: foldHold only lets a close end the open Hold when `ts >= open.start`; an older close back-fills its own held_ms instead. Test added; mutation-checked (reverting the guard fails it).
+  - `[low]` `[patch]` Intent: a reclaim of an unreadable owner is logged with `hold_kind: null` (lock.mjs:164) and the fold ignored it, so the open Hold stayed open, a job's to the window's end — the intent says a close with hold_kind not `reservation` ends the Hold. Patched: foldEvent passes a release/reclaim/force-release with a null or missing hold_kind to foldHold. Test added; mutation-checked.
+  - `[false]` `[reject]` Intent: readings follow the time they were taken, not log order — the intent's probe rule runs from `checked_at`, so taken-time is the intent's own clock; the first pass tested this on purpose.
+  - `[low]` `[reject]` Intent: "any further host" holds only while lock names stay unique and there is one emulator Pool — lock names come from the one Registry, which keys Resources and locks uniquely; a second Pool is not in v1 scope.
+  - `[low]` `[reject]` Intent: matrix rows not asserted at the route (the peer mark, empty history with a successful sync, chunking, a /history regression) — coverPeers is the unchanged /history step whose own suite asserts the mark; the rest are covered at the pure surface or by openReader's tests.
+  - `[low]` `[reject]` Intent: memory is unbounded — carried: same root as the per-request-cost row.
+  - `[false]` `[reject]` Intent: an unrelated host-agent test change is bundled — carried: its own commit (bc1615f).
+
 ## Design Notes
 
 Shape of the answer (all ms integers; shares unrounded `ms / span_ms`):
@@ -146,52 +181,38 @@ The `emulator` Resource row is the rollup (`span_ms = window_ms × slot count`).
 - `node --test tools/registry/utilisation.test.mjs tools/hub-api/utilisation.test.mjs tools/hub-api/history.test.mjs tools/registry/history.test.mjs tools/hub-api/contract.test.mjs` -- expected: all pass
 - `heavy mise run check` -- expected: green
 
+
 ## Auto Run Result
 
 Status: done
 
-**Summary.** The Hub API now answers `GET /utilisation?from&to`: for each Resource, how much of the window it spent `held`, `idle_while_reserved`, `idle`, `away` and `unknown`, as integer ms plus unrounded shares. Emulator slots get their own rows and roll up into the Pool's row. The pure `utilisation(events, registry, lockToResource, window, options)` in `tools/registry/history.mjs` is built from an incremental fold (`createTimeline`/`foldEvent`) and `sharesOf`. The route keeps one folded timeline per host source (this host's log, each peer's replica) in memory and advances each from its cached `{month, offset}`, so a request reads only newly appended bytes. It reuses /history's peer-coverage step (`coverPeers`, now shared), so a Mac gap reads `unknown` past its `synced_through` with `partial: true`. Everything is keyed by host key and lock, so any further host, phone or `res-*` Resource is covered with no new code.
+**Summary.** The Hub API answers `GET /utilisation?from&to`: for each Resource, how much of the window it spent `held`, `idle_while_reserved`, `idle`, `away` and `unknown`, as whole ms plus unrounded shares, with per-slot emulator rows rolled up into the Pool's row. The pure `utilisation(events, registry, lockToResource, window, options)` in `tools/registry/history.mjs` is built from the incremental fold (`createTimeline`/`foldEvent`/`mergeTimelines`) and `sharesOf`; the route keeps one folded timeline per host source in memory, advances it from its cached `{month, offset}`, and shares /history's peer-coverage step (`coverPeers`). Keyed by host key and lock, so any further host, phone or `res-*` Resource is covered with no new code. This follow-up review pass fixed two fold rules that real logs reach: a close that lock.mjs appends after the next holder's `acquire` no longer drops the new Hold, and a reclaim of an unreadable owner (`hold_kind: null`) now ends the open Hold.
 
-**Files changed.**
-- `tools/registry/history.mjs`: `parseUtilisationQuery`, `UTILISATION_CLASSES`, the fold (`createTimeline`, `foldEvent`, `mergeTimelines`), `shownInWindow`, the classification sweep, `sharesOf` and `utilisation`.
+**Files changed (story).**
+- `tools/registry/history.mjs`: query check, the fold, `mergeTimelines`, `shownInWindow`, the classification sweep, `sharesOf`, `utilisation`. This pass: `foldHold` lets a close end the open Hold only when `ts >= open.start`; `foldEvent` routes a close with a null/missing `hold_kind` to `foldHold`.
 - `tools/hub-api/history.mjs`: `coverPeers` extracted from `queryHistory` (answers unchanged); `abortError` exported.
-- `tools/hub-api/utilisation.mjs` (new): the in-memory per-host cache, serialized refreshes, and `queryUtilisation`.
+- `tools/hub-api/utilisation.mjs` (new): the in-memory per-host cache, serialized refreshes, `queryUtilisation`.
 - `tools/hub-api/routes.mjs`, `tools/hub-api/server.mjs`: the `/utilisation` route and its ctx cache.
-- `docs/hub-api-contract.md`, `tools/hub-api/contract.test.mjs`: the route row, the `Utilisation` shape, and the `HUB_USAGE`/`HUB_HOST_UNKNOWN` rows, held equal by the contract test.
-- `tools/registry/utilisation.test.mjs`, `tools/hub-api/utilisation.test.mjs` (new): the fixture matrix (pure) and the route, cache and error paths (through `handle()`).
-- `tools/host-agent/server.test.mjs`: a flaky wait bound fixed (commit bc1615f): it now uses a 10 s wall-clock deadline, not 500 loop turns.
+- `docs/hub-api-contract.md`, `tools/hub-api/contract.test.mjs`: the route row, the `Utilisation` shape and error rows. This pass: the Classes table now shows the real precedence (`unknown` for "not synced" first, `unknown` for "no reading" last).
+- `tools/registry/utilisation.test.mjs`, `tools/hub-api/utilisation.test.mjs` (new): the fixture matrix and the route, cache and error paths. This pass: a test for the raced close and the null-kind reclaim, and a seed-missing record in the retired-resources test.
+- `tools/host-agent/server.test.mjs`: a flaky wait bound fixed in its own commit (bc1615f).
 
-**Review findings.** 32 findings: high 0, medium 2, low 17, false 12, maybe-false 1.
-- Patches applied (commit 9d7ad76), counted by verdict: medium 2 and low 7.
-  - Code: `mergeTimelines` keeps a second host's open Hold or claim on a shared key, and `registry()` is now read before the peer sync.
-  - Tests: the checked_at clamp and re-sort, the route's max-age wiring, warm-cache serialization (mutation-checked), the non-vanished error branch, and the route matching the pure function.
-- Deferred, 1: an earlier-month append after the cache moved on (medium, unverified).
-- Rejected false, 12:
-  - Holds by lease_id, open job Holds, and held_ms null (×2): lock.mjs always names the owner and writes held_ms.
-  - A rewritten log (×2): the source is append-only and the replica mirrors it byte for byte.
-  - The bundled test fix: its own commit.
-  - A host missing from syncedThrough: a host outside HOST_KEYS has nothing folded.
-  - Intent extras and semantics (×3) and the operator-action reading (×1): see the triage log.
-- Rejected low, 10:
-  - Per-request CPU over all history (×3): the I/O is incremental, and the volume is small.
-  - Retired-in-window time (×2): rare, and it reads unknown or away.
-  - The pool-size fallback: as specified.
-  - Abort during a cold fold (×2): the result is cached and reused.
-  - A part-way failure forcing a full re-fold (×2): rare and correct.
-  - seed_missing hidden: the contract's rule.
+**Review findings (follow-up pass).** 31 findings: high 0, medium 1, low 21, false 8, maybe-false 1.
+- Patches applied, by verdict: medium 1 (the raced close dropping a Hold), low 3 (null-kind reclaim, the contract's class order, the seed-missing test).
+- Deferred: none new. The earlier-month append case is carried in the existing deferred entry, not deferred again.
+- Rejected false, 8: rewritten log (append-only source); slots idle before the log (the intent's rule); track reading with no track-lost (the intent's rule); lease_id matching (lock.mjs:569); a huge Pool (hostPool caps at 8); a claim with no expires_at (readReservation refuses it); readings by taken-time (the intent's clock); the bundled test fix (its own commit).
+- Rejected low, 18: per-request CPU and memory over all history (×5, carried); retirement and seed_missing rows (carried); the in-place fold read by a waiting request (clipped by the window, no worse than a later answer); abort not passed into the refresh (carried); test gaps without a defect (×2); the dead `DEFAULT_MAX_AGE_S` fallback (policy.mjs requires the key); contract wording omissions (cosmetic); the Pool log line per request; one host's read error making a 500 (intended, tested); a retired Pool's orphan slots; the untested abort guard (server.mjs drops aborted answers); a non-vanished error re-fold (carried); lock-name uniqueness for further hosts.
+- The full per-finding record is the second entry of `## Review Triage Log`; the first pass's record (32 findings, patched in 9d7ad76) is the first entry.
 
-**Follow-up review: recommended (`true`).** Two medium entries were patched. The unverified risk is the `mergeTimelines` collision change and the registry read-order change in `queryUtilisation`: both were patched after review and have not been through a review layer, only their own new tests and the full suite.
+**Follow-up review: not recommended (`false`).** This is a follow-up pass and it patched no `high`; patched counts: high 0, medium 1, low 3.
 
 **Verification.**
-- The focused tests pass: `node --test tools/registry/utilisation.test.mjs tools/hub-api/utilisation.test.mjs tools/hub-api/history.test.mjs tools/registry/history.test.mjs tools/hub-api/contract.test.mjs` gives 89/89.
-- `heavy mise run check` is green after the patches, 1989/1989, exit 0.
-- Mutation check: removing the per-host refresh chain fails the new warm-cache test.
-- Earlier runs:
-  - Twice, the full check failed on `tools/host-agent/server.test.mjs:515`. It was bounded by loop turns under load, which bc1615f fixed.
-  - Once, it failed on `tools/host-agent/push.test.mjs:420`. That flake predates this story and passed 3/3 in isolation.
+- Focused: `node --test tools/registry/utilisation.test.mjs tools/hub-api/utilisation.test.mjs tools/hub-api/history.test.mjs tools/registry/history.test.mjs tools/hub-api/contract.test.mjs`: 90/90 pass.
+- Mutation checks: removing the `ts >= open.start` guard, or the null-kind close routing, each fails the new test (16 pass, 1 fail).
+- `heavy mise run check`: green, 1990/1990, exit 0.
 
 **Residual risks.**
-- The cache is in memory, so the first request after a service restart folds each host's whole history once.
-- Per-request CPU grows with the intervals folded over the service's life.
-- The ios-lane's reachability is never logged, so its free time reads `unknown`. That is correct for the data but not useful until a reading source exists.
-- The deferred earlier-month append case.
+- The cache is in memory: the first request after a restart folds each host's whole history once, and per-request CPU grows with the intervals folded over the service's life.
+- In the raced-close case the previous Hold reads as held until the next holder's acquire (milliseconds later than its real end), not until its own release.
+- The ios-lane's reachability is never logged, so its free time reads `unknown`.
+- The deferred earlier-month append case (medium, unverified).
