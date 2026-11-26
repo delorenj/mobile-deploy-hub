@@ -151,7 +151,7 @@ export const sshArgv = (alias, command, policy) => [
 export function aliasFor(key, devices) {
   checkKey(key);
   const alias = devices?.[key]?.host;
-  if (typeof alias !== 'string' || !/^[A-Za-z0-9.-]+$/.test(alias)) throw usageError(`devices.${key}.host "${alias}" is not a host name`);
+  if (typeof alias !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(alias)) throw usageError(`devices.${key}.host "${alias}" is not a host name`);
   return alias;
 }
 
@@ -202,7 +202,7 @@ function viaSsh({ host, verb, path, body, bound }, { policy, devices, sshImpl, t
       child = (sshImpl ?? (args => spawn(SSH_PATH, args, { stdio: ['pipe', 'pipe', 'pipe'] })))(argv);
       child.stdin.on('error', () => {});
       child.stdout.on('data', chunk => { chunks.push(Buffer.from(chunk)); });
-      child.stderr?.on?.('data', chunk => { if (stderr.length < 500) stderr += String(chunk); });
+      child.stderr?.on?.('data', chunk => { stderr = (stderr + String(chunk)).slice(0, 500); });
       child.on('error', error => lost(`ssh did not start (${error?.code ?? error?.message ?? error})`));
       child.on('close', code => {
         if (settled) return;
@@ -211,7 +211,12 @@ function viaSsh({ host, verb, path, body, bound }, { policy, devices, sshImpl, t
         const head = newline === -1 ? undefined : parseHead(out.subarray(0, newline).toString('utf8'));
         const why = stderr.trim().split('\n')[0];
         if (code === 255 || code === null || head === undefined) return lost(code === 255 && why ? why : `ssh ended with ${code === null ? 'a signal' : `exit ${code}`} and no answer`);
-        if (head.error) return end(reject, Object.assign(new TypeError('fetch failed'), { cause: { code: head.error.code } }));
+        if (head.error) {
+          const cause = head.error.code;
+          // The relay's own refusal (no host key, no policy) is this host being unusable, not an API transport failure.
+          if (cause.startsWith('HUB_') && cause !== 'HUB_RELAY_USAGE') return lost(`the relay refused: ${head.error.message ?? cause} (${cause})`);
+          return end(reject, Object.assign(new TypeError('fetch failed'), { cause: { code: cause } }));
+        }
         if (code !== 0) return lost(`ssh ended with exit ${code} before the answer was complete`);
         try {
           end(resolve, new Response(NO_BODY.has(head.status) ? null : out.subarray(newline + 1), { status: head.status, headers: head.headers }));
@@ -293,7 +298,7 @@ export async function relay({ method, path, stdin, stdout, policy: given, hostKe
     return done(1);
   }
   const text = await first;
-  if (text === null) return done(1);
+  if (text === null || gone) return done(1);
   let body;
   if (text.trim() !== '') {
     body = parseJson(text);
@@ -331,6 +336,6 @@ export async function main(argv = [], { stdin = process.stdin, stdout = process.
 let entry = null;
 try { entry = process.argv[1] ? pathToFileURL(realpathSync(process.argv[1])).href : null; } catch { /* not run as a file */ }
 if (entry === import.meta.url) {
-  process.exitCode = await main(process.argv.slice(2));
-  process.stdin.destroy();
+  // No top-level await: the module must finish evaluating before the default `hostKey` imports claims.mjs (which imports this file).
+  main(process.argv.slice(2)).then(code => { process.exitCode = code; process.stdin.destroy(); });
 }

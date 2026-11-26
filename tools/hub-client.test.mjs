@@ -1,9 +1,9 @@
 // Story 6.8: the same-host Hub API client, hermetic: every fetch is an injected fake and every timeout an injected signal. No port is bound.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -334,6 +334,8 @@ test('the ssh argv is exactly the AD-26 option set, the alias, then the command'
   assert.throws(() => aliasFor('ipad', devices), /not a host key/);
   assert.throws(() => aliasFor('mac', { mac: { host: 'a b; rm' } }), /not a host name/);
   assert.throws(() => aliasFor('mac', {}), /not a host name/);
+  assert.throws(() => aliasFor('mac', { mac: { host: '-oProxyCommand=x' } }), /not a host name/);
+  assert.throws(() => aliasFor('mac', { mac: { host: '-oProxyCommand' } }), /not a host name/);
   assert.equal(frontDoorPort(policy, 'linux'), policy.api.hub_api_port);
   assert.equal(frontDoorPort(policy, 'mac'), policy.api.host_agent_port);
   assert.throws(() => frontDoorPort(policy, 'other'), /not a host key/);
@@ -545,6 +547,25 @@ test('a relay error head with a usage code is a TypeError with that cause code, 
   assert.ok(t.cleared.includes(t.intervals[0]) && t.cleared.includes(t.timeouts[0]));
 });
 
+test('a relay error head with a HUB_ code (no host key, no policy) is HUB_DEVICE_AWAY carrying the relay\'s message and code; a non-HUB_ cause keeps the TypeError path', async () => {
+  const child = sshChild();
+  const t = fakeTimers();
+  const pending = code(request({ host: 'mac', path: '/x' }, { policy, hostKey: () => 'linux', devices, timers: t, sshImpl: () => child }));
+  await flush();
+  child.answer('{"format":1,"error":{"code":"HUB_HOST_UNKNOWN","message":"this host does not know which host it is"}}\n', 1);
+  const error = await pending;
+  assert.deepEqual([error.code, error.exit, error.reason, error.api], ['HUB_DEVICE_AWAY', 75, 'host-unreachable', false]);
+  assert.match(error.message, /this host does not know which host it is/);
+  assert.match(error.message, /HUB_HOST_UNKNOWN/);
+  assert.ok(t.cleared.includes(t.intervals[0]) && t.cleared.includes(t.timeouts[0]));
+  const plain = sshChild();
+  const other = code(request({ host: 'mac', path: '/x' }, { policy, hostKey: () => 'linux', devices, timers: fakeTimers(), sshImpl: () => plain }));
+  await flush();
+  plain.answer('{"format":1,"error":{"code":"ECONNREFUSED","message":"x"}}\n', 0);
+  const refusedAnswer = await other;
+  assert.deepEqual([refusedAnswer.name, refusedAnswer.cause.code], ['TypeError', 'ECONNREFUSED']);
+});
+
 test('a client that vanishes mid-wait (stdin EOF) aborts the relay\'s request: the service records cancel (aborted) and nothing is written', async () => {
   const s = scratch();
   try {
@@ -694,4 +715,31 @@ test('the relay\'s answer is byte-exact for a binary body and drops only hop hea
   const head = JSON.parse(all.subarray(0, newline).toString());
   assert.deepEqual(head.headers, { 'content-type': 'application/octet-stream', 'x-keep': '1' });
   assert.deepEqual(all.subarray(newline + 1), bytes);
+});
+
+// The real entry, run through a symlink as production runs it (`current`), with stdin held open: it must exit by itself.
+test('the real relay entry through a symlink exits by itself with stdin open: no host key is HUB_HOST_UNKNOWN (exit 1), a bad method is HUB_RELAY_USAGE (exit 2)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-client-entry-'));
+  try {
+    const link = join(dir, 'hub-client.mjs');
+    symlinkSync(fileURLToPath(new URL('./hub-client.mjs', import.meta.url)), link);
+    const home = join(dir, 'home');
+    mkdirSync(home);
+    const runRelay = args => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [link, 'relay', ...args], { env: { ...process.env, HOME: home }, stdio: ['pipe', 'pipe', 'pipe'] });
+      let stdout = '';
+      const guard = setTimeout(() => { child.kill('SIGKILL'); reject(new Error(`relay ${args.join(' ')} did not exit by itself`)); }, 10_000);
+      child.stdout.on('data', chunk => { stdout += chunk; });
+      child.on('error', reject);
+      child.on('close', status => { clearTimeout(guard); resolve({ status, stdout }); });
+      child.stdin.on('error', () => {});
+      child.stdin.write('\n');
+    });
+    const unknown = await runRelay(['GET', '/health']);
+    assert.equal(unknown.status, 1);
+    assert.equal(JSON.parse(unknown.stdout.split('\n')[0]).error.code, 'HUB_HOST_UNKNOWN');
+    const usage = await runRelay(['TRACE', '/x']);
+    assert.equal(usage.status, 2);
+    assert.equal(JSON.parse(usage.stdout.split('\n')[0]).error.code, 'HUB_RELAY_USAGE');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
