@@ -44,22 +44,27 @@ export function fakeWire({ listed = [], serials = {}, fail = null, hang = false,
   return Object.assign(factory, { requests, opened });
 }
 
-// A real adb-protocol server on a free loopback port. `requests` lists every request frame received, in order.
+// A real adb-protocol server on a free loopback port. `requests` lists every request frame received, in order. `host:track-devices-l`
+// is answered OKAY plus the current listing and the socket is kept open: `push(next)` sends the (new) listing to every open track
+// socket, and `dropTracks()` closes them all.
 export async function fakeAdbServer({ listed = [], serials = {} } = {}) {
   const requests = [];
   const sockets = new Set();
+  const tracks = new Set();
+  let current = listed;
+  const listing = () => { const text = `${read(current).map(longLine).join('\n')}\n`; return `${hex4(Buffer.byteLength(text))}${text}`; };
   const server = createServer(socket => {
     sockets.add(socket);
-    socket.on('close', () => sockets.delete(socket));
+    socket.on('close', () => { sockets.delete(socket); tracks.delete(socket); });
     socket.on('error', () => {});
     let buffer = Buffer.alloc(0);
     let transport = null;
     const fail = message => socket.end(`FAIL${hex4(Buffer.byteLength(message))}${message}`);
     const answer = request => {
+      if (request === 'host:track-devices-l') { tracks.add(socket); socket.write(`OKAY${listing()}`); return; }
       if (request === 'host:version') { socket.end(`OKAY${hex4(4)}0041`); return; }
       if (request === 'host:devices-l') {
-        const text = `${read(listed).map(longLine).join('\n')}\n`;
-        socket.end(`OKAY${hex4(Buffer.byteLength(text))}${text}`);
+        socket.end(`OKAY${listing()}`);
         return;
       }
       if (request.startsWith('host:transport:')) { transport = request.slice('host:transport:'.length); socket.write('OKAY'); return; }
@@ -82,6 +87,8 @@ export async function fakeAdbServer({ listed = [], serials = {} } = {}) {
   return {
     port: server.address().port,
     requests,
+    push: next => { if (next !== undefined) current = next; for (const socket of tracks) socket.write(listing()); },
+    dropTracks: () => { for (const socket of [...tracks]) socket.destroy(); },
     close: () => new Promise(done => { for (const socket of sockets) socket.destroy(); server.close(() => done()); }),
   };
 }

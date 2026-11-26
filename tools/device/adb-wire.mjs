@@ -74,6 +74,75 @@ export function parseDevicesLong(text) {
   });
 }
 
+// `host:track-devices-l`: the one long-lived request. The server answers OKAY, then sends one length-prefixed `devices-l` listing now
+// and another every time a device appears, changes state or goes (Story 8.3, AD-35). The socket is never a poll: it is `unref()`ed so it
+// never holds a process open, it never reconnects (its owner decides when to open another) and it starts nothing, because a socket to
+// a port nobody listens on is refused.
+//
+// `onDevices(list)` gets each pushed listing parsed (`parseDevicesLong`), whether a payload arrives whole, split across chunks, or
+// several to a chunk. `onClose({opened, error})` is called exactly once: `opened` is true once OKAY arrived, `error` is why the socket
+// ended when it was not a clean close (FAIL carries `code: 'ADB_FAIL'`; a malformed frame, a refused connection and a server that does
+// not answer within `handshakeMs` are errors too). Returns `{close()}`, which ends the socket and still calls `onClose` once.
+// `connect` is the socket seam, and `handshakeMs` the bound on the OKAY.
+export function trackDevices(port, { onDevices = () => {}, onClose = () => {}, connect: dial = connect, handshakeMs = 5000 } = {}) {
+  const request = 'host:track-devices-l';
+  let socket = null;
+  let buffer = Buffer.alloc(0);
+  let opened = false;
+  let closed = false;
+  let timer = null;
+  const finish = error => {
+    if (closed) return;
+    closed = true;
+    clearTimeout(timer);
+    try { socket?.destroy(); } catch { /* already gone */ }
+    try { onClose({ opened, error: error ?? null }); } catch { /* a handler that throws never reaches the socket's owner */ }
+  };
+  const drain = () => {
+    while (!closed) {
+      if (!opened) {
+        if (buffer.length < 4) return;
+        const status = buffer.subarray(0, 4).toString('latin1');
+        if (status === 'FAIL') {
+          if (buffer.length < 8) return;
+          const head = buffer.subarray(4, 8).toString('latin1');
+          if (!/^[0-9a-fA-F]{4}$/.test(head)) { finish(new Error(`adb ${request}: malformed FAIL`)); return; }
+          const length = Number.parseInt(head, 16);
+          if (buffer.length < 8 + length) return;
+          finish(Object.assign(new Error(`adb ${request}: ${buffer.subarray(8, 8 + length).toString('utf8')}`), { code: 'ADB_FAIL' }));
+          return;
+        }
+        if (status !== 'OKAY') { finish(new Error(`adb ${request}: unexpected answer ${JSON.stringify(status)}`)); return; }
+        buffer = buffer.subarray(4);
+        opened = true;
+        clearTimeout(timer);
+        continue;
+      }
+      if (buffer.length < 4) return;
+      const head = buffer.subarray(0, 4).toString('latin1');
+      const length = /^[0-9a-fA-F]{4}$/.test(head) ? Number.parseInt(head, 16) : NaN;
+      if (!Number.isFinite(length)) { finish(new Error(`adb ${request}: malformed frame ${JSON.stringify(head)}`)); return; }
+      if (buffer.length < 4 + length) return;
+      const text = buffer.subarray(4, 4 + length).toString('utf8');
+      buffer = buffer.subarray(4 + length);
+      try { onDevices(parseDevicesLong(text)); } catch { /* a handler that throws never ends the stream */ }
+    }
+  };
+  try {
+    socket = dial({ host: '127.0.0.1', port });
+    socket.unref?.();
+    timer = setTimeout(() => finish(new Error(`adb server on ${port} did not answer ${request} within ${handshakeMs} ms`)), handshakeMs);
+    timer.unref?.();
+    socket.on('error', error => finish(error));
+    socket.on('close', () => finish(opened ? null : new Error(`adb server on ${port} closed the connection before answering ${request}`)));
+    socket.on('data', chunk => { buffer = Buffer.concat([buffer, chunk]); drain(); });
+    socket.write(frame(request));
+  } catch (error) {
+    finish(error);
+  }
+  return { close: () => finish(null) };
+}
+
 export function createAdbWire(port, { signal } = {}) {
   return {
     port,
@@ -86,6 +155,8 @@ export function createAdbWire(port, { signal } = {}) {
     devicesLong: async () => parseDevicesLong(payload(await exchange(port, ['host:devices-l'], { signal, timeout: 5000 }))),
     // Tells the server an emulator listens on adbPort (what the emulator itself does at start); the server sends no reply.
     registerEmulator: adbPort => exchange(port, [`host:emulator:${adbPort}`], { signal, noReply: true, timeout: 5000 }),
+    // Streams the track-devices listings to the handlers; see `trackDevices` (a plain socket: it never starts a server).
+    trackDevices: handlers => trackDevices(port, handlers),
     // Runs a shell command on one device and returns its output.
     shell: async (serial, command) => (await exchange(port, [`host:transport:${serial}`, `shell:${command}`], { signal, timeout: 15_000 })).replace(/\r/g, ''),
   };

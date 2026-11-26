@@ -8,6 +8,13 @@
 // event per state that differs from the last this cache logged (the Event Log's one appender is lock.mjs's `noteReachability`). A
 // probe or note that throws is one `HUB_API_REACHABILITY_FAILED` line on `log` and never reaches a request.
 //
+// The track socket (Story 8.3, AD-35) is the second writer of this cache and shares its `logged` map, so the Event Log still has one
+// writer per state change. `track(entries, {at})` stores `source: 'track'` readings for the Resources it names and marks them live;
+// `read()` serves a live reading as current, stamped at the read's own `now` (the socket pushes every change, so a silent one means the
+// state still holds; the stamp is derived when served and never stored), and a live reading never starts a probe. A probe never
+// overwrites a live reading. `trackLost({at})` (the socket closed) writes one `reachability` event per live id, `to: 'unknown'`, drops
+// those readings and clears the live set, so the next read probes. Nothing here opens a socket or starts a timer.
+//
 // The deploy path never imports this directory (tools/deploy-path.test.mjs).
 import { noteReachability } from '../ci/lib/lock.mjs';
 import { sleep as realSleep } from '../ci/lib/pause.mjs';
@@ -34,9 +41,18 @@ export function createReadings({ env = process.env, policy, now = Date.now, host
   const ask = probe ?? (phones => phoneReadings(phones, deviceCtx({ env, now, log: { err: say }, ...seams })));
   const stored = new Map();    // Resource id -> stored reading
   const logged = new Map();    // Resource id -> the last state this cache wrote an event for
+  const live = new Set();      // Resource ids the track socket is reporting on right now
   let inflight = null;
 
   const hostKeyOrNull = () => { try { return keyOf() ?? null; } catch { return null; } };
+
+  // Writes one `reachability` event when `state` differs from the last this cache logged (the one rule for the probe and the socket;
+  // `always` is a loss of the socket, which is written for every live id).
+  function noteChange(id, state, checkedAt, reason, { always = false } = {}) {
+    if (!always && logged.get(id) === state) return;
+    const noted = note({ resource: id, from: logged.get(id) ?? null, to: state, checked_at: checkedAt, reason }, { env, now, hostId, log: say });
+    if (noted === true) logged.set(id, state);
+  }
 
   async function refresh(own) {
     // Stamped when adb was asked, not when it answered: a slow probe must not make its reading look fresher than it is.
@@ -47,11 +63,10 @@ export function createReadings({ env = process.env, policy, now = Date.now, host
       try {
         const state = states?.get?.(record.name) ?? states?.get?.(record.id);
         if (!isReachability(state)) continue;
+        if (live.has(record.id)) continue;   // the socket's word is newer than a probe that started before it
         const reading = { ...stamp(state, { checkedAt: at, receivedAt: at }), source: 'probe' };
         stored.set(record.id, reading);
-        if (logged.get(record.id) === state) continue;
-        const noted = note({ resource: record.id, from: logged.get(record.id) ?? null, to: state, checked_at: reading.checked_at, reason: 'probe' }, { env, now, hostId, log: say });
-        if (noted === true) logged.set(record.id, state);
+        noteChange(record.id, state, reading.checked_at, 'probe');
       } catch (error) { failed(error); }
     }
   }
@@ -64,11 +79,13 @@ export function createReadings({ env = process.env, policy, now = Date.now, host
     const own = [];
     let needed = false;
     for (const record of records) {
-      const reading = stored.get(record.id) ?? null;
+      const isLive = live.has(record.id) && stored.has(record.id);
+      // A live reading is as old as this read: the socket would have said otherwise.
+      const reading = isLive ? { ...stamp(stored.get(record.id).state, { checkedAt: at, receivedAt: at }), source: 'track' } : stored.get(record.id) ?? null;
       served.set(record.id, serve(reading, { now: at }));
       if (key !== null && record.kind === 'phone' && record.host === key) {
         own.push(record);
-        if (present(reading, { now: at, maxAgeS }).stale) needed = true;
+        if (!isLive && present(reading, { now: at, maxAgeS }).stale) needed = true;
       }
     }
     if (needed && inflight === null) {
@@ -77,5 +94,31 @@ export function createReadings({ env = process.env, policy, now = Date.now, host
     return served;
   }
 
-  return { read, settled: () => inflight ?? Promise.resolve() };
+  // The socket's listing, mapped: `entries` are `{id, state}` (a Resource id and its Reachability) for the own-host phones it covers.
+  // Ids the socket no longer covers (a retired Resource) stop being live and fall back to the probe.
+  function track(entries = [], { at = now() } = {}) {
+    const covered = new Set();
+    for (const entry of entries) {
+      try {
+        if (!isReachability(entry?.state)) continue;
+        const reading = { ...stamp(entry.state, { checkedAt: at, receivedAt: at }), source: 'track' };
+        stored.set(entry.id, reading);
+        covered.add(entry.id);
+        live.add(entry.id);
+        noteChange(entry.id, entry.state, reading.checked_at, 'track');
+      } catch (error) { failed(error); }
+    }
+    for (const id of [...live]) if (!covered.has(id)) { live.delete(id); stored.delete(id); }
+  }
+
+  // The socket closed: nobody is watching any more. One event per live id (`to: 'unknown'`), then the readings go and the next read probes.
+  function trackLost({ at = now() } = {}) {
+    for (const id of [...live]) {
+      try { noteChange(id, 'unknown', at, 'track-lost', { always: true }); } catch (error) { failed(error); }
+      stored.delete(id);
+    }
+    live.clear();
+  }
+
+  return { read, track, trackLost, settled: () => inflight ?? Promise.resolve() };
 }

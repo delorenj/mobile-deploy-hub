@@ -13,6 +13,11 @@
 // A failed gather is one `HUB_API_OBSERVE_FAILED <why>` line, keeps the last snapshot and never reaches a request; before any success
 // it leaves an empty snapshot (`taken_at: null`, `adb.note` "the host could not be observed"), so the next read retries.
 //
+// The track socket (Story 8.3, AD-35) feeds the adb half: `track(listed)` stores the listing the socket just pushed, and while one is
+// stored `adbQuery()` answers with it (`note: null`, the last gather's `serials`, and `checked_at` the time of the read, because the
+// server pushes every change and a silent socket means the listing still holds). A gather never replaces it; `untrack()` (the socket
+// closed) returns `adbQuery()` to the gathers. The listing is kept as plain data and its age is never stored.
+//
 // A process start is trusted from the snapshot only while the snapshot is younger than `maxAgeMs` (one pass, JOB_POLL_MS). Otherwise,
 // and for a pid the snapshot never saw, one shared cached reader answers (`cachedProcessStart`: one read per pid per pass), so a pid reused
 // between a gather and a take never reads as gone for longer than that cache allows.
@@ -41,6 +46,7 @@ export function createSnapshot({ env = process.env, now = Date.now, maxAgeMs = J
   const fallbackLive = cachedProcessStart({ startOf: liveStartOf, now: () => now(), ttlMs: maxAgeMs });
   let current = null;    // the last snapshot; null until the first gather has settled
   let inflight = null;
+  let tracked = null;    // the listing the track socket last pushed; null while no socket is open
 
   async function gather() {
     // Stamped when the host was asked, not when it answered: a slow gather must not make its snapshot look fresher than it is.
@@ -103,9 +109,12 @@ export function createSnapshot({ env = process.env, now = Date.now, maxAgeMs = J
     },
     adbQuery: async () => {
       touch();
+      if (tracked !== null) return { port: (current ?? emptySnapshot(env)).adb.port, note: null, listed: tracked, serials: (current ?? emptySnapshot(env)).adb.serials, checked_at: now() };
       if (current === null) await refresh();
       return { ...current.adb, checked_at: current.taken_at };
     },
+    track: listed => { tracked = Array.isArray(listed) ? [...listed] : []; },
+    untrack: () => { tracked = null; },
     processStart: pid => startFrom(pid, 'starts', fallbackStart),
     liveStart: pid => startFrom(pid, 'live_starts', fallbackLive),
   };

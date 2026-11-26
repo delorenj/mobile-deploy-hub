@@ -15,11 +15,14 @@ import { createServer as nodeCreateServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
 import { onPath } from '../ci/lib/heavy.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
-import { createLeaseWaits, exitCodeOf, phoneReadings, withoutDeployIdentity } from '../device/claims.mjs';
+import { trackDevices as realTrackDevices } from '../device/adb-wire.mjs';
+import { createLeaseWaits, exitCodeOf, hostKey as realHostKey, phoneReadings, withoutDeployIdentity } from '../device/claims.mjs';
 import { observeHost, observeOffThread } from '../device/observe-thread.mjs';
-import { recoverRegistry, applySeed } from '../registry/store.mjs';
+import { retirement } from '../registry/match.mjs';
+import { recoverRegistry, applySeed, readRegistry } from '../registry/store.mjs';
 import { createReadings, deviceCtx } from './readings.mjs';
 import { createSnapshot } from './snapshot.mjs';
+import { createTrack } from './track.mjs';
 import { ROUTES, SERVICE, handle } from './routes.mjs';
 
 export const HOST = '127.0.0.1';
@@ -71,11 +74,13 @@ async function readJson(req) {
 //
 // Nothing is written until the outcome (Story 7.2, AD-37): a wait keeps its connection open with no status line and no header. Every
 // request has an abort signal that aborts when `res` closes before the answer was fully written (the client went away): `handle` passes
-// it to the route, and an answer for an aborted request is dropped, not written. `listener.drain()` resolves when every request that
-// is past its body (being handled, or being answered) has ended: a stop awaits it so the answers of the waits it just ended are written.
+// it to the route, and an answer for an aborted request is dropped, not written. `ctx.onRequest` (Story 8.3) is called first for every
+// request, in a try block that never changes an answer: the service's track socket is reopened by a request and by nothing else.
+// `listener.drain()` resolves when every request that is past its body (being handled, or being answered) has ended: a stop awaits it so the answers of the waits it just ended are written.
 export function requestListener(ctx) {
   const inflight = new Set();
   const listener = async (req, res) => {
+    try { ctx.onRequest?.(); } catch { /* a request hook never changes an answer */ }
     const controller = new AbortController();
     res.on?.('close', () => { if (!res.writableFinished) controller.abort(new Error('the connection closed before the answer was written')); });
     let body;
@@ -98,10 +103,11 @@ export function requestListener(ctx) {
 // ---- the generic service start ----
 
 // Starts one loopback service: checks, bind (the singleton), `afterBind` (the service's own start work), then the LISTEN line.
+// `onStop` (Story 8.3) is awaited first by a stop, before the open waits end and the server closes (the Hub API closes its track socket there).
 // Returns `{server, port, stop, stopped}`; `stopped` resolves once a signal or `stop()` has closed the server. A check that fails or
 // a lost bind throws a coded error (HUB_API_NODE, HUB_API_NO_HEAVY, HUB_API_ALREADY_RUNNING) with nothing bound or written.
 export async function startService({
-  service = SERVICE, port, routes = ROUTES, ctx = {}, afterBind,
+  service = SERVICE, port, routes = ROUTES, ctx = {}, afterBind, onStop,
   env: given = process.env, log = defaultLog(), versions = process.versions, onPath: hasOnPath = onPath, createServer = nodeCreateServer, signals = process,
 } = {}) {
   // A service belongs to no deploy run: whatever GITHUB_* identity its environment carries never reaches a Lease or an event.
@@ -131,7 +137,7 @@ export async function startService({
         for (const [name, handler] of handlers) signals.removeListener?.(name, handler);
         // Open waits answer 503 HUB_API_RESTARTING (their tickets aborted) and those answers are written before the server closes.
         (async () => {
-          try { await context.waits.shutdown(); await listener.drain?.(); } catch (error) { log.err(`HUB_API_ERROR stop ${oneLine(error)}`); }
+          try { await onStop?.(); await context.waits.shutdown(); await listener.drain?.(); } catch (error) { log.err(`HUB_API_ERROR stop ${oneLine(error)}`); }
           server.close(() => { log.out('HUB_API_STOP'); resolve(); });
         })();
       }
@@ -166,7 +172,7 @@ export async function startService({
 // context), and `processStart` / `liveStart`, which are the snapshot's fallback readers (a pid it has not seen), never the request
 // path's own. A test that injects `inventory` or `adbWire` gets a gather that uses them in the calling thread (a function does not
 // cross into a worker).
-export async function startHubApi({ policy, env: given = process.env, log = defaultLog(), now, hostId, devices, qaDevices, routes = ROUTES, adbWire, inventory, hostKey, sleep, devicectl, observe, snapshot: injected, adbQuery, processStart, liveStart, ...seams } = {}) {
+export async function startHubApi({ policy, env: given = process.env, log = defaultLog(), now, hostId, devices, qaDevices, routes = ROUTES, adbWire, inventory, hostKey, sleep, devicectl, observe, snapshot: injected, adbQuery, processStart, liveStart, trackDevices, ...seams } = {}) {
   const env = withoutDeployIdentity(given);
   const resolved = policy ?? loadPolicy().policy;
   const afterBind = async () => {
@@ -177,7 +183,7 @@ export async function startHubApi({ policy, env: given = process.env, log = defa
       log.err(`HUB_API_SEED_FAILED ${error?.code ?? 'ERROR'} ${oneLine(error)}`);
     }
     // The first gather starts after the bind has won, and is never waited for here: a read that needs it awaits `snapshot.ready()`.
-    snapshot.refresh();
+    Promise.resolve().then(() => snapshot.refresh()).then(() => track.ensure()).catch(error => log.err(`HUB_API_TRACK_FAILED ${oneLine(error)}`));
   };
   const inThread = inventory !== undefined || adbWire !== undefined;
   const snapshot = injected ?? createSnapshot({
@@ -194,7 +200,17 @@ export async function startHubApi({ policy, env: given = process.env, log = defa
   // queried on the main thread.
   const probe = async phones => { await snapshot.refresh(); return phoneReadings(phones, deviceCtx({ env, now, log: { err: log.err }, ...device })); };
   const readings = createReadings({ env, policy: resolved, now, hostId, log: log.err, hostKey, probe });
-  return startService({ ...seams, service: SERVICE, port: resolved.api.hub_api_port, routes, ctx: { policy: resolved, now, hostId, devices, qaDevices, readings, snapshot, ...device }, afterBind, env, log });
+  // The one track socket (Story 8.3, tools/hub-api/track.mjs): the real `trackDevices` unless a test fakes the host (it injected `observe`,
+  // `inventory`, `adbWire`, `snapshot` or `adbQuery` without a `trackDevices`), because a faked inventory can list a server that is not
+  // there. It is opened after the first gather and by a request, never by a timer, and closed by a stop.
+  const faked = observe !== undefined || inventory !== undefined || adbWire !== undefined || injected !== undefined || adbQuery !== undefined;
+  const keyOf = hostKey ?? realHostKey;
+  const records = () => {
+    const key = keyOf({ env });
+    return readRegistry({ env, devices, qaDevices, warn: () => {} }).resources.filter(record => retirement(record) === null && record.kind === 'phone' && record.host === key);
+  };
+  const track = createTrack({ env, now, hostKey: keyOf, records, snapshot, readings, open: trackDevices !== undefined ? trackDevices : faked ? null : realTrackDevices, log: log.err });
+  return startService({ ...seams, service: SERVICE, port: resolved.api.hub_api_port, routes, ctx: { policy: resolved, now, hostId, devices, qaDevices, readings, snapshot, onRequest: () => track.ensure(), ...device }, afterBind, onStop: () => track.stop(), env, log });
 }
 
 // The process entry: starts the service and ends 0 after a stop. An error prints `<CODE> <message>` on stderr and exits with its `exit`.
