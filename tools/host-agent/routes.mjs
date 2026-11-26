@@ -24,10 +24,10 @@ function knownOf(ctx) {
   return fallbacks.get(ctx);
 }
 
-// This host's key. An unknown host throws HUB_HOST_UNKNOWN, which the HTTP table answers 503 `host-unknown`.
 // The `dedicated_qa` ids a Lease view is redacted by here: what the agent knows (the Hub API's last answer, else the seed), never a Registry file it does not read.
 const withQa = ctx => ({ ...ctx, qaIds: () => knownOf(ctx).qaIds() });
 
+// This host's key. An unknown host throws HUB_HOST_UNKNOWN, which the HTTP table answers 503 `host-unknown`.
 const ownKey = ctx => (ctx.hostKey ?? realHostKey)({ env: ctx.env ?? process.env });
 
 // This host's phones, from what the agent knows (`[]` on the Mac).

@@ -2,7 +2,7 @@
 title: 'Freeze the contract and prove nothing leaks'
 type: 'feature'
 created: '2026-11-26'
-status: 'in-progress'
+status: 'in-review'
 baseline_revision: '15b20d5c0b54aa2edb65402dd69a47bfd9281900'
 review_loop_iteration: 0
 followup_review_recommended: false
