@@ -4,6 +4,20 @@ One section per hub release, headed `## vX.Y.Z`. `mise run release -- X.Y.Z` (`t
 
 A section is plain text read in a terminal: everything after its heading up to the next `## ` heading. Use `###` for sub-headings and `-` lists; do not start a section line with `## `.
 
+## v1.2.59
+
+The dedicated QA phones (MOBI-48) and forward-only installs (MOBI-51), on top of v1.2.58. A release or `hosts:install` can no longer take a host back to an older hub: the catch-up on big-chungus lost the S24's QA pass on 2026-11-26 when an install put `current` back on v1.2.58, which predates it.
+
+### What changed
+
+- The catch-up brings every dedicated QA phone (the private QA file's `dedicated` entries; today the S24) to the current build of every hub app, under the phone's own lock, with `adb install -r --user N` for its `allowed_users` only, the same sha256, signer and no-downgrade checks as the S26 and a version and `base.apk` sha256 readback. A phone that is away or busy reads `pending` and never fails a run. One Bloodbank event per status change, `data.trigger: catch-up`, on the deploy's correlation. State: `~/.local/state/mobile-deploy-hub/qa-delivery.json`; `catchup.mjs qa-retry <lock> <slug>` clears a parked build.
+- `hub-device lease|run` on a dedicated phone takes a hub-owned adb server on a fixed port (`HUB_QA_ADB_PORT_BASE`, default 5060, plus the phone's place in `android_extra`), started and reaped under the lease, and hands the port to QA tools as `ANDROID_ADB_SERVER_PORT`. Another adb server holding the phone's USB interface is named in the away reason and never stopped.
+- `tools/catchup/units/install.sh` records the installed commit (`releases/<ref>/.hub-commit`) and refuses to move `current` back to an ancestor of the installed commit (exit 3, `HUB_INSTALL_REFUSED`, both refs named) unless `--allow-downgrade`; `hosts:install` passes the flag through, writes the record for the Mac's copy, and stops at a refusal before it touches the Hub API or the Host Agent.
+
+### Rolling back
+
+Move `v1` back as the tag's `Roll back:` line says, then run `mise run hosts:install -- --allow-downgrade` from a clean checkout at the older tag if that checkout's installer is this release's or newer. An older tag's own installer predates the guard and needs no flag.
+
 ## v1.2.58
 
 Epic 9 (the Mac and its iPad, visible and leasable from big-chungus), on top of v1.2.57. Agents, Holocene's future board and Jarad can see the Mac's `ios-lane` and take it from big-chungus without ssh by hand. The Mac's lock dir stays authoritative: `mac-ios` lives on the Mac's disk and the Mac renders its own state, so every Queue timestamp on it comes from the Mac's clock. Every cross-host action is a forward to the owning host's own loopback service, and the Mac pushes only changes, never a stream, because it is a laptop that sleeps. `contract` stays 1: every change to `docs/hub-api-contract.md` is additive. Deploy jobs and the iPad catch-up are unchanged (AD-22, AD-25): nothing under `tools/ci/commands/` or `tools/catchup/` imports `claims.mjs`, the Registry, the Hub API, the Host Agent or `hub-client`, or calls a service (`tools/deploy-path.test.mjs` asserts it), and `HUB_MAC_BUSY` is still reported as success.

@@ -12,7 +12,20 @@
 # `catchup.mjs mode live` on that host.
 set -euo pipefail
 
-ref=${1:?usage: install.sh <ref, e.g. v1.1.0 or main-1a2b3c4>}
+# Forward-only (MOBI-51): `current` never moves to a commit that is an ancestor of the installed one unless --allow-downgrade (or
+# HUB_ALLOW_DOWNGRADE=1) is given. Every install records the commit it installed in releases/<ref>/.hub-commit, so a tree without .git
+# (the Mac's copy, a release copy) can be compared too. A refusal exits 3 and prints HUB_INSTALL_REFUSED naming both refs; nothing is
+# copied, repointed or restarted.
+allow_downgrade=${HUB_ALLOW_DOWNGRADE:-0}
+ref=
+for arg in "$@"; do
+  case $arg in
+    --allow-downgrade) allow_downgrade=1 ;;
+    -*) echo "install.sh: unknown option '$arg'" >&2; exit 2 ;;
+    *) [[ -z $ref ]] || { echo "install.sh: one ref only" >&2; exit 2; }; ref=$arg ;;
+  esac
+done
+[[ -n $ref ]] || { echo "usage: install.sh [--allow-downgrade] <ref, e.g. v1.1.0 or main-1a2b3c4>" >&2; exit 2; }
 [[ $ref =~ ^[A-Za-z0-9._-]{1,64}$ ]] || { echo "install.sh: bad ref '$ref'" >&2; exit 2; }
 units=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 tools=$(cd "$units/../.." && pwd -P)
@@ -22,13 +35,85 @@ node="$HOME/.local/share/mise/installs/node/24/bin/node"
 
 share="$HOME/.local/share/mobile-deploy-hub"
 release="$share/releases/$ref"
+
+# A commit record is `commit=<sha>` and `count=<commits in its history>` in <release>/.hub-commit.
+record_field() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n1; }
+# The repo to ask about ancestry: HUB_REPO, the tree this script runs from, or the usual checkout.
+hub_repo() {
+  local candidate
+  for candidate in "${HUB_REPO:-}" "$tools/.." "$HOME/code/mobile-deploy-hub"; do
+    [[ -n $candidate ]] && git -C "$candidate" rev-parse --git-dir >/dev/null 2>&1 && { echo "$candidate"; return 0; }
+  done
+  return 1
+}
+# Prints "<sha> <count>" for a release dir (its record, else - for a checkout tree - git HEAD), nothing when unknown.
+commit_of_tree() {
+  local dir=$1 sha count
+  if [[ -f $dir/.hub-commit ]]; then
+    sha=$(record_field "$dir/.hub-commit" commit); count=$(record_field "$dir/.hub-commit" count)
+    [[ -n $sha ]] && { echo "$sha ${count:-}"; return 0; }
+  fi
+  return 1
+}
+commit_from_git() {
+  local sha=$1 repo count
+  repo=$(hub_repo) || return 1
+  sha=$(git -C "$repo" rev-parse --verify -q "$sha^{commit}") || return 1
+  count=$(git -C "$repo" rev-list --count "$sha") || return 1
+  echo "$sha $count"
+}
+
+# What this install is: the tree's own record when it is a release copy, else the checkout's HEAD.
+new_commit=
+if [[ $tools == "$release/tools" ]]; then
+  new_commit=$(commit_of_tree "$release" || true)
+elif git -C "$tools" rev-parse --git-dir >/dev/null 2>&1; then
+  new_commit=$(cd "$tools/.." && commit_from_git HEAD || true)
+fi
+# What is installed: current's record; a legacy install with none is read from its ref name (main-<sha> or a vX.Y.Z tag).
+installed_ref=; installed_commit=
+if [[ -L $share/current ]]; then
+  installed_ref=$(basename "$(readlink "$share/current")")
+  installed_commit=$(commit_of_tree "$share/current" || true)
+  if [[ -z $installed_commit ]]; then
+    case $installed_ref in
+      main-*) installed_commit=$(commit_from_git "${installed_ref#main-}" || true) ;;
+      v[0-9]*) installed_commit=$(commit_from_git "$installed_ref" || true) ;;
+    esac
+  fi
+fi
+
+if [[ -n $new_commit && -n $installed_commit ]]; then
+  read -r new_sha new_count <<<"$new_commit"
+  read -r old_sha old_count <<<"$installed_commit"
+  behind=0
+  if [[ $new_sha != "$old_sha" ]]; then
+    repo=$(hub_repo || true)
+    if [[ -n $repo ]] && git -C "$repo" cat-file -e "$new_sha^{commit}" 2>/dev/null && git -C "$repo" cat-file -e "$old_sha^{commit}" 2>/dev/null; then
+      git -C "$repo" merge-base --is-ancestor "$new_sha" "$old_sha" && behind=1
+    elif [[ -n ${new_count:-} && -n ${old_count:-} && $new_count -lt $old_count ]]; then
+      behind=1
+    fi
+  fi
+  if [[ $behind == 1 && $allow_downgrade != 1 ]]; then
+    echo "HUB_INSTALL_REFUSED current stays on $installed_ref (${old_sha:0:7}): $ref (${new_sha:0:7}) is an ancestor of it, so installing it would take the hosts back. Pass --allow-downgrade to do that on purpose." >&2
+    exit 3
+  fi
+  [[ $behind == 1 ]] && echo "HUB_INSTALL_DOWNGRADE current moves back from $installed_ref (${old_sha:0:7}) to $ref (${new_sha:0:7}) (--allow-downgrade)"
+elif [[ -n $installed_ref && $installed_ref != "$ref" ]]; then
+  echo "HUB_INSTALL_UNVERIFIED cannot order $ref against $installed_ref (commit of $ref: ${new_commit%% *}, commit of $installed_ref: ${installed_commit%% *}; empty means unknown); installing without the forward-only check" >&2
+fi
+
 mkdir -p "$share/releases"
 if [[ $tools != "$release/tools" ]]; then
   rm -rf "$release.part"
   mkdir -p "$release.part"
   cp -R "$tools" "$release.part/tools"
+  [[ -n $new_commit ]] && { read -r sha count <<<"$new_commit"; printf 'commit=%s\ncount=%s\n' "$sha" "$count" > "$release.part/.hub-commit"; }
   rm -rf "$release"
   mv "$release.part" "$release"
+elif [[ -n $new_commit && ! -f $release/.hub-commit ]]; then
+  read -r sha count <<<"$new_commit"; printf 'commit=%s\ncount=%s\n' "$sha" "$count" > "$release/.hub-commit"
 fi
 ln -sfn "releases/$ref" "$share/current"
 echo "catch-up code: $share/current -> releases/$ref"

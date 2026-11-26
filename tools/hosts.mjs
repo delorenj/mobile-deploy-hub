@@ -17,7 +17,7 @@
 //     swaps the tree a running service reads. The services switch only at the installer's own restart or bootout and bootstrap.
 // Writes to the bucket use the hub writer's keys from 1Password, as deliver does.
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -39,11 +39,35 @@ function sh(command, args, { input, timeout = 120_000 } = {}) {
   return { ok: !result.error && result.status === 0, out: `${result.stdout ?? ''}${result.stderr ?? ''}`.trim() };
 }
 
+// The HUB_INSTALL_REFUSED line of an install.sh output (the forward-only refusal), or null.
+const refusalOf = out => /HUB_INSTALL_REFUSED[^\n]*/.exec(out)?.[0] ?? null;
+
 export function releaseName(run = sh) {
   const tag = run('git', ['describe', '--exact-match', '--tags', '--match', 'v[0-9]*.[0-9]*.[0-9]*', 'HEAD']);
   if (tag.ok && /^v\d+\.\d+\.\d+$/.test(tag.out)) return tag.out;
   const head = run('git', ['rev-parse', '--short=7', 'HEAD']);
   return `main-${head.out}`;
+}
+
+// MOBI-51: the commit a release copy was made from, recorded at install time as `commit=<sha>` and `count=<commits in its history>`
+// (releases/<ref>/.hub-commit), so install.sh can order two installs without a .git. The checkout is at `ref` by construction (releaseName
+// names HEAD), so HEAD is the commit of any release copy of that ref. Null when git cannot say.
+export function headCommit() {
+  const git = args => spawnSync('git', args, { encoding: 'utf8', cwd: hubRoot, timeout: 15_000 });
+  const sha = git(['rev-parse', 'HEAD']);
+  const count = git(['rev-list', '--count', 'HEAD']);
+  if (sha.status !== 0 || count.status !== 0 || !/^[0-9a-f]{40}$/.test(sha.stdout.trim()) || !/^\d+$/.test(count.stdout.trim())) return null;
+  return { sha: sha.stdout.trim(), count: count.stdout.trim() };
+}
+export const commitRecord = ({ sha, count }) => `commit=${sha}\ncount=${count}\n`;
+
+// A release copy that was installed before the record existed gets it now (never replaced when present).
+export function recordCommitLocally(release, commit = headCommit()) {
+  const file = join(release, '.hub-commit');
+  if (!commit || !existsSync(release) || existsSync(file)) return false;
+  writeFileSync(`${file}.part`, commitRecord(commit));
+  renameSync(`${file}.part`, file);
+  return true;
 }
 
 // The Mac side of the seed: for each app folder, the newest run's tarballs unpacked into the cache, and kept beside
@@ -176,7 +200,7 @@ export async function servicesAgree({ seams = {} } = {}) {
   return `contract ${first.body.contract}, hub_version ${first.body.hub_version} on ${first.host} and ${second.host}`;
 }
 
-export async function hostsInstall({ log = console.log, run = sh, fetchImpl = fetch, sleep = realSleep, now = Date.now, home = homedir(), credentials = writerCredentials, sshImpl, hostKey = () => claimsHostKey({ home }), timers } = {}) {
+export async function hostsInstall({ allowDowngrade = process.argv.includes('--allow-downgrade') || process.env.HUB_ALLOW_DOWNGRADE === '1', log = console.log, run = sh, fetchImpl = fetch, sleep = realSleep, now = Date.now, home = homedir(), credentials = writerCredentials, sshImpl, hostKey = () => claimsHostKey({ home }), timers } = {}) {
   const { policy } = loadPolicy();
   const devices = loadDevices();
   const failures = [];
@@ -185,6 +209,8 @@ export async function hostsInstall({ log = console.log, run = sh, fetchImpl = fe
   };
   const ref = releaseName(run);
   const host = devices.mac.host;
+  const downgradeFlag = allowDowngrade ? ['--allow-downgrade'] : [];
+  let refused = null;
   // The seams `request` takes (hub-client): the Mac is reached over ssh, this host's own service by a loopback fetch.
   const seams = { policy, devices, hostKey, fetchImpl, ...(sshImpl ? { sshImpl } : {}), ...(timers ? { timers } : {}) };
 
@@ -243,11 +269,15 @@ export async function hostsInstall({ log = console.log, run = sh, fetchImpl = fe
   if (!existsSync(installer)) {
     log('HOSTS catch-up: tools/catchup/units/install.sh is not in this checkout yet (CATCHUP); skipped');
   } else {
+    recordCommitLocally(join(releasesDir(home), ref));
     await step('catch-up on big-chungus', async () => {
-      const result = run('bash', [installer, ref], { timeout: 5 * 60_000 });
-      if (!result.ok) throw new Error(result.out.slice(-300));
+      const result = run('bash', [installer, ...downgradeFlag, ref], { timeout: 5 * 60_000 });
+      if (!result.ok) { refused = refusalOf(result.out) ?? refused; throw new Error(result.out.slice(-300)); }
       return `${ref}: ${result.out.split('\n').slice(-2).join('; ')}`;
     });
+    // A refused install means this checkout is behind what is installed: the Hub API and the Host Agent would be moved back by the steps
+    // that follow (they run from releases/<ref>), so nothing after this runs.
+    if (refused) throw new Error(`hosts:install: ${refused} Nothing after the catch-up step was run.`);
   }
   // Always runs, after the big-chungus catch-up step (which puts releases/<ref> in place): a missing release copy fails loudly here.
   await step('hub api on big-chungus', () => installHubApi({ ref, run, fetchImpl, sleep, now, home, port: policy.api.hub_api_port, log }));
@@ -268,10 +298,14 @@ export async function hostsInstall({ log = console.log, run = sh, fetchImpl = fe
         if (!move.ok) throw new Error(move.out.slice(-200));
         copied = `${/Total bytes sent:\s*([\d,]+)/.exec(copy.out)?.[1] ?? '?'} bytes sent`;
       }
-      const install = run('ssh', [...ssh, host, `bash '${release}/tools/catchup/units/install.sh' '${ref}'`], { timeout: 5 * 60_000 });
-      if (!install.ok) throw new Error(install.out.slice(-300));
+      // The copy's commit record is written first when it is missing (never replaced), then the Mac's own installer orders the two installs.
+      const commit = headCommit();
+      const record = commit ? `[ -e '${release}/.hub-commit' ] || printf 'commit=%s\\ncount=%s\\n' '${commit.sha}' '${commit.count}' > '${release}/.hub-commit'; ` : '';
+      const install = run('ssh', [...ssh, host, `${record}bash '${release}/tools/catchup/units/install.sh'${allowDowngrade ? " '--allow-downgrade'" : ''} '${ref}'`], { timeout: 5 * 60_000 });
+      if (!install.ok) { refused = refusalOf(install.out) ?? refused; throw new Error(install.out.slice(-300)); }
       return `${ref} (${copied}): ${install.out.split('\n').slice(-2).join('; ')}`;
     });
+    if (refused) throw new Error(`hosts:install: ${refused} Nothing after the Mac's catch-up step was run.`);
   }
   // Always run: a Mac with no release copy fails loudly here (the installer is not there), and the agreement step reports what it can read.
   await step('host agent on the Mac', () => installHostAgent({ ref, host, run, seams, sleep, now, port: policy.api.host_agent_port, log }));

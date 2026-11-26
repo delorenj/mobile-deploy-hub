@@ -16,7 +16,7 @@ import { main as hostAgentMain } from '../host-agent/server.mjs';
 import { inHeavy, onPath, which } from '../ci/lib/heavy.mjs';
 import { bootCommand } from '../device/emulator.mjs';
 import { onPath as serverOnPath } from '../hub-api/server.mjs';
-import { HOST_AGENT_LABEL, HUB_API_UNIT, hostsInstall, installHubApi, servicesAgree } from '../hosts.mjs';
+import { HOST_AGENT_LABEL, HUB_API_UNIT, commitRecord, hostsInstall, installHubApi, recordCommitLocally, servicesAgree } from '../hosts.mjs';
 import { HOST_AGENT_SERVICE, HUB_API_CONTRACT, HUB_API_SERVICE } from '../hub-client.mjs';
 
 hermetic();
@@ -478,6 +478,45 @@ function hostsRun({ release = false, healthRef = 'v1.2.3', macRelease = false, m
 const only = (calls, ...commands) => calls.filter(call => commands.includes(call[0]) && !(call[0] === 'bash' && call[1] === '-s'));
 const macCommands = calls => calls.filter(call => call[0] === 'ssh' || call[0] === 'rsync').map(call => call.at(-1));
 
+test('hostsInstall (MOBI-51): an existing release copy with no commit record gets one, and a present record is never replaced', () => {
+  const home = scratch('hub-hosts-record-');
+  try {
+    const release = join(home, 'releases/v1.2.3');
+    const commit = { sha: 'a'.repeat(40), count: '12' };
+    assert.equal(recordCommitLocally(release, commit), false, 'no release copy, nothing written');
+    mkdirSync(release, { recursive: true });
+    assert.equal(recordCommitLocally(release, commit), true);
+    assert.equal(readFileSync(join(release, '.hub-commit'), 'utf8'), `commit=${'a'.repeat(40)}\ncount=12\n`);
+    assert.equal(recordCommitLocally(release, { sha: 'b'.repeat(40), count: '99' }), false);
+    assert.equal(readFileSync(join(release, '.hub-commit'), 'utf8'), commitRecord(commit));
+    assert.equal(recordCommitLocally(release, null), false);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test('hostsInstall (MOBI-51): a refused catch-up install (this checkout is behind current) stops everything after it: no Hub API restart, nothing on the Mac', async () => {
+  const h = hostsRun();
+  try {
+    const refusal = 'HUB_INSTALL_REFUSED current stays on main-c92f6f9 (c92f6f9): v1.2.3 (e9b7b70) is an ancestor of it';
+    const run = (command, args, options) => (command === 'bash' && /catchup\/units\/install\.sh$/.test(args[0]) ? (h.calls.push([command, ...args]), { ok: false, out: refusal }) : h.opts.run(command, args, options));
+    await assert.rejects(hostsInstall({ ...h.opts, run }), /hosts:install: HUB_INSTALL_REFUSED current stays on main-c92f6f9.*Nothing after the catch-up step was run/);
+    assert.equal(h.calls.some(call => call[0] === 'systemctl'), false, 'the Hub API was not touched');
+    assert.equal(h.calls.some(call => /releases/.test(call.at(-1)) && call[0] === 'ssh'), false, 'the Mac was not touched');
+    assert.ok(h.log.some(line => line.startsWith('HOSTS_FAILED catch-up on big-chungus: HUB_INSTALL_REFUSED')), h.log.join('\n'));
+  } finally { h.cleanup(); }
+});
+
+test('hostsInstall (MOBI-51): --allow-downgrade reaches both catch-up installers; without it neither gets the flag', async () => {
+  const on = hostsRun();
+  const off = hostsRun();
+  try {
+    await hostsInstall({ ...on.opts, allowDowngrade: true });
+    assert.deepEqual(only(on.calls, 'bash')[0], ['bash', join(hubRoot, 'tools/catchup/units/install.sh'), '--allow-downgrade', 'v1.2.3']);
+    assert.ok(macCommands(on.calls).some(command => /catchup\/units\/install\.sh' '--allow-downgrade' 'v1\.2\.3'$/.test(command)), macCommands(on.calls).join('\n'));
+    await hostsInstall({ ...off.opts, allowDowngrade: false });
+    assert.equal(off.calls.some(call => call.some(part => /--allow-downgrade/.test(part))), false);
+  } finally { on.cleanup(); off.cleanup(); }
+});
+
 test('hostsInstall: the catch-up installer, then the units installer, then enable, then restart, then the readback', async () => {
   const h = hostsRun();
   try {
@@ -529,13 +568,18 @@ test('hostsInstall: a release copy that is missing fails the Hub API step loudly
 
 // ---- the Host Agent on the Mac, and the two services agreeing (Story 9.7) ----
 
+// MOBI-51: the Mac's catch-up installer is preceded by writing the copy's commit record when it is missing; the rest of the command is unchanged.
+const RECORD = /^\[ -e '[^']*\.hub-commit' \] \|\| printf 'commit=%s\\ncount=%s\\n' '[0-9a-f]{40}' '\d+' > '[^']*\.hub-commit'; /;
+const withoutRecord = command => command.replace(RECORD, '');
+
 test('hostsInstall, fresh Mac: the release is copied into <ref>.part and moved, the catch-up installer runs, then the units installer, then /health is read through the relay', async () => {
   const h = hostsRun();
   try {
     await hostsInstall(h.opts);
     const release = '.local/share/mobile-deploy-hub/releases/v1.2.3';
     const mac = macCommands(h.calls).filter(command => /releases/.test(command));
-    assert.deepEqual(mac, [
+    assert.match(mac.find(command => /catchup\/units\/install\.sh/.test(command)), RECORD, 'the copy gets its commit record first');
+    assert.deepEqual(mac.map(withoutRecord), [
       `if [ -e '${release}/tools' ]; then echo RELEASE_PRESENT; else echo RELEASE_MISSING; fi`,
       `mkdir -p '${release}.part/tools'`,
       `hub-mac:${release}.part/tools/`,
@@ -563,7 +607,7 @@ test('hostsInstall, same-ref reinstall on the Mac: nothing is copied or moved, a
     assert.equal(h.calls.filter(call => call[0] === 'rsync').length, 0, 'no rsync into a tree a running agent reads');
     assert.equal(macCommands(h.calls).filter(command => /\bmv\b|mkdir -p '\.local/.test(command)).length, 0, 'no mv, no mkdir of the release');
     const release = '.local/share/mobile-deploy-hub/releases/v1.2.3';
-    const mac = macCommands(h.calls).filter(command => /^bash '/.test(command));
+    const mac = macCommands(h.calls).filter(command => /bash '/.test(command)).map(withoutRecord);
     assert.deepEqual(mac, [`bash '${release}/tools/catchup/units/install.sh' 'v1.2.3'`, `bash '${release}/tools/hosts/units/install.sh' 'v1.2.3'`]);
     assert.ok(h.log.some(line => /^HOSTS catch-up on the Mac: v1\.2\.3 \(release copy already on the Mac, not copied\)/.test(line)), h.log.join('\n'));
     assert.equal(h.log.at(-1), 'HOSTS_OK v1.2.3');
