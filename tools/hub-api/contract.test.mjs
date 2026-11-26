@@ -8,17 +8,18 @@
 // whatever the value, even null); `{name}` in a route path is a parameter.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadDevices } from '../ci/lib/devices.mjs';
-import { acquireLease, buildTicket, listWaiters, reserve } from '../ci/lib/lock.mjs';
+import { acquireLease, buildTicket, listWaiters, noteReachability, reserve } from '../ci/lib/lock.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { hermetic } from '../ci/test-fixtures.mjs';
 import { EXIT_CODES, createLeaseWaits } from '../device/claims.mjs';
 import { fakeWire } from '../device/wire-fixtures.mjs';
 import { AGENT_ROUTES } from '../host-agent/routes.mjs';
+import { createPeers } from './peers.mjs';
 import { CONTRACT_VERSION, PROBLEM_EXTENSIONS, ROUTES, handle } from './routes.mjs';
 import { createStream } from './stream.mjs';
 
@@ -196,6 +197,27 @@ function prepareStatus(ctx) {
   });
 }
 
+// The live state `GET /history` needs so every field appears: a past `host-reachability` event that opened a range for the Mac, and a transport
+// whose Mac never answers (HUB_DEVICE_AWAY), so the answer is `partial` with an open range. `after` puts back everything it touched.
+const eventFiles = ctx => (existsSync(ctx.env.HUB_EVENT_DIR) ? readdirSync(ctx.env.HUB_EVENT_DIR).filter(name => /^\d{4}-\d{2}\.jsonl$/.test(name)) : []);
+
+function prepareHistory(ctx) {
+  const before = new Map(eventFiles(ctx).map(name => [name, readFileSync(join(ctx.env.HUB_EVENT_DIR, name))]));
+  noteReachability({ host: 'mac', from: null, to: 'unreachable', reason: 'timeout', checked_at: Date.now() - 3_600_000 }, { env: ctx.env, now: () => Date.now() - 3_600_000, hostId: 'contract-host', log: () => {} });
+  ctx.peers = createPeers({ env: ctx.env, policy: ctx.policy, hostId: 'contract-host', log: () => {} });
+  ctx.request = async () => { throw Object.assign(new Error('the mac host did not answer: contract'), { code: 'HUB_DEVICE_AWAY', api: false, reason: 'host-unreachable', status: 503, exit: 75, detail: 'timeout' }); };
+  return { ctx, before };
+}
+
+function afterHistory({ ctx, before }) {
+  delete ctx.request;
+  delete ctx.peers;
+  for (const name of eventFiles(ctx)) {
+    if (before.has(name)) writeFileSync(join(ctx.env.HUB_EVENT_DIR, name), before.get(name));
+    else rmSync(join(ctx.env.HUB_EVENT_DIR, name), { force: true });
+  }
+}
+
 const POST_SAMPLES = Object.freeze({
   // A push from the Mac to a Hub API on linux (Story 9.5).
   '/agent/push': { status: 200, body: { format: 1, host: 'mac', host_id: null, boot: '0123456789ab', seq: 1, sent_at: '2026-11-26T10:00:00.000Z', status: null, readings: null, events: null } },
@@ -216,6 +238,7 @@ const POST_SAMPLES = Object.freeze({
 const GET_SAMPLES = Object.freeze({
   '/leases/{id}': { params: { id: 'contract-1' }, setup: ['/leases'] },
   '/status': { prepare: prepareStatus },
+  '/history': { prepare: prepareHistory, after: afterHistory },
 });
 const sampleOf = (route, samples = POST_SAMPLES) => {
   if (!Object.hasOwn(samples, route.path)) throw new Error(`no request body sample for ${route.method} ${route.path}: add it to POST_SAMPLES`);
@@ -464,7 +487,7 @@ test('the Host Agent table of the document equals AGENT_ROUTES both ways, each w
   for (const route of AGENT_ROUTES.filter(candidate => !['AgentHealth', 'HostView', 'AgentSync'].includes(candidate.shape))) {
     assert.equal(ROUTES.find(candidate => routeKey(candidate) === agentKey(route))?.shape, route.shape, `${agentKey(route)} is the Hub API's route`);
   }
-  for (const route of ROUTES.filter(candidate => !candidate.path.startsWith('/registry') && !['/resources', '/resources/{id}', '/pools', '/discovery', '/stream', '/health', '/status', '/agent/push'].includes(candidate.path))) {
+  for (const route of ROUTES.filter(candidate => !candidate.path.startsWith('/registry') && !['/resources', '/resources/{id}', '/pools', '/discovery', '/stream', '/history', '/health', '/status', '/agent/push'].includes(candidate.path))) {
     assert.ok(AGENT_ROUTES.some(candidate => agentKey(candidate) === routeKey(route)), `${routeKey(route)} is a Hold route the agent serves`);
   }
 });
