@@ -239,6 +239,8 @@ const GET_SAMPLES = Object.freeze({
   '/leases/{id}': { params: { id: 'contract-1' }, setup: ['/leases'] },
   '/status': { prepare: prepareStatus },
   '/history': { prepare: prepareHistory, after: afterHistory },
+  // `from` long ago, so the window is never in the future whatever the clock says.
+  '/utilisation': { query: 'from=2020-01-01', prepare: prepareHistory, after: afterHistory },
 });
 const sampleOf = (route, samples = POST_SAMPLES) => {
   if (!Object.hasOwn(samples, route.path)) throw new Error(`no request body sample for ${route.method} ${route.path}: add it to POST_SAMPLES`);
@@ -282,7 +284,7 @@ async function callGet(route, ctx) {
   const state = await sample.prepare?.(ctx);
   let answer = null;
   try {
-    answer = await handle({ method: 'GET', url: samplePath(route.path, { ...PARAM_SAMPLES, ...sample.params }) }, ctx);
+    answer = await handle({ method: 'GET', url: `${samplePath(route.path, { ...PARAM_SAMPLES, ...sample.params })}${sample.query === undefined ? '' : `?${sample.query}`}` }, ctx);
     return answer;
   } finally { await sample.after?.(state, answer); }
 }
@@ -487,7 +489,7 @@ test('the Host Agent table of the document equals AGENT_ROUTES both ways, each w
   for (const route of AGENT_ROUTES.filter(candidate => !['AgentHealth', 'HostView', 'AgentSync'].includes(candidate.shape))) {
     assert.equal(ROUTES.find(candidate => routeKey(candidate) === agentKey(route))?.shape, route.shape, `${agentKey(route)} is the Hub API's route`);
   }
-  for (const route of ROUTES.filter(candidate => !candidate.path.startsWith('/registry') && !['/resources', '/resources/{id}', '/pools', '/discovery', '/stream', '/history', '/health', '/status', '/agent/push'].includes(candidate.path))) {
+  for (const route of ROUTES.filter(candidate => !candidate.path.startsWith('/registry') && !['/resources', '/resources/{id}', '/pools', '/discovery', '/stream', '/history', '/utilisation', '/health', '/status', '/agent/push'].includes(candidate.path))) {
     assert.ok(AGENT_ROUTES.some(candidate => agentKey(candidate) === routeKey(route)), `${routeKey(route)} is a Hold route the agent serves`);
   }
 });

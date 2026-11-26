@@ -29,6 +29,7 @@ import { deviceCtx } from './readings.mjs';
 import { checkPushBody, createRemotes } from './remotes.mjs';
 import { createReplicas } from './replica.mjs';
 import { STREAM_HEADERS } from './stream.mjs';
+import { createUtilisation, queryUtilisation } from './utilisation.mjs';
 
 // One name and one contract number for the service: the server answers with them, and the installer's readback and the smoke check for them.
 import { HUB_API_CONTRACT, HUB_API_SERVICE } from '../hub-client.mjs';
@@ -294,6 +295,36 @@ export async function historyRoute(ctx, { query, signal } = {}) {
   }
   return queryHistory({
     query, own, env, registry: () => readIt(ctx), hostId: ctx.hostId, now: ctx.now ?? Date.now, signal,
+    peers: peersOf(ctx), replicas: replicasOf(ctx), history: historyOf(ctx), transport: transportOf(ctx),
+    contact: (host, at) => noteContact(ctx, host, at), failure: (host, at) => noteFailure(ctx, host, at),
+    log: line => { try { ctx.log?.err?.(line); } catch { /* a broken log seam never changes the answer */ } },
+  });
+}
+
+// The folded timelines `/utilisation` keeps (Story 10.3: one per host source, in memory): the context's `utilisation` (the service's), or, for a bare
+// `handle()` with none, one per context.
+const fallbackUtilisation = new WeakMap();
+function utilisationOf(ctx) {
+  if (ctx.utilisation) return ctx.utilisation;
+  if (!fallbackUtilisation.has(ctx)) fallbackUtilisation.set(ctx, createUtilisation());
+  return fallbackUtilisation.get(ctx);
+}
+
+// GET /utilisation?from&to (Story 10.3, FR-18, AD-40): how each Resource spent the window `[from, to)` (`to` defaults to, and is clipped to, now): ms and
+// share held, idle while reserved, idle, away and `unknown`, with each emulator slot's row and the Pool's rollup. It answers from one folded
+// timeline per host source (this host's log, each peer's replica) that a request advances over only the bytes appended since the last one, takes
+// the peers' coverage as `/history` does (a sync for a replica that may lack the window, `partial`, `synced_through`: time past a host's
+// `synced_through` is `unknown`) and writes nothing of its own. The Resources are the Registry's live ones plus those retired at or after `from`; the
+// emulator Pool's size is the host's (`emulatorPool`). The query is checked first (400 HUB_USAGE, nothing read); a host that does not know its key is
+// 503 HUB_HOST_UNKNOWN. The logic is tools/registry/history.mjs and tools/hub-api/utilisation.mjs.
+export async function utilisationRoute(ctx, { query, signal } = {}) {
+  const env = ctx.env ?? process.env;
+  let own;
+  try { own = (ctx.hostKey ?? realHostKey)({ env }); } catch (error) {
+    throw error?.code === 'HUB_HOST_UNKNOWN' ? HOST_UNKNOWN(oneLine(error.message)) : error;
+  }
+  return queryUtilisation({
+    query, own, env, registry: () => readIt(ctx), hostId: ctx.hostId, now: ctx.now ?? Date.now, signal, policy: ctx.policy, cache: utilisationOf(ctx),
     peers: peersOf(ctx), replicas: replicasOf(ctx), history: historyOf(ctx), transport: transportOf(ctx),
     contact: (host, at) => noteContact(ctx, host, at), failure: (host, at) => noteFailure(ctx, host, at),
     log: line => { try { ctx.log?.err?.(line); } catch { /* a broken log seam never changes the answer */ } },
@@ -591,6 +622,7 @@ export const ROUTES = Object.freeze([
   Object.freeze({ method: 'GET', path: '/status', shape: 'Status', handler: statusDocument }),
   Object.freeze({ method: 'GET', path: '/stream', shape: 'StreamFrame', handler: streamRoute, stream: true }),
   Object.freeze({ method: 'GET', path: '/history', shape: 'History', handler: historyRoute }),
+  Object.freeze({ method: 'GET', path: '/utilisation', shape: 'Utilisation', handler: utilisationRoute }),
   Object.freeze({ method: 'POST', path: '/agent/push', shape: 'AgentPushAck', handler: agentPush }),
   Object.freeze({ method: 'POST', path: '/registry/resources', shape: 'Resource', handler: registerResource }),
   Object.freeze({ method: 'POST', path: '/registry/resources/{id}', shape: 'Resource', handler: editResource }),

@@ -161,7 +161,7 @@ export async function replicaLastTs(env, host) {
   return null;
 }
 
-const abortError = signal => signal?.reason ?? Object.assign(new Error('the request was aborted'), { name: 'AbortError' });
+export const abortError = signal => signal?.reason ?? Object.assign(new Error('the request was aborted'), { name: 'AbortError' });
 
 // Asks one peer to push what its replica lacks: `POST /agent/sync` with the replica's settled sizes. The marks gate it (`peers.gate` throws the
 // fast-fail HUB_DEVICE_AWAY of a marked host, before any transport call), the sizes are read under the replica's queue and the call is made
@@ -185,16 +185,12 @@ async function syncPeer({ host, peers, replicas, history, transport, now, signal
   if (answer.body?.synced === true) history.proofs.set(host, sent);
 }
 
-// The whole of `GET /history`: the checked query, the on-demand syncs, the merged and paged read, and the gaps. `registry` is a function (the
-// Registry is read only for a query that passed the check); `transport` the context's one transport (`transportOf(ctx)`); `contact` and `failure`
-// the callbacks that note a peer's mark; `now` the clock. Answers `History`.
-export async function queryHistory({ query: params, own, env = process.env, registry, hostId, now = Date.now, signal, peers, replicas, history, transport, contact = () => {}, failure = () => {}, log = () => {} }) {
-  const query = parseHistoryQuery(params);
-  const at = now();
-  const windowEnd = query.to ?? at;
+// Where each peer's replica stands, and a sync for the ones that may lack the window `[.., windowEnd]` (Story 10.2; `GET /utilisation` calls the same
+// step, Story 10.3). Returns `{through, partial, spokes}`: `through` maps every host key to its `synced_through` in ms or null (this host's own is
+// `at`, the request's receipt time), `partial` is true when some peer's is null or before `windowEnd`, `spokes` the peer host keys. A peer that
+// cannot be reached is the expected case (partial), not a fault; anything else is one `HUB_API_HISTORY_SYNC_FAILED` line.
+export async function coverPeers({ own, env = process.env, windowEnd, at, peers, replicas, history, transport, now = Date.now, signal, contact = () => {}, failure = () => {}, log = () => {} }) {
   const spokes = HOST_KEYS.filter(host => host !== own);
-
-  // 1. Where each peer's replica stands, and a sync for the ones that may lack the window.
   const through = {};
   for (const host of spokes) {
     const covered = async () => latest(await replicaLastTs(env, host), history.proofs.get(host) ?? null);
@@ -212,6 +208,19 @@ export async function queryHistory({ query: params, own, env = process.env, regi
   }
   through[own] = at;
   const partial = spokes.some(host => through[host] === null || through[host] < windowEnd);
+  return { through, partial, spokes };
+}
+
+// The whole of `GET /history`: the checked query, the on-demand syncs, the merged and paged read, and the gaps. `registry` is a function (the
+// Registry is read only for a query that passed the check); `transport` the context's one transport (`transportOf(ctx)`); `contact` and `failure`
+// the callbacks that note a peer's mark; `now` the clock. Answers `History`.
+export async function queryHistory({ query: params, own, env = process.env, registry, hostId, now = Date.now, signal, peers, replicas, history, transport, contact = () => {}, failure = () => {}, log = () => {} }) {
+  const query = parseHistoryQuery(params);
+  const at = now();
+  const windowEnd = query.to ?? at;
+
+  // 1. Where each peer's replica stands, and a sync for the ones that may lack the window.
+  const { through, partial, spokes } = await coverPeers({ own, env, windowEnd, at, peers, replicas, history, transport, now, signal, contact, failure, log });
 
   // 2. The k-way read: one reader per host in host key order, one matched head each.
   // The Registry is read only for a filter that needs it (a time-only query never fails on it).
