@@ -526,10 +526,13 @@ test('a start replicates the Mac\'s Event Log to the Hub API\'s replica, and /ag
   const sha256 = path => createHash('sha256').update(readFileSync(path)).digest('hex');
   const replica = join(hubEnv.HUB_EVENT_DIR, 'replicas', 'mac', '2031-06.jsonl');
   const source = join(s.env.HUB_EVENT_DIR, '2031-06.jsonl');
+  // A wall-clock bound, not a count of event-loop turns: under a loaded full suite the push's file I/O (the libuv pool) can take longer than
+  // any fixed number of turns, which made this test fail only in `mise run check`.
   const until = async (check, what) => {
-    for (let n = 0; n < 500; n += 1) {
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
       if (check()) return;
-      await new Promise(done => setImmediate(done));
+      await new Promise(done => setTimeout(done, 2));
     }
     throw new Error(`timed out waiting for ${what}`);
   };
