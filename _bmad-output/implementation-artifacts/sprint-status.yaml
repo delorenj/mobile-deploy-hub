@@ -111,7 +111,7 @@ development_status:
   epic-8: backlog
   8-1-one-status-document-from-the-api: done
   8-2-reads-and-waits-never-block-the-event-loop: done
-  8-3-live-reachability-from-one-adb-socket: backlog
+  8-3-live-reachability-from-one-adb-socket: done
   8-4-one-stream-on-the-candybar-wire: backlog
   8-5-a-change-reaches-subscribers-within-two-seconds: backlog
   8-6-a-restart-loses-nothing: backlog

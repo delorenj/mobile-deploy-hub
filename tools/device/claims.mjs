@@ -1493,6 +1493,16 @@ export function forceReleaseReservation(runKey, input, ctx) {
 
 // ---- status ----
 
+// One phone's observation from an adb answer (`queryAdb`'s result, or a pushed listing in that shape): the answer's note when nobody
+// could look, else the state adb lists the phone in, or null when the server does not list it. The one mapper the probe (this file) and
+// the track socket (tools/hub-api/track.mjs, Story 8.3) share, so a push and a probe can never read the same listing differently.
+export function adbStateOf(adb, serial) {
+  if (adb.note !== null) return adb.note;
+  const { listed, serials } = adb;
+  const entry = listed.find(device => idMatchesSerial(device.id, serial) || (Boolean(serials.get(device.id)) && serials.get(device.id) === serial));
+  return entry ? entry.state : null;
+}
+
 // Which fleet phones the hub's adb server lists, from the one read-only query (`reachability.queryAdb`: the wire only, never the adb
 // client). Returns each fleet phone's observation: the state adb lists it in, null when the server does not list it, or a note saying
 // why nobody could look. Only asked when the inventory shows the hub's server already running, so status can never start one (and a
@@ -1506,16 +1516,7 @@ async function phoneObservations(fleet, ctx, found) {
   const { env, adbWire, timing } = ctx;
   const hubPort = Number(env.HUB_ADB_SERVER_PORT) || 5037;
   const adb = await (ctx.adbQuery ?? queryAdb)({ port: hubPort, running: found.adb_servers.some(server => server.port === hubPort), wire: adbWire ?? createAdbWire, sleep: timing.sleep });
-  const { note, listed, serials } = adb;
-  const at = adb.checked_at;
-  if (note !== null) return { observed: new Map(fleet.map(phone => [phone.device, note])), at };
-  return {
-    observed: new Map(fleet.map(phone => {
-      const entry = listed.find(device => idMatchesSerial(device.id, phone.serial) || (Boolean(serials.get(device.id)) && serials.get(device.id) === phone.serial));
-      return [phone.device, entry ? entry.state : null];
-    })),
-    at,
-  };
+  return { observed: new Map(fleet.map(phone => [phone.device, adbStateOf(adb, phone.serial)])), at: adb.checked_at };
 }
 
 // The one adb-to-Reachability path (AD-35): the hub's adb server over the wire (inventory first, so a server nobody started is never
