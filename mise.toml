@@ -2,7 +2,7 @@
 # https://mise.jdx.dev/configuration.html
 
 [env]
-_.path = [".mise/scripts", "agents/hermes/pm"]
+_.path = [".mise/scripts"]
 _.file = [".env"]
 
 # This block will handle the linking of
