@@ -29,6 +29,7 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 | GET | `/pools` | PoolList | 6.5 |
 | GET | `/discovery` | Discovery | 6.10 |
 | GET | `/status` | Status | 8.1 |
+| GET | `/stream` | StreamFrame | 8.4 |
 | POST | `/registry/resources` | Resource | 6.6 |
 | POST | `/registry/resources/{id}` | Resource | 6.7 |
 | POST | `/registry/resources/{id}/retire` | Retirement | 6.7 |
@@ -253,6 +254,29 @@ The age rule: a reader on the service's host computes `age_ms = age_ms_at_receip
 - `registry.resources[].visibility` as in `ResourceList`
 
 `registry.resources` is the same list `GET /resources` serves (visible and retiring Resources, in the Registry's order), with no `reachability`: a Resource's Reachability is in its host's view only.
+
+### StreamFrame
+
+`GET /stream`: the change stream of the status document (FR-14, AD-43), the Candybar SSE wire. It is not JSON: the response is `text/event-stream` with `Cache-Control: no-store` and `X-Accel-Buffering: no`, and it stays open until the client or the service ends it. Loopback only, like every route.
+
+- The first bytes of every connection are `retry: 3000` (a client reconnects after 3 s). A frame is `id: <boot>-<seq>`, `event: <type>` and one line `data: <JSON>`, ended by a blank line. The id matches `^[0-9a-f]{12}-[0-9]+$`: `<boot>` is 12 hex characters the service mints at each start, `<seq>` counts the frames of that boot from 1. The data starts with `type`, `seq`, `key` and `at`.
+- Types. `ready` is the opening of a new connection (no `Last-Event-ID`) and carries the whole `/status` document in `status`. `status` is the whole document again (absolute: a client that has one needs no earlier one). `event` is one Event Log line, `event` with its id as `event_id` (its id in the Event Log, whichever way a client read it: a client dedupes on it). `reset` is the opening of a connection that cannot resume, with `reason: unresumable` and the whole document, and the client then refetches `/history` (the Event Log's read route, which is not in this contract yet).
+- An opening frame (`ready` or `reset`) is per connection: its id is `<boot>-<cursor>` (the last seq emitted, `<boot>-0` before the first frame), it takes no seq of its own and is never replayed to another client.
+- The service keeps the last 1024 frames of its boot. A `Last-Event-ID` of this boot whose seq is still covered by them (at least the oldest kept seq minus one, at most the cursor) resumes: the connection gets `retry: 3000` and then every frame after that seq, with no opening frame and no document. Any other id (another boot, so after a restart; a malformed id; an evicted or future seq) gets `reset`.
+- A comment line `: keepalive` (no id) is sent after `api.stream_keepalive_s` (15 s) of silence on a connection, whatever else the other connections got. A client that falls far behind (more than 8 MiB buffered for it) is disconnected and reconnects with its last id; the replay of a connection's opening is not held to that bound.
+- When the service stops, every stream ends, and a `GET /stream` that arrives while it stops is 503 `HUB_API_RESTARTING` (`retry: requeue`). A connection that needs the document (no `Last-Event-ID`, or one that gets `reset`) on a host that does not know its key is 503 `HUB_HOST_UNKNOWN`, with no stream; an exact resume never builds the document and does not read the host key.
+- Nothing is emitted for a change that only time causes (a Hold's expiry, a grace end, a reading going stale): a reader derives those from `at` and its own clock.
+
+The fields of a frame's data:
+
+- `type` `ready`, `status`, `event` or `reset`
+- `seq` the frame's seq (for an opening frame, the cursor it resumes from)
+- `key` `status` for a `status` frame, the event's id for an `event` frame, else the frame's type
+- `at` an ISO time: when the frame was made, or the event's own `ts` for an `event` frame
+- `reason` `unresumable`; only on a `reset` frame
+- `status.*` the whole `/status` document, exactly the fields of `Status` above; on `ready`, `status` and `reset` frames
+- `event_id` the Event Log line's id; only on an `event` frame
+- `event.*` the Event Log line as its writer allowlisted it (no serials); only on an `event` frame
 
 ### Lease
 
@@ -485,7 +509,7 @@ For every write route the actor is `actor` as given, else `{holder, via: 'api'}`
 | `HUB_FORCE_RELEASE_JOB` | 409 | 2 | `POST /leases/{id}/force-release` of a deploy job's Hold (`reason: job`): a Job Hold is only ended by cancelling its run; `repo`, `run` and `job` name it and `detail` says `gh run cancel`. |
 | `HUB_RESERVATION_NOT_FOUND` | 404 | 2 | `POST /reservations/{run_key}/force-release`: no Reservation of this run key exists on this host (`reason: unknown`): already released or pruned, never reserved, or its record is unreadable. Nothing was written. |
 | `HUB_LEASE_SUPERSEDED` | 409 | 1 | `POST /leases`: a newer request with the same `id` and `holder` took over this wait (`reason: superseded`). The wait itself goes on. |
-| `HUB_API_RESTARTING` | 503 | 1 | The service is stopping (`reason: restarting`; member `retry: requeue`). Every open wait gets it, and so does a lease request that arrives while it stops. |
+| `HUB_API_RESTARTING` | 503 | 1 | The service is stopping (`reason: restarting`; member `retry: requeue`). Every open wait gets it, and so does a lease request that arrives while it stops; every open `GET /stream` is ended, and a `GET /stream` that arrives while it stops gets it too. |
 | `HUB_REGISTRY_NAME` | 400, 409 | 2 | A register's or edit's name is not a slug (`not-slug`) or is too long (`too-long`) with 400; reserved (`reserved`), already used (`taken`) or out of `-<n>` suffixes (`exhausted`) with 409. |
 | `HUB_REGISTRY_DUPLICATE` | 409 | 2 | A live Resource already has the serial (`reason: serial`) or UDID (`reason: udid`); `holder` names it. |
 | `HUB_REGISTRY_CONFLICT` | 409 | 1 | `if_rev` is not the Registry's revision; `rev` is the current one. |

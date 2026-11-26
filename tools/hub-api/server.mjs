@@ -9,7 +9,7 @@
 // on stderr, and the next start retries. SIGTERM and SIGINT end every open lease wait (503 HUB_API_RESTARTING), close the server, print `HUB_API_STOP` and let the process end 0.
 //
 // Every seam is injected (env, policy, log, versions, onPath, createServer, now, hostId, devices, qaDevices, signals). There is no
-// timer here: the keepalive of a later stream lives in stream.mjs, the one file the no-new-clock rule names (tools/clock.test.mjs).
+// timer here: the keepalive of every open stream lives in stream.mjs, the one file the no-new-clock rule names (tools/clock.test.mjs).
 import { realpathSync } from 'node:fs';
 import { createServer as nodeCreateServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
@@ -22,6 +22,7 @@ import { retirement } from '../registry/match.mjs';
 import { recoverRegistry, applySeed, readRegistry } from '../registry/store.mjs';
 import { createReadings, deviceCtx } from './readings.mjs';
 import { createSnapshot } from './snapshot.mjs';
+import { createStream } from './stream.mjs';
 import { createTrack } from './track.mjs';
 import { ROUTES, SERVICE, handle } from './routes.mjs';
 
@@ -87,8 +88,14 @@ export function requestListener(ctx) {
     let bodyError;
     try { body = await readJson(req); } catch (error) { bodyError = error; }
     const work = (async () => {
-      const answer = await handle({ method: req.method, url: req.url, body, bodyError, signal: controller.signal }, ctx);
+      const answer = await handle({ method: req.method, url: req.url, headers: req.headers, body, bodyError, signal: controller.signal }, ctx);
       if (controller.signal.aborted) return;
+      if (answer.stream) {
+        // A stream's work ends here (so `drain()` never waits on one): the head, then the stream writes to `res` until it or the client ends.
+        res.writeHead(answer.status, answer.headers);
+        try { answer.stream.open(res); } catch (error) { ctx.log?.err?.(`HUB_API_ERROR stream ${oneLine(error)}`); res.destroy?.(); }
+        return;
+      }
       const text = JSON.stringify(answer.body);
       res.writeHead(answer.status, { ...answer.headers, 'Content-Length': Buffer.byteLength(text) });
       res.end(text);
@@ -172,7 +179,7 @@ export async function startService({
 // context), and `processStart` / `liveStart`, which are the snapshot's fallback readers (a pid it has not seen), never the request
 // path's own. A test that injects `inventory` or `adbWire` gets a gather that uses them in the calling thread (a function does not
 // cross into a worker).
-export async function startHubApi({ policy, env: given = process.env, log = defaultLog(), now, hostId, devices, qaDevices, routes = ROUTES, adbWire, inventory, hostKey, sleep, devicectl, observe, snapshot: injected, adbQuery, processStart, liveStart, trackDevices, ...seams } = {}) {
+export async function startHubApi({ policy, env: given = process.env, log = defaultLog(), now, hostId, devices, qaDevices, routes = ROUTES, adbWire, inventory, hostKey, sleep, devicectl, observe, snapshot: injected, adbQuery, processStart, liveStart, trackDevices, stream: injectedStream, ...seams } = {}) {
   const env = withoutDeployIdentity(given);
   const resolved = policy ?? loadPolicy().policy;
   const afterBind = async () => {
@@ -210,7 +217,14 @@ export async function startHubApi({ policy, env: given = process.env, log = defa
     return readRegistry({ env, devices, qaDevices, warn: () => {} }).resources.filter(record => retirement(record) === null && record.kind === 'phone' && record.host === key);
   };
   const track = createTrack({ env, now, hostKey: keyOf, records, snapshot, readings, open: trackDevices !== undefined ? trackDevices : faked ? null : realTrackDevices, log: log.err });
-  return startService({ ...seams, service: SERVICE, port: resolved.api.hub_api_port, routes, ctx: { policy: resolved, now, hostId, devices, qaDevices, readings, snapshot, onRequest: () => track.ensure(), ...device }, afterBind, onStop: () => track.stop(), env, log });
+  // The one stream (Story 8.4, tools/hub-api/stream.mjs): `GET /stream`'s hub. Its keepalive is the policy's, owned by each open connection.
+  // A stop closes it after the track, so a stop never hangs on an open subscriber and a later `GET /stream` is 503 HUB_API_RESTARTING.
+  const stream = injectedStream ?? createStream({ now, keepaliveMs: resolved.api.stream_keepalive_s * 1000 });
+  return startService({
+    ...seams, service: SERVICE, port: resolved.api.hub_api_port, routes,
+    ctx: { policy: resolved, now, hostId, devices, qaDevices, readings, snapshot, stream, onRequest: () => track.ensure(), ...device },
+    afterBind, onStop: () => { try { track.stop(); } finally { stream.close(); } }, env, log,
+  });
 }
 
 // The process entry: starts the service and ends 0 after a stop. An error prints `<CODE> <message>` on stderr and exits with its `exit`.

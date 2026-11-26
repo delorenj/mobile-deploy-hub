@@ -19,6 +19,7 @@ import { hermetic } from '../ci/test-fixtures.mjs';
 import { EXIT_CODES, createLeaseWaits } from '../device/claims.mjs';
 import { fakeWire } from '../device/wire-fixtures.mjs';
 import { CONTRACT_VERSION, PROBLEM_EXTENSIONS, ROUTES, handle } from './routes.mjs';
+import { createStream } from './stream.mjs';
 
 hermetic();
 
@@ -256,7 +257,7 @@ function scratch() {
   // One unregistered phone on a fake adb server, so `GET /discovery` has a device to describe; nothing here touches a real adb.
   const serverUp = () => ({ adb_servers: [{ port: 5037, pid: 4242, cwd: null }], emulators: [], xvfb: [] });
   const adbWire = fakeWire({ listed: [{ id: 'ZY22PIX', state: 'device', model: 'Pixel_9' }] });
-  return { root, ctx: { env, policy: loadPolicy().policy, devices, qaDevices: () => [], hostKey: () => 'linux', inventory: serverUp, adbWire, log: { out: () => {}, err: () => {} } }, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  return { root, ctx: { env, policy: loadPolicy().policy, devices, qaDevices: () => [], hostKey: () => 'linux', inventory: serverUp, adbWire, log: { out: () => {}, err: () => {} }, stream: createStream() }, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 test('the Status line carries the contract version of the code', () => {
@@ -324,7 +325,8 @@ test('every route names a shape the document describes, and no shape is orphaned
 test('each GET route answers with exactly the field list of its shape', async () => {
   const s = scratch();
   try {
-    for (const route of ROUTES.filter(candidate => candidate.method === 'GET')) {
+    // A stream route answers an event stream, not JSON: the StreamFrame test below holds it to its list.
+    for (const route of ROUTES.filter(candidate => candidate.method === 'GET' && !candidate.stream)) {
       const answer = await callGet(route, s.ctx);
       assert.equal(answer.status, 200, routeKey(route));
       assert.deepEqual(fieldDiff(contract.shapes[route.shape], shapeFields(route.shape, answer.body)), [], routeKey(route));
@@ -421,6 +423,39 @@ test('GET /status is in the route table and its live answer\'s key set is the do
   } finally { s.cleanup(); }
 });
 
+test('GET /stream\'s frames carry exactly the StreamFrame list, and each frame\'s status is the Status list', async () => {
+  const route = ROUTES.find(candidate => routeKey(candidate) === 'GET /stream');
+  assert.equal(contract.shapeOf['GET /stream'], 'StreamFrame');
+  assert.equal(route.shape, 'StreamFrame');
+  const s = scratch();
+  try {
+    await prepareStatus(s.ctx);   // the rich state the Status list needs, so its documents are held to the whole list
+    const sinks = [];
+    const open = async headers => {
+      const answer = await handle({ method: 'GET', url: '/stream', headers }, s.ctx);
+      assert.equal(answer.status, 200, JSON.stringify(answer.body));
+      const sink = { text: '', on() {}, write(chunk) { this.text += chunk; return true; }, end() {} };
+      answer.stream.open(sink);
+      sinks.push(sink);
+      return sink;
+    };
+    const ready = await open({});
+    const document = JSON.parse(ready.text.split('\n').find(line => line.startsWith('data: ')).slice(6)).status;
+    s.ctx.stream.status(document);
+    s.ctx.stream.event({ id: 'host/2026-11/0', offset: 0, event: { ts: '2026-11-25T09:00:00.000Z', kind: 'lease', resource: 's24' } });
+    await open({ 'last-event-id': 'bogus' });
+    const frames = sinks.flatMap(sink => sink.text.split('\n\n').filter(block => block.includes('\ndata: ')).map(block => JSON.parse(/^data: (.*)$/m.exec(block)[1])));
+    assert.deepEqual(new Set(frames.map(frame => frame.type)), new Set(['ready', 'status', 'event', 'reset']));
+    const open2 = openPrefixes(contract.shapes.StreamFrame);
+    const union = new Set(frames.flatMap(frame => flatten(frame, '', open2)));
+    assert.deepEqual(fieldDiff(contract.shapes.StreamFrame, [...union]), []);
+    for (const frame of frames) {
+      assert.deepEqual(Object.keys(frame).slice(0, 4), ['type', 'seq', 'key', 'at'], frame.type);
+      if ('status' in frame) assert.deepEqual(fieldDiff(contract.shapes.Status, shapeFields('Status', frame.status)), [], frame.type);
+    }
+  } finally { s.ctx.stream.close(); s.cleanup(); }
+});
+
 test('samplePath substitutes route parameters and fails on one it has no sample for', () => {
   assert.equal(samplePath('/resources/{id}'), '/resources/s26');
   assert.equal(samplePath('/health'), '/health');
@@ -444,7 +479,7 @@ test('every key, in the document and in a response, is snake_case', async () => 
     // `[]`, `*` and `{name}` are notation, not keys.
     const keysOf = path => path.split('.').filter(key => !/^\{[a-z_]+\}$/.test(key)).map(key => key.replace(/\[\]$/, '')).filter(key => key !== '*');
     const keys = new Set(Object.values(contract.shapes).flat().flatMap(keysOf));
-    for (const route of ROUTES.filter(candidate => candidate.method === 'GET')) {
+    for (const route of ROUTES.filter(candidate => candidate.method === 'GET' && !candidate.stream)) {
       const body = (await callGet(route, s.ctx)).body;
       for (const path of shapeFields(route.shape, body)) for (const key of keysOf(path)) keys.add(key);
     }

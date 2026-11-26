@@ -884,7 +884,7 @@ async function serviceEmulator(input, resolved, local, signal) {
 
 // ---- waits bound to the connection (Story 7.2; AD-37, AD-48) ----
 
-const restartingError = () => Object.assign(failure('HUB_API_RESTARTING', 'the service is stopping; ask again when it is back'), { retry: 'requeue' });
+export const restartingError = () => Object.assign(failure('HUB_API_RESTARTING', 'the service is stopping; ask again when it is back'), { retry: 'requeue' });
 const supersededError = id => failure('HUB_LEASE_SUPERSEDED', `the wait for lease ${id} was taken over by a newer request with the same id`);
 const disconnectedError = id => Object.assign(failure('HUB_LEASE_CANCELLED', `the connection that asked for lease ${id} closed`), { reason: 'disconnected' });
 
