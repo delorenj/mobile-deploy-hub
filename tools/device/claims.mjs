@@ -29,6 +29,7 @@ import { loadDevices } from '../ci/lib/devices.mjs';
 import { CLAIMANT_KINDS, MAX_LEASE_MS, RESERVABLE, SEED_RESOURCES, acquireLease, acquirePool, cachedProcessStart, cancelRequest, capText, checkActor, deployTargetCapMs, etaHistory, extendLease, forceRelease, forceReleaseJobError, heldText, isLease, listLocks, lockDir, newLeaseId as newLockLeaseId, queueView, readOwner, releaseLease, releaseReservation, resourceOf, updateLease, waiterEtas } from '../ci/lib/lock.mjs';
 import { sleep as realSleep } from '../ci/lib/pause.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
+import { awayHint, dedicatedPhoneOfLock, foreignHolders, qaAdbEnv, reapQaServer } from '../ci/lib/qa-phones.mjs';
 import { createAdbWire } from './adb-wire.mjs';
 import { createAsyncAdb } from './async-adb.mjs';
 import { GATE, LEASE_ID, MAX_POOL, PROFILES, doomed, emulatorStatus, exportsOf as emulatorExports, forceReleaseSlot, hostPool, isEmulatorLease, isEmulatorLock, isEmulatorSlot, provision, readRecord, reap, releaseEmulator as releaseEmulatorLease, resolveImage, slotHolding, teardownNow } from './emulator.mjs';
@@ -527,13 +528,31 @@ export function checkEmulatorLeaseId(id) {
 // Connects the phone a Lease on its lock was just taken for (unless noConnect) and records the device on the Lease. Returns the device
 // `{phone, serial, adb_id, adb_port}`. Gives nothing back: a phone that does not come throws its own error (HUB_PHONE_AWAY) with the
 // Lease still held, for the caller to give back. A Lease released or reclaimed while the phone was being found is HUB_LEASE_CANCELLED.
+// A dedicated QA phone (MOBI-48) has the hub's own adb server on its own port, started here under the lease and reaped with it
+// (`reapQaServerOf`); every other phone uses the deploys' server on HUB_ADB_SERVER_PORT. Never throws: a broken QA file means none.
+function dedicatedOf(phone, ctx) {
+  if (isLane(phone) || !phone.lock) return null;
+  try { return dedicatedPhoneOfLock(phone.lock, { devices: ctx.devices ?? loadDevices(ctx.env), env: ctx.env }); } catch { return null; }
+}
+
+// The end of a dedicated phone's hold stops its server, before the lock is freed so the next holder's own server is never the one stopped.
+function reapQaServerOf(lock, ctx) {
+  try {
+    const dedicated = dedicatedOf({ lock }, ctx);
+    if (dedicated) reapQaServer({ port: dedicated.port, env: ctx.env });
+  } catch { /* the next take and the catch-up's free-lock sweep stop it */ }
+}
+
 async function connectPhone(phone, lease, options, ctx) {
   const { env, log, timing } = ctx;
-  const port = String(env.HUB_ADB_SERVER_PORT || '5037');
+  const dedicated = dedicatedOf(phone, ctx);
+  const port = String(dedicated ? dedicated.port : env.HUB_ADB_SERVER_PORT || '5037');
   const device = { phone: phone.device, serial: null, adb_id: null, adb_port: Number(port) };
   if (options.noConnect) return device;
   try {
-    const adbEnv = { ...env, ANDROID_ADB_SERVER_PORT: port };
+    // Holding the phone's lock, any server already on the hub's QA port is a leftover of an earlier hold: start from none.
+    if (dedicated) reapQaServer({ port: dedicated.port, env });
+    const adbEnv = dedicated ? qaAdbEnv(env, port) : { ...env, ANDROID_ADB_SERVER_PORT: port };
     delete adbEnv.ANDROID_SERIAL;
     const adb = ctx.adbFactory
       ? ctx.adbFactory({ env: adbEnv, signal: options.signal })
@@ -546,6 +565,11 @@ async function connectPhone(phone, lease, options, ctx) {
     const owner = readOwnerOf(phone.lock, env);
     if (owner?.kind !== 'lease' || owner.lease_id !== lease.lease_id) {
       throw failure('HUB_LEASE_CANCELLED', `lease ${lease.lease_id} was released while the phone was being found`);
+    }
+    // A dedicated phone that did not come says whose adb server holds its USB interface, and its server ends with the lease that failed.
+    if (dedicated) {
+      if (error?.code === 'HUB_PHONE_AWAY') error.message += awayHint(dedicated, foreignHolders(dedicated, { env, inventoryOf: ctx.inventory ?? realInventory }));
+      reapQaServerOf(phone.lock, ctx);
     }
     throw error;
   }
@@ -1054,7 +1078,11 @@ export function jobTicket(id) {
 }
 
 // Gives one lock's lease back by id, with no report (the holder's own exit paths).
-export const releaseHeld = (lock, id, { env = process.env } = {}) => releaseLease(lock, id, { env });
+export function releaseHeld(lock, id, { env = process.env } = {}) {
+  // A dedicated phone's QA adb server ends with the lease that holds it (stopped before the lock is freed).
+  if (readOwnerOf(lock, env)?.lease_id === id) reapQaServerOf(lock, { env });
+  return releaseLease(lock, id, { env });
+}
 
 // An emulator lease: its slot, record and processes, torn down. Returns emulator.mjs's result ({outcome, slot, record, result}).
 export const releaseEmulator = async (id, ctx) => releaseEmulatorLease(checkEmulatorLeaseId(id), { env: ctx.env, log: ctx.log, graceMs: ctx.emulator.graceMs });
@@ -1094,6 +1122,7 @@ export function releasePhone(id, ctx, actor = null) {
   // A Pool request waits in the queue of every member it can be served from: cancelling it takes it out of all of them (the request
   // writes its own one `cancel`).
   for (const phone of waiting) if (phone !== found) releaseLease(phone.lock, id, { env, actor });
+  if (found === owning) reapQaServerOf(found.lock, ctx);
   const result = releaseLease(found.lock, id, { env, actor });
   const base = { kind: 'phone', device: found.device, lock: found.lock, id, notes: [] };
   if (result.cancelled && !result.released) return { ...base, outcome: 'cancelled' };
@@ -1113,6 +1142,7 @@ export function releaseAny(ctx, actor = null) {
   for (const phone of fleet) {
     // --any is "whichever lease holds a phone": a lane's Lease is released by its id.
     if (isLane(phone)) continue;
+    if (isLease(readOwnerOf(phone.lock, env))) reapQaServerOf(phone.lock, ctx);
     const result = releaseLease(phone.lock, null, { env, actor });
     switch (result.reason) {
       case 'released': return { kind: 'phone', outcome: 'released', device: phone.device, lock: phone.lock, leaseId: result.owner.lease_id, notes: [] };

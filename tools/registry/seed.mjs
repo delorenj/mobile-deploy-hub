@@ -5,42 +5,20 @@
 // caller passes (default `loadQaDevices`, the only code in the hub that opens the private QA file).
 //
 // The deploy path never imports this directory (tools/deploy-path.test.mjs).
-import { readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
 import { nameRefusal } from '../ci/lib/lock.mjs';
+import { QA_DEVICES_FILE, qaDevicesPath, readQaEntries } from '../ci/lib/qa-devices.mjs';
 
 // The `phone` word's order: the S24 first (the one a lease should take), then the deploy phone.
 export const PHONE_POOL_SEED = Object.freeze(['s24', 's26']);
 
-// The private QA file (never committed): devices a person dedicated to QA. Only name, model and serial are ever read from it;
-// its `allowed_users` and every other key are dropped here, so nothing downstream can import them.
-export const QA_DEVICES_FILE = '.config/mobile-deploy-hub/qa-devices.json';
-export const qaDevicesPath = (env = process.env, home = env.HOME || homedir()) => env.HUB_QA_DEVICES || join(home, QA_DEVICES_FILE);
-
-const SERIAL = /^[A-Za-z0-9]+$/;
-const broken = (file, reason) => Object.assign(new Error(`${file}: ${reason}`), { code: 'HUB_QA_DEVICES' });
+// The private QA file (never committed): devices a person dedicated to QA. The Registry reads only name, model and serial from
+// it; `allowed_users` and every other key are dropped here, so nothing in the Registry can import them. The file itself is read
+// by tools/ci/lib/qa-devices.mjs, which the catch-up also uses (it must install to the allowed users and may not import this directory).
+export { QA_DEVICES_FILE, qaDevicesPath };
 
 // The QA file's devices as [{name, model, serial}]; a missing file is []. A broken one throws HUB_QA_DEVICES naming the file and
 // the entry index, never a serial and never the parser's own message (which can quote the text it choked on).
-export function loadQaDevices({ env = process.env, home = env.HOME || homedir(), readFile = readFileSync } = {}) {
-  const file = qaDevicesPath(env, home);
-  let text;
-  try { text = String(readFile(file, 'utf8')); } catch (error) {
-    if (error?.code === 'ENOENT') return [];
-    throw broken(file, `cannot read it (${error?.code ?? 'read error'})`);
-  }
-  let parsed;
-  try { parsed = JSON.parse(text); } catch { throw broken(file, 'not valid JSON'); }
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed) || parsed.schema !== 1) throw broken(file, 'schema must be 1');
-  if (!Array.isArray(parsed.devices)) throw broken(file, '"devices" must be an array');
-  return parsed.devices.map((entry, index) => {
-    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) throw broken(file, `devices[${index}] must be an object`);
-    if (typeof entry.serial !== 'string' || !SERIAL.test(entry.serial)) throw broken(file, `devices[${index}].serial must be letters and digits`);
-    if (typeof entry.name !== 'string' || entry.name.trim() === '') throw broken(file, `devices[${index}].name must be a non-empty string`);
-    return { name: entry.name, model: typeof entry.model === 'string' ? entry.model : null, serial: entry.serial };
-  });
-}
+export const loadQaDevices = options => readQaEntries(options).map(({ name, model, serial }) => ({ name, model, serial }));
 
 const record = fields => ({
   id: null, lock: null, name: null, words: [], display_name: null, kind: null, host: null, identity: null,

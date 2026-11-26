@@ -431,6 +431,8 @@ test('the extra phones are hub-device\'s alone: no deploy-side reader of devices
   }
   for (const side of sides) {
     if (side.endsWith('tools/ci/lib/devices.mjs')) continue;   // the one definition and its validation
+    // The dedicated-phone derivation (MOBI-48): hub-device and the catch-up both read it, so it names the extras once.
+    if (side.endsWith('tools/ci/lib/qa-phones.mjs')) continue;
     assert.doesNotMatch(readFileSync(join(hubRoot, side), 'utf8'), /android_extra/, `${side} reads devices.android only`);
   }
 });

@@ -696,8 +696,8 @@ test('the hub never removes an app, clears its data or downgrades it', () => {
     else hits.push(...own);
   }
   assert.deepEqual(hits, []);
-  // The one install each device gets: in place.
-  assert.match(readFileSync(join(repoRoot, 'tools/ci/lib/adb.mjs'), 'utf8'), /install: \(id, apk\) => call\(\['-s', id, 'install', '-r', apk\]/);
+  // The one install each device gets: in place (a dedicated QA phone's `--user N` only narrows it to one Android user).
+  assert.match(readFileSync(join(repoRoot, 'tools/ci/lib/adb.mjs'), 'utf8'), /install: \(id, apk, user = null\) => call\(\['-s', id, 'install', '-r', \.\.\.userArgs\(user\), apk\]/);
   assert.match(readFileSync(join(repoRoot, 'tools/ci/lib/devicectl.mjs'), 'utf8'), /\['device', 'install', 'app', '--device', udid, app\]/);
 });
 

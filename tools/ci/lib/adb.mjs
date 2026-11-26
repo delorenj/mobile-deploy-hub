@@ -103,6 +103,13 @@ export function peekInstalled({ pkg, serial, lease = null, env = process.env, ho
   return result;
 }
 
+// `--user N` for an adb package command, from a whole, non-negative Android user id (anything else is a bug, not a flag to pass on).
+function userArgs(user) {
+  if (user === null || user === undefined) return [];
+  if (!Number.isSafeInteger(user) || user < 0) throw new Error(`bad Android user id ${JSON.stringify(user)}`);
+  return ['--user', String(user)];
+}
+
 export function createAdb({ env: given = process.env, home = homedir(), runner = runBounded } = {}) {
   const env = adbEnv(given);
   const adb = adbPath(env, home);
@@ -118,10 +125,19 @@ export function createAdb({ env: given = process.env, home = homedir(), runner =
     devices: () => parseDeviceList(call(['devices'])),
     prop: (id, name) => call(['-s', id, 'shell', 'getprop', name]).trim(),
     installed: (id, pkg) => parsePackage(call(['-s', id, 'shell', 'dumpsys', 'package', pkg], 60_000), pkg),
-    baseApk: (id, pkg) => parseBaseApk(call(['-s', id, 'shell', 'pm', 'path', pkg])),
+    // `user` (a dedicated QA phone: only its allowed Android users): the package as that user has it, null when that user has none.
+    baseApk: (id, pkg, user = null) => {
+      try {
+        return parseBaseApk(call(['-s', id, 'shell', 'pm', 'path', ...userArgs(user), pkg]));
+      } catch (error) {
+        // `pm path` of a package that user does not have exits 1 with no output: that is an answer (null), not a phone that is silent.
+        if (user !== null && /\(exit 1\)$/.test(String(error?.message ?? ''))) return null;
+        throw error;
+      }
+    },
     sha256: (id, path) => parseSha256(call(['-s', id, 'shell', 'sha256sum', path], 120_000)),
-    // In place, data kept. Nothing else in the hub installs on a phone.
-    install: (id, apk) => call(['-s', id, 'install', '-r', apk], 600_000),
+    // In place, data kept. Nothing else in the hub installs on a phone. `user` limits it to one Android user (a dedicated QA phone).
+    install: (id, apk, user = null) => call(['-s', id, 'install', '-r', ...userArgs(user), apk], 600_000),
     // Someone is playing: the app is the resumed activity and the screen is on (an install would close it mid-game).
     inUse: (id, pkg) => parseResumedPackage(call(['-s', id, 'shell', 'dumpsys', 'activity', 'activities'], 60_000)) === pkg && parseAwake(call(['-s', id, 'shell', 'dumpsys', 'power'], 60_000)),
   };
