@@ -212,3 +212,11 @@ source_spec: `spec-9-2-the-host-agent-serves-the-mac-s-own-state.md`
 severity: medium
 reason: Every start in tools/host-agent/server.test.mjs injects a request seam. Broken wiring degrades to one HUB_AGENT_REGISTRY_FAILED line, and the seed keeps answering, so the start test's expected outcome hides it. It would be settled by a start test that leaves request out but injects the ssh and fetch seams, or by the live /health readback that Story 9.7's install adds.
 status: open
+
+### DW-17: A Hub API restart loses every pushed spoke view and reading until that host next pushes.
+origin: spec-deferred f38b608c3de1
+location: tools/hub-api/remotes.mjs:createRemotes
+source_spec: `spec-9-5-the-host-agent-pushes-changes-and-only-changes.md`
+severity: medium
+reason: createRemotes() and readings.remote() are in memory only (tools/hub-api/remotes.mjs, tools/hub-api/readings.mjs). The agent pushes only on a change, its start, or a request after a failure, and the Hub API may never call it (spec Never). So after a Hub API restart, /status has no hosts.mac and no stale.mac, and ios-lane reads unknown, until something on the Mac changes. That state is honest ("not known") but it is a gap in a service meant to be restartable at will. Possible fixes: persist the remotes store on the Hub's own disk, or have the agent learn of a new Hub boot (for example from the push ack or the stream boot) and re-push on its next request. Both need a design decision, likely alongside Story 9.6 or Epic 10's /agent/sync.
+status: open

@@ -16,6 +16,7 @@ import { statusView, createContext } from '../device/claims.mjs';
 import { HOST_AGENT_SERVICE, HUB_API_CONTRACT } from '../hub-client.mjs';
 import { requestListener } from '../hub-api/server.mjs';
 import { handle } from '../hub-api/routes.mjs';
+import { CHANGE_DEBOUNCE_MS } from '../hub-api/stream.mjs';
 import { seed } from '../registry/seed.mjs';
 import { AGENT_ROUTES } from './routes.mjs';
 import { createKnown } from './known.mjs';
@@ -503,11 +504,11 @@ test('a Hub API that is unreachable at start is one HUB_AGENT_REGISTRY_FAILED li
   } finally { s.cleanup(); }
 });
 
-test('no timer, interval or poll runs across a start, /health, /status, a forward to the other host and a stop', async () => {
+test('no interval or poll runs across a start, /health, /status, a forward to the other host and a stop; the only timer is the push debounce, one-shot, armed by the start', async () => {
   const s = scratch();
   const real = { timeout: globalThis.setTimeout, interval: globalThis.setInterval };
   const spied = [];
-  globalThis.setTimeout = (...args) => { spied.push('setTimeout'); return real.timeout(...args); };
+  globalThis.setTimeout = (fn, ms, ...rest) => { spied.push(`setTimeout ${ms}`); return real.timeout(fn, ms, ...rest); };
   globalThis.setInterval = (...args) => { spied.push('setInterval'); return real.interval(...args); };
   try {
     const running = await s.start();
@@ -527,7 +528,8 @@ test('no timer, interval or poll runs across a start, /health, /status, a forwar
     globalThis.setInterval = real.interval;
     s.cleanup();
   }
-  assert.deepEqual(spied, []);
+  // The start pokes once (the Hub API hears of this host), and the requests and the stop arm nothing: one `trailing` debounce, never repeated.
+  assert.deepEqual(spied, [`setTimeout ${CHANGE_DEBOUNCE_MS}`]);
 });
 
 test('nothing under tools/host-agent/ reads registry.json', () => {

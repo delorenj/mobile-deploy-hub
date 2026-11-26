@@ -24,6 +24,7 @@ import { checkEditBody, checkRegisterBody, checkRetireBody, planEdit, planRegist
 import { REGISTRY_ERRORS, applySeed, readRegistry, registryState, updateRegistry } from '../registry/store.mjs';
 import { viewPools, viewRecord } from '../registry/view.mjs';
 import { deviceCtx } from './readings.mjs';
+import { checkPushBody, createRemotes } from './remotes.mjs';
 import { STREAM_HEADERS } from './stream.mjs';
 
 // One name and one contract number for the service: the server answers with them, and the installer's readback and the smoke check for them.
@@ -172,12 +173,21 @@ export async function discovery(ctx) {
   };
 }
 
+// The pushed views of the spoke hosts: the context's `remotes` (the service's), or, for a bare `handle()` with none, one store per context.
+const fallbackRemotes = new WeakMap();
+function remotesOf(ctx) {
+  if (ctx.remotes) return ctx.remotes;
+  if (!fallbackRemotes.has(ctx)) fallbackRemotes.set(ctx, createRemotes());
+  return fallbackRemotes.get(ctx);
+}
+
 // GET /status: the one status document (Story 8.1, AD-41): `{format, contract, hosts: {<host key>: <view>}, registry, stale, checked_at}`. A host's
 // view is `claims.statusView(key, {audience: 'service', qa_ids})` embedded unchanged: the queue positions, ETAs, Pool fold and QA redaction
 // are the library's, never recomputed here. Only this host's key is in `hosts` today (Epic 9 adds the Mac's); `registry` is the one place the
 // Registry's own fields (names, Capabilities, retired and seed-missing visibility) appear, each Resource as `GET /resources` serves it but
-// with no `reachability`. `stale` is keyed by host key, `{since}` for a view the service last had and no longer can refresh; this host's own
-// view is read fresh, so it is `{}` (Story 9.6 fills it). Nothing is cached: every field that passes with time is derived from `now` here.
+// with no `reachability`. Only this host's own view is read fresh; a spoke host's (Story 9.5) is what it last pushed (`ctx.remotes`), embedded
+// unchanged after this host's own, and `stale` is keyed by host key, `{since: <ISO receipt time>}` for a pushed view older than
+// `registry.reachability_max_age_s` on this clock (Story 9.6 adds unreachable). Nothing is cached: every field that passes with time is derived from `now` here.
 // Story 8.4's stream frames and 8.5's re-read call this same function. A host that does not know its key is 503 HUB_HOST_UNKNOWN.
 export async function statusDocument(ctx) {
   const env = ctx.env ?? process.env;
@@ -194,14 +204,41 @@ export async function statusDocument(ctx) {
   });
   const checkedAt = statusCtx.timing.now();
   const view = await statusView(key, { audience: 'service', qa_ids: dedicatedQaIds(registry) }, statusCtx);
+  const remote = remotesOf(ctx).views({ now: checkedAt, maxAgeS: ctx.policy?.registry?.reachability_max_age_s });
   return {
     format: 1,
     contract: CONTRACT_VERSION,
-    hosts: { [key]: view },
+    hosts: { [key]: view, ...remote.hosts },
     registry: { rev: registry.rev, source: registry.source, resources: registry.resources.map(record => serve(ctx, record)).filter(resource => resource !== null) },
-    stale: {},
+    stale: remote.stale,
     checked_at: new Date(checkedAt).toISOString(),
   };
+}
+
+// POST /agent/push (Story 9.5, AD-49): a spoke host's Host Agent pushes its view when something there changed. The body is checked strictly
+// (`checkPushBody`; this service's own host key is refused: it is `own`, and an unknown one is 503 HUB_HOST_UNKNOWN), then applied once per
+// `(boot, seq)` on this service's clock: a push already applied answers `{applied: false}` and changes nothing. An applied push replaces the
+// host's view (a null `status` keeps the last), stores each reading of a Resource the Registry places on that host (`ctx.readings.remote`; no
+// `reachability` event: only a host's own service logs one), then `ctx.onPush()` pokes the change feed so a stream frame follows. This
+// service never calls the agent to refresh any of it.
+export function agentPush(ctx, { body }) {
+  const env = ctx.env ?? process.env;
+  let own;
+  try { own = (ctx.hostKey ?? realHostKey)({ env }); } catch (error) {
+    throw error?.code === 'HUB_HOST_UNKNOWN' ? HOST_UNKNOWN(oneLine(error.message)) : error;
+  }
+  const push = checkPushBody(body, { own });
+  const at = (ctx.now ?? Date.now)();
+  // The Registry's places are read before anything is applied: a read that throws applies nothing.
+  const places = push.readings !== null ? new Set(readIt(ctx).resources.filter(record => record.host === push.host).map(record => record.id)) : new Set();
+  const { applied } = remotesOf(ctx).apply(push, { at });
+  if (applied) {
+    if (push.readings !== null) {
+      ctx.readings?.remote(push.readings.filter(reading => places.has(reading.resource)).map(reading => ({ id: reading.resource, served: reading })), { at });
+    }
+    try { ctx.onPush?.(); } catch (error) { ctx.log?.err?.(`HUB_API_ERROR push ${oneLine(error?.message ?? error)}`); }
+  }
+  return { applied, host: push.host, boot: push.boot, seq: push.seq };
 }
 
 // POST /registry/resources: registers a Resource (FR-1). The body is checked first (a bad one writes nothing, not even the seed). The
@@ -437,6 +474,7 @@ export const ROUTES = Object.freeze([
   Object.freeze({ method: 'GET', path: '/discovery', shape: 'Discovery', handler: discovery }),
   Object.freeze({ method: 'GET', path: '/status', shape: 'Status', handler: statusDocument }),
   Object.freeze({ method: 'GET', path: '/stream', shape: 'StreamFrame', handler: streamRoute, stream: true }),
+  Object.freeze({ method: 'POST', path: '/agent/push', shape: 'AgentPushAck', handler: agentPush }),
   Object.freeze({ method: 'POST', path: '/registry/resources', shape: 'Resource', handler: registerResource }),
   Object.freeze({ method: 'POST', path: '/registry/resources/{id}', shape: 'Resource', handler: editResource }),
   Object.freeze({ method: 'POST', path: '/registry/resources/{id}/retire', shape: 'Retirement', handler: retireResource }),
