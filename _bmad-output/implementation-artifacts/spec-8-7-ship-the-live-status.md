@@ -2,7 +2,7 @@
 title: 'Story 8.7: Ship the live status (pre-release half)'
 type: 'chore'
 created: '2026-11-26'
-status: 'awaiting-operator'
+status: done
 operator_actions:
   - 'Merge this story branch into main and push main to origin; the release refuses a main that is not origin/main.'
   - 'Before releasing, confirm `git ls-remote origin refs/tags/v1 refs/tags/v1.2.57` shows v1 on v1.2.56 and no v1.2.57 tag; if v1 moved or 1.2.57 is taken, retitle the `## v1.2.57` section of docs/hub-releases.md (and its test in tools/ci/v11.test.mjs) first.'
@@ -187,3 +187,17 @@ Why the status frame is timed from the CLI's answer: the hub-device process has 
 
 - The installed service, the real `systemctl --user restart` default seam (`restartHubApiUnit`) and the S24 have not been touched: they are the operator's checks.
 - `--restart` answers any open wait `HUB_API_RESTARTING`; callers requeue (Story 8.6), but run it when nobody is mid-wait.
+
+## Operator Confirmation
+
+Confirmed 2026-11-26: the external actions this story owed were carried out.
+
+- Merge this story branch into main and push main to origin; the release refuses a main that is not origin/main.
+- Before releasing, confirm `git ls-remote origin refs/tags/v1 refs/tags/v1.2.57` shows v1 on v1.2.56 and no v1.2.57 tag; if v1 moved or 1.2.57 is taken, retitle the `## v1.2.57` section of docs/hub-releases.md (and its test in tools/ci/v11.test.mjs) first.
+- From a fresh clean clone of main on big-chungus, run `mise run release -- 1.2.57`; confirm every app strict dry run is green, v1 moved to v1.2.57, and `git show v1.2.57` carries the notes and a `Roll back:` line that names v1.2.56 (and no service stop).
+- After the release runner confirms its runs are finished, run `mise run hosts:install` on big-chungus from a clean checkout at tag v1.2.57; confirm the HUB_API readback prints `v1.2.57 serves 127.0.0.1:8794, contract 1` and `systemctl --user status mobile-deploy-hub-api`.
+- Run `mise run hosts:smoke -- --restart` on big-chungus and confirm HUB_SMOKE_OK v1.2.57 with a `HUB_SMOKE stream: status frame <n> ms after the lease, keepalive after <m> ms idle` line and a `HUB_SMOKE restart: smoke-<id>-s held across the restart; the reconnect got reset (boot <a> -> <b>)` line (it leaves one retired smoke-<id> record in registry.json; the restart answers any open wait HUB_API_RESTARTING, so run it when nobody is waiting on a Lease).
+- Run the AC live check by hand once: `curl -N 127.0.0.1:8794/stream`, take a Lease with `hub-device lease s24 --no-connect --wait 0 --for 2m --why check`, see a `status` frame within 2 s, see `: keepalive` while idle, `systemctl --user restart mobile-deploy-hub-api`, confirm the Lease survives in `hub-device status` and the reconnect with the last id gets `reset`; release the Lease.
+- If the release is red or anything regresses: move v1 back to v1.2.56, then `mise run hosts:install` from a clean checkout at v1.2.56 (no systemctl disable: no unit is added).
+
+_Appended by the bmad-loop orchestrator (`bmad-loop confirm`, #335): a human confirmed these external actions out of band, and the story was advanced from `awaiting-operator` to `done`._
