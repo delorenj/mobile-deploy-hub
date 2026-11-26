@@ -50,6 +50,25 @@ export function heavyShim(dir) {
   return dir;
 }
 
+// A month of Event Log history for the NFR-7 reads (~15k release lines over 30 days, on `adb`, a third of them Leases): one
+// `<yyyy-mm>.jsonl` per month in `dir`. Returns the number of lines written.
+export function writeMonthOfEvents(dir, { now = Date.now(), lines = 15_000 } = {}) {
+  mkdirSync(dir, { recursive: true });
+  const months = new Map();
+  for (let i = 0; i < lines; i += 1) {
+    const ts = new Date(now - 60_000 - Math.floor(i * (30 * 86_400_000 - 120_000) / lines)).toISOString();
+    const lease = i % 3 === 0;
+    const line = JSON.stringify({
+      format: 1, ts, event: 'release', lock: 'adb', hold_kind: lease ? 'lease' : 'job', held_ms: 60_000 + (i % 40) * 30_000, for_ms: lease ? 3_600_000 : null, last_alive_at: null,
+      claimant: { kind: lease ? 'agent' : 'deploy', holder: 'x', repo: lease ? null : 'o/a', run: String(i), attempt: '1', job: lease ? null : 'android' },
+    });
+    const month = ts.slice(0, 7);
+    months.set(month, `${months.get(month) ?? ''}${line}\n`);
+  }
+  for (const [month, text] of months) writeFileSync(join(dir, `${month}.jsonl`), text);
+  return lines;
+}
+
 export function hermetic() {
   for (const name of Object.keys(process.env)) if (jobVariable(name)) delete process.env[name];
   if (!eventScratch) {

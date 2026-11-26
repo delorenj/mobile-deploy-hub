@@ -15,9 +15,11 @@ import { createServer as nodeCreateServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
 import { onPath } from '../ci/lib/heavy.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
-import { createLeaseWaits, exitCodeOf, withoutDeployIdentity } from '../device/claims.mjs';
+import { createLeaseWaits, exitCodeOf, phoneReadings, withoutDeployIdentity } from '../device/claims.mjs';
+import { observeHost, observeOffThread } from '../device/observe-thread.mjs';
 import { recoverRegistry, applySeed } from '../registry/store.mjs';
-import { createReadings } from './readings.mjs';
+import { createReadings, deviceCtx } from './readings.mjs';
+import { createSnapshot } from './snapshot.mjs';
 import { ROUTES, SERVICE, handle } from './routes.mjs';
 
 export const HOST = '127.0.0.1';
@@ -108,7 +110,7 @@ export async function startService({
   if (!hasOnPath('heavy', env)) throw coded('HUB_API_NO_HEAVY', `${service} needs \`heavy\` on PATH: emulators boot through it`);
 
   // The registry of this service's lease waits (claims.mjs): a stop ends every open wait with HUB_API_RESTARTING before it closes.
-  const context = { ...ctx, env, routes, log, waits: ctx.waits ?? createLeaseWaits({ now: ctx.now }) };
+  const context = { ...ctx, env, routes, log, waits: ctx.waits ?? createLeaseWaits({ now: ctx.now, ...(ctx.processStart ? { startOf: ctx.processStart } : {}) }) };
   const listener = requestListener(context);
   const server = createServer(listener);
   await new Promise((resolve, reject) => {
@@ -156,7 +158,15 @@ export async function startService({
 // and the service keeps serving; `/health` says `registry: unreadable` when the file is the problem. The device seams (`adbWire`,
 // `inventory`, `hostKey`, `sleep`, `devicectl`) go into the request context and into the one readings cache (Story 6.10); a refresh of
 // it is started by a read, never by a timer.
-export async function startHubApi({ policy, env: given = process.env, log = defaultLog(), now, hostId, devices, qaDevices, routes = ROUTES, adbWire, inventory, hostKey, sleep, devicectl, ...seams } = {}) {
+//
+// One host snapshot per service (Story 8.2, AD-44: tools/hub-api/snapshot.mjs): the inventory, the adb listing and the process starts are
+// gathered in a worker thread, the first gather started right after the bind, and every read and wait answers from it (`snapshot`,
+// `inventory`, `adbQuery`, `processStart` and `liveStart` in the request context). The readings cache's probe refreshes it, then maps the
+// adb listing through it. Test seams: `observe` (the gather), `snapshot`, `inventory` and `adbQuery` (replace the snapshot's in the
+// context), and `processStart` / `liveStart`, which are the snapshot's fallback readers (a pid it has not seen), never the request
+// path's own. A test that injects `inventory` or `adbWire` gets a gather that uses them in the calling thread (a function does not
+// cross into a worker).
+export async function startHubApi({ policy, env: given = process.env, log = defaultLog(), now, hostId, devices, qaDevices, routes = ROUTES, adbWire, inventory, hostKey, sleep, devicectl, observe, snapshot: injected, adbQuery, processStart, liveStart, ...seams } = {}) {
   const env = withoutDeployIdentity(given);
   const resolved = policy ?? loadPolicy().policy;
   const afterBind = async () => {
@@ -166,10 +176,25 @@ export async function startHubApi({ policy, env: given = process.env, log = defa
     } catch (error) {
       log.err(`HUB_API_SEED_FAILED ${error?.code ?? 'ERROR'} ${oneLine(error)}`);
     }
+    // The first gather starts after the bind has won, and is never waited for here: a read that needs it awaits `snapshot.ready()`.
+    snapshot.refresh();
   };
-  const device = { adbWire, inventory, hostKey, sleep, devicectl };
-  const readings = createReadings({ env, policy: resolved, now, hostId, log: log.err, ...device });
-  return startService({ ...seams, service: SERVICE, port: resolved.api.hub_api_port, routes, ctx: { policy: resolved, now, hostId, devices, qaDevices, readings, ...device }, afterBind, env, log });
+  const inThread = inventory !== undefined || adbWire !== undefined;
+  const snapshot = injected ?? createSnapshot({
+    env, now, log: log.err,
+    ...(processStart ? { startOf: processStart } : {}), ...(liveStart ? { liveStartOf: liveStart } : {}),
+    observe: observe ?? (inThread ? ({ env: seen }) => observeHost({ env: seen, inventory, adbWire, ...(sleep ? { sleep } : {}) }) : ({ env: seen }) => observeOffThread({ env: seen })),
+  });
+  const device = {
+    adbWire, hostKey, sleep, devicectl,
+    inventory: inventory ?? snapshot.inventory, adbQuery: adbQuery ?? snapshot.adbQuery,
+    processStart: snapshot.processStart, liveStart: snapshot.liveStart,
+  };
+  // The readings probe: a refresh of the snapshot (the host asked again), then the phones' states mapped from it. Nothing is scanned or
+  // queried on the main thread.
+  const probe = async phones => { await snapshot.refresh(); return phoneReadings(phones, deviceCtx({ env, now, log: { err: log.err }, ...device })); };
+  const readings = createReadings({ env, policy: resolved, now, hostId, log: log.err, hostKey, probe });
+  return startService({ ...seams, service: SERVICE, port: resolved.api.hub_api_port, routes, ctx: { policy: resolved, now, hostId, devices, qaDevices, readings, snapshot, ...device }, afterBind, env, log });
 }
 
 // The process entry: starts the service and ends 0 after a stop. An error prints `<CODE> <message>` on stderr and exits with its `exit`.

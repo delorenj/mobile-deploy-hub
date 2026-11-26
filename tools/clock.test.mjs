@@ -11,43 +11,12 @@ import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { strip } from './ci/lib/source-scan.mjs';
 
 export const CLOCK_FILES = Object.freeze(['tools/ci/lib/lock.mjs', 'tools/hub-api/stream.mjs', 'tools/hub-client.mjs']);
 export const SERVICE_SCOPES = Object.freeze(['tools/hub-api/', 'tools/host-agent/', 'tools/hub-client.mjs']);
 
 const root = fileURLToPath(new URL('../', import.meta.url));
-
-// The source with comments and the contents of string and template literals blanked (same length), so a word in a comment or a message
-// is never a hit and braces inside a string never unbalance a body. A `${...}` inside a template is blanked with the rest of it.
-export function strip(source) {
-  let out = '';
-  for (let index = 0; index < source.length;) {
-    const char = source[index];
-    const next = source[index + 1];
-    if (char === '/' && next === '/') {
-      while (index < source.length && source[index] !== '\n') { out += ' '; index += 1; }
-    } else if (char === '/' && next === '*') {
-      const end = source.indexOf('*/', index + 2);
-      const stop = end === -1 ? source.length : end + 2;
-      out += source.slice(index, stop).replace(/[^\n]/g, ' ');
-      index = stop;
-    } else if (char === '"' || char === "'" || char === '`') {
-      out += char;
-      index += 1;
-      while (index < source.length && source[index] !== char) {
-        if (source[index] === '\\') { out += ' '; index += 1; }
-        out += source[index] === '\n' ? '\n' : ' ';
-        index += 1;
-      }
-      out += char;
-      index += 1;
-    } else {
-      out += char;
-      index += 1;
-    }
-  }
-  return out;
-}
 
 const uses = (source, name) => new RegExp(`\\b${name}\\b`).test(strip(source));
 export const usesSetInterval = source => uses(source, 'setInterval');

@@ -188,3 +188,11 @@ source_spec: `spec-7-8-force-release-an-emulator-slot.md`
 severity: medium
 reason: Unverified (maybe-false). forceReleaseEmulator and forceReleaseSlot do not check sameHost on the owner or the record, while doomed() does. Settle by confirming whether any supported topology lets a host other than the one running the emulators take an emulator-<n> lock in this lock dir (today emulators run and are served only on big-chungus); if one does, refuse a foreign owner before the force and skip a foreign record in the teardown. (declared severity: medium (unverified))
 status: open
+
+### DW-14: A host-snapshot gather has no deadline, so a worker that hangs (a /proc read stuck on a wedged process) leaves the first gather in flight forever and every /status and /discovery awaiting
+origin: spec-deferred 3d1434f70077
+location: tools/hub-api/snapshot.mjs:45-70
+source_spec: `spec-8-2-reads-and-waits-never-block-the-event-loop.md`
+severity: medium
+reason: `createSnapshot.gather()` calls `observe({ env })` with no signal or deadline. `ready()` awaits `refresh()` while `current === null`, and single flight keeps `inflight` set. After one success, a hang only freezes the snapshot: reads still answer from it and the fallback readers. Before this story the same `inventory()` scan ran on the main thread, so a hang stalled every request. The change narrows the hang's reach rather than adding it, which makes it pre-existing. A fix needs a gather deadline, and that is a timer, which this spec's Never forbids. That needs a decision: an AbortSignal deadline on `observeOffThread`, or an exemption in tools/clock.test.mjs.
+status: open

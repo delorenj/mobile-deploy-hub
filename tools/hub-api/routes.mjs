@@ -105,7 +105,7 @@ const readIt = ctx => readRegistry({ env: ctx.env ?? process.env, devices: ctx.d
 // is retired or seed-missing (a live one is visible whatever its lock does).
 function serve(ctx, record) {
   const marked = retirement(record) !== null;
-  const activity = marked ? (ctx.lockActivity ?? lockActivity)(record.lock, { env: ctx.env ?? process.env, now: ctx.now }) : {};
+  const activity = marked ? (ctx.lockActivity ?? lockActivity)(record.lock, { env: ctx.env ?? process.env, now: ctx.now, processStart: ctx.processStart }) : {};
   return viewRecord(record, { audience: 'service', held: activity.held === true, queued: activity.queued === true });
 }
 
@@ -147,6 +147,8 @@ const HOST_UNKNOWN = message => routeError(503, 'HUB_HOST_UNKNOWN', message, 'ho
 
 export async function discovery(ctx) {
   const env = ctx.env ?? process.env;
+  // The host snapshot's first gather (Story 8.2): after it, nothing here scans /proc or asks adb on the request path.
+  await ctx.snapshot?.ready();
   let document;
   try {
     const key = (ctx.hostKey ?? realHostKey)({ env });
@@ -172,6 +174,7 @@ export async function discovery(ctx) {
 // Story 8.4's stream frames and 8.5's re-read call this same function. A host that does not know its key is 503 HUB_HOST_UNKNOWN.
 export async function statusDocument(ctx) {
   const env = ctx.env ?? process.env;
+  await ctx.snapshot?.ready();
   let key;
   try { key = (ctx.hostKey ?? realHostKey)({ env }); } catch (error) {
     throw error?.code === 'HUB_HOST_UNKNOWN' ? HOST_UNKNOWN(oneLine(error.message)) : error;
@@ -179,6 +182,7 @@ export async function statusDocument(ctx) {
   const registry = readIt(ctx);
   const statusCtx = createContext({
     env, now: ctx.now, sleep: ctx.sleep, adbWire: ctx.adbWire, devicectl: ctx.devicectl, inventory: ctx.inventory, policy: ctx.policy, hostKey: ctx.hostKey,
+    adbQuery: ctx.adbQuery, processStart: ctx.processStart, liveStart: ctx.liveStart,
     fleet: loadFleet(env, { warn: () => {} }),
   });
   const checkedAt = statusCtx.timing.now();
@@ -269,7 +273,7 @@ export async function retireResource(ctx, { body, params }) {
     if_rev: input.if_rev, reason: 'retire', actor: input.actor, why: input.why, plan: current => planRetire(current, params.id, input, { now: ctx.now }),
   });
   const { record } = planned;
-  const activity = (ctx.lockActivity ?? lockActivity)(record.lock, { env: ctx.env ?? process.env, now: ctx.now });
+  const activity = (ctx.lockActivity ?? lockActivity)(record.lock, { env: ctx.env ?? process.env, now: ctx.now, processStart: ctx.processStart });
   return { rev: written.rev, source: 'file', id: record.id, retired_at: record.retired_at, visibility: visibility(record, { held: activity.held === true, queued: activity.queued === true }) };
 }
 
@@ -297,6 +301,7 @@ function serviceContext(ctx) {
   const out = line => { try { ctx.log?.out?.(line); } catch { /* a broken log seam never changes the answer */ } };
   return {
     env: ctx.env ?? process.env, policy: ctx.policy, now: ctx.now, sleep: ctx.sleep, qaDevices: ctx.qaDevices,
+    ...(ctx.processStart ? { processStart: ctx.processStart } : {}),
     log: out, warn: () => {}, readingsOf: readingsOf(ctx), ...(ctx.hostKey ? { hostKey: ctx.hostKey } : {}),
     ...(ctx.provisionOffThread ? { provisionOffThread: ctx.provisionOffThread } : {}), ...(ctx.releaseOffThread ? { releaseOffThread: ctx.releaseOffThread } : {}), ...(ctx.forceReleaseOffThread ? { forceReleaseOffThread: ctx.forceReleaseOffThread } : {}),
   };
@@ -312,7 +317,7 @@ export async function takeLease(ctx, { body, signal }) {
 // GET /leases/{id}: the Lease an id names, a phone's or an emulator's (Story 7.2, 7.4), the same `Lease` the take answered with: how a client whose connection dropped
 // after the grant finds its Hold. A waiter that holds nothing yet and an unknown id are 404 HUB_LEASE_NOT_FOUND (`waiting`, `unknown`).
 export function getLease(ctx, { params }) {
-  return findLease(params.id, { env: ctx.env ?? process.env, warn: () => {} });
+  return findLease(params.id, { env: ctx.env ?? process.env, warn: () => {}, ...(ctx.processStart ? { processStart: ctx.processStart } : {}) });
 }
 
 // POST /leases/{id}/extend: extends a phone or emulator Lease (Story 7.3), exactly `hub-device extend <id> --for ...`: `serviceExtend` is the one function
