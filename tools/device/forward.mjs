@@ -22,7 +22,7 @@ import { FORWARD_DOORS, FORWARD_HEADER, forward, request as hubRequest } from '.
 import { createKnown } from '../host-agent/known.mjs';
 import { match, parseQuery } from '../registry/match.mjs';
 import { readRegistry } from '../registry/store.mjs';
-import { HOST_PLATFORMS, checkCancelBody, checkExtendBody, checkForceReleaseBody, checkLeaseBody, checkReleaseBody, checkReservationForceReleaseBody, exitCodeOf, hostKey as realHostKey, namesEmulatorSlot, newLeaseId } from './claims.mjs';
+import { HOST_PLATFORMS, checkCancelBody, checkExtendBody, checkForceReleaseBody, checkLeaseBody, checkReleaseBody, checkReservationForceReleaseBody, exitCodeOf, hostKey as realHostKey, isLane, laneEntry, namesEmulatorSlot, newLeaseId } from './claims.mjs';
 
 const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const isText = value => typeof value === 'string' && value.trim() !== '';
@@ -177,10 +177,12 @@ export async function peerView({ env, devices, qaDevices, request, known } = {})
 
 // The fleet with the Resource a forward carries in it, as `{device, lock, deploy}`: the Claims library finds every Hold through its fleet, so
 // release, extend, cancel and take then act on exactly the carried lock. `deploy` is the Registry's `deploy_target` (else the policy's own deploy locks),
-// so taking the iPad lane gets the 60 min deploy cap.
+// so taking the iPad lane gets the 60 min deploy cap. A lane (Story 9.4) is built by the Claims library's `laneEntry`, with its words from the view's
+// `words` (a served record carries none), so `ipad` and `mac` find it and its take never touches adb.
 export function withPlace(fleet, record, view, policy = null) {
   if (fleet.some(phone => phone.lock === record.lock)) return fleet;
   const known = view?.resources?.find(entry => entry.id === record.id);
+  if (isLane(known)) return [...fleet, laneEntry({ ...known, lock: record.lock, words: view?.words?.find(entry => entry.id === record.id)?.words ?? known.words ?? [] }, policy)];
   const deploy = known?.deploy_target === true || deployTargetCapMs(record.lock, { policy }) !== null;
   const name = known?.name ?? record.id;
   return [...fleet, { device: name, lock: record.lock, deploy, name: known?.display_name ?? name, serial: known?.identity?.serial ?? null, model: known?.identity?.model ?? null }];

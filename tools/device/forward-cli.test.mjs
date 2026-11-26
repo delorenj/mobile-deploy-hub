@@ -116,7 +116,7 @@ test('release, extend, cancel and force-release with --resource forward and prin
   } finally { forced.cleanup(); }
 });
 
-test('a linux-keyed CLI forwards a release of the iPad lane to the Mac, and does not forward `lease ipad` (Story 9.4)', async () => {
+test('a linux-keyed CLI forwards a release of the iPad lane to the Mac (the lane take itself is in lease-lane.test.mjs)', async () => {
   const r = await run(['release', 'l-aaaaaaaaaaaa', '--resource', 'ios-lane', '--holder', 'jarad'], { key: 'linux', answers: { 'POST /leases/l-ID/release': json(200, { lease_id: 'l-aaaaaaaaaaaa', outcome: 'released', resource: 'ios-lane', lock: 'mac-ios', device: 'ios-lane' }) } });
   try {
     assert.equal(r.code, 0, r.err.join('\n'));
@@ -125,10 +125,12 @@ test('a linux-keyed CLI forwards a release of the iPad lane to the Mac, and does
     assert.equal(r.calls.some(call => call.path === '/resources'), false, 'big-chungus reads its own Registry: no refresh');
     assert.equal(r.wrote, false);
   } finally { r.cleanup(); }
-  const lease = await run(['lease', 'ipad', '--for', '30m', '--why', 'x'], { key: 'linux' });
+  const lease = await run(['lease', 'ipad', '--for', '30m', '--why', 'x', '--id', 'l-bbbbbbbbbbbb', '--holder', 'jarad'], { key: 'linux', answers: { 'POST /leases': json(200, { ...LEASE_VIEW, lease_id: 'l-bbbbbbbbbbbb', resource: 'ios-lane', lock: 'mac-ios', device: 'ios-lane', env: { HUB_LEASE_ID: 'l-bbbbbbbbbbbb', HUB_DEVICE: 'ios-lane' } }) } });
   try {
-    assert.equal(lease.calls.length, 0, 'the iOS lane take is Story 9.4\'s: nothing is forwarded');
-    assert.notEqual(lease.code, 0);
+    assert.equal(lease.code, 0, lease.err.join('\n'));
+    assert.deepEqual(lease.out, ["export HUB_LEASE_ID='l-bbbbbbbbbbbb'", "export HUB_DEVICE='ios-lane'"]);
+    assert.deepEqual([lease.posts[0].host, lease.posts[0].forwarded, lease.posts[0].body.require_reachable], ['mac', 'cli', true], 'the sender says the take needs the device; the Mac reads it');
+    assert.equal(lease.wrote, false);
   } finally { lease.cleanup(); }
 });
 

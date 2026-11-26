@@ -303,13 +303,13 @@ function readingsOf(ctx) {
 }
 
 // The context the Claims library's service functions take, from the service's own: the lock dir environment, the policy and clock seams, a
-// log that never changes an answer, and the reading of a Pool's members (a `match`).
+// log that never changes an answer, the reading of a Pool's members (a `match`) and the `devicectl` seam (the Host Agent's lane gate reads the iPad through it: Story 9.4).
 function serviceContext(ctx) {
   const out = line => { try { ctx.log?.out?.(line); } catch { /* a broken log seam never changes the answer */ } };
   return {
     env: ctx.env ?? process.env, policy: ctx.policy, now: ctx.now, sleep: ctx.sleep, qaDevices: ctx.qaDevices,
     ...(ctx.processStart ? { processStart: ctx.processStart } : {}), ...(ctx.fleet ? { fleet: ctx.fleet } : {}),
-    log: out, warn: () => {}, readingsOf: readingsOf(ctx), ...(ctx.hostKey ? { hostKey: ctx.hostKey } : {}),
+    log: out, warn: () => {}, readingsOf: readingsOf(ctx), ...(ctx.hostKey ? { hostKey: ctx.hostKey } : {}), ...(ctx.devicectl ? { devicectl: ctx.devicectl } : {}),
     ...(ctx.provisionOffThread ? { provisionOffThread: ctx.provisionOffThread } : {}), ...(ctx.releaseOffThread ? { releaseOffThread: ctx.releaseOffThread } : {}), ...(ctx.forceReleaseOffThread ? { forceReleaseOffThread: ctx.forceReleaseOffThread } : {}),
   };
 }

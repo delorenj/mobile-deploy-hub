@@ -9,7 +9,7 @@
 // this host's phones and the Resource the request names. There are no `/registry/*`, `/resources`, `/discovery` or `/stream` routes here: those are the Hub API's.
 import { HOST_AGENT_SERVICE, HUB_API_CONTRACT } from '../hub-client.mjs';
 import { hubRef } from '../ci/lib/receipt.mjs';
-import { createContext, hostKey as realHostKey, isLocal, phonesOf, statusView } from '../device/claims.mjs';
+import { createContext, hostKey as realHostKey, isLocal, lanesOf, phonesOf, statusView } from '../device/claims.mjs';
 import { NAMED, forwardHold, namedRecords, placeOf, retiredCarried, unseeded, unwrapCarried, withPlace, wrongHost } from '../device/forward.mjs';
 import { ROUTES, reply } from '../hub-api/routes.mjs';
 import { createKnown } from './known.mjs';
@@ -29,6 +29,8 @@ const ownKey = ctx => (ctx.hostKey ?? realHostKey)({ env: ctx.env ?? process.env
 
 // This host's phones, from what the agent knows (`[]` on the Mac).
 const fleetOf = (view, key) => phonesOf(view.resources.filter(record => isLocal(record, { hostKey: () => key })));
+// The fleet of a Hold route that names nothing (a bare id): the phones plus this host's lanes, so a lane's Lease is found by its id. Status keeps `fleetOf`.
+const holdFleet = (view, key, policy) => [...fleetOf(view, key), ...lanesOf(view.resources, key, policy)];
 
 // GET /health: what is running and which contract it speaks. No `registry`: the agent has no Registry file.
 export function agentHealth(ctx) {
@@ -102,7 +104,7 @@ function forwarding(route) {
       }
       const foreign = namedRecords(key, input, request, view, policy).records.find(record => record.host !== own);
       if (foreign) throw wrongHost(foreign, own);
-      return local({ ...ctx, fleet: fleetOf(view, own) }, request);
+      return local({ ...ctx, fleet: holdFleet(view, own, policy) }, request);
     }
     if (ctx.request && named.names(input, request).length > 0) await known.refresh({ request: ctx.request });
     const view = known.current();
@@ -114,7 +116,7 @@ function forwarding(route) {
       const at = placed(fleetOf(view, own), single, request, view, policy);
       return local({ ...ctx, fleet: at.fleet }, at.request);
     }
-    return local({ ...ctx, fleet: fleetOf(view, own) }, request);
+    return local({ ...ctx, fleet: holdFleet(view, own, policy) }, request);
   };
 }
 
@@ -128,7 +130,7 @@ function gated(route) {
     const view = knownOf(ctx).current();
     const foreign = namedRecords(key, input, request, view, ctx.policy ?? null).records.find(record => record.host !== own);
     if (foreign) throw wrongHost(foreign, own);
-    return route.handler({ ...ctx, fleet: fleetOf(view, own) }, request);
+    return route.handler({ ...ctx, fleet: holdFleet(view, own, ctx.policy ?? null) }, request);
   };
 }
 
