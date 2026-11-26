@@ -30,6 +30,7 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 | GET | `/discovery` | Discovery | 6.10 |
 | GET | `/status` | Status | 8.1 |
 | GET | `/stream` | StreamFrame | 8.4 |
+| POST | `/agent/push` | AgentPushAck | 9.5 |
 | POST | `/registry/resources` | Resource | 6.6 |
 | POST | `/registry/resources/{id}` | Resource | 6.7 |
 | POST | `/registry/resources/{id}/retire` | Retirement | 6.7 |
@@ -78,7 +79,7 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 - `resources[].reachability.received_at` the service's clock when it answered, in ms since the epoch, or `null` when there is no reading
 - `resources[].reachability.source` `probe` (the service read it from the host's adb server), `track` (the service's one `host:track-devices-l` socket on that server pushed it), or `null` when there is no reading
 
-`reachability` is on this list only: the `Resource` of the other routes has no such field. A reading is never waited for: a request answers from the service's cache at once. While the service's track socket is open, every own-host phone's reading is current (`source: track`, `age_ms_at_receipt` 0): adb pushes every change, so a silent socket means the state holds, and a push is one `reachability` event with `reason: track`. When the socket closes the service writes one `reachability` event per tracked Resource (`to: unknown`, `reason: track-lost`), drops those readings and probes again, and only the next request opens a new socket (never a timer). Without a live reading, a missing or stale reading (older than `registry.reachability_max_age_s`, 60 s) starts one refresh in the background (at most one at a time), so the first read after a start shows `unknown` with every other field `null`. Only the Resources on the service's own host are probed; an `ios-lane` or the `emulator` Pool reads `unknown`. A change of state is logged once as a `reachability` event. The service remembers what it logged only for as long as it runs, so the first reading after a service start is logged with `from: null`.
+`reachability` is on this list only: the `Resource` of the other routes has no such field. A reading is never waited for: a request answers from the service's cache at once. While the service's track socket is open, every own-host phone's reading is current (`source: track`, `age_ms_at_receipt` 0): adb pushes every change, so a silent socket means the state holds, and a push is one `reachability` event with `reason: track`. When the socket closes the service writes one `reachability` event per tracked Resource (`to: unknown`, `reason: track-lost`), drops those readings and probes again, and only the next request opens a new socket (never a timer). Without a live reading, a missing or stale reading (older than `registry.reachability_max_age_s`, 60 s) starts one refresh in the background (at most one at a time), so the first read after a start shows `unknown` with every other field `null`. Only the Resources on the service's own host are probed. An `ios-lane` is never probed from here: its reading is what the Mac's Host Agent last pushed (`POST /agent/push`, Story 9.5), re-stamped with `receive` on arrival (so the reading's age grows on this clock from the push), and it reads `unknown` until a push carries one; a pushed `unknown` drops the stored reading. The `emulator` Pool reads `unknown`. A change of state of an own-host phone is logged once as a `reachability` event; a pushed reading writes none (only a host's own service logs one). The service remembers what it logged only for as long as it runs, so the first reading after a service start is logged with `from: null`.
 
 The age rule: a reader on the service's host computes `age_ms = age_ms_at_receipt + now - received_at` on its own clock. A client on another host first re-stamps the reading with `receive` (`tools/registry/reachability.mjs`), which keeps `age_ms_at_receipt` and sets `received_at` to the client's own clock, so neither clock's skew can make a reading look fresher than it is.
 
@@ -143,12 +144,12 @@ The age rule: a reader on the service's host computes `age_ms = age_ms_at_receip
 
 ### Status
 
-`GET /status`: every Resource's Reachability, Hold and Queue in one document (FR-14, AD-41), so a reader never recomputes a queue. `hosts` holds one view for each host the service has: today only its own (`linux`), and a later release adds the Mac's key with no change to any key here. A host's view is exactly what `hub-device status --json` would print on that host for a service reader: the v1a lists (`phones`, `locks`, `waiters`, `reservations`, `inventory`, `emulators`), each row naming its `resource`, `deploy_target` (a Resource deploys install to is visibly marked) and `reachability`. A Resource's Registry fields (names, Capabilities, retired and seed-missing visibility) are under `registry` only, never in a view. Nothing derived from time is cached: every answer is derived from the lock dir, the Registry file, the Event Log and the clock at the moment of the request (and from the host snapshot described under `GET /discovery` for the inventory, the adb listing and process starts; while the service's track socket is open its adb listing is the socket's latest push, so a phone's `reachability` here is current), so a Lease past its `expires_at` reads `stale: true` and has no `expected_end` with no file changed. For a `dedicated_qa` Resource the `serial`, `udid` and `adb_id` of its rows, and a Lease's `phone` and `device` serial and adb id, are `null` (the keys stay). An unknown host key is 503 `HUB_HOST_UNKNOWN`.
+`GET /status`: every Resource's Reachability, Hold and Queue in one document (FR-14, AD-41), so a reader never recomputes a queue. `hosts` holds one view for each host the service has: its own first (`linux`), then one for each spoke host that has pushed (the Mac's, `mac`, Story 9.5: `POST /agent/push`), embedded unchanged; a second spoke host adds its key with no change to any key here. A host's view is exactly what `hub-device status --json` would print on that host for a service reader: the v1a lists (`phones`, `locks`, `waiters`, `reservations`, `inventory`, `emulators`), each row naming its `resource`, `deploy_target` (a Resource deploys install to is visibly marked) and `reachability`. A Resource's Registry fields (names, Capabilities, retired and seed-missing visibility) are under `registry` only, never in a view. Nothing derived from time is cached: every answer is derived from the lock dir, the Registry file, the Event Log and the clock at the moment of the request (and from the host snapshot described under `GET /discovery` for the inventory, the adb listing and process starts; while the service's track socket is open its adb listing is the socket's latest push, so a phone's `reachability` here is current), so a Lease past its `expires_at` reads `stale: true` and has no `expected_end` with no file changed. That holds for this service's own view only: a pushed view (`hosts.mac`) is embedded unchanged, so its time-derived fields (`stale`, `expected_end`, queue positions) are as of its push, which is why `stale.<host>` flags it once it is older than `registry.reachability_max_age_s`. For a `dedicated_qa` Resource the `serial`, `udid` and `adb_id` of its rows, and a Lease's `phone` and `device` serial and adb id, are `null` (the keys stay). An unknown host key is 503 `HUB_HOST_UNKNOWN`.
 
 - `format` always `1`
 - `contract` the contract version of this document
 - `checked_at` an ISO time, the service's clock when it built the document
-- `stale.*` the views the service shows from an earlier read, keyed by host key, each `{since}` (an ISO time). Always `{}` today: the service reads its own host fresh on every request
+- `stale.*` the views the service shows from an earlier push, keyed by host key, each `{since}` (an ISO time, when this service received the view). A pushed view is stale when more than `registry.reachability_max_age_s` (60 s) have passed since it was received, judged on this service's clock when the document is built (exactly the limit is still current); a host that has not pushed has no view and no key, and this host's own view is read fresh, so it never has one. `stale` is derived on every answer and never pushed or stored, and no frame is sent when a view turns stale (time alone causes no frame)
 - `hosts.{host}.phones[].device` the word a Claimant says for the phone
 - `hosts.{host}.phones[].lock` the lock a Hold takes
 - `hosts.{host}.phones[].deploy` `true` for the phone deploys install to
@@ -254,6 +255,15 @@ The age rule: a reader on the service's host computes `age_ms = age_ms_at_receip
 - `registry.resources[].visibility` as in `ResourceList`
 
 `registry.resources` is the same list `GET /resources` serves (visible and retiring Resources, in the Registry's order), with no `reachability`: a Resource's Reachability is in its host's view only.
+
+### AgentPushAck
+
+`POST /agent/push` (Story 9.5, AD-49): a spoke host's Host Agent tells this service what changed on its host. It is the only route the agent calls on the Hub API besides `GET /resources`, always through `hub-client` (the agent never opens a socket of its own). The body is under "Request bodies". The answer is 200 in both cases:
+
+- `applied` `true` when the push was applied, `false` when its `(boot, seq)` had already been applied (the same `boot` and a `seq` not above the applied one): nothing changed and no frame was scheduled
+- `host` the pushing host's key, as sent
+- `boot` the agent's boot id, as sent
+- `seq` the push's sequence number, as sent
 
 ### StreamFrame
 
@@ -487,6 +497,22 @@ Refusals, in the order they are checked: `HUB_USAGE` 400 for the body (`bad-body
 
 For every write route the actor is `actor` as given, else `{holder, via: 'api'}`, else `no-holder`; the body is checked before the name's shape, which is checked before anything is read from the Registry.
 
+**`POST /agent/push`** (Story 9.5) is a spoke host's one message to this service. The body is a JSON object with exactly these keys, none optional:
+
+- `format`: `1`.
+- `host`: the pushing host's key (`linux` or `mac`), never this service's own: a host does not push to itself.
+- `host_id`: the machine id of that host (`events.mjs` `hostId()`), or `null`.
+- `boot`: 12 lowercase hex characters, minted once per agent start.
+- `seq`: a whole number of 1 or more, rising by one per push attempt within a `boot` (a failed attempt uses its number).
+- `sent_at`: an ISO time on the agent's clock. It is recorded by nobody: the service times everything it derives on its own clock.
+- `status`: the host's own view (`HostView`, under Host Agent), or `null` when the agent could not build it.
+- `readings`: `null` (the agent could not read), or a list of `{resource, state, checked_at, age_ms_at_receipt, received_at, source}`: a Resource id and its reading in the served form (the `ResourceList` `reachability` fields), one for each lane of that host.
+- `events`: always `null` (the Event Log replica arrives with Epic 10).
+
+Applied once per `(boot, seq)`: a repeat answers 200 `{applied: false}` and changes nothing. A new `boot` is applied whatever its `seq`. An applied push with a non-null `status` replaces that host's view in `GET /status` `hosts.{host}` and its receipt time becomes this service's clock; a `null` `status` keeps the last view and its receipt time. Each reading of a Resource the Registry places on `host` is stored as a `receive`d reading (an `unknown` one drops the stored reading); a reading of any other Resource is ignored. Then the change feed is poked, so a `status` frame follows on `GET /stream` within the 250 ms debounce. The service never calls the agent to refresh a view.
+
+Refusals: `HUB_USAGE` 400 for the body, with one of these reasons, checked in this order and before anything is stored: `bad-body` (not an object, a key outside the list or a missing one), `bad-format`, `bad-host` (not a host key, or this service's own), `bad-host-id`, `bad-boot`, `bad-seq`, `bad-sent-at`, `bad-status`, `bad-readings`, `bad-events`; `HUB_HOST_UNKNOWN` 503 when this service does not know its own host key.
+
 ## Error codes
 
 | Code | Status | Exit | Meaning |
@@ -596,6 +622,8 @@ Base URL: `http://127.0.0.1:8795`, loopback only, no path prefix. The port is `a
 The seven Hold routes take the same bodies and answer the same shapes as the Hub API's (`Lease`, `Release`, `ForceRelease`, `Cancel`, `ReservationForceRelease` above). Every other route, `/registry/*`, `/resources`, `/pools`, `/discovery` and `/stream` included, is 404 `HUB_NO_ROUTE`: only the Hub API on big-chungus reads or writes the Registry.
 
 **Forwarding, not a gate (Story 9.3).** A Hold route acts here only on this host's own Resources, and forwards the rest. After the route's own body check (a bad body is still `HUB_USAGE` 400), the Resource the request names is found in what the agent knows (the Hub API's last `GET /resources` answer, refreshed once per public request that names something, else the in-memory seed of `devices.json`; the seed's words, `ipad` and `mac`, and its Pools, `phone` and `emulator`, always resolve): by id, name or lock, then by word, a Pool word standing for its members, a `match` by the matcher over those Resources (a `profile=` clause names the emulator Pool). `POST /leases` names its `resource` or `match`, `POST /requests/{id}/cancel` its `resource` and `pool`, `POST /leases/{id}/extend`, `/release` and `/force-release` their optional `resource` (a force-release of an `emulator-<n>` id names the emulator Pool), and `POST /reservations/{run_key}/force-release` its `name`. What lives on one other host is forwarded there as the door `host-agent`; what lives here runs here, on the carried or the known record; a forward (the `X-Hub-Forwarded` header) is acted on as described under Forwarding, and one that names another host's Resource is `HUB_WRONG_HOST` 409 (`reason: wrong-host`, exit 2), naming the Resource, its host and this host, and nothing is written. A Reservation's force-release is never forwarded: another host's lock is `HUB_WRONG_HOST`. A name the agent does not know passes to the handler, which refuses it as it always does. The agent never reads `registry.json`.
+
+**Pushes (Story 9.5, AD-49).** The agent tells the Hub API about its host with `POST /agent/push` (`AgentPushAck`; the body is under Request bodies), through `hub-client` (`request({host: 'linux', ...})`): its `status` is `GET /status` rendered at that instant on the Mac's clock, and `readings` is the iPad read once through `devicectl` for each lane of its host. It pushes at its own start, when its lock dir or event dir is written (a watch over the lock dir, `emulators/`, every `.lock`, `.queue` and `.reservations` directory and the event dir; a burst of writes is one push, at most 250 ms after the first), and when a Reachability reading changes: an iPad read on a request (`GET /status` or a lane take that needs the device) that differs from what the last push carried. Nothing else pushes: there is no timer, interval or poll, so a quiet Mac sends nothing, and the Hub API marks its view `stale` from the push's age. A push that fails (the transport throws, or the answer is not 2xx) is one stderr line, `HUB_AGENT_PUSH_FAILED <message>`, and is never retried on a timer: it stays owed, and the next change notification or the next request to the agent pushes again, with the next `seq`. Two pushes never run at once. The agent has no route to receive a push: `/agent/push` is the Hub API's.
 
 ### AgentHealth
 

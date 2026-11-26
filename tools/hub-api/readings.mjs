@@ -15,11 +15,15 @@
 // overwrites a live reading. `trackLost({at})` (the socket closed) writes one `reachability` event per live id, `to: 'unknown'`, drops
 // those readings and clears the live set, so the next read probes. Nothing here opens a socket or starts a timer.
 //
+// A pushing host is the third writer (Story 9.5, AD-49): `remote(entries, {at})` stores what a Host Agent's push carried for the Resources
+// on its host, each `receive`d on this service's clock (`at`), so a reader's clock and the sender's never decide how old one looks. A pushed
+// reading is never probed, never live and never written to the Event Log: only a host's own service logs a `reachability` event.
+//
 // The deploy path never imports this directory (tools/deploy-path.test.mjs).
 import { noteReachability } from '../ci/lib/lock.mjs';
 import { sleep as realSleep } from '../ci/lib/pause.mjs';
 import { hostKey as realHostKey, phoneReadings, phonesOf } from '../device/claims.mjs';
-import { isReachability, present, serve, stamp } from '../registry/reachability.mjs';
+import { isReachability, present, receive, serve, stamp } from '../registry/reachability.mjs';
 
 const oneLine = value => String(value?.message ?? value).replace(/\s+/g, ' ').trim();
 
@@ -120,5 +124,19 @@ export function createReadings({ env = process.env, policy, now = Date.now, host
     live.clear();
   }
 
-  return { read, track, trackLost, settled: () => inflight ?? Promise.resolve() };
+  // A pushed host's readings: `entries` are `{id, served}` (a Resource id and its reading in the served form). `receive` re-stamps each one with
+  // `at`; a reading nobody could take (`unknown`) drops the stored one, so the row reads as missing again. A Resource this service tracks live
+  // is never overwritten (it is on this host: nothing pushes for it).
+  function remote(entries = [], { at = now() } = {}) {
+    for (const entry of entries) {
+      try {
+        if (live.has(entry.id)) continue;
+        const reading = receive(entry.served, { now: at });
+        if (reading === null) stored.delete(entry.id);
+        else stored.set(entry.id, reading);
+      } catch (error) { failed(error); }
+    }
+  }
+
+  return { read, track, trackLost, remote, settled: () => inflight ?? Promise.resolve() };
 }

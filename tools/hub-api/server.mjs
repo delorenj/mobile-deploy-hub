@@ -24,6 +24,7 @@ import { retirement } from '../registry/match.mjs';
 import { recoverRegistry, applySeed, readRegistry } from '../registry/store.mjs';
 import { createChangeFeed, hubPaths } from './changes.mjs';
 import { createReadings, deviceCtx } from './readings.mjs';
+import { createRemotes } from './remotes.mjs';
 import { createSnapshot } from './snapshot.mjs';
 import { createStream } from './stream.mjs';
 import { createTrack } from './track.mjs';
@@ -234,7 +235,9 @@ export async function startHubApi({ policy, env: given = process.env, log = defa
   // The one stream (Story 8.4, tools/hub-api/stream.mjs): `GET /stream`'s hub. Its keepalive is the policy's, owned by each open connection.
   // A stop closes it after the track, so a stop never hangs on an open subscriber and a later `GET /stream` is 503 HUB_API_RESTARTING.
   const stream = injectedStream ?? createStream({ now, keepaliveMs: resolved.api.stream_keepalive_s * 1000 });
-  const ctx = { policy: resolved, now, hostId, devices, qaDevices, readings, snapshot, stream, onRequest: () => track.ensure(), ...device };
+  // `remotes` holds what spoke hosts pushed (Story 9.5, tools/hub-api/remotes.mjs); `onPush` pokes the change feed (below), so a pushed view reaches a
+  // subscriber in one trailing re-read like any other change.
+  const ctx = { policy: resolved, now, hostId, devices, qaDevices, readings, snapshot, stream, remotes: createRemotes(), onPush: () => feed.poke(), onRequest: () => track.ensure(), ...device };
   // The change feed (Story 8.5, tools/hub-api/changes.mjs): `fs.watch` on the lock dir, `emulators/`, every `<name>.lock|.queue|.reservations`
   // and the event dir, so a change by any process (hub-device, a deploy job, this service) is one trailing re-read: the new Event Log lines
   // as `event` frames and, when the document changed for a reason other than time, one `status` frame. Real `fs.watch` unless a test faked

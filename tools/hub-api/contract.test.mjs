@@ -197,6 +197,8 @@ function prepareStatus(ctx) {
 }
 
 const POST_SAMPLES = Object.freeze({
+  // A push from the Mac to a Hub API on linux (Story 9.5).
+  '/agent/push': { status: 200, body: { format: 1, host: 'mac', host_id: null, boot: '0123456789ab', seq: 1, sent_at: '2026-11-26T10:00:00.000Z', status: null, readings: null, events: null } },
   '/registry/resources': { status: 201, body: { kind: 'phone', name: 'pixel', host: 'linux', identity: { serial: 'PX9', model: 'Pixel 9' }, capabilities: { api_level: 35 }, holder: 'contract-test' } },
   // After the seed (rev 1) and the setup register (rev 2), the edit is based on rev 2.
   '/registry/resources/{id}': { status: 200, params: { id: 'res-pixel' }, setup: ['/registry/resources'], body: { if_rev: 2, name: 'pixel-9', capabilities: { api_level: 36 }, holder: 'contract-test' } },
@@ -460,7 +462,7 @@ test('the Host Agent table of the document equals AGENT_ROUTES both ways, each w
   for (const route of AGENT_ROUTES.filter(candidate => !['AgentHealth', 'HostView'].includes(candidate.shape))) {
     assert.equal(ROUTES.find(candidate => routeKey(candidate) === agentKey(route))?.shape, route.shape, `${agentKey(route)} is the Hub API's route`);
   }
-  for (const route of ROUTES.filter(candidate => !candidate.path.startsWith('/registry') && !['/resources', '/resources/{id}', '/pools', '/discovery', '/stream', '/health', '/status'].includes(candidate.path))) {
+  for (const route of ROUTES.filter(candidate => !candidate.path.startsWith('/registry') && !['/resources', '/resources/{id}', '/pools', '/discovery', '/stream', '/health', '/status', '/agent/push'].includes(candidate.path))) {
     assert.ok(AGENT_ROUTES.some(candidate => agentKey(candidate) === routeKey(route)), `${routeKey(route)} is a Hold route the agent serves`);
   }
 });
