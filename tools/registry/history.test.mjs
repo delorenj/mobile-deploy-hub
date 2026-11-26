@@ -11,6 +11,7 @@ const registry = {
     { id: 'ios-lane', lock: 'mac-ios', name: 'ipad', kind: 'ios-lane', host: 'mac', seeded: true },
     { id: 'emulator', lock: 'emulator', name: 'emulator', kind: 'emulator-pool', host: 'linux', seeded: true },
     { id: 'res-pixel', lock: 'res-pixel', name: 'pixel', kind: 'phone', host: 'linux', seeded: false },
+    { id: 'res-qa', lock: 'res-qa', name: 'qa', kind: 'phone', host: 'linux', seeded: false, capabilities: { dedicated_qa: true } },
   ],
   pools: { phone: { members: ['s24', 's26'], named: true }, emulator: { gate: 'emulator' } },
 };
@@ -91,6 +92,7 @@ test('filter by resource: the resource field, else a v1a lock; an id or a name',
 test('filter by pool: members, the event\'s own pool, a gate Pool and the runtime phones', () => {
   assert.equal(keep('pool=phone', ev({ lock: 's24' })), true, 'a member');
   assert.equal(keep('pool=phone', ev({ lock: 'res-pixel', resource: 'res-pixel' })), true, 'a runtime phone is in the phone Pool');
+  assert.equal(keep('pool=phone', ev({ lock: 'res-qa', resource: 'res-qa' })), false, 'a dedicated_qa runtime phone is not in a named Pool (the matcher keeps it out)');
   assert.equal(keep('pool=phone', ev({ lock: 'mac-ios' })), false);
   assert.equal(keep('pool=phone', ev({ lock: null, resource: null, pool: 'phone', request: 'r' })), true, 'event.pool');
   assert.equal(keep('pool=phone', ev({ lock: null, resource: null, pool: 'emulator' })), false);

@@ -336,6 +336,9 @@ test('a cursor position the log never had is 400 bad-cursor', async () => {
     assert.equal(answer.body.reason, 'bad-cursor');
     const past = await s.history(`cursor=${encodeCursor({ linux: { month: '2026-11', offset: 99999 } })}`);
     assert.equal(past.body.reason, 'bad-cursor');
+    const month = await s.history(`cursor=${encodeCursor({ linux: { month: '2026-10', offset: 5 } })}`);
+    assert.equal(month.status, 400, 'a month the log has no file for');
+    assert.equal(month.body.reason, 'bad-cursor');
   } finally { s.cleanup(); }
 });
 

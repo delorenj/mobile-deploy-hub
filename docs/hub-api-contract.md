@@ -293,14 +293,14 @@ The fields of a frame's data:
 
 ### History
 
-`GET /history?resource&pool&claimant&repo&from&to&cursor&limit` (Story 10.2, FR-18, UJ-4, AD-40): the Event Log of both hosts, this host's own log and each peer host's replica (`replicas/<host>/`, Story 10.1), filtered, merged and paged. Everything is keyed by host key, so a further peer host needs no new field. It reads only: it never writes, truncates or deletes a log or a replica.
+`GET /history?resource&pool&claimant&repo&from&to&cursor&limit` (Story 10.2, FR-18, UJ-4, AD-40): the Event Log of both hosts, this host's own log and each peer host's replica (`replicas/<host>/`, Story 10.1), filtered, merged and paged. Everything is keyed by host key, so a further peer host needs no new field. It never compacts or deletes an event, and writes nothing of its own: its only writes are those of a peer call (the Story 9.6 mark, one `host-reachability` event in this host's log) and of the replica's own writer (settling a torn replica tail, and the pushes a sync causes).
 
 Query. Every key is optional and none may repeat or be empty; any other key is 400 `HUB_USAGE` `bad-query`. The filters are ANDed.
 
 | Key | Meaning |
 |-----|---------|
 | `resource` | a Resource id or name; an event matches by its `resource` field, or, when it has none (a v1a event), by its `lock` (`adb` is the S26, `emulator-<n>` the emulator Pool, a `res-*` lock its Registry record) |
-| `pool` | a Pool name (`phone`, `emulator`); an event matches by its own `pool` (a Pool request's events) or when its Resource is a member of the Pool (a gate Pool: its lock's Resource) |
+| `pool` | a Pool name (`phone`, `emulator`); an event matches by its own `pool` (a Pool request's events) or when its Resource is a member of the Pool (a gate Pool: its lock's Resource); a name the Registry has no Pool for matches by the event's own `pool` only |
 | `claimant` | an event's `claimant.kind` (`agent`, `person`, `deploy`, `hub-job`) or `claimant.holder` |
 | `repo` | `owner/name`: the event's `claimant.repo` or `delivery.repo` |
 | `from`, `to` | an ISO time (`2026-11-01T00:00:00Z`, or a date); an event matches when `from` <= its `ts` < `to`, and an event with no readable `ts` matches neither bound. A bad time, or `from` after `to`, is 400 `bad-range` |

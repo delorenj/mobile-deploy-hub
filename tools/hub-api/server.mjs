@@ -240,7 +240,8 @@ export async function startHubApi({ policy, env: given = process.env, log = defa
   const stream = injectedStream ?? createStream({ now, keepaliveMs: resolved.api.stream_keepalive_s * 1000 });
   // `remotes` holds what spoke hosts pushed (Story 9.5, tools/hub-api/remotes.mjs); `onPush` pokes the change feed (below), so a pushed view reaches a
   // subscriber in one trailing re-read like any other change. `replicas` is the only writer of the hosts' Event Log replicas
-  // (Story 10.1, tools/hub-api/replica.mjs); the change feed's watch on the event dir is non-recursive, so replica writes do not churn it.
+  // (Story 10.1, tools/hub-api/replica.mjs); the change feed's watch on the event dir is non-recursive, so replica writes do not churn it. `history` holds /history's in-memory sync proofs
+  // (Story 10.2, tools/hub-api/history.mjs), lost on restart.
   const ctx = { policy: resolved, now, hostId, devices, qaDevices, readings, snapshot, stream, remotes: createRemotes(), replicas: createReplicas({ env }), history: createHistory(), peers: createPeers({ env, now, hostId, policy: resolved, log: log.err }), onPush: () => feed.poke(), onPeerChange: () => feed.poke(), onRequest: () => track.ensure(), ...(sshImpl ? { sshImpl } : {}), ...(timers ? { timers } : {}), ...device };
   // The change feed (Story 8.5, tools/hub-api/changes.mjs): `fs.watch` on the lock dir, `emulators/`, every `<name>.lock|.queue|.reservations`
   // and the event dir, so a change by any process (hub-device, a deploy job, this service) is one trailing re-read: the new Event Log lines

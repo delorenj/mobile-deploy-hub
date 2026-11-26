@@ -282,8 +282,9 @@ function historyOf(ctx) {
 // GET /history?resource&pool&claimant&repo&from&to&cursor&limit (Story 10.2, FR-18, UJ-4, AD-40): this host's Event Log and each peer's replica,
 // filtered, merged by `ts` for display (`cross_host_order: 'display-only'`) and paged by an opaque per-host cursor. A peer whose replica may lack
 // the window is asked to push first (`POST /agent/sync`, behind the peers' gate: a marked host fails at once); a window the replica still cannot be
-// shown to cover answers `partial: true` with `synced_through` and `unreachable_ranges`. Reads only: the one side effect is a peer's mark
-// (Story 9.6, `noteContact`/`noteFailure`) and the agent's own pushes. The query is checked first (400 HUB_USAGE) and reads nothing; a host that
+// shown to cover answers `partial: true` with `synced_through` and `unreachable_ranges`. It never compacts or deletes and writes nothing of its
+// own: its only writes are a peer call's (the mark, Story 9.6 `noteContact`/`noteFailure`) and the replica's own writer's (settling a torn
+// tail, the pushes a sync causes). The query is checked first (400 HUB_USAGE) and reads nothing; a host that
 // does not know its key is 503 HUB_HOST_UNKNOWN. The logic is tools/registry/history.mjs and tools/hub-api/history.mjs.
 export async function historyRoute(ctx, { query, signal } = {}) {
   const env = ctx.env ?? process.env;
@@ -670,7 +671,7 @@ export async function handle({ method, url, headers = {}, body, bodyError, signa
     if (result === null || typeof result !== 'object') throw new TypeError(`the handler for ${verb} ${path} returned ${result === null ? 'null' : typeof result}, not an object`);
     return respond(200, result, echo(result));
   } catch (error) {
-    if (!hasStatus(error) && tableAnswer(error) === null) {
+    if (signal?.aborted !== true && !hasStatus(error) && tableAnswer(error) === null) {
       try { ctx.log?.err?.(`HUB_API_ERROR ${verb} ${path} ${oneLine(error?.message ?? error)}`); } catch { /* a broken log seam never changes the answer */ }
     }
     return problem(error, echo(null));

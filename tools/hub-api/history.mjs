@@ -65,7 +65,9 @@ export function openReader({ host, root, env = process.env, start = null, fromMo
 
   async function fill() {
     if (months === null) {
-      months = (await listMonths(root)).filter(month => (fromMonth === null || month >= fromMonth) && (toMonth === null || month <= toMonth) && (start === null || month >= start.month));
+      const all = await listMonths(root);
+      if (start !== null && !all.includes(start.month)) throw badCursor(`the cursor's month ${start.month} is not one ${host}'s log has`);
+      months = all.filter(month => (fromMonth === null || month >= fromMonth) && (toMonth === null || month <= toMonth) && (start === null || month >= start.month));
       offset = months[0] !== undefined && start !== null && months[0] === start.month ? start.offset : 0;
     }
     while (head === null && !done) {
@@ -212,7 +214,8 @@ export async function queryHistory({ query: params, own, env = process.env, regi
   const partial = spokes.some(host => through[host] === null || through[host] < windowEnd);
 
   // 2. The k-way read: one reader per host in host key order, one matched head each.
-  const accept = historyFilter(query, registry());
+  // The Registry is read only for a filter that needs it (a time-only query never fails on it).
+  const accept = historyFilter(query, query.resource !== null || query.pool !== null ? registry() : null);
   const fromMonth = query.from === null ? null : monthOf(query.from);
   const toMonth = query.to === null ? null : monthOf(query.to);
   const readers = HOST_KEYS.map(host => openReader({

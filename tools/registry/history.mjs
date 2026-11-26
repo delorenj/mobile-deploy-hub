@@ -112,7 +112,7 @@ function poolMembers(registry, name) {
   const ids = new Set();
   if (Array.isArray(pool.members)) {
     for (const id of pool.members) ids.add(id);
-    for (const record of registry?.resources ?? []) if (record?.seeded === false && record.kind === 'phone' && record.host === 'linux') ids.add(record.id);
+    for (const record of registry?.resources ?? []) if (record?.seeded === false && record.kind === 'phone' && record.host === 'linux' && record.capabilities?.dedicated_qa !== true) ids.add(record.id);
   }
   if (typeof pool.gate === 'string') { const id = resourceOf(pool.gate); if (id !== null) ids.add(id); }
   return { ids, gate: typeof pool.gate === 'string' ? pool.gate : null };
