@@ -181,7 +181,7 @@ export function frontDoorPort(policy, key) {
 export const boundMs = ({ waitMs = 0, budgetMs = 0 } = {}) => waitMs + budgetMs + CALL_MARGIN_MS;
 
 const away = (host, alias, policy, detail) => coded('HUB_DEVICE_AWAY', `the ${host} host (ssh alias ${alias}) is not reachable: ${detail} (connect timeout ${policy.api.peer_connect_timeout_s} s)`, {
-  exit: 75, reason: 'host-unreachable', api: false, host, alias,
+  exit: 75, reason: 'host-unreachable', api: false, host, alias, detail: String(detail),
 });
 
 // The relay's head: line 1 of its stdout. Success carries status and headers, failure the cause code of the peer-side fetch.
@@ -288,7 +288,7 @@ export async function request({ host, method = 'GET', path, body, waitMs = 0, bu
   return viaSsh({ host, verb, path, body, bound, door, signal: given }, { policy, devices, sshImpl: seams.sshImpl, timers: seams.timers ?? globalTimers() });
 }
 
-const goneAway = (host, detail) => coded('HUB_DEVICE_AWAY', `the ${host} host did not answer: ${detail}`, { exit: 75, reason: 'host-unreachable', api: false, host, status: 503 });
+const goneAway = (host, detail) => coded('HUB_DEVICE_AWAY', `the ${host} host did not answer: ${detail}`, { exit: 75, reason: 'host-unreachable', api: false, host, status: 503, detail: String(detail) });
 
 // `forward({host, method, path, body, door, waitMs, budgetMs, signal}, seams)` -> `{status, body}` (Story 9.3): one Hold action sent to the host
 // that owns the Resource, as `door` (`cli`, `api` or `host-agent`). `seams.request` replaces the transport (`request`; a test's bridge to the other

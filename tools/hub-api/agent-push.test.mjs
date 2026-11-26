@@ -126,7 +126,7 @@ test('stale: {since: <receipt ISO>} past reachability_max_age_s on this clock, n
     assert.deepEqual((await s.status()).body.stale, {}, 'at 60 s the view is still current');
     s.clock.t = T0 + limit + 1000;
     const late = await s.status();
-    assert.deepEqual(late.body.stale, { mac: { since: iso(T0) } });
+    assert.deepEqual(late.body.stale, { mac: { since: iso(T0), unreachable: null } });
     assert.deepEqual(late.body.hosts.mac, macView(), 'the stale view is still shown, unchanged');
     assert.ok(!('stale' in late.body.hosts.mac));
     // A new push is a new receipt: the view is current again.
@@ -145,7 +145,7 @@ test('a null status keeps the last view and its receipt time, and still applies 
     s.clock.t = T0 + 61_000;
     const status = await s.status();
     assert.deepEqual(status.body.hosts.mac, macView());
-    assert.deepEqual(status.body.stale, { mac: { since: iso(T0) } }, 'the receipt time is the last view\'s');
+    assert.deepEqual(status.body.stale, { mac: { since: iso(T0), unreachable: null } }, 'the receipt time is the last view\'s');
     assert.equal(laneOf(await s.resources()).reachability.state, 'offline');
   } finally { s.cleanup(); }
 });
@@ -252,8 +252,8 @@ test('checkPushBody returns the body as it is and createRemotes holds views by h
   const remotes = createRemotes();
   assert.deepEqual(remotes.apply(checkPushBody(body, { own: 'linux' }), { at: T0 }), { applied: true });
   assert.deepEqual(remotes.views({ now: T0 + 60_000, maxAgeS: 60 }), { hosts: { mac: macView() }, stale: {} });
-  assert.deepEqual(remotes.views({ now: T0 + 60_001, maxAgeS: 60 }).stale, { mac: { since: iso(T0) } });
-  assert.deepEqual(remotes.views({ now: T0, maxAgeS: undefined }).stale, { mac: { since: iso(T0) } }, 'no limit to judge by is never current');
+  assert.deepEqual(remotes.views({ now: T0 + 60_001, maxAgeS: 60 }).stale, { mac: { since: iso(T0), unreachable: null } });
+  assert.deepEqual(remotes.views({ now: T0, maxAgeS: undefined }).stale, { mac: { since: iso(T0), unreachable: null } }, 'no limit to judge by is never current');
 });
 
 // ---- the stream ----

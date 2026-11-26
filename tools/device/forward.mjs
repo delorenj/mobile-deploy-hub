@@ -200,6 +200,7 @@ export const transportOf = ctx => ctx.request ?? (args => hubRequest(args, {
   hostKey: () => ownKey(ctx),
   ...(ctx.fetchImpl ? { fetchImpl: ctx.fetchImpl } : {}),
   ...(ctx.sshImpl ? { sshImpl: ctx.sshImpl } : {}),
+  ...(ctx.timers ? { timers: ctx.timers } : {}),
 }));
 
 // Sends one Hold request to `place.host` as `door` and answers `{status, body}` (hub-client `forward`: the far side's problem is thrown as itself, a

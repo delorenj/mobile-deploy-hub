@@ -17,12 +17,13 @@ import { idMatchesSerial } from '../ci/lib/adb.mjs';
 import { HOST_PLATFORMS, cancel, checkCancelBody, checkExtendBody, checkForceReleaseBody, checkLeaseBody, checkReleaseBody, checkReservationForceReleaseBody, createContext, discover as discoverHost, exitCodeOf, findLease, forceReleaseEmulator, forceReleaseLease, forceReleaseReservation, hostKey as realHostKey, httpAnswerOf, leaseRequestId, loadFleet, lockActivity, namesEmulatorSlot, restartingError, serviceExtend, serviceLease, serviceRelease, statusView } from '../device/claims.mjs';
 import { hubRef } from '../ci/lib/receipt.mjs';
 import { NAMED, forwardHold, hubView, namedRecords, placeOf, unwrapCarried, wrongHost } from '../device/forward.mjs';
-import { NO_READING } from '../registry/reachability.mjs';
+import { NO_READING, serve as serveReading } from '../registry/reachability.mjs';
 import { dedicatedQaIds, loadQaDevices } from '../registry/seed.mjs';
 import { retirement, visibility } from '../registry/match.mjs';
 import { checkEditBody, checkRegisterBody, checkRetireBody, planEdit, planRegister, planRetire } from '../registry/changes.mjs';
 import { REGISTRY_ERRORS, applySeed, readRegistry, registryState, updateRegistry } from '../registry/store.mjs';
 import { viewPools, viewRecord } from '../registry/view.mjs';
+import { createPeers, failureReason, isContact, isUnreached, offlineView } from './peers.mjs';
 import { deviceCtx } from './readings.mjs';
 import { checkPushBody, createRemotes } from './remotes.mjs';
 import { STREAM_HEADERS } from './stream.mjs';
@@ -117,13 +118,35 @@ function serve(ctx, record) {
   return viewRecord(record, { audience: 'service', held: activity.held === true, queued: activity.queued === true });
 }
 
+// The marks of the peer hosts (Story 9.6, tools/hub-api/peers.mjs): the context's `peers` (the service's), or, for a bare `handle()` with none,
+// one store per context.
+const fallbackPeers = new WeakMap();
+function peersOf(ctx) {
+  if (ctx.peers) return ctx.peers;
+  if (!fallbackPeers.has(ctx)) fallbackPeers.set(ctx, createPeers({ env: ctx.env ?? process.env, now: ctx.now, hostId: ctx.hostId, policy: ctx.policy, log: ctx.log }));
+  return fallbackPeers.get(ctx);
+}
+
+// The cache's reading of each record (served form, by Resource id), except that a record on a host marked unreachable reads `offline`, stamped at the
+// failure, `source: 'host'`, and served on this clock. The cache itself is never changed, so a cleared mark shows what the host last pushed again.
+function readingsFor(ctx, records) {
+  const served = new Map(ctx.readings?.read(records) ?? []);
+  const peers = peersOf(ctx);
+  const at = (ctx.now ?? Date.now)();
+  for (const record of records) {
+    const offline = peers.offlineReading(record.host);
+    if (offline !== null) served.set(record.id, serveReading({ ...offline, source: 'host' }, { now: at }));
+  }
+  return served;
+}
+
 // GET /resources: every visible Resource (visible or retiring), in the Registry's order, each with its `reachability` (AD-35): the
 // service's cached reading in its served form, read without waiting (a stale or missing one starts one refresh in the background), or
 // the no-reading form when the context has no cache. Only this list carries it: the `Resource` shape is the same for every route.
 export function listResources(ctx) {
   const registry = readIt(ctx);
   const shown = registry.resources.map(record => ({ record, resource: serve(ctx, record) })).filter(entry => entry.resource !== null);
-  const readings = ctx.readings?.read(shown.map(entry => entry.record)) ?? new Map();
+  const readings = readingsFor(ctx, shown.map(entry => entry.record));
   return {
     rev: registry.rev,
     source: registry.source,
@@ -186,8 +209,8 @@ function remotesOf(ctx) {
 // are the library's, never recomputed here. Only this host's key is in `hosts` today (Epic 9 adds the Mac's); `registry` is the one place the
 // Registry's own fields (names, Capabilities, retired and seed-missing visibility) appear, each Resource as `GET /resources` serves it but
 // with no `reachability`. Only this host's own view is read fresh; a spoke host's (Story 9.5) is what it last pushed (`ctx.remotes`), embedded
-// unchanged after this host's own, and `stale` is keyed by host key, `{since: <ISO receipt time>}` for a pushed view older than
-// `registry.reachability_max_age_s` on this clock (Story 9.6 adds unreachable). Nothing is cached: every field that passes with time is derived from `now` here.
+// unchanged after this host's own, and `stale` is keyed by host key, `{since: <ISO receipt time>, unreachable}` for a pushed view older than
+// `registry.reachability_max_age_s` on this clock, or one the Hub API has marked unreachable (Story 9.6: `{since, unreachable}`; its rows read `offline`). Nothing is cached: every field that passes with time is derived from `now` here.
 // Story 8.4's stream frames and 8.5's re-read call this same function. A host that does not know its key is 503 HUB_HOST_UNKNOWN.
 export async function statusDocument(ctx) {
   const env = ctx.env ?? process.env;
@@ -204,7 +227,14 @@ export async function statusDocument(ctx) {
   });
   const checkedAt = statusCtx.timing.now();
   const view = await statusView(key, { audience: 'service', qa_ids: dedicatedQaIds(registry) }, statusCtx);
-  const remote = remotesOf(ctx).views({ now: checkedAt, maxAgeS: ctx.policy?.registry?.reachability_max_age_s });
+  const maxAgeS = ctx.policy?.registry?.reachability_max_age_s;
+  const peers = peersOf(ctx);
+  const remote = remotesOf(ctx).views({ now: checkedAt, maxAgeS, marks: peers.marks() });
+  // A host marked unreachable shows its last view with every row's reachability `offline` (a copy: the pushed view is the host's own words).
+  for (const host of Object.keys(remote.hosts)) {
+    const offline = peers.offlineReading(host);
+    if (offline !== null) remote.hosts[host] = offlineView(remote.hosts[host], offline, { now: checkedAt, maxAgeS });
+  }
   return {
     format: 1,
     contract: CONTRACT_VERSION,
@@ -213,6 +243,19 @@ export async function statusDocument(ctx) {
     stale: remote.stale,
     checked_at: new Date(checkedAt).toISOString(),
   };
+}
+
+// A mark change pokes the change feed so a stream frame follows; a throw there is logged, never answered.
+function pokePeers(ctx) {
+  try { ctx.onPeerChange?.(); } catch (error) { ctx.log?.err?.(`HUB_API_ERROR peer ${oneLine(error?.message ?? error)}`); }
+}
+function noteContact(ctx, host, { at, reason }) {
+  if (peersOf(ctx).reached(host, { at, reason })) pokePeers(ctx);
+}
+// Every recorded failure pokes, not only the first: a retry that fails again moves `failed_at` and `reason`, which rows and `stale` show.
+function noteFailure(ctx, host, { at, reason }) {
+  peersOf(ctx).failed(host, { at, reason });
+  pokePeers(ctx);
 }
 
 // POST /agent/push (Story 9.5, AD-49): a spoke host's Host Agent pushes its view when something there changed. The body is checked strictly
@@ -232,6 +275,8 @@ export function agentPush(ctx, { body }) {
   // The Registry's places are read before anything is applied: a read that throws applies nothing.
   const places = push.readings !== null ? new Set(readIt(ctx).resources.filter(record => record.host === push.host).map(record => record.id)) : new Set();
   const { applied } = remotesOf(ctx).apply(push, { at });
+  // Any push that passed the body check, applied or a duplicate, is contact (Story 9.6): a host marked unreachable is restored, with one event.
+  noteContact(ctx, push.host, { at, reason: 'push' });
   if (applied) {
     if (push.readings !== null) {
       ctx.readings?.remote(push.readings.filter(reading => places.has(reading.resource)).map(reading => ({ id: reading.resource, served: reading })), { at });
@@ -334,7 +379,7 @@ function readingsOf(ctx) {
   return members => {
     const registry = readIt(ctx);
     const records = new Map(members.map(member => [member.device, registry.resources.find(record => record.lock === member.lock)]));
-    const served = ctx.readings?.read([...records.values()].filter(Boolean)) ?? new Map();
+    const served = readingsFor(ctx, [...records.values()].filter(Boolean));
     return new Map(members.map(member => [member.device, served.get(records.get(member.device)?.id)?.state ?? 'unknown']));
   };
 }
@@ -440,7 +485,21 @@ function hubHold(route) {
     }
     const host = placeOf(records, own);
     if (host === null) return route.handler(ctx, request);
-    const answer = await forwardHold({ key, request, input, place: { host, records, single }, rev: view.rev, door: 'api', ctx });
+    // Story 9.6: a host marked unreachable fails at once (before any transport call) until a push or the 5x window; a call that fails at the ssh
+    // leg marks it, and one that gets any answer (even the far side's own problem) restores it. A request the client aborted says nothing.
+    const clock = ctx.now ?? Date.now;
+    peersOf(ctx).gate(host, { at: clock() });
+    let answer;
+    try {
+      answer = await forwardHold({ key, request, input, place: { host, records, single }, rev: view.rev, door: 'api', ctx });
+    } catch (error) {
+      if (request.signal?.aborted !== true) {
+        if (isUnreached(error)) noteFailure(ctx, host, { at: clock(), reason: failureReason(error) });
+        else if (isContact(error)) noteContact(ctx, host, { at: clock(), reason: 'call' });
+      }
+      throw error;
+    }
+    noteContact(ctx, host, { at: clock(), reason: 'call' });
     return answer.status === 200 ? answer.body : reply(answer.status, answer.body);
   };
 }
