@@ -2,7 +2,7 @@
 title: 'Story 7.9: Ship Leases through the API (pre-release half)'
 type: 'chore'
 created: '2026-11-25'
-status: 'awaiting-operator'
+status: done
 operator_actions:
   - 'Merge this story branch into main and push main to origin (main is 16+ commits past origin/main 3999f38); the release refuses a main that is not origin/main.'
   - 'Before releasing, confirm `git ls-remote origin refs/tags/v1 refs/tags/v1.2.56` shows v1 on v1.2.55 and no v1.2.56 tag; if v1 moved or 1.2.56 is taken, retitle the `## v1.2.56` section of docs/hub-releases.md (and its test in tools/ci/v11.test.mjs) first.'
@@ -208,3 +208,17 @@ Why both doors in one run: parity is about one code path (Claims) answering two 
 - The withdrawal of the CLI waiter is exercised only on the failure paths.
 - The v11 gate tests are slow (about 6 s each) and can push focused runs past short timeouts.
 - If `v1` moves or 1.2.56 is taken before the release, the notes section and its test need a new title first. The operator actions include that check.
+
+## Operator Confirmation
+
+Confirmed 2026-11-25: the external actions this story owed were carried out.
+
+- Merge this story branch into main and push main to origin (main is 16+ commits past origin/main 3999f38); the release refuses a main that is not origin/main.
+- Before releasing, confirm `git ls-remote origin refs/tags/v1 refs/tags/v1.2.56` shows v1 on v1.2.55 and no v1.2.56 tag; if v1 moved or 1.2.56 is taken, retitle the `## v1.2.56` section of docs/hub-releases.md (and its test in tools/ci/v11.test.mjs) first.
+- From a fresh clean clone of main on big-chungus, run `mise run release -- 1.2.56`; confirm every app strict dry run is green, v1 moved to v1.2.56, and `git show v1.2.56` carries the notes and a `Roll back:` line that names v1.2.55 (and no service stop).
+- After the release runner confirms its runs are finished, run `mise run hosts:install` on big-chungus from a clean checkout at tag v1.2.56; confirm the HUB_API readback for v1.2.56 and `systemctl --user status mobile-deploy-hub-api`.
+- Run `mise run hosts:smoke` on big-chungus and confirm HUB_SMOKE_OK v1.2.56 with a `HUB_SMOKE holds: api and cli match on smoke-<id>` line (it leaves one retired smoke-<id> record in registry.json).
+- Run the AC live check on the S24: `mise run hosts:smoke -- --holds-on s24` (s24 must be free with nobody waiting) and confirm HUB_SMOKE_OK with `holds: api and cli match on s24`; optionally watch `hub-device status` in another shell while it runs.
+- If the release is red or anything regresses: move v1 back to v1.2.55, then `mise run hosts:install` from a clean checkout at v1.2.55 (no systemctl disable: no unit is added).
+
+_Appended by the bmad-loop orchestrator (`bmad-loop confirm`, #335): a human confirmed these external actions out of band, and the story was advanced from `awaiting-operator` to `done`._
