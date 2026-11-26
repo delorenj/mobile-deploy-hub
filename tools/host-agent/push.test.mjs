@@ -451,7 +451,7 @@ test('end to end: a Lease on the Mac reaches /status.hosts.mac within 250 ms wit
     hub.t = FAR + 25_000 + 60_000;
     assert.deepEqual((await hubGet('/status')).body.stale, {});
     hub.t += 1000;
-    assert.deepEqual((await hubGet('/status')).body.stale, { mac: { since: iso(FAR + 25_000) } });
+    assert.deepEqual((await hubGet('/status')).body.stale, { mac: { since: iso(FAR + 25_000), unreachable: null } });
     assert.equal(s.pushes.length, 2, 'no push for the passing of time');
     assert.deepEqual(s.err, []);
   } finally { await s.running.stop(); s.cleanup(); rmSync(hubRoot, { recursive: true, force: true }); }

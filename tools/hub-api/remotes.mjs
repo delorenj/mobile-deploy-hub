@@ -7,9 +7,10 @@
 //   apply(push, {at})              applies a checked push once per `(boot, seq)`: a push of the same boot whose `seq` is not above the applied one
 //                                  changes nothing (`{applied: false}`). A non-null `status` replaces the host's view and its receipt time becomes
 //                                  `at`; a null one keeps the last view and its receipt time.
-//   views({now, maxAgeS})          `{hosts: {<host>: <view>}, stale: {<host>: {since}}}`: every pushed view, embedded unchanged, and `{since: <ISO receipt
-//                                  time>}` for a view older than `maxAgeS` seconds at `now` (exactly the limit is still current). `stale` is derived on
-//                                  every call and never stored.
+//   views({now, maxAgeS, marks})   `{hosts: {<host>: <view>}, stale: {<host>: {since, unreachable}}}`: every pushed view, embedded unchanged, and for a host
+//                                  whose view is older than `maxAgeS` seconds at `now` (exactly the limit is still current) or that is marked unreachable
+//                                  (`marks`: a Map of host key to `{since, reason}` in ms, from tools/hub-api/peers.mjs) `{since: <ISO receipt time of the
+//                                  view, null when it has none>, unreachable: null | {since: <ISO>, reason}}`. `stale` is derived on every call and never stored.
 import { exitCodeOf } from '../device/claims.mjs';
 import { HOST_KEYS } from '../hub-client.mjs';
 import { isReachability } from '../registry/reachability.mjs';
@@ -80,16 +81,26 @@ export function createRemotes() {
       return { applied: true };
     },
 
-    views({ now, maxAgeS } = {}) {
+    views({ now, maxAgeS, marks } = {}) {
       const shown = {};
       const stale = {};
       const limited = Number.isSafeInteger(maxAgeS) && maxAgeS > 0;
+      const unreachable = host => {
+        const mark = marks?.get?.(host);
+        return mark === undefined ? null : { since: new Date(mark.since).toISOString(), reason: mark.reason };
+      };
       for (const [host, held] of hosts) {
-        if (held.view === null) continue;
+        const down = unreachable(host);
+        if (held.view === null) {
+          if (down !== null) stale[host] = { since: null, unreachable: down };
+          continue;
+        }
         shown[host] = held.view;
         // No limit to judge by is never shown as current (the readings' rule).
-        if (!limited || now - held.received_at > maxAgeS * 1000) stale[host] = { since: new Date(held.received_at).toISOString() };
+        if (down !== null || !limited || now - held.received_at > maxAgeS * 1000) stale[host] = { since: new Date(held.received_at).toISOString(), unreachable: down };
       }
+      // A marked host that never pushed a view has the key too, with no view to show.
+      for (const host of marks?.keys?.() ?? []) if (!hosts.has(host)) stale[host] = { since: null, unreachable: unreachable(host) };
       return { hosts: shown, stale };
     },
   };
