@@ -1,0 +1,17 @@
+{
+  "actions": [
+    "Merge this story branch into main and push main to origin; the release refuses a main that is not origin/main.",
+    "Confirm `git ls-remote origin refs/tags/v1 refs/tags/v1.2.60` shows v1 on v1.2.59 and no v1.2.60 tag; if v1 moved or 1.2.60 is taken, retitle the `## v1.2.60` section of docs/hub-releases.md (and its test in tools/ci/v11.test.mjs) first.",
+    "From a fresh clean clone of main on big-chungus, run `mise run release -- 1.2.60`; confirm every app strict dry run is green, v1 moved to v1.2.60, and `git show v1.2.60` carries the notes and a `Roll back:` line.",
+    "After the release runner confirms its runs are finished, run `mise run hosts:install` on big-chungus from a clean checkout at tag v1.2.60 (the Mac must be awake); confirm the Hub API and Host Agent /health readbacks print equal contract and hub_version, and the services agree step passes.",
+    "Run `mise run hosts:smoke -- --lanes --history` on big-chungus when no iOS deploy holds or waits on mac-ios, and confirm HUB_SMOKE_OK v1.2.60 with a `HUB_SMOKE history: ios-lane on mac: ...` line (partial false, nothing in big-chungus own log).",
+    "Prove the sleep/wake /history path once by hand on big-chungus: note T, take and release the lane (`hub-device lease ios-lane --no-connect --wait 0 --for 2m --why sleep-check`, then `hub-device release <id> --resource ios-lane`), close the Mac lid, run `curl -s \"http://127.0.0.1:8794/history?claimant=<your holder>&from=<T>\" | jq \"{partial, synced_through, unreachable_ranges}\"` and see partial: true with a mac range in unreachable_ranges, open the lid, run the same query and see partial: false with the acquire and release under host mac.",
+    "Run `git unpushed` after the release and land what it lists; a clean report is the definition of done.",
+    "If the release is red or anything regresses: move v1 back to v1.2.59, then run `mise run hosts:install -- --allow-downgrade` from a clean checkout at v1.2.59; leave replicas/ in place."
+  ],
+  "followup_review_recommended": false,
+  "parked_at": "2026-11-26",
+  "run_id": "20261126-140515-f01a",
+  "spec_file": "_bmad-output/implementation-artifacts/spec-10-5-ship-v1b.md",
+  "story_key": "10-5-ship-v1b"
+}

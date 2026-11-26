@@ -24,6 +24,10 @@
 //               (`laneCheck`): the forwarded Lease shows in that host's own view of `status --json` with that host's `started_at`, this host
 //               wrote no lock for it, and the release frees the lane again. It holds the lane for seconds with `--no-connect --wait 0`, only
 //               when it is free, and it is opt-in because a sleeping laptop fails it and the lane is a deploy target: ask for it at release time;
+//   5e. history (Story 10.5, opt-in: `--history`, needs `--lanes`) the lanes phase just wrote one `acquire` and one `release` in each spoke's own
+//               Event Log; `historyCheck` reads `GET /history` on this host's Hub API and requires both under that spoke's host key, with
+//               `partial: false` and an ISO `synced_through`, and nothing for the id in this host's own log: the agent's push, the replica's
+//               append, the on-demand `/agent/sync` and the merge, proven by a fresh event (an old replica cannot pass it). Read-only;
 //   6. retire   the phone is retired through the API;
 //   7. gone     a new lease is refused `HUB_RESOURCE_RETIRED`, and the `phone` members and `status` no longer list it.
 // Any failure after the register releases the lease it took (and every id the holds and stream phases started) and retires the phone, and each is logged. The run prints
@@ -57,6 +61,9 @@ export const KEEPALIVE_MARGIN_MS = 5000;
 export const STREAM_FOR_MS = 120_000;
 export const LANE_SHOWS_WITHIN_MS = 10_000;
 export const LANE_FOR_MS = 120_000;
+export const HISTORY_SHOWS_WITHIN_MS = 10_000;
+export const HISTORY_LOOKBACK_MS = 600_000;
+export const HISTORY_MAX_PAGES = 5;
 const HEALTH_RETRY_MS = 500;
 const MAX_WINDOWS = 3;
 const MAX_ITEMS = 500;
@@ -648,11 +655,108 @@ export async function laneCheck({ tag, ref, cli, lanesOf = hostLanes, now = Date
   }
 }
 
+// ---------------------------------------------------------------------------------------------------- Story 10.5: the history phase
+
+const EVENT_ID = /^[^/]+\/\d{4}-\d{2}\/\d+$/;
+
+// The repeatable live check that each spoke host's Event Log reaches this host's `/history` (Story 10.5, FR-18, UJ-4), run right after `laneCheck`
+// with its `lanes`. Each lane's take and release wrote an `acquire` and a `release` (event `lease_id` = the lane's id, claimant holder `hosts:smoke`)
+// in the spoke's own log. One read is `GET /history?claimant=hosts:smoke&from=<now - 10 min>&limit=1000` through `api` (`apiCaller`), following
+// `cursor` while `more` is true for at most 5 pages. A read that is not 200 with `format: 1` and an `events` array fails at once, naming the status,
+// code and detail. A read passes when every lane is satisfied: both events are there, every entry for the id is under the lane's host with an id of
+// the form `<host_id>/<YYYY-MM>/<offset>`, the answer says `partial: false` and `synced_through[<host>]` is an ISO time. An entry for the id under
+// another host (this host wrote it) fails at once. One read every WAITER_POLL_MS until a read passes or 10 s from the start (no read after it), a
+// bounded `for` loop (AD-19). Read-only: nothing to undo. Resolves `{history: [{host, device, id, eventIds, syncedThrough, shownMs}]}`.
+export async function historyCheck({ ref, api, lanes, now = Date.now, sleep = realSleep, log = () => {} } = {}) {
+  if (typeof ref !== 'string' || ref === '') throw new TypeError('historyCheck: a release ref is required');
+  if (typeof api !== 'function') throw new TypeError('historyCheck: an api caller is required');
+  if (!Array.isArray(lanes) || lanes.length === 0) throw new TypeError('historyCheck: lanes is the non-empty result of laneCheck');
+  const fail = detail => Object.assign(failure('history', detail), { detail });
+  const seconds = HISTORY_SHOWS_WITHIN_MS / 1000;
+  const rangesOf = answer => JSON.stringify({ unreachable_ranges: answer.unreachable_ranges ?? [], synced_through: answer.synced_through ?? null });
+
+  const start = now();
+  const base = `/history?claimant=${HOLDER}&from=${new Date(start - HISTORY_LOOKBACK_MS).toISOString()}&limit=1000`;
+
+  // One read: every page of the answer. `{events, partial, last}`: `partial` is false only when every page says so, `last` is the last page.
+  const read = async () => {
+    const events = [];
+    let partial = false;
+    let last = null;
+    let cursor = null;
+    for (let page = 1; page <= HISTORY_MAX_PAGES; page += 1) {
+      const result = await api({ method: 'GET', path: cursor === null ? base : `${base}&cursor=${encodeURIComponent(cursor)}` });
+      const body = result?.body;
+      if (result?.status !== 200 || !isObject(body) || body.format !== 1 || !Array.isArray(body.events)) {
+        const code = isObject(body) && body.code ? ` ${body.code}` : '';
+        const detail = isObject(body) && body.detail ? `: ${String(body.detail).slice(0, 200)}` : result?.status === 200 ? ': no format 1 answer with an events array' : '';
+        throw fail(`/history answered status ${result?.status}${code}${detail}`);
+      }
+      events.push(...body.events);
+      partial ||= body.partial !== false;
+      last = body;
+      if (body.more !== true || typeof body.cursor !== 'string') break;
+      cursor = body.cursor;
+    }
+    return { events, partial, last };
+  };
+
+  // The verdict on one read: throws at once for an entry another host wrote, else `{shown}` (the lane results) or `{missing}` (why not yet).
+  const judge = ({ events, partial, last }) => {
+    const entries = events.filter(entry => isObject(entry) && isObject(entry.event));
+    const mine = lane => entries.filter(entry => entry.event.lease_id === lane.id);
+    for (const lane of lanes) {
+      for (const entry of mine(lane)) {
+        const host = entry.host ?? 'no host';
+        if (entry.host !== lane.host) throw fail(`${host} wrote an event for ${lane.id}: it is in ${host}'s log`);
+        if (!EVENT_ID.test(String(entry.id))) throw fail(`the ${entry.event.event} of ${lane.id} has the id ${entry.id ?? '(none)'}, not <host_id>/<YYYY-MM>/<offset>`);
+      }
+    }
+    const shown = [];
+    for (const lane of lanes) {
+      const acquire = mine(lane).find(entry => entry.event.event === 'acquire');
+      const release = mine(lane).find(entry => entry.event.event === 'release');
+      const syncedThrough = last.synced_through?.[lane.host];
+      const aside = partial ? ` (the answer is partial: true, ${rangesOf(last)})` : '';
+      if (acquire === undefined) return { missing: `the acquire of ${lane.id} is not in ${lane.host}'s history${aside}` };
+      if (release === undefined) return { missing: `the release of ${lane.id} is not in ${lane.host}'s history${aside}` };
+      if (partial) return { missing: `the answer is partial: true, ${rangesOf(last)}` };
+      if (!isoTime(syncedThrough)) return { missing: `synced_through of ${lane.host} is ${JSON.stringify(syncedThrough ?? null)}, not an ISO time` };
+      shown.push({ host: lane.host, device: lane.device, id: lane.id, eventIds: [acquire.id, release.id], syncedThrough });
+    }
+    return { shown };
+  };
+
+  try {
+    const deadline = start + HISTORY_SHOWS_WITHIN_MS;
+    const tries = Math.ceil(HISTORY_SHOWS_WITHIN_MS / WAITER_POLL_MS) + 2;
+    let verdict = { missing: 'no read was made' };
+    for (let attempt = 1; attempt <= tries; attempt += 1) {
+      verdict = judge(await read());
+      if (verdict.shown !== undefined) break;
+      const left = deadline - now();
+      if (left <= 0) break;
+      await sleep(Math.min(WAITER_POLL_MS, left));
+      if (now() >= deadline) break;
+    }
+    if (verdict.shown === undefined) throw fail(`${verdict.missing} within ${seconds} s`);
+    const shownMs = now() - start;
+    const history = verdict.shown.map(entry => ({ ...entry, shownMs }));
+    for (const entry of history) {
+      log(`HUB_SMOKE history: ${entry.device} on ${entry.host}: acquire and release of ${entry.id} read back from ${entry.host}'s log (${entry.eventIds[0]}, ${entry.eventIds[1]}), partial false, ${entry.host} synced_through ${entry.syncedThrough}, in ${shownMs} ms`);
+    }
+    return { history };
+  } catch (error) {
+    throw error.smoke ? error : fail(`unexpected: ${error.message}`);
+  }
+}
+
 // The whole check. Seams: `cli(args)` -> `{code, stdout, stderr}` (hub-device), `fetchImpl`, `now`, `sleep`, `log`, `policy`, `members()`
 // (the `phone` word's device names), `name` (the test phone's name), `holds` (`false`, the default, skips the holds phase; `true` runs it on
 // the test phone; a device word runs it on that word), `stream` (`false`, the default, skips the stream phase: see `streamCheck`) and `restart`
 // (`false`, the default; `true` needs `stream` and restarts the service through the `restartUnit` seam, which `systemctl --user restart`s the
-// unit by default) and `lanes` (`false`, the default, skips the lanes phase: see `laneCheck`; `lanesOf` is its seam). Resolves the line `HUB_SMOKE_OK ...`; rejects with
+// unit by default), `lanes` (`false`, the default, skips the lanes phase: see `laneCheck`; `lanesOf` is its seam) and `history` (`false`, the
+// default; `true` needs `lanes` and runs `historyCheck` on the lanes it took). Resolves the line `HUB_SMOKE_OK ...`; rejects with
 // `HUB_SMOKE_FAILED <step>: <detail>` (`code` HUB_SMOKE_FAILED, `step`, `smoke: true`) after cleaning up what it registered.
 export async function hubSmoke({
   ref,
@@ -670,6 +774,7 @@ export async function hubSmoke({
   restartUnit = restartHubApiUnit,
   lanes = false,
   lanesOf = hostLanes,
+  history = false,
 } = {}) {
   if (typeof ref !== 'string' || ref === '') throw new TypeError('hubSmoke: a release ref is required');
   if (typeof cli !== 'function') throw new TypeError('hubSmoke: a cli (hub-device runner) is required');
@@ -678,6 +783,8 @@ export async function hubSmoke({
   if (typeof restart !== 'boolean') throw new TypeError('hubSmoke: restart is a boolean');
   if (restart && !stream) throw new TypeError('hubSmoke: restart needs stream');
   if (typeof lanes !== 'boolean') throw new TypeError('hubSmoke: lanes is a boolean');
+  if (typeof history !== 'boolean') throw new TypeError('hubSmoke: history is a boolean');
+  if (history && !lanes) throw new TypeError('hubSmoke: history needs lanes');
   const why = `hosts:smoke ${ref}`;
   const step = (label, text) => log(`HUB_SMOKE ${label}: ${text}`);
   const fail = (label, detail) => { const error = failure(label, detail); log(error.message); return error; };
@@ -787,10 +894,18 @@ export async function hubSmoke({
 
     // 5d. lanes: every other host's lane, taken and released through hub-device from here (opt-in). It cleans up its own ids; a failure then
     // retires the phone like any other.
+    let laned = null;
     if (lanes) {
       try {
-        await laneCheck({ tag: phone, ref, cli, lanesOf, now, sleep, log });
+        laned = await laneCheck({ tag: phone, ref, cli, lanesOf, now, sleep, log });
       } catch (error) { throw await stop('lanes', error.detail ?? error.message); }
+    }
+
+    // 5e. history: the events those lane leases wrote in each spoke's own log, read back from this host's /history (opt-in, read-only).
+    if (history) {
+      try {
+        await historyCheck({ ref, api: apiCaller(fetchImpl, policy), lanes: laned.lanes, now, sleep, log });
+      } catch (error) { throw await stop('history', error.detail ?? error.message); }
     }
 
     // 6. retire
@@ -828,29 +943,33 @@ function option(argv, flag) {
   return value;
 }
 
-// The entry's arguments: `{hubDevice, ref, holds, stream, restart, lanes}` (`ref` undefined when not given; `holds` true by default, a word for
+// The entry's arguments: `{hubDevice, ref, holds, stream, restart, lanes, history}` (`ref` undefined when not given; `holds` true by default, a word for
 // `--holds-on`, false for `--no-holds`; `stream` true by default, false for `--no-stream`; `restart` false unless `--restart`; `lanes` false
-// unless `--lanes`). Throws a usage Error for an unknown word, a flag without its value, both holds flags, or `--restart` with `--no-stream`.
+// unless `--lanes`; `history` false unless `--history`). Throws a usage Error for an unknown word, a flag without its value, both holds flags,
+// `--restart` with `--no-stream`, or `--history` without `--lanes`.
 export function parseSmokeArgs(argv) {
   const valued = new Set(['--hub-device', '--ref', '--holds-on']);
-  const bare = new Set(['--no-holds', '--no-stream', '--restart', '--lanes']);
+  const bare = new Set(['--no-holds', '--no-stream', '--restart', '--lanes', '--history']);
   const stray = argv.filter((word, index) => !valued.has(word) && !bare.has(word) && !valued.has(argv[index - 1]));
-  if (stray.length > 0) throw new Error(`usage: mise run hosts:smoke [-- --hub-device <cmd>] [--ref <ref>] [--holds-on <word> | --no-holds] [--no-stream | --restart] [--lanes] (unknown: ${stray[0]})`);
+  if (stray.length > 0) throw new Error(`usage: mise run hosts:smoke [-- --hub-device <cmd>] [--ref <ref>] [--holds-on <word> | --no-holds] [--no-stream | --restart] [--lanes [--history]] (unknown: ${stray[0]})`);
   const on = option(argv, '--holds-on');
   const off = argv.includes('--no-holds');
   if (on !== undefined && off) throw new Error('--holds-on and --no-holds exclude each other');
   const stream = !argv.includes('--no-stream');
   const restart = argv.includes('--restart');
   if (restart && !stream) throw new Error('--restart and --no-stream exclude each other: the restart is part of the stream phase');
-  return { hubDevice: option(argv, '--hub-device') ?? 'hub-device', ref: option(argv, '--ref'), holds: off ? false : on ?? true, stream, restart, lanes: argv.includes('--lanes') };
+  const lanes = argv.includes('--lanes');
+  const history = argv.includes('--history');
+  if (history && !lanes) throw new Error('--history needs --lanes: the history phase reads back the events the lanes phase wrote');
+  return { hubDevice: option(argv, '--hub-device') ?? 'hub-device', ref: option(argv, '--ref'), holds: off ? false : on ?? true, stream, restart, lanes, history };
 }
 
-// The entry's body: parse the arguments, run the smoke with `holds`, `stream`, `restart` and `lanes` forwarded, and resolve the exit code (0, or 1 after a
+// The entry's body: parse the arguments, run the smoke with `holds`, `stream`, `restart`, `lanes` and `history` forwarded, and resolve the exit code (0, or 1 after a
 // `HUB_SMOKE_FAILED` line on stderr for a usage failure or a failure that is not the smoke's own, which logged itself).
 export async function runEntry(argv, { smoke = hubSmoke, makeCli = hubDeviceCli, defaultRef = releaseName } = {}) {
   try {
-    const { hubDevice, ref, holds, stream, restart, lanes } = parseSmokeArgs(argv);
-    await smoke({ ref: ref ?? defaultRef(), cli: makeCli(hubDevice), holds, stream, restart, lanes });
+    const { hubDevice, ref, holds, stream, restart, lanes, history } = parseSmokeArgs(argv);
+    await smoke({ ref: ref ?? defaultRef(), cli: makeCli(hubDevice), holds, stream, restart, lanes, history });
     return 0;
   } catch (error) {
     if (!error.smoke) console.error(`HUB_SMOKE_FAILED ${error.message}`);

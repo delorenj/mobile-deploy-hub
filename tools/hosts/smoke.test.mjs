@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hermetic } from '../ci/test-fixtures.mjs';
-import { HOLD_EXTEND_MS, LANE_SHOWS_WITHIN_MS, LEASABLE_WITHIN_MS, RESTART_WITHIN_MS, STATUS_WITHIN_MS, TRY_EVERY_MS, WAITER_SHOWS_WITHIN_MS, apiCaller, holdParity, hubDeviceCli, hubSmoke, laneCheck, parseSmokeArgs, runEntry, sseReader, streamCheck } from './smoke.mjs';
+import { HISTORY_MAX_PAGES, HISTORY_SHOWS_WITHIN_MS, HOLD_EXTEND_MS, LANE_SHOWS_WITHIN_MS, LEASABLE_WITHIN_MS, RESTART_WITHIN_MS, STATUS_WITHIN_MS, TRY_EVERY_MS, WAITER_SHOWS_WITHIN_MS, apiCaller, holdParity, hubDeviceCli, hubSmoke, laneCheck, historyCheck, parseSmokeArgs, runEntry, sseReader, streamCheck } from './smoke.mjs';
 import { ID_PATTERN, createStream } from '../hub-api/stream.mjs';
 import { phoneWordMembers } from '../device/claims.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
@@ -547,10 +547,10 @@ test('apiCaller: posts JSON to the policy port, answers {status, body}, never re
 });
 
 test('the CLI arguments: --holds-on takes a word, --no-holds turns the phase off, the default is on, a bad combination is a usage failure', () => {
-  assert.deepEqual(parseSmokeArgs([]), { hubDevice: 'hub-device', ref: undefined, holds: true, stream: true, restart: false, lanes: false });
+  assert.deepEqual(parseSmokeArgs([]), { hubDevice: 'hub-device', ref: undefined, holds: true, stream: true, restart: false, lanes: false, history: false });
   assert.equal(parseSmokeArgs(['--holds-on', 's24']).holds, 's24');
   assert.equal(parseSmokeArgs(['--no-holds']).holds, false);
-  assert.deepEqual(parseSmokeArgs(['--hub-device', 'node x.mjs', '--ref', 'v1.2.56', '--no-holds']), { hubDevice: 'node x.mjs', ref: 'v1.2.56', holds: false, stream: true, restart: false, lanes: false });
+  assert.deepEqual(parseSmokeArgs(['--hub-device', 'node x.mjs', '--ref', 'v1.2.56', '--no-holds']), { hubDevice: 'node x.mjs', ref: 'v1.2.56', holds: false, stream: true, restart: false, lanes: false, history: false });
   assert.throws(() => parseSmokeArgs(['--holds-on']), /--holds-on takes a value/);
   assert.throws(() => parseSmokeArgs(['--holds-on', '--no-holds']), /--holds-on takes a value/);
   assert.throws(() => parseSmokeArgs(['--holds-on', 's24', '--no-holds']), /exclude each other/);
@@ -582,9 +582,9 @@ test('runEntry forwards holds (true by default, a word, false), the ref and the 
   assert.equal(await runEntry(['--holds-on', 's24', '--ref', 'v1.2.56', '--hub-device', 'node x.mjs'], seams()), 0);
   assert.equal(await runEntry(['--no-holds'], seams()), 0);
   assert.deepEqual(calls, [
-    { ref: 'v-default', cli: 'cli:hub-device', holds: true, stream: true, restart: false, lanes: false },
-    { ref: 'v1.2.56', cli: 'cli:node x.mjs', holds: 's24', stream: true, restart: false, lanes: false },
-    { ref: 'v-default', cli: 'cli:hub-device', holds: false, stream: true, restart: false, lanes: false },
+    { ref: 'v-default', cli: 'cli:hub-device', holds: true, stream: true, restart: false, lanes: false, history: false },
+    { ref: 'v1.2.56', cli: 'cli:node x.mjs', holds: 's24', stream: true, restart: false, lanes: false, history: false },
+    { ref: 'v-default', cli: 'cli:hub-device', holds: false, stream: true, restart: false, lanes: false, history: false },
   ]);
   assert.deepEqual(makes, ['hub-device', 'node x.mjs', 'hub-device']);
   const before = calls.length;
@@ -910,9 +910,9 @@ test('stream, arguments: restart needs stream, both are booleans; the default se
 });
 
 test('the CLI arguments: the stream phase is on by default, --no-stream skips it, --restart turns the restart on, both together are a usage failure', () => {
-  assert.deepEqual(parseSmokeArgs(['--no-stream']), { hubDevice: 'hub-device', ref: undefined, holds: true, stream: false, restart: false, lanes: false });
-  assert.deepEqual(parseSmokeArgs(['--restart']), { hubDevice: 'hub-device', ref: undefined, holds: true, stream: true, restart: true, lanes: false });
-  assert.deepEqual(parseSmokeArgs(['--no-holds', '--restart', '--ref', 'v1.2.57']), { hubDevice: 'hub-device', ref: 'v1.2.57', holds: false, stream: true, restart: true, lanes: false });
+  assert.deepEqual(parseSmokeArgs(['--no-stream']), { hubDevice: 'hub-device', ref: undefined, holds: true, stream: false, restart: false, lanes: false, history: false });
+  assert.deepEqual(parseSmokeArgs(['--restart']), { hubDevice: 'hub-device', ref: undefined, holds: true, stream: true, restart: true, lanes: false, history: false });
+  assert.deepEqual(parseSmokeArgs(['--no-holds', '--restart', '--ref', 'v1.2.57']), { hubDevice: 'hub-device', ref: 'v1.2.57', holds: false, stream: true, restart: true, lanes: false, history: false });
   assert.throws(() => parseSmokeArgs(['--restart', '--no-stream']), /--restart and --no-stream exclude each other/);
   assert.throws(() => parseSmokeArgs(['--no-stream', '--restart']), /exclude each other/);
   assert.throws(() => parseSmokeArgs(['--stream']), /unknown: --stream/);
@@ -1196,8 +1196,8 @@ test('lanes, arguments are checked: laneCheck wants a tag, a ref, a cli and a la
 test('the CLI arguments: --lanes turns the lanes phase on, the default is off, and it combines with the other flags', () => {
   assert.equal(parseSmokeArgs([]).lanes, false);
   assert.equal(parseSmokeArgs(['--lanes']).lanes, true);
-  assert.deepEqual(parseSmokeArgs(['--lanes', '--restart', '--no-holds', '--ref', 'v1.2.58']), { hubDevice: 'hub-device', ref: 'v1.2.58', holds: false, stream: true, restart: true, lanes: true });
-  assert.throws(() => parseSmokeArgs(['--lane']), /\[--lanes\] \(unknown: --lane\)/);
+  assert.deepEqual(parseSmokeArgs(['--lanes', '--restart', '--no-holds', '--ref', 'v1.2.58']), { hubDevice: 'hub-device', ref: 'v1.2.58', holds: false, stream: true, restart: true, lanes: true, history: false });
+  assert.throws(() => parseSmokeArgs(['--lane']), /\[--lanes \[--history\]\] \(unknown: --lane\)/);
 });
 
 test('runEntry forwards lanes to hubSmoke (false by default)', async () => {
@@ -1253,4 +1253,246 @@ test('lanes, a foreign row on the lane is not the Lease: another lease id, or a 
     assert.ok(w.lines.includes(`HUB_SMOKE cleanup: released ${LANE_ID}`));
     assert.ok(w.retired);
   }
+});
+
+// ---------------------------------------------------------------------------------------------------- Story 10.5: the history phase
+
+const SYNCED = '2026-11-26T15:00:01.400Z';
+const HIST_LANES = [{ host: 'mac', device: 'ios-lane', id: LANE_ID }];
+const histEvent = (host, id, event, offset) => ({ id: `${host === 'mac' ? 'm1' : 'l1'}/2026-11/${offset}`, host, event: { event, lock: 'mac-ios', lease_id: id, claimant: { kind: 'agent', holder: 'hosts:smoke' } } });
+const bothEvents = (id = LANE_ID, host = 'mac') => [histEvent(host, id, 'acquire', 88210), histEvent(host, id, 'release', 88807)];
+const histAnswer = (events, extra = {}) => ({ format: 1, events, cursor: 'c0', more: false, partial: false, synced_through: { linux: SYNCED, mac: SYNCED }, unreachable_ranges: [], cross_host_order: 'display-only', checked_at: SYNCED, ...extra });
+
+// A fake `/history`: `script(call)` answers `{status, body}` for the n-th read (1-based); every call is recorded with the fake clock.
+function historyWorld(script) {
+  const w = { clock: 1_700_000_000_000, calls: [], lines: [] };
+  w.now = () => w.clock;
+  w.sleep = async ms => { w.clock += ms; };
+  w.fetch = async (url, init = {}) => {
+    const parsed = new URL(url);
+    w.calls.push({ at: w.clock, method: init.method, path: parsed.pathname, query: parsed.searchParams, url });
+    const { status, body } = script(w.calls.length, w);
+    return { status, text: async () => JSON.stringify(body) };
+  };
+  w.check = (extra = {}) => historyCheck({ ref: 'v1.2.60', api: apiCaller(w.fetch, policy), lanes: HIST_LANES, now: w.now, sleep: w.sleep, log: line => w.lines.push(line), ...extra });
+  return w;
+}
+const histOk = body => ({ status: 200, body });
+
+test('history, happy: one GET /history read of the smoke claimant, the line names both event ids, partial false and the host synced_through', async () => {
+  const w = historyWorld(() => histOk(histAnswer(bothEvents())));
+  const start = w.clock;
+  const { history } = await w.check();
+  assert.equal(w.calls.length, 1);
+  assert.equal(w.calls[0].method, 'GET');
+  assert.equal(w.calls[0].path, '/history');
+  assert.deepEqual([...w.calls[0].query.entries()], [['claimant', 'hosts:smoke'], ['from', new Date(start - 600_000).toISOString()], ['limit', '1000']]);
+  assert.deepEqual(history, [{ host: 'mac', device: 'ios-lane', id: LANE_ID, eventIds: ['m1/2026-11/88210', 'm1/2026-11/88807'], syncedThrough: SYNCED, shownMs: 0 }]);
+  assert.deepEqual(w.lines, [`HUB_SMOKE history: ios-lane on mac: acquire and release of ${LANE_ID} read back from mac's log (m1/2026-11/88210, m1/2026-11/88807), partial false, mac synced_through ${SYNCED}, in 0 ms`]);
+});
+
+test('history, shows late: the first reads lack the release, a later one has it, shownMs is the time to the passing read', async () => {
+  const w = historyWorld(n => histOk(histAnswer(n < 3 ? bothEvents().slice(0, 1) : bothEvents())));
+  const { history } = await w.check();
+  assert.equal(w.calls.length, 3);
+  assert.equal(history[0].shownMs, 1000);
+  assert.match(w.lines[0], /, in 1000 ms$/);
+});
+
+test('history, never shown: the release is missing for 10 s by the fake clock; fails naming it, no read after the deadline', async () => {
+  const w = historyWorld(() => histOk(histAnswer(bothEvents().slice(0, 1))));
+  const start = w.clock;
+  await assert.rejects(w.check(), error => error.step === 'history' && error.message === `HUB_SMOKE_FAILED history: the release of ${LANE_ID} is not in mac's history within 10 s`);
+  assert.ok(w.calls.length > 1 && w.calls.length <= HISTORY_SHOWS_WITHIN_MS / 500 + 3, 'bounded');
+  assert.ok(w.calls.every(call => call.at < start + HISTORY_SHOWS_WITHIN_MS), 'no read at or after the deadline');
+  assert.ok(w.clock >= start + HISTORY_SHOWS_WITHIN_MS);
+  const none = historyWorld(() => histOk(histAnswer([])));
+  await assert.rejects(none.check(), /^Error: HUB_SMOKE_FAILED history: the acquire of smoke-x-l-ios-lane is not in mac's history within 10 s$/);
+  assert.deepEqual(w.lines, []);
+});
+
+test('history, a clock that never advances still ends (bounded reads)', async () => {
+  const w = historyWorld(() => histOk(histAnswer([])));
+  await assert.rejects(w.check({ sleep: async () => {} }), /within 10 s/);
+  assert.ok(w.calls.length <= HISTORY_SHOWS_WITHIN_MS / 500 + 2);
+});
+
+test('history, partial: the events are there but the answer is partial: true; fails after 10 s naming it, the ranges and synced_through', async () => {
+  const ranges = [{ host: 'mac', from: '2026-11-26T14:00:00.000Z', to: '2026-11-26T15:00:00.000Z' }];
+  const w = historyWorld(() => histOk(histAnswer(bothEvents(), { partial: true, unreachable_ranges: ranges, synced_through: { linux: SYNCED, mac: null } })));
+  const start = w.clock;
+  await assert.rejects(w.check(), error => {
+    assert.match(error.message, /HUB_SMOKE_FAILED history: the answer is partial: true, /);
+    assert.ok(error.message.includes(JSON.stringify({ unreachable_ranges: ranges, synced_through: { linux: SYNCED, mac: null } })));
+    assert.match(error.message, / within 10 s$/);
+    return true;
+  });
+  assert.ok(w.calls.length > 1 && w.calls.every(call => call.at < start + HISTORY_SHOWS_WITHIN_MS));
+  const late = historyWorld(n => histOk(histAnswer(bothEvents(), n < 3 ? { partial: true, unreachable_ranges: ranges } : {})));
+  assert.equal((await late.check()).history[0].shownMs, 1000, 'the gap closes and the same events then pass');
+});
+
+test('history, written locally: an event for the id in another host\'s log fails at once, with no more reads', async () => {
+  const w = historyWorld(() => histOk(histAnswer([...bothEvents(), histEvent('linux', LANE_ID, 'acquire', 7)])));
+  await assert.rejects(w.check(), error => error.message === `HUB_SMOKE_FAILED history: linux wrote an event for ${LANE_ID}: it is in linux's log`);
+  assert.equal(w.calls.length, 1);
+  const other = historyWorld(() => histOk(histAnswer([histEvent('linux', LANE_ID, 'release', 7)])));
+  await assert.rejects(other.check(), /history: linux wrote an event for smoke-x-l-ios-lane/);
+  assert.equal(other.calls.length, 1);
+});
+
+test('history, refused: a 503 HUB_HOST_UNKNOWN, a status 0 HUB_API_DOWN, a wrong format or a non-array fails at once naming status, code and detail', async () => {
+  const cases = [
+    [{ status: 503, body: { code: 'HUB_HOST_UNKNOWN', detail: 'no host key' } }, /HUB_SMOKE_FAILED history: \/history answered status 503 HUB_HOST_UNKNOWN: no host key$/],
+    [{ status: 0, body: { code: 'HUB_API_DOWN', detail: 'connect ECONNREFUSED' } }, /^HUB_SMOKE_FAILED history: \/history answered status 0 HUB_API_DOWN: connect ECONNREFUSED$/],
+    [{ status: 200, body: { ...histAnswer([]), format: 2 } }, /answered status 200: no format 1 answer with an events array/],
+    [{ status: 200, body: { ...histAnswer([]), events: 'x' } }, /answered status 200: no format 1 answer/],
+    [{ status: 500, body: null }, /answered status 500$/],
+  ];
+  for (const [answer, pattern] of cases) {
+    const w = historyWorld(() => answer);
+    if (answer.status === 0) w.fetch = async () => { throw new Error('connect ECONNREFUSED'); };
+    await assert.rejects(w.check(), error => pattern.test(error.message) && error.step === 'history');
+    assert.ok(w.calls.length <= 1, 'no second read');
+  }
+});
+
+test('history, paged: the cursor is followed while more is true, at most 5 pages per read', async () => {
+  const w = historyWorld(n => histOk(n === 1 ? histAnswer([], { more: true, cursor: 'p1/x=' }) : histAnswer(bothEvents(), { cursor: 'p2' })));
+  await w.check();
+  assert.equal(w.calls.length, 2);
+  assert.equal(w.calls[0].query.get('cursor'), null);
+  assert.equal(w.calls[1].query.get('cursor'), 'p1/x=');
+  assert.equal(w.calls[1].query.get('claimant'), 'hosts:smoke');
+  const endless = historyWorld(n => histOk(histAnswer([], { more: true, cursor: `c${n}` })));
+  await assert.rejects(endless.check({ sleep: async () => { endless.clock += 11_000; } }), /acquire of smoke-x-l-ios-lane is not in mac's history within 10 s/);
+  assert.equal(endless.calls.length, HISTORY_MAX_PAGES, 'one read is at most 5 pages');
+  const partialPage = historyWorld(n => histOk(histAnswer(n === 1 ? [] : bothEvents(), n === 1 ? { more: true, cursor: 'a', partial: true } : { partial: false })));
+  await assert.rejects(partialPage.check({ sleep: async () => { partialPage.clock += 11_000; } }), /partial: true/);
+});
+
+test('history, entry checks: an id that is not <host_id>/<YYYY-MM>/<offset> fails at once; a synced_through that is not ISO never passes', async () => {
+  const badId = historyWorld(() => histOk(histAnswer([{ ...histEvent('mac', LANE_ID, 'acquire', 1), id: 'm1-2026-11-1' }])));
+  await assert.rejects(badId.check(), /history: the acquire of smoke-x-l-ios-lane has the id m1-2026-11-1, not <host_id>\/<YYYY-MM>\/<offset>/);
+  assert.equal(badId.calls.length, 1);
+  for (const synced of [{ linux: SYNCED }, { linux: SYNCED, mac: null }, { linux: SYNCED, mac: 'yesterday' }]) {
+    const w = historyWorld(() => histOk(histAnswer(bothEvents(), { synced_through: synced })));
+    await assert.rejects(w.check(), /history: synced_through of mac is .*, not an ISO time within 10 s$/);
+  }
+  const unrelated = historyWorld(() => histOk(histAnswer([...bothEvents('someone-else-l-ios-lane', 'linux'), ...bothEvents()])));
+  assert.equal((await unrelated.check()).history.length, 1, 'another id\'s events are not this lane\'s');
+});
+
+test('history, two lanes on two hosts: every lane must be satisfied under its own host, one line each', async () => {
+  const lanes = [HIST_LANES[0], { host: 'pad', device: 'x-lane', id: X_ID }];
+  const events = [...bothEvents(), histEvent('pad', X_ID, 'acquire', 5), histEvent('pad', X_ID, 'release', 9)];
+  const synced = { linux: SYNCED, mac: SYNCED, pad: '2026-11-26T15:00:02.000Z' };
+  const w = historyWorld(() => histOk(histAnswer(events, { synced_through: synced })));
+  const { history } = await w.check({ lanes });
+  assert.deepEqual(history.map(entry => [entry.host, entry.id, entry.syncedThrough]), [['mac', LANE_ID, SYNCED], ['pad', X_ID, '2026-11-26T15:00:02.000Z']]);
+  assert.equal(w.lines.length, 2);
+  const second = historyWorld(() => histOk(histAnswer(events.slice(0, 3), { synced_through: synced })));
+  await assert.rejects(second.check({ lanes }), /the release of smoke-x-l-x-lane is not in pad's history within 10 s/);
+});
+
+test('history, arguments are checked: a ref, an api caller and a non-empty lanes array', async () => {
+  const api = async () => ({ status: 200, body: histAnswer([]) });
+  await assert.rejects(historyCheck({ api, lanes: HIST_LANES }), TypeError);
+  await assert.rejects(historyCheck({ ref: 'v1', lanes: HIST_LANES }), TypeError);
+  await assert.rejects(historyCheck({ ref: 'v1', api }), TypeError);
+  await assert.rejects(historyCheck({ ref: 'v1', api, lanes: [] }), TypeError);
+  await assert.rejects(historyCheck({ ref: 'v1', api, lanes: 'mac' }), TypeError);
+});
+
+// The whole smoke with `--lanes --history`: the fake Mac of `laneWorld`, plus a `/history` that answers from the lane's own id.
+function historyPair(script, knobs = {}) {
+  const w = laneWorld(knobs);
+  const reads = [];
+  w.fetch = async (url, init = {}) => {
+    const path = new URL(url).pathname;
+    if (path === '/health') return health()();
+    reads.push({ method: init.method, url, at: w.clock });
+    const { status, body } = script(reads.length, w);
+    return { status, text: async () => JSON.stringify(body) };
+  };
+  w.reads = reads;
+  w.runHistory = (extra = {}) => w.run({ lanes: true, history: true, lanesOf: MAC_LANES, fetchImpl: w.fetch, stream: false, holds: false, ...extra });
+  return w;
+}
+
+test('history, in the smoke: after the lanes line and before retire; the OK line is unchanged', async () => {
+  const w = historyPair(() => histOk(histAnswer(bothEvents())));
+  const line = await w.runHistory();
+  assert.equal(line, 'HUB_SMOKE_OK v1.2.53 res-smoke-x leasable after 0 ms');
+  assert.equal(w.lines.at(-1), line);
+  const at = text => w.lines.findIndex(entry => entry.startsWith(text));
+  assert.ok(at('HUB_SMOKE lanes:') !== -1 && at('HUB_SMOKE history:') > at('HUB_SMOKE lanes:') && at('HUB_SMOKE history:') < at('HUB_SMOKE retire:'), 'lanes, history, retire');
+  assert.match(w.lines[at('HUB_SMOKE history:')], new RegExp(`^HUB_SMOKE history: ios-lane on mac: acquire and release of ${LANE_ID} read back from mac's log \\(m1/2026-11/88210, m1/2026-11/88807\\), partial false, mac synced_through ${SYNCED}, in \\d+ ms$`));
+  assert.equal(w.reads.length, 1);
+  assert.equal(w.reads[0].method, 'GET');
+  assert.ok(w.retired);
+});
+
+test('history: false is the lanes world: the exact call list, and /history is never fetched', async () => {
+  const w = historyPair(() => { throw new Error('/history must not be fetched'); });
+  await w.runHistory({ history: false });
+  const noHistory = historyPair(() => { throw new Error('/history must not be fetched'); });
+  await noHistory.run({ lanes: true, lanesOf: MAC_LANES, fetchImpl: noHistory.fetch, stream: false, holds: false });
+  assert.deepEqual(verbs(w), verbs(noHistory), 'history: false is the same call list as leaving it out');
+  assert.deepEqual(verbs(w).filter(verb => verb !== 'status'), ['registry list', 'registry add', 'lease', 'release', 'lease', 'release', 'registry retire', 'lease']);
+  assert.deepEqual(w.reads, []);
+  assert.deepEqual(w.lines.filter(line => line.startsWith('HUB_SMOKE history:')), []);
+  const plain = historyPair(() => { throw new Error('no'); });
+  await plain.run({ fetchImpl: plain.fetch });
+  assert.deepEqual(plain.reads, []);
+});
+
+test('history, a failure in the smoke retires the phone: never shown, partial, written locally and a refusal each fail through step history', async () => {
+  const never = historyPair(() => histOk(histAnswer(bothEvents().slice(0, 1))));
+  await assert.rejects(never.runHistory(), error => error.step === 'history' && /^HUB_SMOKE_FAILED history: the release of smoke-x-l-ios-lane is not in mac's history within 10 s$/.test(error.message));
+  assert.ok(never.retired);
+  assert.ok(never.lines.some(line => /^HUB_SMOKE cleanup: retired res-smoke-x/.test(line)));
+  assert.ok(!never.lines.some(line => line.startsWith('HUB_SMOKE_OK')));
+  const partial = historyPair(() => histOk(histAnswer(bothEvents(), { partial: true, unreachable_ranges: [{ host: 'mac', from: SYNCED, to: SYNCED }] })));
+  await assert.rejects(partial.runHistory(), /HUB_SMOKE_FAILED history: the answer is partial: true, /);
+  assert.ok(partial.retired);
+  const local = historyPair(() => histOk(histAnswer([...bothEvents(), histEvent('linux', LANE_ID, 'acquire', 3)])));
+  await assert.rejects(local.runHistory(), /HUB_SMOKE_FAILED history: linux wrote an event for smoke-x-l-ios-lane/);
+  assert.equal(local.reads.length, 1);
+  assert.ok(local.retired);
+  const refused = historyPair(() => ({ status: 503, body: { code: 'HUB_HOST_UNKNOWN', detail: 'no host key' } }));
+  await assert.rejects(refused.runHistory(), /HUB_SMOKE_FAILED history: \/history answered status 503 HUB_HOST_UNKNOWN: no host key$/);
+  assert.ok(refused.retired);
+});
+
+test('history, a lanes failure never reaches history, and history needs lanes: a TypeError before anything is registered', async () => {
+  const w = historyPair(() => histOk(histAnswer(bothEvents())), { remote: {} });
+  await assert.rejects(w.runHistory(), error => error.step === 'lanes');
+  assert.deepEqual(w.reads, []);
+  const bare = historyPair(() => histOk(histAnswer(bothEvents())));
+  await assert.rejects(bare.run({ history: true, lanes: false, fetchImpl: bare.fetch }), error => error instanceof TypeError && /history needs lanes/.test(error.message));
+  await assert.rejects(bare.run({ history: true, fetchImpl: bare.fetch }), /history needs lanes/);
+  await assert.rejects(bare.run({ history: 'yes', lanes: true, fetchImpl: bare.fetch }), error => error instanceof TypeError && /history is a boolean/.test(error.message));
+  await assert.rejects(bare.run({ history: 1, lanes: true, fetchImpl: bare.fetch }), TypeError);
+  assert.deepEqual(bare.log, [], 'nothing was registered');
+  assert.deepEqual(bare.reads, []);
+});
+
+test('the CLI arguments: --history turns the history phase on and needs --lanes; the default is off', () => {
+  assert.equal(parseSmokeArgs([]).history, false);
+  assert.equal(parseSmokeArgs(['--lanes']).history, false);
+  assert.deepEqual(parseSmokeArgs(['--lanes', '--history']), { hubDevice: 'hub-device', ref: undefined, holds: true, stream: true, restart: false, lanes: true, history: true });
+  assert.deepEqual(parseSmokeArgs(['--history', '--lanes', '--restart', '--ref', 'v1.2.60']), { hubDevice: 'hub-device', ref: 'v1.2.60', holds: true, stream: true, restart: true, lanes: true, history: true });
+  assert.throws(() => parseSmokeArgs(['--history']), /^Error: --history needs --lanes/);
+  assert.throws(() => parseSmokeArgs(['--history', '--no-holds']), /--history needs --lanes/);
+});
+
+test('runEntry forwards history (false by default); --history alone is a usage failure that never reaches hubSmoke', async () => {
+  const calls = [];
+  const seams = { smoke: async options => { calls.push(options); }, makeCli: command => `cli:${command}`, defaultRef: () => 'v-default' };
+  assert.equal(await runEntry([], seams), 0);
+  assert.equal(await runEntry(['--lanes', '--history'], seams), 0);
+  assert.deepEqual(calls.map(({ lanes, history }) => [lanes, history]), [[false, false], [true, true]]);
+  assert.equal(await runEntry(['--history'], seams), 1);
+  assert.equal(calls.length, 2);
 });
