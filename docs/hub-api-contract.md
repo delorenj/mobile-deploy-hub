@@ -376,7 +376,7 @@ An error of these codes carries the named members besides the `Problem` fields a
 |------|---------|---------|
 | `HUB_REGISTRY_CONFLICT` | `rev` | The Registry's current revision, so a client can read again and retry. |
 | `HUB_REGISTRY_DUPLICATE` | `holder` | The id of the live Resource that already has the serial or UDID. |
-| `HUB_API_RESTARTING` | `retry` | Always `requeue`: the service is stopping, so ask again (a wait is placed again with the same `id`). |
+| `HUB_API_RESTARTING` | `retry` | Always `requeue`: the service is stopping, so ask again (a wait is placed again with the same `id`). `hub-client` raises the same code, with `api: false`, for a connection reset during a wait (the service died). |
 | `HUB_FORCE_RELEASE_JOB` | `repo`, `run`, `job` | The run to cancel instead (`owner/name`, the run id, the job name); each is `null` when unknown (a local run, the catch-up). |
 
 ## Request bodies
@@ -437,7 +437,7 @@ Refusals, in the order they are checked: `HUB_USAGE` 400 for the body (`bad-body
 - The connection closing before the answer is written ends the wait: the ticket is gone and the Event Log has a `cancel` with `reason: aborted`. A Hold granted after that is released at once (a `release` with `reason: undelivered`); a Hold granted before it, with its answer written, stands, and `GET /leases/{id}` returns it.
 - A repeat of an `id` already held by the same `holder` answers 200 with the existing Lease (no second take, no event), whether or not it asks for a wait. A repeat of an `id` held by another `holder` is `HUB_USAGE` 400 as any taken id.
 - A repeat with the `id` and `holder` of a wait that is still open takes it over: the wait goes on with its original Resource, `for_ms` and deadline and keeps its place (no event), the new connection gets the outcome, and the old connection gets `HUB_LEASE_SUPERSEDED` 409.
-- When the service stops (`SIGTERM`), every open wait gets `HUB_API_RESTARTING` 503 with `retry: requeue` and its ticket is withdrawn (a `cancel` with `reason: aborted`); a request that arrives while it stops gets the same. A client places its wait again with the same `id` when the service is back.
+- When the service stops (`SIGTERM`), every open wait gets `HUB_API_RESTARTING` 503 with `retry: requeue` and its ticket is withdrawn (a `cancel` with `reason: aborted`); a request that arrives while it stops gets the same. A client places its wait again with the same `id` when the service is back. When the service dies instead (a crash, `SIGKILL`), `hub-client`'s `call()` turns a connection reset during a wait (`waitMs > 0`) into the same `HUB_API_RESTARTING` with `retry: requeue` and `api: false` (a service's own 503 has `api: true`), and `requeueable(error)` is the one test a caller uses to place the wait again; a reset on a write with no wait stays `HUB_API_UNKNOWN`. For a phone wait the dead service's ticket no longer names the `id` (a stale ticket is ignored by the id check), so the repeat is granted exactly one Lease, and the take prunes the dead ticket. An emulator request the crash cut short keeps its `id` taken until the next emulator reap (`holder gone`) tears the orphan down, so it is placed again with a new `id`.
 
 **`POST /leases/{id}/extend`** moves a phone or an emulator Lease's expiry later (AD-16). `{id}` is the Lease's id; there is no holder check (no authentication, so the id is the handle, as on the CLI). The body is a JSON object with only these keys:
 

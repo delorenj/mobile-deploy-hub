@@ -2,12 +2,15 @@
 // same refusal, the same exit code and the same events. Every case runs on temp lock and event dirs, with the adb seam injected.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { acquireLease, acquirePool } from '../ci/lib/lock.mjs';
+import { TICKET_FORMAT, acquireLease, acquirePool, localHost, processStart } from '../ci/lib/lock.mjs';
 import { readEvents } from '../ci/lib/events.mjs';
+import { loadPolicy } from '../ci/lib/policy.mjs';
+import { call } from '../hub-client.mjs';
 import * as claims from './claims.mjs';
 import { main } from './hub-device.mjs';
 
@@ -472,6 +475,9 @@ test('registryWrite: the three routes (id URI-encoded), an unknown op or a missi
     assert.deepEqual([down.code, down.exit, claims.exitCodeOf(down)], ['HUB_API_DOWN', claims.EXIT_CODES.HUB_API_DOWN, claims.EXIT_CODES.HUB_API_DOWN]);
     const unknown = await claims.registryWrite('add', { body: {} }, { env: s.env, fetchImpl: async url => { if (new URL(url).pathname === '/health') return new Response('{"service":"mobile-deploy-hub-api"}', { status: 200 }); throw new TypeError('reset'); } }).catch(error => error);
     assert.deepEqual([unknown.code, unknown.exit], ['HUB_API_UNKNOWN', claims.EXIT_CODES.HUB_API_UNKNOWN]);
+    // Story 8.6: a reset during a wait is the client's own HUB_API_RESTARTING, and its exit is the table's.
+    const waiting = await call({ method: 'POST', path: '/leases', body: {}, waitMs: 1000 }, { policy: loadPolicy().policy, fetchImpl: async url => { if (new URL(url).pathname === '/health') return new Response('{"service":"mobile-deploy-hub-api"}', { status: 200 }); throw Object.assign(new TypeError('reset'), { cause: { code: 'ECONNRESET' } }); } }).catch(error => error);
+    assert.deepEqual([waiting.code, waiting.exit, waiting.retry], ['HUB_API_RESTARTING', claims.EXIT_CODES.HUB_API_RESTARTING, 'requeue']);
   } finally { s.cleanup(); }
 });
 
@@ -542,5 +548,27 @@ test('matchTarget with emulators: a profile= clause, or a query only the emulato
     assert.throws(() => ask('profile=default,kind=phone', { emulators: true }), error => error.code === 'HUB_NO_MATCH' && /emulator kind is emulator-pool, not phone/.test(error.reason));
     assert.throws(() => ask('kind=emulator-pool'), error => error.code === 'HUB_NO_MATCH' && /--match takes a phone/.test(error.message));
     assert.throws(() => ask('profile=default'), error => error.code === 'HUB_NO_MATCH', 'the CLI keeps `profile` an ordinary Capability');
+  } finally { s.cleanup(); }
+});
+
+// Story 8.6: a waiter whose process is dead names nothing, so a wait the service lost in a crash can be placed again with the same id.
+test('checkLeaseId: a ticket naming the id throws for a live pid, and not for a dead pid or a reused one (process_start differs)', () => {
+  const s = side();
+  try {
+    const dead = spawnSync(process.execPath, ['-e', '']).pid;
+    const live = processStart(process.pid);
+    assert.ok(live, 'this process has a readable start time');
+    const queue = join(s.root, 'locks/s24.queue');
+    mkdirSync(queue, { recursive: true });
+    const put = ticket => writeFileSync(join(queue, '000000000000001-000000-00000000.json'), JSON.stringify({ format: TICKET_FORMAT, kind: 'lease', lease_id: 'w-1', holder: 'agent-a', why: 'proof', enqueued_at: new Date().toISOString(), ...localHost(), ...ticket }));
+    const check = () => claims.checkLeaseId('w-1', { fleet: s.ctx.fleet, env: s.env });
+    put({ pid: dead, process_start: 1 });
+    assert.doesNotThrow(check, 'a dead pid');
+    put({ pid: process.pid, process_start: live });
+    assert.throws(check, error => error.code === 'HUB_USAGE' && /already names a lease or a waiter/.test(error.message), 'a live pid with its own start time');
+    put({ pid: process.pid });
+    assert.throws(check, error => error.code === 'HUB_USAGE' && /already names a lease or a waiter/.test(error.message), 'a live pid with no recorded start time');
+    put({ pid: process.pid, process_start: `${live}-other` });
+    assert.doesNotThrow(check, 'a live pid whose start time differs (the pid was reused)');
   } finally { s.cleanup(); }
 });

@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadPolicy } from './ci/lib/policy.mjs';
 import { hermetic } from './ci/test-fixtures.mjs';
-import { CALL_MARGIN_MS, DOWN_MESSAGE, HEALTH_TIMEOUT_MS, HUB_API_SERVICE, UNKNOWN_MESSAGE, call, hubUrl } from './hub-client.mjs';
+import { CALL_MARGIN_MS, DOWN_MESSAGE, HEALTH_TIMEOUT_MS, HUB_API_SERVICE, RESTARTING_MESSAGE, UNKNOWN_MESSAGE, call, hubUrl, requeueable } from './hub-client.mjs';
 import { SERVICE } from './hub-api/routes.mjs';
 
 hermetic();
@@ -182,4 +182,42 @@ test('problem members named like an Error field never overwrite it', async () =>
   const error = await code(call({ method: 'POST', path: '/x', body: {} }, { policy, fetchImpl }));
   assert.deepEqual([error.message, error.name, error.cause, error.rev], ['real', 'Error', undefined, 3]);
   assert.notEqual(error.stack, 's');
+});
+
+// Story 8.6: a reset during a wait is a requeue for every waiting caller.
+const resetOf = code => Object.assign(new TypeError('fetch failed'), { cause: { code } });
+
+test('a reset during a wait is HUB_API_RESTARTING with retry requeue and api false; `requeueable` is true for it', async () => {
+  for (const make of [() => resetOf('ECONNRESET'), () => resetOf('UND_ERR_SOCKET'), () => resetOf('EPIPE'), () => resetOf('UND_ERR_CLOSED'), () => Object.assign(new Error('x'), { code: 'ECONNRESET' })]) {
+    const error = await code(call({ method: 'POST', path: '/leases', body: {}, waitMs: 30_000 }, { policy, fetchImpl: fake({ '/health': healthy, '/leases': make() }).fetchImpl }));
+    assert.deepEqual([error.code, error.exit, error.reason, error.retry, error.api, error.message], ['HUB_API_RESTARTING', 1, 'restarting', 'requeue', false, RESTARTING_MESSAGE]);
+    assert.equal(requeueable(error), true);
+  }
+});
+
+test('the other failures of a wait keep their codes: its own timeout is UNKNOWN, a refused connect is DOWN, and a reset with no wait is UNKNOWN', async () => {
+  const c = clock();
+  const { fetchImpl } = fake({ '/health': healthy, '/leases': 'hang' });
+  const pending = code(call({ method: 'POST', path: '/leases', body: {}, waitMs: 30_000 }, { policy, fetchImpl, timeout: c.timeout }));
+  await new Promise(done => setImmediate(done));
+  await new Promise(done => setImmediate(done));
+  c.controllers[1].abort(new Error('timed out'));
+  const timed = await pending;
+  assert.equal(timed.code, 'HUB_API_UNKNOWN');
+  assert.equal(requeueable(timed), false);
+  const aborted = await code(call({ method: 'POST', path: '/leases', body: {}, waitMs: 30_000 }, { policy, fetchImpl: fake({ '/health': healthy, '/leases': new DOMException('timed out', 'TimeoutError') }).fetchImpl }));
+  assert.equal(aborted.code, 'HUB_API_UNKNOWN');
+  const refused = await code(call({ method: 'POST', path: '/leases', body: {}, waitMs: 30_000 }, { policy, fetchImpl: fake({ '/health': healthy, '/leases': refusedError() }).fetchImpl }));
+  assert.equal(refused.code, 'HUB_API_DOWN');
+  const write = await code(call({ method: 'POST', path: '/leases', body: {} }, { policy, fetchImpl: fake({ '/health': healthy, '/leases': resetOf('ECONNRESET') }).fetchImpl }));
+  assert.equal(write.code, 'HUB_API_UNKNOWN');
+  assert.equal(requeueable(write), false);
+});
+
+test('requeueable is true for a problem error that says requeue (a SIGTERM answer) and false for everything else', async () => {
+  const body = { type: 'urn:x', title: 'Restarting', status: 503, detail: 'the service is stopping', code: 'HUB_API_RESTARTING', exit: 1, reason: 'restarting', retry: 'requeue' };
+  const { fetchImpl } = fake({ '/health': healthy, '/leases': () => json(503, body, 'application/problem+json') });
+  const error = await code(call({ method: 'POST', path: '/leases', body: {}, waitMs: 1000 }, { policy, fetchImpl }));
+  assert.deepEqual([error.code, error.api, error.retry, requeueable(error)], ['HUB_API_RESTARTING', true, 'requeue', true]);
+  for (const other of [undefined, null, new Error('x'), { retry: 'later' }]) assert.equal(requeueable(other), false);
 });
