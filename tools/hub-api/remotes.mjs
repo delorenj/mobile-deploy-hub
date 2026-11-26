@@ -14,6 +14,7 @@
 import { exitCodeOf } from '../device/claims.mjs';
 import { HOST_KEYS } from '../hub-client.mjs';
 import { isReachability } from '../registry/reachability.mjs';
+import { checkEvents } from './replica.mjs';
 
 export const PUSH_FORMAT = 1;
 export const PUSH_KEYS = Object.freeze(['format', 'host', 'host_id', 'boot', 'seq', 'sent_at', 'status', 'readings', 'events']);
@@ -40,7 +41,8 @@ function checkReading(reading) {
 // Checks the body of a push into the same fields, or throws HUB_USAGE 400 with a `reason` (checked in this order, before anything is stored):
 // bad-body (not an object, a key outside the list or a missing one), bad-format (not 1), bad-host (not a host key, or this service's own: `own` is
 // its key), bad-host-id (text or null), bad-boot (12 lowercase hex characters), bad-seq (a whole number of 1 or more), bad-sent-at (an ISO
-// time), bad-status (an object or null), bad-readings (an array of readings or null), bad-events (`null`: Epic 10 fills it).
+// time), bad-status (an object or null), bad-readings (an array of readings or null), bad-events (Story 10.1: not null and not a valid
+// `{month, from_offset, lines}`, checked by checkEvents).
 export function checkPushBody(body, { own } = {}) {
   if (!isObject(body)) throw bad('bad-body', 'the body must be a JSON object');
   for (const key of Object.keys(body)) if (!PUSH_KEYS.includes(key)) throw bad('bad-body', `the body has no key "${key}" (${PUSH_KEYS.join(', ')})`);
@@ -56,10 +58,10 @@ export function checkPushBody(body, { own } = {}) {
   if (body.readings !== null && !(Array.isArray(body.readings) && body.readings.every(checkReading))) {
     throw bad('bad-readings', 'readings must be null or a list of {resource, state, checked_at, age_ms_at_receipt, received_at, source}, each state a Reachability');
   }
-  if (body.events !== null) throw bad('bad-events', 'events must be null (the Event Log replica arrives with Epic 10)');
+  const events = checkEvents(body.events);
   return {
     format: body.format, host: body.host, host_id: body.host_id, boot: body.boot, seq: body.seq, sent_at: body.sent_at,
-    status: body.status, readings: body.readings, events: null,
+    status: body.status, readings: body.readings, events,
   };
 }
 
@@ -79,6 +81,12 @@ export function createRemotes() {
         received_at: fresh ? at : held?.received_at ?? null,
       });
       return { applied: true };
+    },
+
+    // Read-only: whether this `(boot, seq)` was already applied (a repeated delivery: the push handler appends nothing for it).
+    seen(push) {
+      const held = hosts.get(push.host);
+      return held !== undefined && held.boot === push.boot && push.seq <= held.seq;
     },
 
     views({ now, maxAgeS, marks } = {}) {

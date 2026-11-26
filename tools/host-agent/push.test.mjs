@@ -31,7 +31,16 @@ const FAR = Date.parse('2031-06-01T00:00:00Z');
 const iso = ms => new Date(ms).toISOString();
 const BOOT = 'a1b2c3d4e5f6';
 const noServer = () => ({ adb_servers: [], emulators: [], xvfb: [] });
-const flush = async (rounds = 25) => { for (let round = 0; round < rounds; round += 1) await new Promise(done => setImmediate(done)); };
+// Enough loop turns for a push's whole chain, the Hub API's replica append (async fs) included.
+const flush = async (rounds = 250) => { for (let round = 0; round < rounds; round += 1) await new Promise(done => setImmediate(done)); };
+// A hub-side effect (the pokes, a stored view) lands when the push's chain has crossed the bridge: wait for it, never guess.
+// The bound is wall-clock (hrtime: the mocked timers never touch it), not a count of loop turns: under a loaded box the
+// replica's async fs work takes longer in real time while the loop keeps spinning.
+const until = async (check, what) => {
+  const deadline = process.hrtime.bigint() + 10_000_000_000n;
+  while (process.hrtime.bigint() < deadline) { if (await check()) return; await new Promise(done => setImmediate(done)); }
+  throw new Error(`never happened: ${what}`);
+};
 
 class FakeServer extends EventEmitter {
   constructor(listener) { super(); this.listener = listener; }
@@ -424,6 +433,7 @@ test('end to end: a Lease on the Mac reaches /status.hosts.mac within 250 ms wit
   const hubGet = url => handle({ method: 'GET', url }, hubCtx);
   try {
     await s.settle();
+    await until(async () => Object.keys((await hubGet('/status')).body.hosts).includes('mac'), 'the start push reached the Hub API');
     let status = await hubGet('/status');
     assert.deepEqual(Object.keys(status.body.hosts), ['linux', 'mac']);
     assert.deepEqual(status.body.hosts.mac.locks, []);
@@ -435,7 +445,11 @@ test('end to end: a Lease on the Mac reaches /status.hosts.mac within 250 ms wit
     s.watcher.fire(s.env.HUB_LOCK_DIR);
     mock.timers.tick(CHANGE_DEBOUNCE_MS);
     await flush();
-    assert.equal(pokes.length, 2, 'each applied push poked the change feed');
+    // The lease reaches the Hub API with the triggered push. Under load the start trigger may still be draining when the
+    // lease is taken; its catch-up round then replicates the lease event (status null), so wait for the view, not a count.
+    await until(async () => (await hubGet('/status')).body.hosts.mac.locks.length === 1, 'the triggered push carried the lease');
+    assert.ok(pokes.length >= 2, 'each applied push poked the change feed');
+    const sent = s.pushes.length;
     status = await hubGet('/status');
     const [row] = status.body.hosts.mac.locks;
     assert.equal(row.lock, 'mac-ios');
@@ -452,7 +466,7 @@ test('end to end: a Lease on the Mac reaches /status.hosts.mac within 250 ms wit
     assert.deepEqual((await hubGet('/status')).body.stale, {});
     hub.t += 1000;
     assert.deepEqual((await hubGet('/status')).body.stale, { mac: { since: iso(FAR + 25_000), unreachable: null } });
-    assert.equal(s.pushes.length, 2, 'no push for the passing of time');
+    assert.equal(s.pushes.length, sent, 'no push for the passing of time');
     assert.deepEqual(s.err, []);
   } finally { await s.running.stop(); s.cleanup(); rmSync(hubRoot, { recursive: true, force: true }); }
 });

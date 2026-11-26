@@ -381,6 +381,8 @@ test('the Problem extensions of the document equal PROBLEM_EXTENSIONS both ways,
       HUB_API_RESTARTING: await handle({ method: 'POST', url: lease.path, body: sampleBody(lease) }, { ...s.ctx, waits }),
       // A deploy job's place in line is refused from the id alone, naming the run to cancel.
       HUB_FORCE_RELEASE_JOB: await handle({ method: 'POST', url: '/leases/job:o%2Fr%2341.1%2Fandroid/force-release', body: { why: 'contract', holder: 'contract-test' } }, s.ctx),
+      // A push whose events do not continue the replica at its settled size is a gap, with the size to push from.
+      HUB_REPLICA_GAP: await handle({ method: 'POST', url: '/agent/push', body: { format: 1, host: 'mac', host_id: null, boot: '0123456789ab', seq: 1, sent_at: '2026-11-26T10:00:00.000Z', status: null, readings: null, events: { month: '2026-11', from_offset: 5, lines: ['{"format":1}\n'] } } }, s.ctx),
     };
     assert.deepEqual(Object.keys(answers).sort(), Object.keys(PROBLEM_EXTENSIONS).sort(), 'every extension code has a live answer here');
     for (const [code, answer] of Object.entries(answers)) {
@@ -459,7 +461,7 @@ test('the Host Agent table of the document equals AGENT_ROUTES both ways, each w
     assert.equal(contract.agentShapeOf[agentKey(route)], route.shape, agentKey(route));
     assert.ok(contract.shapes[route.shape]?.length > 0, `${route.shape} has a field list`);
   }
-  for (const route of AGENT_ROUTES.filter(candidate => !['AgentHealth', 'HostView'].includes(candidate.shape))) {
+  for (const route of AGENT_ROUTES.filter(candidate => !['AgentHealth', 'HostView', 'AgentSync'].includes(candidate.shape))) {
     assert.equal(ROUTES.find(candidate => routeKey(candidate) === agentKey(route))?.shape, route.shape, `${agentKey(route)} is the Hub API's route`);
   }
   for (const route of ROUTES.filter(candidate => !candidate.path.startsWith('/registry') && !['/resources', '/resources/{id}', '/pools', '/discovery', '/stream', '/health', '/status', '/agent/push'].includes(candidate.path))) {
@@ -497,6 +499,29 @@ test('the agent\'s GET /status is a HostView: the six v1a lists at the root, eve
     // HostView is Status's `hosts.{host}.` list, unprefixed: nothing in one is missing from the other.
     const status = contract.shapes.Status.filter(field => field.startsWith('hosts.{host}.')).map(field => field.slice('hosts.{host}.'.length));
     assert.deepEqual(fieldDiff(status, fields), []);
+  } finally { s.cleanup(); }
+});
+
+// Story 10.1: `POST /agent/sync` hands the agent the replica sizes and makes it push. Its answer's key set is exactly
+// AgentSync, and a bad body is HUB_USAGE 400 with `bad-body` or `bad-replica`.
+test('the agent\'s POST /agent/sync keys are exactly AgentSync, and a bad body is refused', async () => {
+  const s = agentScratch();
+  try {
+    const ctx = { ...s.ctx, sync: async replica => ({ pushed: true, synced: true, replica }) };
+    const answer = await handle({ method: 'POST', url: '/agent/sync', body: { replica: { '2026-11': 120 } } }, ctx);
+    assert.equal(answer.status, 200, JSON.stringify(answer.body));
+    assert.deepEqual(fieldDiff(contract.shapes.AgentSync, flatten(answer.body, '', openPrefixes(contract.shapes.AgentSync))), []);
+    const cases = [
+      ['bad-body', null], ['bad-body', { replica: {}, extra: 1 }], ['bad-body', {}], ['bad-body', []],
+      ['bad-replica', { replica: [] }], ['bad-replica', { replica: 'x' }], ['bad-replica', { replica: { '2026-13': 1 } }], ['bad-replica', { replica: { '2026-11': -1 } }], ['bad-replica', { replica: { '2026-11': 1.5 } }],
+    ];
+    for (const [reason, body] of cases) {
+      const refusal = await handle({ method: 'POST', url: '/agent/sync', body }, ctx);
+      assert.equal(refusal.status, 400, `${reason} ${JSON.stringify(refusal.body)}`);
+      assert.equal(refusal.body.code, 'HUB_USAGE');
+      assert.equal(refusal.body.exit, 2);
+      assert.equal(refusal.body.reason, reason);
+    }
   } finally { s.cleanup(); }
 });
 

@@ -26,6 +26,7 @@ import { viewPools, viewRecord } from '../registry/view.mjs';
 import { createPeers, failureReason, isContact, isUnreached, offlineView } from './peers.mjs';
 import { deviceCtx } from './readings.mjs';
 import { checkPushBody, createRemotes } from './remotes.mjs';
+import { createReplicas } from './replica.mjs';
 import { STREAM_HEADERS } from './stream.mjs';
 
 // One name and one contract number for the service: the server answers with them, and the installer's readback and the smoke check for them.
@@ -63,6 +64,7 @@ export const PROBLEM_EXTENSIONS = Object.freeze({
   HUB_REGISTRY_DUPLICATE: Object.freeze(['holder']),
   HUB_API_RESTARTING: Object.freeze(['retry']),
   HUB_FORCE_RELEASE_JOB: Object.freeze(['repo', 'run', 'job']),
+  HUB_REPLICA_GAP: Object.freeze(['size']),
 });
 
 export function problem(error, extra = {}) {
@@ -204,6 +206,15 @@ function remotesOf(ctx) {
   return fallbackRemotes.get(ctx);
 }
 
+// The Event Log replicas of the spoke hosts (Story 10.1): the context's `replicas` (the service's), or, for a bare `handle()`
+// with none, one per context over the context's event dir.
+const fallbackReplicas = new WeakMap();
+function replicasOf(ctx) {
+  if (ctx.replicas) return ctx.replicas;
+  if (!fallbackReplicas.has(ctx)) fallbackReplicas.set(ctx, createReplicas({ env: ctx.env ?? process.env }));
+  return fallbackReplicas.get(ctx);
+}
+
 // GET /status: the one status document (Story 8.1, AD-41): `{format, contract, hosts: {<host key>: <view>}, registry, stale, checked_at}`. A host's
 // view is `claims.statusView(key, {audience: 'service', qa_ids})` embedded unchanged: the queue positions, ETAs, Pool fold and QA redaction
 // are the library's, never recomputed here. Only this host's key is in `hosts` today (Epic 9 adds the Mac's); `registry` is the one place the
@@ -258,13 +269,18 @@ function noteFailure(ctx, host, { at, reason }) {
   pokePeers(ctx);
 }
 
-// POST /agent/push (Story 9.5, AD-49): a spoke host's Host Agent pushes its view when something there changed. The body is checked strictly
-// (`checkPushBody`; this service's own host key is refused: it is `own`, and an unknown one is 503 HUB_HOST_UNKNOWN), then applied once per
-// `(boot, seq)` on this service's clock: a push already applied answers `{applied: false}` and changes nothing. An applied push replaces the
-// host's view (a null `status` keeps the last), stores each reading of a Resource the Registry places on that host (`ctx.readings.remote`; no
-// `reachability` event: only a host's own service logs one), then `ctx.onPush()` pokes the change feed so a stream frame follows. This
-// service never calls the agent to refresh any of it.
-export function agentPush(ctx, { body }) {
+// POST /agent/push (Story 9.5, AD-49; the `events` replication is Story 10.1): a spoke host's Host Agent pushes its view when
+// something there changed. The body is checked strictly (`checkPushBody`; this service's own host key is refused: it is `own`,
+// and an unknown one is 503 HUB_HOST_UNKNOWN), then everything happens in one serialized operation per host (the replica
+// queue): any push that passed the body check is contact (Story 9.6), then a repeated delivery (`seen`) skips the append, the
+// `events` append runs against the replica (a `from_offset` that is not the settled size is 409 HUB_REPLICA_GAP with `size`:
+// nothing appended and nothing applied, but the push is still contact), then the push is applied once per `(boot, seq)` on
+// this service's clock: a push already applied answers `{applied: false}` and changes nothing. An applied push replaces the
+// host's view (a null `status` keeps the last), stores each reading of a Resource the Registry places on that host
+// (`ctx.readings.remote`; no `reachability` event: only a host's own service logs one), then `ctx.onPush()` pokes the change
+// feed so a stream frame follows. Every 2xx answer, a duplicate's included, reports the replica's sizes under `replica`, so
+// the agent resumes from them and keeps no cursor of its own. This service never calls the agent to refresh any of it.
+export async function agentPush(ctx, { body }) {
   const env = ctx.env ?? process.env;
   let own;
   try { own = (ctx.hostKey ?? realHostKey)({ env }); } catch (error) {
@@ -274,16 +290,26 @@ export function agentPush(ctx, { body }) {
   const at = (ctx.now ?? Date.now)();
   // The Registry's places are read before anything is applied: a read that throws applies nothing.
   const places = push.readings !== null ? new Set(readIt(ctx).resources.filter(record => record.host === push.host).map(record => record.id)) : new Set();
-  const { applied } = remotesOf(ctx).apply(push, { at });
-  // Any push that passed the body check, applied or a duplicate, is contact (Story 9.6): a host marked unreachable is restored, with one event.
-  noteContact(ctx, push.host, { at, reason: 'push' });
-  if (applied) {
-    if (push.readings !== null) {
-      ctx.readings?.remote(push.readings.filter(reading => places.has(reading.resource)).map(reading => ({ id: reading.resource, served: reading })), { at });
+  const remotes = remotesOf(ctx);
+  const replicas = replicasOf(ctx);
+  return replicas.exclusive(push.host, async () => {
+    // Any push that passed the body check, applied or a duplicate, is contact (Story 9.6): a host marked unreachable is restored, with one event.
+    noteContact(ctx, push.host, { at, reason: 'push' });
+    let applied = false;
+    // A repeated delivery appends nothing and applies nothing; a gap refuses the whole push (both stay as they were).
+    if (!(push.events !== null && remotes.seen(push))) {
+      if (push.events !== null) await replicas.append(push.host, push.events);
+      ({ applied } = remotes.apply(push, { at }));
+      if (applied) {
+        if (push.readings !== null) {
+          ctx.readings?.remote(push.readings.filter(reading => places.has(reading.resource)).map(reading => ({ id: reading.resource, served: reading })), { at });
+        }
+        try { ctx.onPush?.(); } catch (error) { ctx.log?.err?.(`HUB_API_ERROR push ${oneLine(error?.message ?? error)}`); }
+      }
     }
-    try { ctx.onPush?.(); } catch (error) { ctx.log?.err?.(`HUB_API_ERROR push ${oneLine(error?.message ?? error)}`); }
-  }
-  return { applied, host: push.host, boot: push.boot, seq: push.seq };
+    const replica = await replicas.sizes(push.host);
+    return { applied, host: push.host, boot: push.boot, seq: push.seq, replica };
+  });
 }
 
 // POST /registry/resources: registers a Resource (FR-1). The body is checked first (a bad one writes nothing, not even the seed). The

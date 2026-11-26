@@ -9,7 +9,7 @@
 // this host's phones and the Resource the request names. There are no `/registry/*`, `/resources`, `/discovery` or `/stream` routes here: those are the Hub API's.
 import { HOST_AGENT_SERVICE, HUB_API_CONTRACT } from '../hub-client.mjs';
 import { hubRef } from '../ci/lib/receipt.mjs';
-import { createContext, hostKey as realHostKey, isLocal, lanesOf, phonesOf, statusView } from '../device/claims.mjs';
+import { createContext, exitCodeOf, hostKey as realHostKey, isLocal, lanesOf, phonesOf, statusView } from '../device/claims.mjs';
 import { NAMED, forwardHold, namedRecords, placeOf, retiredCarried, unseeded, unwrapCarried, withPlace, wrongHost } from '../device/forward.mjs';
 import { ROUTES, reply } from '../hub-api/routes.mjs';
 import { createKnown } from './known.mjs';
@@ -134,11 +134,33 @@ function gated(route) {
   };
 }
 
+// POST /agent/sync (Story 10.1): hands the agent the Hub API's replica sizes and makes it push from them (Story 10.2's
+// `/history` will call it when a range the replica lacks is requested). The body is `{replica: {<YYYY-MM>: <a whole number
+// of bytes, 0 or more>}}` and nothing else (`HUB_USAGE` 400 `bad-body`; a `replica` that is not such a map is `bad-replica`).
+// `ctx.sync` is the pusher's: it adopts the sizes, pushes (draining the oldest differing month first) and answers
+// `{pushed, synced, replica}`.
+const SYNC_MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
+const badSync = (reason, message) => Object.assign(new Error(message), { status: 400, code: 'HUB_USAGE', exit: exitCodeOf({ code: 'HUB_USAGE' }), reason });
+const isPlain = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+export async function agentSync(ctx, { body }) {
+  if (!isPlain(body)) throw badSync('bad-body', 'the body must be a JSON object');
+  for (const key of Object.keys(body)) if (key !== 'replica') throw badSync('bad-body', `the body has no key "${key}" (replica)`);
+  if (!Object.hasOwn(body, 'replica')) throw badSync('bad-body', 'the body needs "replica"');
+  if (!isPlain(body.replica)) throw badSync('bad-replica', 'replica must be an object keyed by month (YYYY-MM)');
+  for (const [month, size] of Object.entries(body.replica)) {
+    if (!SYNC_MONTH.test(month)) throw badSync('bad-replica', `replica's key "${month}" is not a month (YYYY-MM)`);
+    if (!Number.isSafeInteger(size) || size < 0) throw badSync('bad-replica', `replica's "${month}" must be a whole number of bytes, 0 or more`);
+  }
+  return ctx.sync(body.replica);
+}
+
 // The Hub API's Hold routes (the same method, path and shape), behind forwarding or the gate.
 const HOLD_ROUTES = Object.freeze(Object.keys(NAMED));
 
 export const AGENT_ROUTES = Object.freeze([
   Object.freeze({ method: 'GET', path: '/health', shape: 'AgentHealth', handler: agentHealth }),
   Object.freeze({ method: 'GET', path: '/status', shape: 'HostView', handler: agentStatus }),
+  Object.freeze({ method: 'POST', path: '/agent/sync', shape: 'AgentSync', handler: agentSync }),
   ...ROUTES.filter(route => HOLD_ROUTES.includes(keyOfRoute(route))).map(route => Object.freeze({ ...route, handler: NAMED[keyOfRoute(route)].forward ? forwarding(route) : gated(route) })),
 ]);

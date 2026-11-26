@@ -42,7 +42,7 @@ export async function startHostAgent({ policy, env: given = process.env, log = d
   // The push's own reads (`agentStatus` and the lane readings) use the RAW devicectl, so a push never looks like a request-path read.
   const pushCtx = { env, policy: resolved, now, devices, qaDevices, hostKey, devicectl, inventory, processStart, liveStart, known, request: send, log };
   const pusher = createPusher({
-    policy: resolved, hostKey: keyOf, hostId: typeof injectedHostId === 'function' ? injectedHostId : injectedHostId !== undefined ? () => injectedHostId : () => realHostId(),
+    policy: resolved, env, hostKey: keyOf, hostId: typeof injectedHostId === 'function' ? injectedHostId : injectedHostId !== undefined ? () => injectedHostId : () => realHostId(),
     boot, now: now ?? Date.now, send, status: () => agentStatus(pushCtx), readings: () => laneReadings(pushCtx), log,
   });
   const watch = watchFor({ watch: injectedWatch, faked: inventory !== undefined || devicectl !== undefined });
@@ -56,6 +56,8 @@ export async function startHostAgent({ policy, env: given = process.env, log = d
     ...pushCtx, devicectl: observed,
     // A request to the agent pokes when the last push failed: the failed one is not retried on a timer, so this is the next chance.
     onRequest: () => { if (pusher.owed()) pushes.poke(); },
+    // `POST /agent/sync` (Story 10.1): hands the agent the Hub API's replica sizes and makes it push from them.
+    sync: replica => pusher.sync(replica),
   };
   // After the bind has won: one request for the Registry's resources, started and never waited for (`refresh` never rejects), then the watchers
   // (the directories exist first: a watch needs them, and a writer creates them lazily; only when a watcher really runs) and the one start poke.

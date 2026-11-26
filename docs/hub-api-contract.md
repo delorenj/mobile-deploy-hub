@@ -258,12 +258,13 @@ The age rule: a reader on the service's host computes `age_ms = age_ms_at_receip
 
 ### AgentPushAck
 
-`POST /agent/push` (Story 9.5, AD-49): a spoke host's Host Agent tells this service what changed on its host. It is the only route the agent calls on the Hub API besides `GET /resources`, always through `hub-client` (the agent never opens a socket of its own). The body is under "Request bodies". The answer is 200 in both cases:
+`POST /agent/push` (Story 9.5, AD-49; the Event Log replica is Story 10.1): a spoke host's Host Agent tells this service what changed on its host. It is the only route the agent calls on the Hub API besides `GET /resources`, always through `hub-client` (the agent never opens a socket of its own). The body is under "Request bodies". The answer is 200 in both cases:
 
 - `applied` `true` when the push was applied, `false` when its `(boot, seq)` had already been applied (the same `boot` and a `seq` not above the applied one): nothing changed and no frame was scheduled
 - `host` the pushing host's key, as sent
 - `boot` the agent's boot id, as sent
 - `seq` the push's sequence number, as sent
+- `replica.*` the settled sizes of the Hub API's replica of the pushing host's Event Log (Story 10.1), keyed by month (`2026-11`): the byte size of each `replicas/<host>/<YYYY-MM>.jsonl`, `{}` before anything was replicated. The agent keeps no cursor of its own: it resumes from these sizes, including at its start, and a duplicate's answer reports them too
 
 ### StreamFrame
 
@@ -388,6 +389,7 @@ An error of these codes carries the named members besides the `Problem` fields a
 | `HUB_REGISTRY_DUPLICATE` | `holder` | The id of the live Resource that already has the serial or UDID. |
 | `HUB_API_RESTARTING` | `retry` | Always `requeue`: the service is stopping, so ask again (a wait is placed again with the same `id`). `hub-client` raises the same code, with `api: false`, for a connection reset during a wait (the service died). |
 | `HUB_FORCE_RELEASE_JOB` | `repo`, `run`, `job` | The run to cancel instead (`owner/name`, the run id, the job name); each is `null` when unknown (a local run, the catch-up). |
+| `HUB_REPLICA_GAP` | `size` | The settled size of the pushed month's replica file, so the agent adopts it and pushes again from it. |
 
 ## Request bodies
 
@@ -505,13 +507,21 @@ For every write route the actor is `actor` as given, else `{holder, via: 'api'}`
 - `boot`: 12 lowercase hex characters, minted once per agent start.
 - `seq`: a whole number of 1 or more, rising by one per push attempt within a `boot` (a failed attempt uses its number).
 - `sent_at`: an ISO time on the agent's clock. It is recorded by nobody: the service times everything it derives on its own clock.
-- `status`: the host's own view (`HostView`, under Host Agent), or `null` when the agent could not build it.
-- `readings`: `null` (the agent could not read), or a list of `{resource, state, checked_at, age_ms_at_receipt, received_at, source}`: a Resource id and its reading in the served form (the `ResourceList` `reachability` fields), one for each lane of that host.
-- `events`: always `null` (the Event Log replica arrives with Epic 10).
+- `status`: the host's own view (`HostView`, under Host Agent), or `null` when the agent could not build it (or when a catch-up push carries none, Story 10.1).
+- `readings`: `null` (the agent could not read, or a catch-up push carries none), or a list of `{resource, state, checked_at, age_ms_at_receipt, received_at, source}`: a Resource id and its reading in the served form (the `ResourceList` `reachability` fields), one for each lane of that host.
+- `events`: `null`, or one month of the host's Event Log for the replica (Story 10.1, AD-49): `{month, from_offset, lines}` with `month` `YYYY-MM`, `from_offset` a whole number of bytes 0 or more, and `lines` a non-empty list of complete source lines, each a non-empty string whose only newline is its last byte (their total at most 1 MiB). A push never spans two months and a month is never closed. The Hub API appends the lines byte-for-byte to `replicas/<host>/<month>.jsonl` only when `from_offset` equals the file's settled size (a torn tail, a file whose last byte is not a newline, is truncated to its last complete line before the compare); otherwise it answers 409 `HUB_REPLICA_GAP` with `size` and appends nothing. The agent sends `events` only when it knows the replica sizes (from a 2xx answer's `replica` or from `/agent/sync`), so a new agent never sends events to an old Hub API and an old agent's `null` stays valid.
 
-Applied once per `(boot, seq)`: a repeat answers 200 `{applied: false}` and changes nothing. A new `boot` is applied whatever its `seq`. An applied push with a non-null `status` replaces that host's view in `GET /status` `hosts.{host}` and its receipt time becomes this service's clock; a `null` `status` keeps the last view and its receipt time. Each reading of a Resource the Registry places on `host` is stored as a `receive`d reading (an `unknown` one drops the stored reading); a reading of any other Resource is ignored. Then the change feed is poked, so a `status` frame follows on `GET /stream` within the 250 ms debounce. The service never calls the agent to refresh a view.
+Applied once per `(boot, seq)`: a repeat answers 200 `{applied: false}` and changes nothing (a repeated delivery appends nothing). A new `boot` is applied whatever its `seq`. An applied push with a non-null `status` replaces that host's view in `GET /status` `hosts.{host}` and its receipt time becomes this service's clock; a `null` `status` keeps the last view and its receipt time. Each reading of a Resource the Registry places on `host` is stored as a `receive`d reading (an `unknown` one drops the stored reading); a reading of any other Resource is ignored. Then the change feed is poked, so a `status` frame follows on `GET /stream` within the 250 ms debounce. The service never calls the agent to refresh a view. A push whose `events` gap-fails changes nothing: no view, no readings, no recorded `seq` and no append; it is still contact (Story 9.6). Every 2xx answer, a duplicate's included, reports the replica's settled sizes under `replica`.
 
 Refusals: `HUB_USAGE` 400 for the body, with one of these reasons, checked in this order and before anything is stored: `bad-body` (not an object, a key outside the list or a missing one), `bad-format`, `bad-host` (not a host key, or this service's own), `bad-host-id`, `bad-boot`, `bad-seq`, `bad-sent-at`, `bad-status`, `bad-readings`, `bad-events`; `HUB_HOST_UNKNOWN` 503 when this service does not know its own host key.
+
+**`POST /agent/sync`** (Story 10.1) is the Host Agent's route, not the Hub API's: it hands the agent the replica sizes to push from (Story 10.2's `/history` will call it when a range the replica lacks is requested). The body is a JSON object with only this key:
+
+- `replica` (required): an object keyed by month (`YYYY-MM`), every value a whole number of bytes 0 or more — the settled sizes of the Hub API's replica of this host.
+
+The agent adopts the sizes, pushes (draining the oldest differing month first, one month per push) and answers `AgentSync`.
+
+Refusals: `HUB_USAGE` 400 with `bad-body` (not an object, a key outside the list or a missing `replica`) or `bad-replica` (not an object, a key that is not a month, or a value that is not a whole number 0 or more), before anything happens.
 
 ## Error codes
 
@@ -537,6 +547,7 @@ Refusals: `HUB_USAGE` 400 for the body, with one of these reasons, checked in th
 | `HUB_DEVICE_JOB_ID` | 400 | 2 | `POST /leases/{id}/extend`, `/release` or `POST /requests/{id}/cancel` with a `job:` id (or, for a cancel, the id of a deploy job's ticket): a deploy job's place in line is not a lease, and the hub never extends, releases or cancels it; `detail` names the run to cancel (`gh run cancel`). |
 | `HUB_FORCE_RELEASE_JOB` | 409 | 2 | `POST /leases/{id}/force-release` of a deploy job's Hold (`reason: job`): a Job Hold is only ended by cancelling its run; `repo`, `run` and `job` name it and `detail` says `gh run cancel`. |
 | `HUB_RESERVATION_NOT_FOUND` | 404 | 2 | `POST /reservations/{run_key}/force-release`: no Reservation of this run key exists on this host (`reason: unknown`): already released or pruned, never reserved, or its record is unreadable. Nothing was written. |
+| `HUB_REPLICA_GAP` | 409 | 1 | `POST /agent/push` with an `events` whose `from_offset` is not the replica file's settled size (`reason: gap`; member `size` is the size to push from): nothing was appended and nothing of the push was applied, but the push is still contact (Story 9.6). |
 | `HUB_LEASE_SUPERSEDED` | 409 | 1 | `POST /leases`: a newer request with the same `id` and `holder` took over this wait (`reason: superseded`). The wait itself goes on. |
 | `HUB_API_RESTARTING` | 503 | 1 | The service is stopping (`reason: restarting`; member `retry: requeue`). Every open wait gets it, and so does a lease request that arrives while it stops; every open `GET /stream` is ended, and a `GET /stream` that arrives while it stops gets it too. |
 | `HUB_REGISTRY_NAME` | 400, 409 | 2 | A register's or edit's name is not a slug (`not-slug`) or is too long (`too-long`) with 400; reserved (`reserved`), already used (`taken`) or out of `-<n>` suffixes (`exhausted`) with 409. |
@@ -613,6 +624,7 @@ Base URL: `http://127.0.0.1:8795`, loopback only, no path prefix. The port is `a
 |--------|------|-------|-------|
 | GET | `/health` | AgentHealth | 9.2 |
 | GET | `/status` | HostView | 9.2 |
+| POST | `/agent/sync` | AgentSync | 10.1 |
 | POST | `/leases` | Lease | 9.2 |
 | GET | `/leases/{id}` | Lease | 9.2 |
 | POST | `/leases/{id}/extend` | Lease | 9.2 |
@@ -626,6 +638,8 @@ The seven Hold routes take the same bodies and answer the same shapes as the Hub
 **Forwarding, not a gate (Story 9.3).** A Hold route acts here only on this host's own Resources, and forwards the rest. After the route's own body check (a bad body is still `HUB_USAGE` 400), the Resource the request names is found in what the agent knows (the Hub API's last `GET /resources` answer, refreshed once per public request that names something, else the in-memory seed of `devices.json`; the seed's words, `ipad` and `mac`, and its Pools, `phone` and `emulator`, always resolve): by id, name or lock, then by word, a Pool word standing for its members, a `match` by the matcher over those Resources (a `profile=` clause names the emulator Pool). `POST /leases` names its `resource` or `match`, `POST /requests/{id}/cancel` its `resource` and `pool`, `POST /leases/{id}/extend`, `/release` and `/force-release` their optional `resource` (a force-release of an `emulator-<n>` id names the emulator Pool), and `POST /reservations/{run_key}/force-release` its `name`. What lives on one other host is forwarded there as the door `host-agent`; what lives here runs here, on the carried or the known record; a forward (the `X-Hub-Forwarded` header) is acted on as described under Forwarding, and one that names another host's Resource is `HUB_WRONG_HOST` 409 (`reason: wrong-host`, exit 2), naming the Resource, its host and this host, and nothing is written. A Reservation's force-release is never forwarded: another host's lock is `HUB_WRONG_HOST`. A name the agent does not know passes to the handler, which refuses it as it always does. The agent never reads `registry.json`.
 
 **Pushes (Story 9.5, AD-49).** The agent tells the Hub API about its host with `POST /agent/push` (`AgentPushAck`; the body is under Request bodies), through `hub-client` (`request({host: 'linux', ...})`): its `status` is `GET /status` rendered at that instant on the Mac's clock, and `readings` is the iPad read once through `devicectl` for each lane of its host. It pushes at its own start, when its lock dir or event dir is written (a watch over the lock dir, `emulators/`, every `.lock`, `.queue` and `.reservations` directory and the event dir; a burst of writes is one push, at most 250 ms after the first), and when a Reachability reading changes: an iPad read on a request (`GET /status` or a lane take that needs the device) that differs from what the last push carried. Nothing else pushes: there is no timer, interval or poll, so a quiet Mac sends nothing, and the Hub API marks its view `stale` from the push's age. A push that fails (the transport throws, or the answer is not 2xx) is one stderr line, `HUB_AGENT_PUSH_FAILED <message>`, and is never retried on a timer: it stays owed, and the next change notification or the next request to the agent pushes again, with the next `seq`. Two pushes never run at once. The agent has no route to receive a push: `/agent/push` is the Hub API's.
+
+**Replication (Story 10.1).** The push's `events` replicates this host's Event Log to the Hub API's `replicas/<host>/<YYYY-MM>.jsonl`, byte-for-byte. The agent keeps no cursor of its own: every 2xx push answer's `replica` reports the sizes it acknowledges, and the agent resumes from them, including at its start. On each trigger the first push carries `status` and `readings` (read once); catch-up rounds carry `null` for both once a push of the trigger has been answered 2xx, and each carries the oldest source month whose complete-line end differs from its acknowledged size — one month per push, at most 256 KiB, until nothing differs. A month whose acknowledged size is past its source end or not at a line start is skipped (one `HUB_AGENT_REPLICA_SKIPPED <month> <code>` line, retried when its acknowledged size changes); a month is never closed. A 409 `HUB_REPLICA_GAP` adopts the answered `size` for the pushed month and the trigger goes on. Pushes stay serialized: no overlap, no timer. `POST /agent/sync` hands the agent the sizes and makes it push (see its body under Request bodies).
 
 ### AgentHealth
 
@@ -730,6 +744,14 @@ The seven Hold routes take the same bodies and answer the same shapes as the Hub
 - `emulators[].resource` always `emulator`
 - `emulators[].deploy_target` always `false`
 - `emulators[].reachability.*` the Pool's Reachability (`unknown`: it has no transport yet)
+
+### AgentSync
+
+`POST /agent/sync` (Story 10.1): the replica sizes were handed over and the agent pushed from them (Story 10.2's `/history` will call it when a range the replica lacks is requested). The body is under "Request bodies". The answer is 200:
+
+- `pushed` `true` when the push it made was answered 2xx and drained what differed, `false` when it failed (it stays owed, as any failed push)
+- `synced` `true` when the drain left every source month replicated (its complete-line end equals its acknowledged size); `false` when the push failed, the Hub API answered no valid replica sizes, or a month was skipped (a bad size in the body is the 400, never a 200)
+- `replica.*` the replica sizes the agent holds after the push, keyed by month; `{}` when it holds none
 
 ## For the v1c module (non-binding)
 
