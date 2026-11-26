@@ -15,6 +15,8 @@ import { createReadings } from './readings.mjs';
 import { createRemotes } from './remotes.mjs';
 import { ROUTES, handle } from './routes.mjs';
 import { createUtilisation, queryUtilisation } from './utilisation.mjs';
+import { lockToResource, utilisation } from '../registry/history.mjs';
+import { readRegistry } from '../registry/store.mjs';
 
 hermetic();
 
@@ -33,15 +35,15 @@ const line = (minutes, who, event, extra = {}) => `${JSON.stringify({ format: 1,
 const track = (minutes, who, resource, to) => line(minutes, who, 'reachability', { resource, from: null, to, checked_at: iso(at(minutes)), reason: 'track' });
 const hold = (minutes, who, event, lock, extra = {}) => line(minutes, who, event, { lock, resource: undefined, hold_kind: 'lease', lease_id: 'l-1', expires_at: null, held_ms: null, ...extra });
 
-function scratch({ hostKey = () => 'linux', request } = {}) {
+function scratch({ hostKey = () => 'linux', request, policy: used = policy } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'hub-api-utilisation-'));
   const env = { PATH: process.env.PATH, HOME: root, HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events'), HUB_ADB_SERVER_PORT: '5037' };
   const clock = { t: NOW };
   const calls = [];
   const errors = [];
-  const readings = createReadings({ env, policy, now: () => clock.t, hostId: 'HUB', hostKey, probe: async () => new Map() });
+  const readings = createReadings({ env, policy: used, now: () => clock.t, hostId: 'HUB', hostKey, probe: async () => new Map() });
   const ctx = {
-    env, policy, routes: ROUTES, now: () => clock.t, hostId: 'HUB', devices: structuredClone(loadDevices({})), qaDevices: () => [], hostKey, inventory: serverUp,
+    env, policy: used, routes: ROUTES, now: () => clock.t, hostId: 'HUB', devices: structuredClone(loadDevices({})), qaDevices: () => [], hostKey, inventory: serverUp,
     adbWire: fakeWire({ listed: [] }), sleep: () => Promise.resolve(), log: { out: () => {}, err: text => errors.push(text) }, readings, remotes: createRemotes(),
     history: createHistory(), utilisation: createUtilisation(),
     request: request ?? (async args => { calls.push(structuredClone(args)); return response({ pushed: true, synced: true, replica: args.body.replica }); }),
@@ -282,5 +284,76 @@ test('queryUtilisation is the whole of it: the injected Pool size and cache are 
     assert.deepEqual(answer.slots.map(slot => slot.slot), ['emulator-1', 'emulator-2', 'emulator-3']);
     assert.deepEqual(answer.resources, [], 'only the Registry\'s Resources have a row');
     assert.equal(read, 1);
+  } finally { s.cleanup(); }
+});
+
+test('the route reads the probe max age from the policy: a probe reading holds for registry.reachability_max_age_s', async () => {
+  const wide = structuredClone(policy);
+  wide.registry.reachability_max_age_s = 600;
+  const s = scratch({ policy: wide });
+  try {
+    s.write('2026-11', line(-30, 'HUB', 'reachability', { resource: 's26', from: null, to: 'reachable', checked_at: iso(at(-30)), reason: 'probe' }));
+    classes(s.resource(await s.utilisation(), 's26'), { idle: 600_000, unknown: m(60) - 600_000 });
+  } finally { s.cleanup(); }
+});
+
+test('warm cache, two requests at once: each appended Hold is folded exactly once', async () => {
+  const s = scratch();
+  try {
+    const pair = (from, to, id) => [hold(from, 'HUB', 'acquire', 'adb', { lease_id: id, expires_at: iso(at(to)) }), hold(to, 'HUB', 'release', 'adb', { lease_id: id, held_ms: m(to - from) })];
+    s.write('2026-11', track(-60, 'HUB', 's26', 'reachable'), ...pair(-40, -30, 'l-1'));
+    await s.utilisation();
+    assert.equal(s.ctx.utilisation.sources.get('linux').timeline.held.get('adb').length, 1);
+    s.write('2026-11', ...pair(-20, -10, 'l-2'), ...pair(-8, -5, 'l-3'));
+    const [a, b] = await Promise.all([s.utilisation(), s.utilisation()]);
+    assert.equal(s.ctx.utilisation.sources.get('linux').timeline.held.get('adb').length, 3);
+    classes(s.resource(a, 's26'), { idle: m(60) - m(23), held: m(23) });
+    assert.deepEqual(a.body, b.body);
+  } finally { s.cleanup(); }
+});
+
+test('a read error that is not a vanished position forgets that host, fails the request, and the next one rebuilds the full history', async () => {
+  const s = scratch();
+  try {
+    const first = track(-60, 'HUB', 's26', 'reachable');
+    const rest = [hold(-40, 'HUB', 'acquire', 'adb', { expires_at: iso(at(-30)) }), hold(-30, 'HUB', 'release', 'adb', { held_ms: m(10) })];
+    s.write('2026-11', first, ...rest);
+    await s.utilisation();
+    assert.equal(s.ctx.utilisation.sources.has('linux'), true);
+    // The month file becomes a directory: reading it fails with EISDIR, which is no vanished position.
+    const text = readFileSync(s.file('2026-11'), 'utf8');
+    rmSync(s.file('2026-11'));
+    mkdirSync(s.file('2026-11'));
+    const failed = await s.utilisation();
+    assert.equal(failed.status, 500);
+    assert.equal(s.ctx.utilisation.sources.has('linux'), false);
+    rmSync(s.file('2026-11'), { recursive: true });
+    writeFileSync(s.file('2026-11'), text);
+    const answer = await s.utilisation();
+    assert.equal(answer.status, 200);
+    classes(s.resource(answer, 's26'), { idle: m(50), held: m(10) });
+  } finally { s.cleanup(); }
+});
+
+test('the route answers exactly what the pure utilisation() gives over the same events', async () => {
+  const s = scratch();
+  try {
+    const key = 'o--a--1';
+    const claim = (minutes, event, extra = {}) => line(minutes, 'HUB', event, { lock: 'adb', hold_kind: 'reservation', run_key: key, reserved_at: iso(at(-50)), expires_at: iso(at(-10)), ...extra });
+    s.write('2026-11',
+      track(-60, 'HUB', 's26', 'reachable'), track(-60, 'HUB', 's24', 'reachable'), claim(-50, 'claim'),
+      hold(-40, 'HUB', 'acquire', 'adb', { expires_at: iso(at(-20)) }), hold(-35, 'HUB', 'extend', 'adb', { expires_at: iso(at(-15)) }),
+      claim(-30, 'release', { held_ms: m(20) }), hold(-25, 'HUB', 'release', 'adb', { held_ms: m(15) }),
+      line(-20, 'HUB', 'reachability', { resource: 's24', from: 'reachable', to: 'unknown', checked_at: null, reason: 'track-lost' }),
+      hold(-30, 'HUB', 'acquire', 'emulator-1', { lease_id: 'e-1' }), hold(-10, 'HUB', 'release', 'emulator-1', { lease_id: 'e-1', held_ms: m(20) }));
+    const answer = await s.utilisation();
+    assert.equal(answer.status, 200);
+    const events = readFileSync(s.file('2026-11'), 'utf8').split('\n').filter(Boolean).map(text => JSON.parse(text));
+    const registry = readRegistry({ env: s.env, devices: s.ctx.devices, qaDevices: s.ctx.qaDevices });
+    const expected = utilisation(events, registry, lockToResource(registry), { from: at(-60), to: NOW }, { maxAgeS: policy.registry.reachability_max_age_s, syncedThrough: { linux: NOW, mac: NOW }, slots: ['emulator-1', 'emulator-2'] });
+    assert.deepEqual(answer.body.resources, expected.resources);
+    assert.deepEqual(answer.body.slots, expected.slots);
+    assert.equal(answer.body.window_ms, expected.window_ms);
+    assert.ok(s.resource(answer, 's26').ms.held > 0 && s.resource(answer, 's26').ms.idle_while_reserved > 0);
   } finally { s.cleanup(); }
 });

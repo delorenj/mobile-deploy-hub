@@ -212,3 +212,29 @@ test('parseUtilisationQuery: from is required, to defaults to and is clipped to 
   refused('from=2026-11-26T12:00:00Z', 'bad-range');
   refused('from=2026-11-27', 'bad-range');
 });
+
+test('mergeTimelines: an open Hold or claim two hosts both have joins as its interval instead of being dropped', () => {
+  const a = createTimeline();
+  const b = createTimeline();
+  const claim = (minutes, extra) => reservation(minutes, 'claim', 'adb', { reserved_at: iso(at(minutes)), ...extra });
+  for (const event of [track(-60, 's26', 'reachable'), hold(-50, 'acquire', 'adb', { expires_at: iso(at(-40)) }), claim(-55, { expires_at: iso(at(-50)) })]) foldEvent(a, event);
+  for (const event of [hold(-20, 'acquire', 'adb', { lease_id: 'l-2', expires_at: iso(at(-10)) }), claim(-30, { expires_at: iso(at(-25)) })]) foldEvent(b, event);
+  const merged = mergeTimelines([a, b]);
+  assert.equal(merged.held.get('adb').length, 1, 'the second open Hold is a closed interval');
+  ms(row(sharesOf(merged, registry, lockToResource(registry), WINDOW), 's26'), { idle: m(30), held: m(20), idle_while_reserved: m(10) });
+});
+
+test('a reading starts at min(checked_at, ts), and readings logged out of order are sorted by when they were taken', () => {
+  const timeline = createTimeline();
+  // A probe logged at -30 but taken at -31 holds from -31 (10 minutes with a 600 s max age).
+  foldEvent(timeline, ev(-30, 'reachability', { resource: 's26', from: null, to: 'reachable', checked_at: iso(at(-31)), reason: 'probe' }));
+  // A checked_at after the log time is never believed: it starts at ts.
+  foldEvent(timeline, ev(-20, 'reachability', { resource: 'res-pixel', from: null, to: 'reachable', checked_at: iso(at(-10)), reason: 'track' }));
+  // Logged in the reverse order of their checked_at: the later-taken reading (offline, taken -20) wins from -20.
+  foldEvent(timeline, ev(-10, 'reachability', { resource: 's24', from: null, to: 'offline', checked_at: iso(at(-20)), reason: 'track' }));
+  foldEvent(timeline, ev(-5, 'reachability', { resource: 's24', from: null, to: 'reachable', checked_at: iso(at(-30)), reason: 'track' }));
+  const answer = sharesOf(timeline, registry, lockToResource(registry), WINDOW, { maxAgeS: 600 });
+  ms(row(answer, 's26'), { idle: m(10), unknown: m(50) });
+  ms(row(answer, 'res-pixel'), { idle: m(20), unknown: m(40) });
+  ms(row(answer, 's24'), { idle: m(10), away: m(20), unknown: m(30) });
+});

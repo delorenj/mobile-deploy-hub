@@ -328,8 +328,15 @@ export function mergeTimelines(timelines) {
     for (const name of ['held', 'reserved']) {
       for (const [lock, intervals] of timeline[name]) out[name].set(lock, [...(out[name].get(lock) ?? []), ...intervals]);
     }
-    for (const [lock, open] of timeline.open) if (!out.open.has(lock)) out.open.set(lock, open);
-    for (const [key, claim] of timeline.claims) if (!out.claims.has(key)) out.claims.set(key, claim);
+    // A second open Hold on a lock (or open claim of a key) joins as the interval it stands for: its start to its expiry.
+    for (const [lock, open] of timeline.open) {
+      if (!out.open.has(lock)) out.open.set(lock, open);
+      else out.held.set(lock, [...(out.held.get(lock) ?? []), [open.start, open.expires]]);
+    }
+    for (const [key, claim] of timeline.claims) {
+      if (!out.claims.has(key)) out.claims.set(key, claim);
+      else out.reserved.set(claim.lock, [...(out.reserved.get(claim.lock) ?? []), [claim.start, claim.end]]);
+    }
     for (const [resource, readings] of timeline.readings) {
       out.readings.set(resource, [...(out.readings.get(resource) ?? []), ...readings].sort((a, b) => a.at - b.at));
     }

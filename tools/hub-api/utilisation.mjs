@@ -64,9 +64,9 @@ export async function queryUtilisation({
 }) {
   const at = now();
   const query = parseUtilisationQuery(params, { at });
+  const records = registry();
   const { through, partial } = await coverPeers({ own, env, windowEnd: query.to, at, peers, replicas, history, transport, now, signal, contact, failure, log });
   if (signal?.aborted === true) throw abortError(signal);
-  const records = registry();
   const sources = await Promise.all(HOST_KEYS.map(host => refreshSource({ cache, host, root: host === own ? eventDir(env) : replicaDir(env, host), env, hostId: host === own ? hostId : undefined, log })));
   if (signal?.aborted === true) throw abortError(signal);
 
