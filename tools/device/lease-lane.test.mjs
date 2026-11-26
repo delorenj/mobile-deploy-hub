@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadDevices } from '../ci/lib/devices.mjs';
@@ -253,6 +253,57 @@ test('the Mac\'s own CLI takes, finds and releases the lane in-process: the loca
     assert.equal(mac.code, 0, mac.err.join('\n'));
     assert.equal(w.owner().lease_id, 'l-dddddddddddd');
     assert.deepEqual(w.devicectlCalls, [], 'lease mac needs only the host');
+  } finally { w.cleanup(); }
+});
+
+const PROBE = "require('node:fs').writeFileSync(process.argv[1], JSON.stringify({ env: process.env, held: require('node:fs').existsSync(process.argv[2]) }))";
+
+test('the Mac\'s own `run ipad|mac -- <cmd>`: ipad needs the iPad, the child gets HUB_DEVICE and no ANDROID_*, and the lock is released after', async () => {
+  const w = world({ ipad: 'offline' });
+  try {
+    const out = join(w.root, 'child.json');
+    const lockFile = join(w.macEnv.HUB_LOCK_DIR, 'mac-ios.lock');
+    const argv = word => ['run', word, '--for', '10m', '--why', 'run proof', '--holder', 'jarad', '--', process.execPath, '-e', PROBE, out, lockFile];
+    const away = await w.macCli(argv('ipad'));
+    assert.equal(away.code, 75);
+    assert.deepEqual(away.out, ['HUB_DEVICE_AWAY ipad']);
+    assert.equal(w.macLocks(), false, 'no lock was written');
+    assert.equal(existsSync(out), false, 'the child never ran');
+
+    w.state.ipad = 'reachable';
+    const ran = await w.macCli(argv('ipad'));
+    assert.equal(ran.code, 0, ran.err.join('\n'));
+    const seen = JSON.parse(readFileSync(out, 'utf8'));
+    assert.equal(seen.env.HUB_DEVICE, 'ios-lane');
+    assert.ok(seen.env.HUB_LEASE_ID);
+    assert.deepEqual(Object.keys(seen.env).filter(key => key.startsWith('ANDROID_')), []);
+    assert.equal(seen.held, true, 'the lane was held while the child ran');
+    assert.equal(w.owner(), null, 'and released afterwards');
+
+    w.state.ipad = 'offline';
+    w.devicectlCalls.length = 0;
+    rmSync(out);
+    const mac = await w.macCli(argv('mac'));
+    assert.equal(mac.code, 0, mac.err.join('\n'));
+    assert.equal(JSON.parse(readFileSync(out, 'utf8')).env.HUB_DEVICE, 'ios-lane');
+    assert.deepEqual(w.devicectlCalls, [], 'run mac needs only the host');
+  } finally { w.cleanup(); }
+});
+
+test('the Mac agent finds a lane Lease by its id with no Resource named: GET /leases/{id}, extend and release', async () => {
+  const w = world();
+  try {
+    const taken = await handle({ method: 'POST', url: '/leases', body: { resource: 'ipad', for_ms: 30 * MIN, why: 'x', holder: 'jarad', id: ID } }, w.mac);
+    assert.equal(taken.status, 200, JSON.stringify(taken.body));
+    const read = await handle({ method: 'GET', url: `/leases/${ID}` }, w.mac);
+    assert.equal(read.status, 200, JSON.stringify(read.body));
+    assert.equal(read.body.lock, 'mac-ios');
+    const extended = await handle({ method: 'POST', url: `/leases/${ID}/extend`, body: { for_ms: 5 * MIN, holder: 'jarad' } }, w.mac);
+    assert.equal(extended.status, 200, JSON.stringify(extended.body));
+    const released = await handle({ method: 'POST', url: `/leases/${ID}/release`, body: { holder: 'jarad' } }, w.mac);
+    assert.equal(released.status, 200, JSON.stringify(released.body));
+    assert.equal(released.body.outcome, 'released');
+    assert.equal(w.owner(), null);
   } finally { w.cleanup(); }
 });
 

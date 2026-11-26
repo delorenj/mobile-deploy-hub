@@ -689,15 +689,14 @@ async function reachableMembers(members, ctx, statesOf = null) {
 }
 
 // `options.requireReachable` (a take that needs its one Resource's device reachable): the lane is read now through devicectl (`laneReachability`), a
-// phone through the service's own cache (`options.readingsOf`, no adb on a request path; without one nothing is checked). Anything but `reachable`
+// phone through the service's own cache (`options.readingsOf`, no adb on a request path; without one it reads `unknown`). Anything but `reachable`
 // is HUB_DEVICE_AWAY (503, exit 75) with `reason` the state, before anything is written.
 async function mustBeReachable(entry, options, ctx) {
   let state;
   if (isLane(entry)) state = await laneReachability(ctx);
-  else if (options.readingsOf) state = (await options.readingsOf([entry]))?.get?.(entry.device) ?? REACHABILITY.unknown;
-  else return;
+  else state = (options.readingsOf ? (await options.readingsOf([entry]))?.get?.(entry.device) : null) ?? REACHABILITY.unknown;
   if (state === REACHABILITY.reachable) return;
-  throw Object.assign(failure('HUB_DEVICE_AWAY', `${entry.device} reads ${state}: this take needs it reachable (--no-connect takes the lock without it)`), { status: 503, reason: state });
+  throw Object.assign(failure('HUB_DEVICE_AWAY', `${entry.device} reads ${state}: this take needs it reachable (without require_reachable, --no-connect on the CLI, it takes the lock only)`), { status: 503, reason: state });
 }
 
 // One take for every kind of target: a phone, the `phone` Pool (an ordered try under one Pool request) or an emulator.
@@ -1342,7 +1341,7 @@ export function requestLocks(resource, ctx) {
   const env = ctx.env ?? process.env;
   if (resource === EMULATOR) return [GATE];
   const fleet = ctx.fleet ?? loadFleet(env, { warn: ctx.warn });
-  if (resource === PHONE) return fleet.map(phone => phone.lock);
+  if (resource === PHONE) return fleet.filter(phone => !isLane(phone)).map(phone => phone.lock);
   const phone = fleet.find(entry => entry.lock === resource || resourceOf(entry.lock) === resource || entry.device === resource);
   if (phone) return [phone.lock];
   const record = readRegistry({ env, qaDevices: () => [], warn: ctx.warn }).resources
