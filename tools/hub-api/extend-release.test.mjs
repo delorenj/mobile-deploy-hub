@@ -310,10 +310,17 @@ test('the bodies are checked before anything is read: reasons, and the actor def
     assert.deepEqual(await reasonOf('/leases/x-1/release', { holder: 'a', for_ms: 1 }), [400, 'bad-body']);
     assert.deepEqual(await reasonOf('/leases/x-1/release', { actor: [] }), [400, 'bad-actor']);
     assert.deepEqual(await reasonOf('/leases/x-1/release', {}), [400, 'no-holder']);
+    // The optional `resource` (Story 9.3) routes the call, so a malformed one is refused, never answered from the wrong host.
+    for (const bad of [7, ' ', '', null, ['s24']]) {
+      assert.deepEqual(await reasonOf('/leases/x-1/extend', { for_ms: MIN, holder: 'a', resource: bad }), [400, 'bad-resource'], JSON.stringify(bad));
+      assert.deepEqual(await reasonOf('/leases/x-1/release', { holder: 'a', resource: bad }), [400, 'bad-resource'], JSON.stringify(bad));
+    }
     // Neither id is looked up before the body is right, and a bad body writes nothing.
     assert.deepEqual(s.events(), []);
     assert.deepEqual(checkExtendBody({ for_ms: 5, actor: { holder: 'a', via: 'api' } }), { forMs: 5, holder: null, actor: { holder: 'a', via: 'api' }, override: null });
     assert.deepEqual(checkReleaseBody({ holder: 'h' }), { holder: 'h', actor: null });
+    assert.deepEqual(checkExtendBody({ for_ms: 5, holder: 'h', resource: 'ios-lane' }), { forMs: 5, holder: 'h', actor: null, override: null, resource: 'ios-lane' });
+    assert.deepEqual(checkReleaseBody({ holder: 'h', resource: 's24' }), { holder: 'h', actor: null, resource: 's24' });
     assert.equal(ROUTES.filter(route => /\/leases\/\{id\}\/(extend|release)$/.test(route.path)).length, 2);
     // A GET on either is 405 with Allow: POST.
     const get = await s.api('/leases/x-1/extend', undefined, 'GET');

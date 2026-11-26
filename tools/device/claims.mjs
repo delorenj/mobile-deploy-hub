@@ -1110,9 +1110,9 @@ export function extendHeld(id, { forMs, actor = null, override = null }, ctx) {
 // The new owner record alone (the CLI's v1a shape).
 export const extend = (id, options, ctx) => extendHeld(id, options, ctx).record;
 
-const EXTEND_BODY_KEYS = Object.freeze(['for_ms', 'holder', 'actor', 'override']);
+const EXTEND_BODY_KEYS = Object.freeze(['for_ms', 'holder', 'actor', 'override', 'resource']);
 const OVERRIDE_KEYS = Object.freeze(['why', 'actor']);
-const RELEASE_BODY_KEYS = Object.freeze(['holder', 'actor']);
+const RELEASE_BODY_KEYS = Object.freeze(['holder', 'actor', 'resource']);
 
 // The `actor` of a body, as `checkActor` writes it (null when absent), with the same refusal as a lease body.
 function bodyActor(body) {
@@ -1123,7 +1123,15 @@ function bodyActor(body) {
   return actor;
 }
 
-// Checks the body of a service's extend into `{forMs, holder, actor, override}` (`holder`, `actor` and `override` null when absent;
+// The optional `resource` of an extend, release or force-release body (Story 9.3): the Resource the Lease is on, the one thing a front door
+// can route by (the Lease id names none). A non-empty string, or null when absent; anything else is `bad-resource`.
+function bodyResource(body) {
+  if (body.resource === undefined) return null;
+  if (!isText(body.resource)) throw bodyUsage('bad-resource', 'resource must be a non-empty string (the Resource the Lease is on)');
+  return body.resource;
+}
+
+// Checks the body of a service's extend into `{forMs, holder, actor, override, resource?}` (`holder`, `actor` and `override` null when absent, `resource` absent;
 // `override` is `{why, actor}`, its `actor` null when absent: the caller defaults it to the request's). HUB_USAGE with a `reason`,
 // before anything is read: bad-body (not an object, or a key outside `for_ms`, `holder`, `actor`, `override`), bad-for, bad-actor,
 // bad-override (not `{why, actor?}`, an empty `why`, or a bad override actor), no-holder (neither an `actor` nor a `holder`).
@@ -1145,18 +1153,20 @@ export function checkExtendBody(body) {
     }
     override = { why: given.why, actor: by };
   }
+  const resource = bodyResource(body);
   if (actor === null && !isText(body.holder)) throw bodyUsage('no-holder', 'say who is extending: an actor or a holder');
-  return { forMs: body.for_ms, holder: body.holder ?? null, actor, override };
+  return { forMs: body.for_ms, holder: body.holder ?? null, actor, override, ...(resource === null ? {} : { resource }) };
 }
 
-// Checks the body of a service's release into `{holder, actor}` (both null when absent). bad-body (not an object, or a key outside
-// `holder`, `actor`), bad-actor, no-holder (neither an `actor` nor a `holder`).
+// Checks the body of a service's release into `{holder, actor, resource?}` (`holder` and `actor` null when absent, `resource` absent). bad-body (not an object, or a key outside
+// `holder`, `actor`, `resource`), bad-actor, bad-resource, no-holder (neither an `actor` nor a `holder`).
 export function checkReleaseBody(body) {
   if (body === null || typeof body !== 'object' || Array.isArray(body)) throw bodyUsage('bad-body', 'the body must be a JSON object');
   for (const key of Object.keys(body)) if (!RELEASE_BODY_KEYS.includes(key)) throw bodyUsage('bad-body', `the body has no key "${key}" (${RELEASE_BODY_KEYS.join(', ')})`);
   const actor = bodyActor(body);
+  const resource = bodyResource(body);
   if (actor === null && !isText(body.holder)) throw bodyUsage('no-holder', 'say who is releasing: an actor or a holder');
-  return { holder: body.holder ?? null, actor };
+  return { holder: body.holder ?? null, actor, ...(resource === null ? {} : { resource }) };
 }
 
 // The context a service action runs in: the environment without `GITHUB_*` (as a take), the fleet, the policy and the clocks.
@@ -1333,7 +1343,7 @@ export function cancel(id, input, ctx) {
 
 // ---- force-release a Lease (Story 7.6) ----
 
-const FORCE_RELEASE_BODY_KEYS = Object.freeze(['why', 'holder', 'actor']);
+const FORCE_RELEASE_BODY_KEYS = Object.freeze(['why', 'holder', 'actor', 'resource']);
 
 // A force-release's `why`: missing is `no-why`, anything but a non-empty string `bad-why` (HUB_USAGE, before anything is read).
 function checkWhy(why) {
@@ -1342,16 +1352,17 @@ function checkWhy(why) {
   return why;
 }
 
-// Checks the body of a service's force-release into `{why, holder, actor}` (`holder` and `actor` null when absent). HUB_USAGE with a `reason`,
-// before anything is read: bad-body (not an object, or a key outside `why`, `holder`, `actor`), no-why, bad-why, bad-actor, no-holder (neither
+// Checks the body of a service's force-release into `{why, holder, actor, resource?}` (`holder` and `actor` null when absent, `resource` absent). HUB_USAGE with a `reason`,
+// before anything is read: bad-body (not an object, or a key outside `why`, `holder`, `actor`, `resource`), no-why, bad-why, bad-actor, bad-resource, no-holder (neither
 // an `actor` nor a `holder`). There is no holder check on the Lease and no confirmation step (NFR-6).
 export function checkForceReleaseBody(body) {
   if (body === null || typeof body !== 'object' || Array.isArray(body)) throw bodyUsage('bad-body', 'the body must be a JSON object');
   for (const key of Object.keys(body)) if (!FORCE_RELEASE_BODY_KEYS.includes(key)) throw bodyUsage('bad-body', `the body has no key "${key}" (${FORCE_RELEASE_BODY_KEYS.join(', ')})`);
   const why = checkWhy(body.why);
   const actor = bodyActor(body);
+  const resource = bodyResource(body);
   if (actor === null && !isText(body.holder)) throw bodyUsage('no-holder', 'say who is force-releasing: an actor or a holder');
-  return { why, holder: body.holder ?? null, actor };
+  return { why, holder: body.holder ?? null, actor, ...(resource === null ? {} : { resource }) };
 }
 
 // The members of a `job:` id as forceReleaseJobError takes them: the repo and run it names (a local run's `local` repo and `local-<pid>` run

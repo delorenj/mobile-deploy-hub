@@ -12,8 +12,9 @@ const oneLine = value => String(value?.message ?? value).replace(/\s+/g, ' ').tr
 
 // `createKnown({env, devices, qaDevices, log})` -> `{note, current, qaIds, refresh}`.
 //   note(answer)        keeps a Hub API `GET /resources` answer (`{rev, source, resources}`); anything else is ignored.
-//   current()           `{resources, pools, words}`: the noted answer's Resources, else the seed's; `pools` (the seed's, by name) and
-//                       `words` (`[{id, words}]` of the seed's Resources that have any) always from the seed.
+//   current()           `{rev, seeded, resources, pools, words}`: the noted answer's Resources and `rev` (0 for the seed, Story 9.3), else the seed's;
+//                       `seeded` the ids of the seed's Resources (a forward that carries `rev: 0` is accepted only for one of them); `pools`
+//                       (the seed's, by name) and `words` (`[{id, words}]` of the seed's Resources that have any) always from the seed.
 //   qaIds()             the ids of the current Resources marked `dedicated_qa`.
 //   refresh({request})  one `GET /resources` through `request({host: 'linux', method, path})` (tools/hub-client.mjs `request`); resolves
 //                       true when an answer was noted. It never rejects: a failure is one `HUB_AGENT_REGISTRY_FAILED <message>` line.
@@ -40,6 +41,8 @@ export function createKnown({ env = process.env, devices, qaDevices, log = {} } 
     current() {
       const base = seedOf();
       return {
+        rev: Number.isSafeInteger(answer?.rev) && answer.rev >= 0 ? answer.rev : 0,
+        seeded: base.resources.map(resource => resource.id),
         resources: answer?.resources ?? base.resources,
         pools: base.pools,
         words: base.resources.filter(resource => Array.isArray(resource.words) && resource.words.length > 0).map(resource => ({ id: resource.id, words: [...resource.words] })),

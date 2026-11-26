@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 // The deploy path's entry points (relative to the repo root): a directory stands for its non-test .mjs files, a file for itself.
 export const DEPLOY_PATH = Object.freeze(['tools/ci/commands', 'tools/catchup', 'tools/ci/hub.mjs', 'tools/ci/macwatch.mjs', 'tools/deploy.mjs']);
 // What the deploy path must never reach: a file, or a directory (trailing slash) with everything under it.
-export const FORBIDDEN = Object.freeze(['tools/device/claims.mjs', 'tools/registry/', 'tools/hub-api/', 'tools/host-agent/', 'tools/hub-client.mjs']);
+export const FORBIDDEN = Object.freeze(['tools/device/claims.mjs', 'tools/device/forward.mjs', 'tools/registry/', 'tools/hub-api/', 'tools/host-agent/', 'tools/hub-client.mjs']);
 
 const repoRoot = resolve(fileURLToPath(new URL('../', import.meta.url)));
 
@@ -61,7 +61,7 @@ export function violations(root, { deployPath = DEPLOY_PATH, forbidden = FORBIDD
 test('the deploy path tables are frozen data that name the v1b code', () => {
   assert.ok(Object.isFrozen(DEPLOY_PATH) && Object.isFrozen(FORBIDDEN));
   assert.deepEqual([...DEPLOY_PATH], ['tools/ci/commands', 'tools/catchup', 'tools/ci/hub.mjs', 'tools/ci/macwatch.mjs', 'tools/deploy.mjs']);
-  for (const path of ['tools/device/claims.mjs', 'tools/registry/', 'tools/hub-api/', 'tools/host-agent/', 'tools/hub-client.mjs']) assert.ok(FORBIDDEN.includes(path), path);
+  for (const path of ['tools/device/claims.mjs', 'tools/device/forward.mjs', 'tools/registry/', 'tools/hub-api/', 'tools/host-agent/', 'tools/hub-client.mjs']) assert.ok(FORBIDDEN.includes(path), path);
 });
 
 test('the live deploy path imports nothing forbidden, directly or transitively', () => {

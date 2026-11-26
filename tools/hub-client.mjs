@@ -18,6 +18,12 @@
 // request, so the far service records a disconnect and a forwarded wait is never left as a ghost waiter. Any failure of the ssh leg is
 // `HUB_DEVICE_AWAY` (exit 75, reason `host-unreachable`). No retry, and no timer but the call's heartbeat, the relay's idle timeout and the bound kill.
 //
+// `forward()` (Story 9.3, AD-48) is a Hold action sent to the host that owns the Resource: the public route, with header `X-Hub-Forwarded: <door>`
+// (the front door that forwarded it: `cli`, `api` or `host-agent`) and the carried Resource in the body, through `request()` (an ssh relay word
+// carries the door to the peer). It answers `{status, body}` for a 2xx, the far side's own problem as an error with `api: true`, a far host that
+// does not answer as `HUB_DEVICE_AWAY` (exit 75, `status: 503`) and an answer that is no problem as `HUB_API_UNKNOWN` (`status: 502`). It never
+// retries and never forwards again: the receiver decides (tools/device/forward.mjs).
+//
 // The deploy path never imports this file (tools/deploy-path.test.mjs). It does not import claims.mjs (which imports it) statically, so the
 // exit codes of its own errors are written here and held equal to the exit table by claims.test.mjs (a thrown error's `.exit` against EXIT_CODES);
 // the relay and the default `hostKey` load claims.mjs at run time only.
@@ -123,11 +129,14 @@ export async function call({ method = 'GET', path, body, waitMs = 0 }, { policy,
 export const PEER_NODE = '.local/share/mise/installs/node/24/bin/node';
 export const PEER_SCRIPT = '.local/share/mobile-deploy-hub/current/tools/hub-client.mjs';
 export const HOST_KEYS = Object.freeze(['linux', 'mac']);
+// The header a forward carries, and the front doors that may set it (Story 9.3, AD-48): the CLI, the Hub API and the Host Agent.
+export const FORWARD_HEADER = 'X-Hub-Forwarded';
+export const FORWARD_DOORS = Object.freeze(['cli', 'api', 'host-agent']);
 export const RELAY_METHODS = Object.freeze(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']);
 // ssh outlives the call's own bound by this much before it is killed.
 export const SSH_KILL_GRACE_MS = 10_000;
 export const SSH_PATH = '/usr/bin/ssh';
-export const RELAY_USAGE = 'usage: hub-client.mjs relay <GET|POST|PUT|PATCH|DELETE> </path>   (body: first stdin line, then heartbeat newlines)\n';
+export const RELAY_USAGE = 'usage: hub-client.mjs relay <GET|POST|PUT|PATCH|DELETE> </path> [<cli|api|host-agent>]   (body: first stdin line, then heartbeat newlines; the optional last word is the forwarding door)\n';
 const NO_BODY = new Set([204, 205, 304]);
 // Headers that describe the relay's own hop or the encoding of bytes `fetch` already decoded; the body is sent exactly, so they are not carried.
 const HOP_HEADERS = new Set(['connection', 'keep-alive', 'transfer-encoding', 'content-encoding', 'content-length']);
@@ -145,7 +154,8 @@ const RELAY_FETCH_FAILED = 'RELAY_FETCH_FAILED';
 export const quoteWord = word => `'${String(word).replaceAll("'", "'\\''")}'`;
 
 // The one remote command: single-quoted words joined by spaces.
-export const remoteCommand = ({ method, path }, { node = PEER_NODE, script = PEER_SCRIPT } = {}) => [node, script, 'relay', String(method).toUpperCase(), path].map(quoteWord).join(' ');
+// A forward appends its door as the last word (`relay POST /leases api`); a plain call has none.
+export const remoteCommand = ({ method, path, door }, { node = PEER_NODE, script = PEER_SCRIPT } = {}) => [node, script, 'relay', String(method).toUpperCase(), path, ...(door === undefined || door === null ? [] : [door])].map(quoteWord).join(' ');
 
 // The one ssh option set (AD-26), then the alias and the command.
 export const sshArgv = (alias, command, policy) => [
@@ -185,9 +195,9 @@ function parseHead(line) {
 
 // A call to the peer over ssh: resolves with the `Response` the relay wrote, rejects with the peer-side fetch failure as a TypeError (cause.code)
 // or with HUB_DEVICE_AWAY for anything the ssh leg does wrong.
-function viaSsh({ host, verb, path, body, bound }, { policy, devices, sshImpl, timers }) {
+function viaSsh({ host, verb, path, body, bound, door, signal }, { policy, devices, sshImpl, timers }) {
   const alias = aliasFor(host, devices);
-  const argv = sshArgv(alias, remoteCommand({ method: verb, path }), policy);
+  const argv = sshArgv(alias, remoteCommand({ method: verb, path, door }), policy);
   // Serialized before ssh is spawned: a body that cannot be JSON is the caller's error, never an AWAY.
   const bodyLine = `${body === undefined ? '' : JSON.stringify(body)}\n`;
   return new Promise((resolve, reject) => {
@@ -197,16 +207,24 @@ function viaSsh({ host, verb, path, body, bound }, { policy, devices, sshImpl, t
     let killer;
     const chunks = [];
     let stderr = '';
+    // The caller's signal ends the call: ssh is killed (its stdin closes, so the far relay aborts its request) and the call rejects with the signal's reason.
+    const onAbort = () => {
+      try { child?.kill(); } catch { /* already gone */ }
+      end(reject, signal.reason ?? new Error('aborted'));
+    };
     const end = (settle, value) => {
       if (settled) return;
       settled = true;
+      signal?.removeEventListener?.('abort', onAbort);
       timers.clearInterval(heartbeat);
       timers.clearTimeout(killer);
       try { child?.stdin?.end(); } catch { /* the pipe is already gone */ }
       settle(value);
     };
     const lost = detail => end(reject, away(host, alias, policy, detail));
+    if (signal?.aborted) { end(reject, signal.reason ?? new Error('aborted')); return; }
     try {
+      signal?.addEventListener?.('abort', onAbort, { once: true });
       child = (sshImpl ?? (args => spawn(SSH_PATH, args, { stdio: ['pipe', 'pipe', 'pipe'] })))(argv);
       child.stdin.on('error', () => {});
       child.stdout.on('data', chunk => { chunks.push(Buffer.from(chunk)); });
@@ -244,34 +262,73 @@ function viaSsh({ host, verb, path, body, bound }, { policy, devices, sshImpl, t
   });
 }
 
-// `request({host, method, path, body, waitMs, budgetMs}, {policy, devices, hostKey, fetchImpl, sshImpl, timers, timeout})` -> `Response`.
+// `request({host, method, path, body, waitMs, budgetMs, forwarded, signal}, {policy, devices, hostKey, fetchImpl, sshImpl, timers, timeout})` -> `Response`.
 // `host` is `linux` or `mac`. This host's own front door is a `fetch` on loopback; the other host is one ssh call to its relay. A same-host
 // failure is the `fetch` error unchanged; no retry here, no classification either: a caller classifies it as it does for `call()`.
-export async function request({ host, method = 'GET', path, body, waitMs = 0, budgetMs = 0 }, seams = {}) {
+// `forwarded` (Story 9.3) is a door (`FORWARD_DOORS`): the loopback fetch carries `X-Hub-Forwarded: <door>` and the ssh relay gets the door as
+// its last word, which sets the same header on its own loopback call. `signal` ends the call: the fetch aborts, ssh is killed and the call
+// rejects with `signal.reason`.
+export async function request({ host, method = 'GET', path, body, waitMs = 0, budgetMs = 0, forwarded, signal: given }, seams = {}) {
   checkKey(host);
+  if (forwarded !== undefined && forwarded !== null && !FORWARD_DOORS.includes(forwarded)) throw usageError(`"${forwarded}" is not a forwarding door (one of ${FORWARD_DOORS.join(', ')})`);
+  const door = forwarded ?? undefined;
   const policy = seams.policy ?? loadPolicy().policy;
   const verb = String(method).toUpperCase();
   const own = await (seams.hostKey ?? defaultHostKey)();
   const bound = boundMs({ waitMs, budgetMs });
   if (host === own) {
     const send = seams.fetchImpl ?? globalThis.fetch;
-    const signal = (seams.timeout ?? (ms => AbortSignal.timeout(ms)))(bound);
-    const init = { method: verb, headers: { accept: 'application/json', ...(body === undefined ? {} : { 'content-type': 'application/json' }) }, signal };
+    const limit = (seams.timeout ?? (ms => AbortSignal.timeout(ms)))(bound);
+    const signal = given ? AbortSignal.any([limit, given]) : limit;
+    const init = { method: verb, headers: { accept: 'application/json', ...(door === undefined ? {} : { [FORWARD_HEADER]: door }), ...(body === undefined ? {} : { 'content-type': 'application/json' }) }, signal };
     if (body !== undefined) init.body = JSON.stringify(body);
     return bounded(send(`http://127.0.0.1:${frontDoorPort(policy, host)}${path}`, init), signal);
   }
   const devices = seams.devices ?? (await import('./ci/lib/devices.mjs')).loadDevices();
-  return viaSsh({ host, verb, path, body, bound }, { policy, devices, sshImpl: seams.sshImpl, timers: seams.timers ?? globalTimers() });
+  return viaSsh({ host, verb, path, body, bound, door, signal: given }, { policy, devices, sshImpl: seams.sshImpl, timers: seams.timers ?? globalTimers() });
 }
 
-// The peer side: `relay({method, path, stdin, stdout, policy, hostKey, fetchImpl, timers})` -> the exit code. stdin line 1 is the JSON body (empty for
+const goneAway = (host, detail) => coded('HUB_DEVICE_AWAY', `the ${host} host did not answer: ${detail}`, { exit: 75, reason: 'host-unreachable', api: false, host, status: 503 });
+
+// `forward({host, method, path, body, door, waitMs, budgetMs, signal}, seams)` -> `{status, body}` (Story 9.3): one Hold action sent to the host
+// that owns the Resource, as `door` (`cli`, `api` or `host-agent`). `seams.request` replaces the transport (`request`; a test's bridge to the other
+// side's `handle()`) and receives the same arguments, and every other seam is `request`'s. A 2xx answer is `{status, body}`; a problem+json answer is
+// the far side's own error (`api: true`, its code, status, exit and reason); a transport failure (the ssh leg, a refused or reset loopback, a
+// timeout, an answer cut short) is `HUB_DEVICE_AWAY` (exit 75, reason `host-unreachable`, `status: 503`); an answer that is neither is
+// `HUB_API_UNKNOWN` (`status: 502`: the action may have applied). An aborted `signal` rejects with its reason. No retry.
+export async function forward({ host, method = 'POST', path, body, door, waitMs = 0, budgetMs = 0, signal } = {}, seams = {}) {
+  const send = seams.request ?? request;
+  const classify = error => {
+    if (signal?.aborted) return signal.reason ?? error;
+    if (error?.code === 'HUB_DEVICE_AWAY') return Object.assign(error, { status: 503 });
+    // A caller's own mistake (a bad host key, a bad door, a body that is not JSON) is not a host that went away.
+    if (typeof error?.code === 'string' && error.code.startsWith('HUB_')) return error;
+    return goneAway(host, String(error?.cause?.code ?? error?.message ?? error).split('\n')[0]);
+  };
+  let status;
+  let type;
+  let text;
+  try {
+    const response = await send({ host, method, path, body, waitMs, budgetMs, forwarded: door, signal }, seams);
+    status = response.status;
+    type = String(response.headers?.get?.('content-type') ?? '');
+    text = await bounded(response.text(), signal);
+  } catch (error) { throw classify(error); }
+  const parsed = parseJson(text);
+  if (status >= 200 && status < 300 && parsed !== undefined) return { status, body: parsed };
+  if (!(status >= 200 && status < 300) && type.includes('application/problem+json') && isObject(parsed) && typeof parsed.code === 'string') throw problemError(parsed, status);
+  throw coded('HUB_API_UNKNOWN', `the ${host} host answered ${status}, which is not a JSON answer or a problem document; the action may have applied`, { status: 502, api: false, host });
+}
+
+// The peer side: `relay({method, path, door, stdin, stdout, policy, hostKey, fetchImpl, timers})` -> the exit code. stdin line 1 is the JSON body (empty for
 // none); every later byte is a heartbeat. stdin EOF, or 3 heartbeat intervals with no byte, aborts the loopback request and the relay writes
 // nothing (exit 1). Otherwise stdout gets one JSON head line and then the raw body.
-export async function relay({ method, path, stdin, stdout, policy: given, hostKey: keyOf, fetchImpl, timers } = {}) {
+export async function relay({ method, path, door, stdin, stdout, policy: given, hostKey: keyOf, fetchImpl, timers } = {}) {
   const emit = (head, bytes) => stdout.write(bytes === undefined ? `${JSON.stringify({ format: 1, ...head })}\n` : Buffer.concat([Buffer.from(`${JSON.stringify({ format: 1, ...head })}\n`), bytes]));
   const refuse = (code, message, exit) => { emit({ error: { code, message } }); return exit; };
   if (!RELAY_METHODS.includes(method)) return refuse('HUB_RELAY_USAGE', `the method must be one of ${RELAY_METHODS.join(', ')}`, 2);
   if (typeof path !== 'string' || !path.startsWith('/') || /[\s\u0000-\u001f\u007f]/.test(path)) return refuse('HUB_RELAY_USAGE', 'the path must start with / and hold no whitespace or control characters', 2);
+  if (door !== undefined && door !== null && !FORWARD_DOORS.includes(door)) return refuse('HUB_RELAY_USAGE', `the door must be one of ${FORWARD_DOORS.join(', ')}`, 2);
   let policy;
   try { policy = given ?? loadPolicy().policy; } catch (error) { return refuse(refusalCode(error), String(error?.message ?? error).split('\n')[0], 1); }
   const clock = timers ?? globalTimers();
@@ -320,7 +377,7 @@ export async function relay({ method, path, stdin, stdout, policy: given, hostKe
   let answer;
   let failure;
   try {
-    const init = { method, headers: { accept: 'application/json', ...(body === undefined ? {} : { 'content-type': 'application/json' }) }, signal: abort.signal };
+    const init = { method, headers: { accept: 'application/json', ...(door ? { [FORWARD_HEADER]: door } : {}), ...(body === undefined ? {} : { 'content-type': 'application/json' }) }, signal: abort.signal };
     if (body !== undefined) init.body = JSON.stringify(body);
     const response = await bounded((fetchImpl ?? globalThis.fetch)(`http://127.0.0.1:${port}${path}`, init), abort.signal);
     answer = { response, bytes: Buffer.from(await bounded(response.arrayBuffer(), abort.signal)) };
@@ -335,14 +392,14 @@ export async function relay({ method, path, stdin, stdout, policy: given, hostKe
   return done(0);
 }
 
-// `main(argv, seams)`: the process entry, `hub-client.mjs relay <method> <path>`. Anything else prints the usage on stderr and is 2.
+// `main(argv, seams)`: the process entry, `hub-client.mjs relay <method> <path> [<door>]`. Anything else prints the usage on stderr and is 2.
 export async function main(argv = [], { stdin = process.stdin, stdout = process.stdout, stderr = process.stderr, ...seams } = {}) {
-  const [verb, method, path, ...rest] = argv;
+  const [verb, method, path, door, ...rest] = argv;
   if (verb !== 'relay' || method === undefined || path === undefined || rest.length > 0) {
     stderr.write(RELAY_USAGE);
     return 2;
   }
-  return relay({ method, path, stdin, stdout, ...seams });
+  return relay({ method, path, ...(door === undefined ? {} : { door }), stdin, stdout, ...seams });
 }
 
 let entry = null;
