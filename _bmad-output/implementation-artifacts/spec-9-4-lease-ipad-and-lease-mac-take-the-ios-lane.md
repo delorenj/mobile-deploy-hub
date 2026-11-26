@@ -2,10 +2,10 @@
 title: 'Story 9.4: `lease ipad` and `lease mac` take the `ios-lane`'
 type: 'feature'
 created: '2026-11-26'
-status: 'in-progress'
+status: 'done'
 baseline_revision: '31bef704a254cea0a428a13c7018dcd51a405c92'
 review_loop_iteration: 0
-followup_review_recommended: false
+followup_review_recommended: true
 context:
   - '{project-root}/_bmad-output/implementation-artifacts/epic-9-context.md'
 warnings: ['oversized']
@@ -93,7 +93,7 @@ The neighbouring level (`belsky-doctrine`) is every lane, by every one of its wo
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `tools/device/claims.mjs`:
+- [x] `tools/device/claims.mjs`:
   - Add `LANE_DEVICE_WORDS = {'ios-lane': ['ipad']}`, `isLane(record)`, `laneEntry(record, policy)` (`{device: name, lock, deploy, name, serial: null, model, kind, words}`), `lanesOf(resources, key)`, `hostLanes(key, {env})` (from the seed of `devices.json`) and `needsDevice(word, entry, {noConnect})`.
   - `resolve`: also match `entry.words`.
   - `take` `case 'phone'`: when `options.requireReachable`, run `mustBeReachable` first. A lane is read with `laneReachability` (`readIpad`). A phone is read with `options.readingsOf` and skipped without one. A lane is taken with `noConnect: true`.
@@ -102,9 +102,9 @@ The neighbouring level (`belsky-doctrine`) is every lane, by every one of its wo
   - `serviceLease`: pass it to `take`. A non-`phone` target with it set is `bad-reachable`.
   - `releaseAny`: skip lanes.
   - `statusView`: use `laneReachability`.
-- [ ] `tools/device/forward.mjs` -- `withPlace` builds a lane through `laneEntry`, with the carried lock.
-- [ ] `tools/hub-api/routes.mjs` -- `serviceContext` passes `ctx.devicectl`.
-- [ ] `tools/device/hub-device.mjs`:
+- [x] `tools/device/forward.mjs` -- `withPlace` builds a lane through `laneEntry`, with the carried lock.
+- [x] `tools/hub-api/routes.mjs` -- `serviceContext` passes `ctx.devicectl`.
+- [x] `tools/device/hub-device.mjs`:
   - `main`: for the Hold verbs on a host whose key is known, set `context.fleet` to the fleet plus `hostLanes(own)`.
   - `lease` and `runCommand`: pass `requireReachable: needsDevice(word, entry, {noConnect})`.
   - `forwardCommand`:
@@ -113,14 +113,14 @@ The neighbouring level (`belsky-doctrine`) is every lane, by every one of its wo
     - For a single carried Resource, run `checkBounds` locally on its `withPlace` entry, so the cap error names `--for <text>`.
     - Set `body.require_reachable = true` only when `needsDevice`.
   - Update the header comment and `USAGE`.
-- [ ] Tests:
+- [x] Tests:
   - New `tools/device/lease-lane.test.mjs`:
     - A linux CLI → bridge → agent `handle()` over a temp Mac dir, covering every matrix row: ipad reachable and not, mac, `--no-connect`, Mac asleep, `--for 2h`, Hub API down (no linux call).
     - The Mac's in-process `lease`/`release`/busy.
     - The FIFO-and-clock test with an iOS `job` and a `hub-job`.
   - Add the `bad-reachable` and `s24` cache gate cases in `tools/hub-api/leases.test.mjs`. Update :382 for `requireReachable`.
   - Rewrite `forward-cli.test.mjs:119`.
-- [ ] `docs/hub-api-contract.md`:
+- [x] `docs/hub-api-contract.md`:
   - `require_reachable` in the `POST /leases` body.
   - Its refusals (`bad-reachable`, `HUB_DEVICE_AWAY` with the state as `reason`).
   - A lane's `env` (`HUB_LEASE_ID`, `HUB_DEVICE`).
@@ -135,6 +135,37 @@ The neighbouring level (`belsky-doctrine`) is every lane, by every one of its wo
 ## Spec Change Log
 
 ## Review Triage Log
+
+### 2026-11-26 — Review pass
+- verdicts: 27 findings — high 0, medium 4, low 12, false 10, maybe-false 1
+- findings:
+  - `[false]` `[reject]` Blind: a Hub API forward may drop `require_reachable` — `forwardHold` (tools/device/forward.mjs) copies `request.body` verbatim before it sets `resource`/`actor`/`id`, so the key travels. The new hub-api/forward.test.mjs case now shows it end to end.
+  - `[low]` `[patch]` Blind: `mustBeReachable` silently passes a phone when there is no `readingsOf` — now the phone reads `unknown` (HUB_DEVICE_AWAY), as the contract says.
+  - `[low]` `[reject]` Blind: reachability is read once before queueing, so a waited take can be granted after the iPad goes away — real, but the spec says to read before any ticket, and an iPad dropping off during a ≤2 min wait is rare. A re-check at grant time needs a release-and-throw branch. The holder releases it like any Lease.
+  - `[low]` `[reject]` Blind: the devicectl read ignores the abort signal and runs once per take — the read is bounded at 10 s by `devicectl(…, 10)`. Threading the signal or caching it adds plumbing for a rare case.
+  - `[false]` `[reject]` Blind: `lease ios-lane` skips the iPad gate while `lease ipad` enforces it, and LANE_DEVICE_WORDS duplicates the seed words — this is intended. The intent's Approach gates only the lane's *device* word, and `mac` and the id need only the host. LANE_DEVICE_WORDS is the device-word subset, not a copy of the word list.
+  - `[medium]` `[patch]` Blind: `run ipad|mac` is untested — grouped with the verification-gap finding below. Mac-side `run ipad` (offline, then reachable) and `run mac` tests were added.
+  - `[false]` `[reject]` Blind: the JSON or API lease view of a lane emits a phantom `adb_port` — `leaseView` and the CLI's `--json` print `device: phone.device` (a string) and `env: leaseExports(...)`, which has no `ANDROID_*` for a lane. The connectPhone `device` object is never printed.
+  - `[false]` `[reject]` Blind: `withPlace`'s `view.words` lookup is dead — `hubView` supplies `words: wordsOf(registry.resources)` (forward.mjs:159,165), so big-chungus' lane entry carries `ipad` and `mac`.
+  - `[low]` `[patch]` Blind: the AWAY message tells an HTTP caller about `--no-connect` — it now reads "(without require_reachable, --no-connect on the CLI, it takes the lock only)".
+  - `[low]` `[reject]` Blind: the lane tests use real `settle(30)` sleeps that may flake — this is the same pattern as the existing mac-ios FIFO test (lease.test.mjs:1095), and the suite is green. Rewriting the harness to poll is more than a direct fix.
+  - `[low]` `[reject]` Blind: docs outside the API contract (README, features.md, the design doc) are not updated — no doc outside the contract claims `lease ipad` is unsupported (grep finds nothing), the contract is the reference for verbs, and the CLI header and USAGE are updated.
+  - `[medium]` `[patch]` Edge: the agent's Hold routes that name nothing (GET /leases/{id}, a bare release, extend or force-release) used a phones-only fleet, so a lane Lease came back 404 on the Mac — the Hold routes now use `holdFleet` (phones plus `lanesOf`), and status keeps `fleetOf`. A test was added: a take through the agent, then GET, extend and release by id.
+  - `[low]` `[reject]` Edge: a queued lane take is granted after a one-shot read — the same root cause as the Blind reachability-race row, rejected on the same grounds.
+  - `[maybe-false]` `[reject]` Edge: a stale cached phone reading may still say `reachable` — whether `ctx.readings.read` downgrades stale readings was not checked. If true, it is only low: the spec specifies the service cache for phones, and the cache already gates `--match`.
+  - `[false]` `[reject]` Edge: `hostLanes` re-reads devices.json, so a missing devices.json breaks every Hold verb — `readRegistry` (tools/registry/store.mjs:93) loads devices.json for the seed on every call too, so `loadFleet` already fails the same way.
+  - `[low]` `[patch]` Edge: the `phone` Pool in `requestLocks` covered the lane's lock once the lane joined the Mac fleet — lanes are now filtered out.
+  - `[false]` `[reject]` Edge: `lease ios-lane` skips the gate — this duplicates the Blind row above, and the behaviour is intended.
+  - `[low]` `[patch]` Edge: the contract says `bad-reachable` is checked "before anything is read", but the Pool-word and emulator case comes after resolve — the contract now says that case follows the word's resolution, with nothing written.
+  - `[medium]` `[patch]` Verification gap: `runCommand`'s lane path (the gate and the exports) has no test — the Mac `run ipad` offline case (75, no lock, the child never runs), the reachable case (`HUB_DEVICE=ios-lane`, no `ANDROID_*`, released after) and `run mac` (no devicectl call) were added in lease-lane.test.mjs.
+  - `[false]` `[reject]` Verification gap (other): the `withPlace` empty-words fallback on a peerView host is unexercised — only two host keys exist. The Mac resolves its own lane through `hostLanes` (seed words), and big-chungus through `hubView` words. No host reaches the fallback for a word lookup.
+  - `[false]` `[reject]` Intent: the production agent's `devicectl` may not reach the lane gate — `startHostAgent` puts `devicectl` in ctx (server.mjs:31), the routes pass it (host-agent/routes.mjs:52), and `serviceContext` now forwards it. The live relay is Story 9.8's check.
+  - `[low]` `[reject]` Intent: a slow-to-answer Mac (connect timeout) is untested — that is 9.3's transport in hub-client.mjs, unchanged here.
+  - `[false]` `[reject]` Intent: "Hub API down" is shown only by zero linux calls — the bridge records and refuses every linux-bound call, so zero calls is the proof that the CLI never asked.
+  - `[low]` `[reject]` Intent: a Mac agent on an older release would refuse `require_reachable` as `bad-body` — the CLI and the agent ship in one hub release. `lease mac` and `--no-connect` are unaffected meanwhile, and the live rollout is Story 9.8's.
+  - `[low]` `[patch]` Intent: the Hub API's own forward (door `api`) of a lane take with `require_reachable` was untested — a case was added in hub-api/forward.test.mjs (offline gives 503 `offline` with nothing written; reachable takes `mac-ios` on the Mac).
+  - `[medium]` `[patch]` Intent: `run` has no lane test — grouped with the verification-gap row, same tests.
+  - `[false]` `[reject]` Intent: the epic's "iPad Reachability" differs from the devicectl read — the iPad's Reachability *is* `readIpad` over `devicectl list devices` on its host, the same read `statusView` uses (now through `laneReachability`).
 
 ## Design Notes
 
@@ -154,3 +185,89 @@ The neighbouring level (`belsky-doctrine`) is every lane, by every one of its wo
 **Commands:**
 - `node --test tools/device/lease-lane.test.mjs tools/device/forward-cli.test.mjs tools/device/forward.test.mjs tools/hub-api/forward.test.mjs tools/hub-api/leases.test.mjs tools/host-agent/server.test.mjs tools/device/hub-device.test.mjs tools/device/lease.test.mjs tools/device/status-view.test.mjs` -- expected: all pass
 - `mise run check` -- expected: actionlint clean, the full suite green
+
+## Auto Run Result
+
+Status: done
+
+**Summary.** `hub-device lease ipad` and `lease mac` now take the `ios-lane` (lock `mac-ios`, with the 60 min deploy-target cap) from either host.
+- On the Mac the take runs in-process.
+- From big-chungus it is forwarded to the Mac's Host Agent through 9.3's `forwardHold`.
+- The take is the lock only: no adb, and the exports are just `HUB_LEASE_ID` and `HUB_DEVICE='ios-lane'`.
+- `ipad` without `--no-connect` sends the new `POST /leases` key `require_reachable: true`. The Mac then reads the iPad through `devicectl` before writing anything, and any reading other than `reachable` is `HUB_DEVICE_AWAY` (75).
+
+The neighbouring level (`belsky-doctrine`):
+- Lanes are fleet entries of their own host. Every word reaches them from every front door: the CLI, the Hub API and the Host Agent.
+- `require_reachable` works for any single-Resource service take. A phone is checked through the service's reading cache.
+
+**Files changed**
+- `tools/device/claims.mjs`:
+  - New lane helpers: `isLane`, `laneEntry`, `lanesOf`, `hostLanes`, `needsDevice` and `laneReachability`.
+  - `resolve` finds a lane by its words.
+  - `take` has the `mustBeReachable` gate.
+  - A lane's exports have no `ANDROID_*` key.
+  - `checkLeaseBody` and `serviceLease` accept `require_reachable` and refuse bad uses with `bad-reachable`.
+  - `releaseAny` and `requestLocks`' phone Pool skip lanes.
+  - `statusView` reuses the lane read.
+- `tools/device/forward.mjs`: `withPlace` builds a lane through `laneEntry`.
+- `tools/device/hub-device.mjs`:
+  - The Hold verbs see the host's lanes, and `lease` and `run` pass `requireReachable`.
+  - `forwardCommand` now forwards lanes, allows `--no-connect` on a lane, checks the cap before sending and sets `require_reachable`.
+  - The header comment and USAGE are updated.
+- `tools/hub-api/routes.mjs`: `serviceContext` passes the `devicectl` seam.
+- `tools/host-agent/routes.mjs`: the Hold routes that name nothing use `holdFleet` (phones plus lanes), so a lane Lease is found by its id.
+- `docs/hub-api-contract.md` documents:
+  - `require_reachable` and its refusals.
+  - A lane's `env`.
+  - The forwarding of `lease ipad|mac`.
+- Tests:
+  - `tools/device/lease-lane.test.mjs` is new. It covers every matrix row, `run ipad|mac`, and the agent finding a lane by id.
+  - `tools/hub-api/leases.test.mjs` adds the `bad-reachable` cases and the `s24` cache gate.
+  - `tools/hub-api/forward.test.mjs` adds the Hub API's forward of a lane take with `require_reachable`.
+  - `tools/device/forward-cli.test.mjs` rewrites the old 9.4 exclusion test.
+
+**Review findings breakdown.** 27 findings: high 0, medium 4, low 12, false 10, maybe-false 1. Every row is in the Review Triage Log above.
+
+7 entries were patched (2 medium entries, 5 low):
+- medium: the `run` lane tests (3 grouped findings).
+- medium: the agent's Hold-route fleet now includes lanes.
+- low: the phone reads `unknown` when there is no reading cache.
+- low: the AWAY message is worded for both doors.
+- low: the phone Pool in `requestLocks` skips lanes.
+- low: the contract's `bad-reachable` ordering.
+- low: the Hub API forward test.
+
+Nothing was deferred.
+
+Rejected:
+- 10 false, each with its refutation in the log.
+- 1 maybe-false: a stale cached phone reading. It would only be low, because the spec names the cache.
+- 7 low:
+  - The reachability race on a waited take (2 findings): spec-mandated, rare, and a fix would add a branch.
+  - The devicectl abort signal: the read is bounded at 10 s.
+  - Real-sleep test timing: the existing pattern.
+  - Non-contract docs: no stale claim.
+  - The slow-Mac timeout: 9.3's transport.
+  - An older Mac release: one hub release ships both sides, and Story 9.8 covers rollout.
+
+**Follow-up review recommended: true.** This first pass patched two medium entries (and no high), so a follow-up is recommended. The specific risk that has not been reviewed is the review-patch change to `tools/host-agent/routes.mjs`. Its new `holdFleet` adds the Mac's lane to the fleet of every forwarded or gated Hold route that names nothing. That fleet is also what `force-release`, `cancel` and the gated routes scan, and nobody has looked at the patched code.
+
+**Verification**
+- The spec's `node --test` list passes 274/274 after the patches (271/271 before).
+- `mise run check` exits 0: actionlint is clean and the full suite passes 1767/1767 (1764 before the patches).
+- Matrix audit: every row is covered by a test that ran and passed in `lease-lane.test.mjs` or `leases.test.mjs`:
+  - AC1.
+  - The unreachable iPad.
+  - `mac` and `--no-connect`.
+  - An asleep Mac.
+  - The cap.
+  - The Mac in-process (lease, release, extend, busy 76).
+  - AC2 (the FIFO and the Mac clock).
+  - The API body cases.
+
+**Residual risks**
+- `hostLanes` loads `devices.json` on every Hold verb.
+- A forwarded phone lease now gets the local `--for` bounds check, so an over-long `--for` is refused before it is sent.
+- Reachability is a point-in-time read before the queue.
+- Until the Mac runs this hub release, its agent answers `bad-body` to `lease ipad` sent from big-chungus.
+- No operator action is owed. The live end-to-end check is Story 9.8's.
