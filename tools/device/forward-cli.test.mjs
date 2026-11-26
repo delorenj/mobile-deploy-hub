@@ -221,3 +221,59 @@ test('a lease of the iPad lane\'s own words from a linux CLI keeps its v1 behavi
     assert.match(job.err.join('\n'), /HUB_DEVICE_JOB_ID/);
   } finally { job.cleanup(); }
 });
+
+test('a far busy or away problem prints the local HUB_DEVICE_* line with the local exit, not the generic API line', async () => {
+  const busy = await run(TAKE, { answers: { 'POST /leases': problem(409, 'HUB_LOCK_TIMEOUT', { exit: 76, reason: 'busy' }) } });
+  try {
+    assert.equal(busy.code, 76);
+    assert.match(busy.err.join('\n'), /^HUB_DEVICE_BUSY s24 /);
+    assert.deepEqual(busy.out, []);
+  } finally { busy.cleanup(); }
+  const away = await run(TAKE, { answers: { 'POST /leases': problem(503, 'HUB_PHONE_AWAY', { exit: 75, reason: 'away' }) } });
+  try {
+    assert.equal(away.code, 75);
+    assert.deepEqual(away.out, ['HUB_DEVICE_AWAY s24']);
+  } finally { away.cleanup(); }
+  const cancelled = await run(TAKE, { answers: { 'POST /leases': problem(409, 'HUB_LEASE_CANCELLED', { exit: 1, reason: 'cancelled' }) } });
+  try {
+    assert.equal(cancelled.code, 1);
+    assert.match(cancelled.err.join('\n'), /^HUB_DEVICE_CANCELLED s24 /);
+  } finally { cancelled.cleanup(); }
+});
+
+test('a bare release or extend takes the Resource from $HUB_DEVICE when the id is $HUB_LEASE_ID, and forwards', async () => {
+  const env = { HUB_LEASE_ID: 'l-aaaaaaaaaaaa', HUB_DEVICE: 's24' };
+  const released = await run(['release', '--holder', 'jarad'], { env, resourcesRev: 2, answers: { 'POST /leases/l-ID/release': json(200, { lease_id: 'l-aaaaaaaaaaaa', outcome: 'released', resource: 's24', lock: 's24', device: 's24' }) } });
+  try {
+    assert.equal(released.code, 0, released.err.join('\n'));
+    assert.deepEqual(released.out, ['HUB_DEVICE_RELEASED s24 l-aaaaaaaaaaaa']);
+    assert.deepEqual([released.posts[0].path, released.posts[0].body.resource.id], ['/leases/l-aaaaaaaaaaaa/release', 's24']);
+  } finally { released.cleanup(); }
+  const extended = await run(['extend', '--for', '10m', '--holder', 'jarad'], { env, answers: { 'POST /leases/l-ID/extend': json(200, LEASE_VIEW) } });
+  try {
+    assert.equal(extended.code, 0, extended.err.join('\n'));
+    assert.equal(extended.posts[0].body.resource.id, 's24');
+  } finally { extended.cleanup(); }
+  const noDevice = await run(['release'], { env: { HUB_LEASE_ID: 'l-aaaaaaaaaaaa' } });
+  try { assert.equal(noDevice.calls.length, 0, 'with no $HUB_DEVICE it names nothing and runs here'); } finally { noDevice.cleanup(); }
+});
+
+test('a Mac-keyed emulator lease forwards as the word with the boot budget and an e- id; force-release emulator-<n> forwards to the slot', async () => {
+  const view = { ...LEASE_VIEW, lease_id: 'e-aaaaaaaaaaaa', device: 'emulator', lock: 'emulator-1', env: { HUB_LEASE_ID: 'e-aaaaaaaaaaaa' }, emulator: {} };
+  const lease = await run(['lease', 'emulator', '--for', '30m', '--why', 'x', '--holder', 'jarad'], { resourcesRev: 1, answers: { 'POST /leases': json(200, view) } });
+  try {
+    assert.equal(lease.code, 0, lease.err.join('\n'));
+    const sent = lease.posts[0];
+    assert.match(sent.body.id, /^e-/);
+    assert.equal(sent.budgetMs, 360_000);
+    assert.equal(sent.body.resource, 'emulator', 'a Pool word carries no record');
+    assert.equal(sent.forwarded, 'cli');
+    assert.deepEqual(lease.out, ["export HUB_LEASE_ID='e-aaaaaaaaaaaa'"]);
+  } finally { lease.cleanup(); }
+  const forced = await run(['force-release', 'emulator-2', '--why', 'x', '--holder', 'ops'], { resourcesRev: 1, answers: { 'POST /leases/emulator-2/force-release': json(200, { lease_id: 'e-bbbbbbbbbbbb', outcome: 'force-released', resource: 'emulator', lock: 'emulator-2', device: 'emulator', holder: 'jarad', why: 'x' }) } });
+  try {
+    assert.equal(forced.code, 0, forced.err.join('\n'));
+    assert.deepEqual([forced.posts[0].host, forced.posts[0].path], ['linux', '/leases/emulator-2/force-release']);
+    assert.deepEqual(forced.out, ['HUB_DEVICE_FORCE_RELEASED emulator-2 e-bbbbbbbbbbbb holder=jarad']);
+  } finally { forced.cleanup(); }
+});

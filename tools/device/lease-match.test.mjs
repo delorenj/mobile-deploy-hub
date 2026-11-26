@@ -218,7 +218,7 @@ test('a member that is away is dropped and the next is tried, which is the order
   } finally { s.cleanup(); }
 });
 
-test('an unknown reading drops nothing: no adb server, a wire that fails, a host with no key, or a Mac key', async () => {
+test('an unknown reading drops nothing: no adb server, a wire that fails or a host with no key', async () => {
   const cases = [
     ['no adb server', { inventory: serverDown }],
     ['a wire that fails', { wire: fakeWire({ fail: 'devices' }) }],

@@ -445,6 +445,29 @@ test('the route table is the Hub API\'s Hold routes plus Health and Status, and 
   } finally { s.cleanup(); }
 });
 
+test('a public take of a retired Resource of this host is 409 HUB_RESOURCE_RETIRED and writes no lock', async () => {
+  const s = scratch();
+  try {
+    const resources = seed(s.devices, { qaDevices: () => [] }).resources.map(record => (record.id === 'ios-lane' ? { ...record, retired_at: '2026-11-01T00:00:00Z' } : record));
+    const request = async () => new Response(JSON.stringify({ rev: 5, source: 'file', resources }), { status: 200 });
+    const answer = await s.post('/leases', { for_ms: 60_000, holder: 'a', why: 'x', resource: 'ipad', id: 'ret-1' }, { request });
+    assert.deepEqual([answer.status, answer.body.code, answer.body.reason], [409, 'HUB_RESOURCE_RETIRED', 'retired']);
+    assert.equal(s.lockDirExists(), false);
+    assert.equal(s.forwards.length, 0);
+  } finally { s.cleanup(); }
+});
+
+test('the agent\'s forward carries the rev the Hub API answered, not 0', async () => {
+  const s = scratch();
+  try {
+    const resources = seed(s.devices, { qaDevices: () => [] }).resources;
+    const refresh = async args => (args.path === '/resources' ? new Response(JSON.stringify({ rev: 9, source: 'file', resources }), { status: 200 }) : s.ctx().request(args));
+    await s.post('/leases', { for_ms: 60_000, holder: 'a', why: 'x', resource: 's24' }, { request: refresh });
+    assert.equal(s.forwards.length, 1);
+    assert.deepEqual(s.forwards[0].body.resource, { id: 's24', lock: 's24', host: 'linux', rev: 9, retired_at: null });
+  } finally { s.cleanup(); }
+});
+
 test('known: the last Hub API answer wins for Resources, the seed keeps the Pools and words; a failed refresh is one line and the seed answers', async () => {
   const devices = structuredClone(loadDevices({}));
   const serial = devices.android_extra[0].serial;
@@ -480,7 +503,7 @@ test('a Hub API that is unreachable at start is one HUB_AGENT_REGISTRY_FAILED li
   } finally { s.cleanup(); }
 });
 
-test('no timer, interval or poll runs across a start, /health, /status, a gate refusal and a stop', async () => {
+test('no timer, interval or poll runs across a start, /health, /status, a forward to the other host and a stop', async () => {
   const s = scratch();
   const real = { timeout: globalThis.setTimeout, interval: globalThis.setInterval };
   const spied = [];
@@ -493,8 +516,11 @@ test('no timer, interval or poll runs across a start, /health, /status, a gate r
     for (const [method, url, body] of [['GET', '/health'], ['GET', '/status'], ['POST', '/leases', { resource: 's26', for_ms: 60_000, holder: 'a', why: 'x' }]]) {
       const e = exchange(method, url, body);
       await listener(e.req, e.res);
-      assert.ok(e.res.head.status === 200 || e.res.head.status === 409, `${method} ${url} ${e.res.text}`);
+      assert.equal(e.res.head.status, 200, `${method} ${url} ${e.res.text}`);
     }
+    // The Mac's take of the S26 (a linux phone) is a forward: it reached the injected request seam as the door host-agent, and no lock was written here.
+    assert.ok(s.requests.some(args => args.method === 'POST' && args.path === '/leases' && args.host === 'linux' && args.forwarded === 'host-agent'), 'the take was forwarded');
+    assert.equal(s.lockDirExists(), false);
     await running.stop();
   } finally {
     globalThis.setTimeout = real.timeout;

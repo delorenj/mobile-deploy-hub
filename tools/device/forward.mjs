@@ -139,7 +139,9 @@ export function namedRecords(key, input, request, view, policy = null) {
   const names = NAMED[key]?.names(input, request) ?? [];
   const records = [];
   for (const named of names) records.push(...(named.match !== undefined ? resourcesOfMatch(named.match, view, policy) : resourcesOfWord(named.word, view)));
-  const single = names.length === 1 && names[0].word !== undefined ? directOf(names[0].word, view) : null;
+  // The emulator Pool is a Pool, not one Resource: it goes as its word, with no carried record.
+  const direct = names.length === 1 && names[0].word !== undefined ? directOf(names[0].word, view) : null;
+  const single = direct?.kind === 'emulator-pool' ? null : direct;
   return { records, single };
 }
 

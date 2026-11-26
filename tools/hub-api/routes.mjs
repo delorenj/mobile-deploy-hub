@@ -392,6 +392,8 @@ function hubHold(route) {
       return route.handler(ctx, request);
     }
     const input = named.check(request.body);
+    // A request that names nothing (a GET, a bare release) is answered here: the Registry is not read for it.
+    if (named.names(input, request).length === 0) return route.handler(ctx, request);
     const view = hubView(ctx);
     const { records, single } = namedRecords(key, input, request, view, ctx.policy);
     if (door !== null) {

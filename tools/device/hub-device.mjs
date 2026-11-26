@@ -29,7 +29,7 @@
 //                    dedicated_qa, and the first that serves it is taken as one Pool request that holds a place in every match's queue; no match is HUB_NO_MATCH (exit 2) with a reason for each
 //                    Resource left out, every match away is HUB_DEVICE_AWAY (75); report lines say `match:<query>` where a device word goes;
 //                    `run --match <query> ... -- <cmd...>` is the same for run)
-//   hub-device release [<lease_id>|--any] [--resource R] [--holder WHO]    (--resource R names the Resource, so a lease on another host is forwarded there; --holder is recorded as the actor; no id: $HUB_LEASE_ID; --any: whichever lease holds a phone; a `job:` id is a deploy job's place in
+//   hub-device release [<lease_id>|--any] [--resource R] [--holder WHO]    (--resource R names the Resource, so a lease on another host is forwarded there (with no id word and no --resource, $HUB_DEVICE, which `lease` exported beside $HUB_LEASE_ID, names it; same for extend); --holder is recorded as the actor; no id: $HUB_LEASE_ID; --any: whichever lease holds a phone; a `job:` id is a deploy job's place in
 //                    line, not a lease: exit 2, HUB_DEVICE_JOB_ID names the run to cancel)
 //   hub-device extend [<lease_id>] --for <dur> [--override <why>] [--resource R] [--holder WHO] [--json]   (no id: $HUB_LEASE_ID; moves the expiry later by
 //                    --for; refused with HUB_LEASE_EXTEND_REFUSED (exit 76) while anyone waits, past the deploy phone's 60 min or 48 h in total,
@@ -825,8 +825,10 @@ function namingOf(parsed, context) {
     if ((flags.match === undefined) === (words[1] === undefined)) return null;
     return { key, input: { match: flags.match ?? null, resource: words[1] ?? null }, params: {} };
   }
-  if (verb === 'release') return flags.resource === undefined || words[1] === 'emulator' ? null : { key, input: { resource: flags.resource }, params: {} };
-  if (verb === 'extend') return flags.resource === undefined ? null : { key, input: { resource: flags.resource }, params: {} };
+  // With no lease id word the id is $HUB_LEASE_ID, and `lease` exported $HUB_DEVICE with it: that is the Resource when `--resource` is not given.
+  const heldResource = () => flags.resource ?? (words[1] === undefined && !flags.any && context.env.HUB_LEASE_ID && context.env.HUB_DEVICE ? context.env.HUB_DEVICE : undefined);
+  if (verb === 'release') return heldResource() === undefined || words[1] === 'emulator' ? null : { key, input: { resource: heldResource() }, params: {} };
+  if (verb === 'extend') return heldResource() === undefined ? null : { key, input: { resource: heldResource() }, params: {} };
   if (verb === 'cancel') return flags.resource === undefined ? null : { key, input: { resource: flags.resource, pool: flags.pool ?? null }, params: {} };
   if (flags.reservation !== undefined) return null;
   const id = words[1];
@@ -872,6 +874,8 @@ function printForwarded(verb, answer, { id, holder, json, label }, context) {
   else stdout(`HUB_DEVICE_NOT_HELD ${label} ${id} (no lease by that id)`);
 }
 
+const LOCAL_LINES = Object.freeze(['HUB_PHONE_AWAY', 'HUB_DEVICE_AWAY', 'HUB_LOCK_TIMEOUT', 'HUB_LEASE_CANCELLED']);
+
 // Forwards the command when it names a Resource on another host and answers its exit code, else null (the verb runs here).
 async function forwardCommand(parsed, context) {
   const place = await placeOfCommand(parsed, context);
@@ -916,7 +920,7 @@ async function forwardCommand(parsed, context) {
     if (!id) throw usage(`${verb} needs a lease id or $HUB_LEASE_ID`);
     const job = verb === 'release' ? claims.jobTicket(id) : null;
     if (job) { context.stderr(`HUB_DEVICE_JOB_ID ${job.message}`); return claims.exitCodeOf(job); }
-    body.resource = flags.resource;
+    body.resource = place.input.resource;
     if (verb === 'extend') {
       if (flags.for === undefined) throw usage('--for <duration> is required');
       body.for_ms = parseDuration(flags.for, '--for');
@@ -940,6 +944,8 @@ async function forwardCommand(parsed, context) {
     return claims.EXIT_OK;
   } catch (error) {
     if (received) return 128 + constants.signals[received];
+    // A far problem whose local verb prints a HUB_DEVICE_* line (busy, away, cancelled) is reported as the local verb reports it, with the same exit.
+    if (error?.api === true && LOCAL_LINES.includes(error.code)) error.api = false;
     throw error;
   } finally {
     for (const name of names) signals.off(name, onSignal);
