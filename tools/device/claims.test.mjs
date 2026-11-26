@@ -85,6 +85,8 @@ test('the library exports the whole action surface and the exit table as frozen 
     HUB_FORCE_RELEASE_JOB: 2,
     // Story 7.7: a force-release of a Reservation that is gone.
     HUB_RESERVATION_NOT_FOUND: 2,
+    // Story 10.1: a push whose events do not continue the host's replica at its settled size.
+    HUB_REPLICA_GAP: 1,
     // Story 6.8: the same-host client's two answers.
     HUB_API_DOWN: 1, HUB_API_UNKNOWN: 1,
   });

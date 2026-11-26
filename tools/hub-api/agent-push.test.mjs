@@ -66,7 +66,7 @@ test('apply: the pushed view is /status.hosts.mac after the service\'s own, the 
     assert.deepEqual(Object.keys((await s.status()).body.hosts), ['linux']);
     const answer = await s.push(pushBody({ seq: 3 }));
     assert.equal(answer.status, 200, JSON.stringify(answer.body));
-    assert.deepEqual(answer.body, { applied: true, host: 'mac', boot: BOOT_B, seq: 3 });
+    assert.deepEqual(answer.body, { applied: true, host: 'mac', boot: BOOT_B, seq: 3, replica: {} });
     const status = await s.status();
     assert.deepEqual(Object.keys(status.body.hosts), ['linux', 'mac']);
     assert.deepEqual(status.body.hosts.mac, macView());
@@ -95,7 +95,7 @@ test('duplicate: the same boot with a seq not above the applied one is 200 {appl
     for (const seq of [3, 2, 1]) {
       const answer = await s.push(pushBody({ seq, status: macView({ phones: [{ device: 'other' }] }), readings: [reading('offline')] }));
       assert.equal(answer.status, 200);
-      assert.deepEqual(answer.body, { applied: false, host: 'mac', boot: BOOT_B, seq });
+      assert.deepEqual(answer.body, { applied: false, host: 'mac', boot: BOOT_B, seq, replica: {} });
     }
     assert.deepEqual((await s.status()).body.hosts.mac, macView());
     assert.equal(laneOf(await s.resources()).reachability.state, 'reachable');
@@ -110,7 +110,7 @@ test('a new boot applies from seq 1 even after seq 9 of the old one', async () =
   try {
     await s.push(pushBody({ seq: 9 }));
     const answer = await s.push(pushBody({ boot: BOOT_C, seq: 1, status: macView({ emulators: [] }), readings: [reading('absent')] }));
-    assert.deepEqual(answer.body, { applied: true, host: 'mac', boot: BOOT_C, seq: 1 });
+    assert.deepEqual(answer.body, { applied: true, host: 'mac', boot: BOOT_C, seq: 1, replica: {} });
     assert.equal(laneOf(await s.resources()).reachability.state, 'absent');
     assert.equal((await s.push(pushBody({ boot: BOOT_B, seq: 10 }))).body.applied, true, 'each boot is its own sequence');
   } finally { s.cleanup(); }

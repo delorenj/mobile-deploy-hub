@@ -252,6 +252,24 @@ test('recovery by push: even a duplicate seq restores with one event reason push
   } finally { w.cleanup(); }
 });
 
+test('recovery by a gap-failed push: a 409 HUB_REPLICA_GAP is still contact and restores with one event reason push (Story 10.1)', async () => {
+  const w = world();
+  try {
+    await w.push({ seq: 3 });
+    w.ssh.mode = REFUSED;
+    await w.lease();
+    assert.equal(w.events().length, 1, 'marked unreachable');
+    w.clock.t = T0 + 30 * SEC;
+    const gap = await w.push({ seq: 4, events: { month: '2026-11', from_offset: 5, lines: ['{"format":1}\n'] } });
+    assert.equal(gap.status, 409, JSON.stringify(gap.body));
+    assert.equal(gap.body.code, 'HUB_REPLICA_GAP');
+    assert.deepEqual(w.events().map(shape).at(-1), { host: 'mac', from: 'unreachable', to: 'reachable', reason: 'push' });
+    assert.equal(w.events().length, 2);
+    assert.equal(w.pokes.length, 2);
+    assert.equal(w.peers.mark('mac'), null, 'the mark is cleared');
+  } finally { w.cleanup(); }
+});
+
 test('status while marked: hosts.mac is the last view with every row reading offline, stale.mac carries both sinces; a clear shows the view unchanged; the view is never mutated', async () => {
   const w = world();
   try {
