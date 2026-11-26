@@ -972,6 +972,25 @@ test('the v1.2.53 release notes (Epic 6) say what a reader of the tag must know:
   assert.ok(readFileSync(notesPath, 'utf8').indexOf('## v1.2.53') < readFileSync(notesPath, 'utf8').indexOf('## v1.2.52'), 'newest first');
 });
 
+test('the v1.2.56 release notes (Epic 7) say what a reader of the tag must know: Job Holds, the caps, the rollback, the routes and verbs, the smoke', () => {
+  const text = readFileSync(notesPath, 'utf8');
+  const notes = releaseNotes(text, 'v1.2.56');
+  assert.ok(notes, 'docs/hub-releases.md has a v1.2.56 section');
+  assert.match(notes, /A Job Hold .* cannot be force-released/);
+  assert.match(notes, /gh run cancel/);
+  assert.match(notes, /capped at 60 min in total, and any Lease at 48 h/);
+  assert.match(notes, /refused while anyone waits/);
+  assert.match(notes, /`contract` stays 1/);
+  assert.match(notes, /No service unit is added/);
+  assert.match(notes, /Rolling back is `hosts:install` of `v1\.2\.55`/);
+  assert.match(notes, /keeps its expiry under `v1\.2\.55`/);
+  assert.match(notes, /hosts:smoke -- --holds-on s24/);
+  assert.match(notes, /--no-holds/);
+  for (const word of [/POST \/leases`/, /\/leases\/\{id\}\/extend/, /\/leases\/\{id\}\/force-release/, /\/requests\/\{id\}\/cancel/, /\/reservations\/\{run_key\}\/force-release/, /force-release --reservation/, /HUB_LEASE_EXTEND_REFUSED/, /exits 76/, /host lock <name> is held by/, /Test changes you will see/, /claims\.test\.mjs/, /hub-device\.test\.mjs/, /lease\.test\.mjs/, /pool-request\.test\.mjs/, /emulator\.test\.mjs/, /emulator-fixtures\.mjs/, /deploy-path\.test\.mjs/, /contract\.test\.mjs/, /HUB_SMOKE_OK/, /Roll back:/]) assert.match(notes, word);
+  assert.ok(notes.split('\n').every(line => !line.startsWith('## ')), 'no line of the section may look like a heading of the next release');
+  assert.ok(text.indexOf('## v1.2.56') !== -1 && text.indexOf('## v1.2.56') < text.indexOf('## v1.2.55'), 'newest first');
+});
+
 // v1.x never removes or retypes a caller input: callers pinned @v1 must keep working when v1 moves (D1).
 test('the v1 caller surface is frozen: every workflow_call input keeps its name, type and default', () => {
   const workflow = readFileSync(join(repoRoot, '.github/workflows/mobile-deploy.yml'), 'utf8');

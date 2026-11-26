@@ -105,7 +105,7 @@ development_status:
   7-6-force-release-a-lease: done
   7-7-force-release-a-reservation: done
   7-8-force-release-an-emulator-slot: done
-  7-9-ship-leases-through-the-api: backlog
+  7-9-ship-leases-through-the-api: awaiting-operator
   epic-7-retrospective: optional
 
   epic-8: backlog

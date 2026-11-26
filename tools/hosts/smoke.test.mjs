@@ -1,4 +1,4 @@
-// Story 6.12: `mise run hosts:smoke` (tools/hosts/smoke.mjs), hermetic: a fake hub-device (`cli`), a fake fetchImpl, a fake clock whose
+// Story 6.12 and 7.9: `mise run hosts:smoke` (tools/hosts/smoke.mjs), hermetic: a fake hub-device (`cli`), a fake fetchImpl, a fake clock whose
 // sleep advances it. No port, lock dir, 1Password or real hub-device is touched.
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hermetic } from '../ci/test-fixtures.mjs';
-import { LEASABLE_WITHIN_MS, TRY_EVERY_MS, hubDeviceCli, hubSmoke } from './smoke.mjs';
+import { HOLD_EXTEND_MS, LEASABLE_WITHIN_MS, TRY_EVERY_MS, WAITER_SHOWS_WITHIN_MS, apiCaller, holdParity, hubDeviceCli, hubSmoke, parseSmokeArgs, runEntry } from './smoke.mjs';
 import { phoneWordMembers } from '../device/claims.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
 import { planRegister } from '../registry/changes.mjs';
@@ -250,4 +250,341 @@ test('the CLI entry refuses an unknown argument with HUB_SMOKE_FAILED on stderr,
     assert.equal(result.stdout, '');
     assert.throws(() => readFileSync(called), { code: 'ENOENT' }, 'hub-device was never called');
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ---------------------------------------------------------------------------------------------------- Story 7.9: the holds phase
+
+const parseMs = text => { const m = /^(\d+)([sm]?)$/.exec(String(text)); return m === null ? NaN : Number(m[1]) * (m[2] === 'm' ? 60_000 : m[2] === 's' ? 1000 : 1); };
+
+// One shared lock state for `target` that the fake `cli` and the fake `fetchImpl` both mutate, so the two doors answer one Claims library.
+// Waits are promises settled when the lock is released, force-released or the waiter is withdrawn.
+function holdsWorld({ target = NAME, busy = false, hideWaiters = false, cliStaysWaiting = false, apiExtendIgnoresWaiters = false, cliExtendIgnoresWaiters = false, extendMs = null } = {}) {
+  const hold = { lease: busy ? 'someone-else' : null, holder: busy ? 'somebody' : null, why: busy ? 'work' : null, expiresAt: null, queue: [] };
+  const w = world({ status: wd => { w.statusAt.push(wd.clock); return out(0, JSON.stringify(statusBody(wd))); } });
+  w.statusAt = [];
+  const leaseBody = id => ({ lease_id: id, resource: target, lock: target, device: target, holder: hold.holder, why: hold.why, claimant_kind: 'agent', started_at: 'x', expires_at: new Date(hold.expiresAt).toISOString(), env: { HUB_LEASE_ID: id, HUB_DEVICE: target, ANDROID_ADB_SERVER_PORT: '5037' }, emulator: null });
+  const grant = ({ id, holder, why, forMs }) => { hold.lease = id; hold.holder = holder; hold.why = why; hold.expiresAt = w.clock + forMs; return leaseBody(id); };
+  const promote = () => {
+    hold.lease = null; hold.holder = null; hold.why = null; hold.expiresAt = null;
+    const next = hold.queue.shift();
+    if (next) next.settle({ kind: 'ok', body: grant(next) });
+  };
+  const ops = {
+    knows: id => hold.lease === id || hold.queue.some(entry => entry.id === id),
+    take(request) {
+      if (hold.lease === null && hold.queue.length === 0) return { kind: 'ok', body: grant(request) };
+      if (!(request.waitMs > 0)) return { kind: 'busy' };
+      return new Promise(settle => hold.queue.push({ ...request, settle }));
+    },
+    extend({ id, forMs, door }) {
+      if (id !== hold.lease) return { kind: 'none' };
+      if (hold.queue.length > 0 && !(door === 'api' ? apiExtendIgnoresWaiters : cliExtendIgnoresWaiters)) return { kind: 'refused' };
+      hold.expiresAt += extendMs ?? forMs;
+      return { kind: 'ok', body: leaseBody(id) };
+    },
+    force({ id, why }) {
+      if (id !== hold.lease) return { kind: 'none' };
+      const body = { lease_id: id, outcome: 'force-released', resource: target, lock: target, device: target, holder: hold.holder, why };
+      promote();
+      return { kind: 'ok', body };
+    },
+    release({ id }) {
+      if (id === hold.lease) { promote(); return { kind: 'released' }; }
+      const index = hold.queue.findIndex(entry => entry.id === id);
+      if (index === -1) return { kind: 'none' };
+      const [gone] = hold.queue.splice(index, 1);
+      gone.settle({ kind: 'cancelled' });
+      return { kind: 'cancelled' };
+    },
+  };
+  function statusBody(wd) {
+    const phones = [{ device: 's24', held: 'free' }, ...(wd.registered && !wd.retired ? [{ device: NAME, held: 'free' }] : [])];
+    const entry = phones.find(phone => phone.device === target);
+    if (entry) Object.assign(entry, { lock: target, held: hold.lease ? 'lease' : 'free', holder: hold.holder, lease_id: hold.lease, why: hold.why, expires_at: hold.expiresAt === null ? null : new Date(hold.expiresAt).toISOString() });
+    let waiters = hideWaiters ? [] : hold.queue.map((entry2, index) => ({ lock: target, device: target, position: index + 1, lease_id: entry2.id, holder: entry2.holder }));
+    if (cliStaysWaiting && String(hold.lease).endsWith('-b-cli')) waiters = [{ lock: target, device: target, position: 1, lease_id: hold.lease, holder: hold.holder }];
+    return { phones, waiters };
+  }
+
+  const fetchLog = [];
+  const reply = (status, payload) => ({ status, text: async () => JSON.stringify(payload) });
+  w.fetchLog = fetchLog;
+  w.fetch = async (url, init = {}) => {
+    const path = new URL(url).pathname;
+    if (path === '/health') return health()();
+    const body = init.body ? JSON.parse(init.body) : {};
+    fetchLog.push({ method: init.method, path, body });
+    if (path === '/leases') {
+      const answer = await ops.take({ id: body.id, holder: body.holder, why: body.why, forMs: body.for_ms, waitMs: body.wait_ms ?? 0 });
+      if (answer.kind === 'ok') return reply(200, answer.body);
+      return answer.kind === 'busy' ? reply(409, { code: 'HUB_LOCK_TIMEOUT', reason: 'busy', detail: 'host lock is held' }) : reply(409, { code: 'HUB_LEASE_CANCELLED', reason: 'cancelled', detail: 'cancelled by x' });
+    }
+    const [, id, action] = /^\/leases\/([^/]+)\/(extend|force-release|release)$/.exec(path) ?? [];
+    if (action === 'extend') {
+      const answer = ops.extend({ id, forMs: body.for_ms, door: 'api' });
+      return answer.kind === 'ok' ? reply(200, answer.body) : answer.kind === 'refused' ? reply(409, { code: 'HUB_LEASE_EXTEND_REFUSED', reason: 'waiters', detail: 'waiters' }) : reply(404, { code: 'HUB_LEASE_NOT_FOUND', reason: 'unknown' });
+    }
+    if (action === 'force-release') { const answer = ops.force({ id, why: body.why }); return answer.kind === 'ok' ? reply(200, answer.body) : reply(404, { code: 'HUB_LEASE_NOT_FOUND', reason: 'unknown' }); }
+    if (action === 'release') { const answer = ops.release({ id }); return reply(200, { lease_id: id, outcome: answer.kind === 'none' ? 'none' : answer.kind, resource: target, lock: target, device: target }); }
+    return reply(404, { code: 'HUB_NO_ROUTE' });
+  };
+
+  const base = w.cli;
+  const flag = (args, name) => args[args.indexOf(name) + 1];
+  w.cli = async args => {
+    const [verb] = args;
+    if (verb === 'lease' && args.includes('--id')) {
+      w.log.push(args);
+      const answer = await ops.take({ id: flag(args, '--id'), holder: flag(args, '--holder'), why: flag(args, '--why'), forMs: parseMs(flag(args, '--for')), waitMs: parseMs(flag(args, '--wait')) });
+      if (answer.kind === 'ok') return out(0, JSON.stringify({ lease_id: answer.body.lease_id, device: target, holder: answer.body.holder, why: answer.body.why, expires_at: answer.body.expires_at, env: answer.body.env }));
+      return answer.kind === 'busy' ? out(76, '', 'HUB_LOCK_TIMEOUT host lock is held by somebody') : out(1, '', 'HUB_LEASE_CANCELLED cancelled by x');
+    }
+    if (verb === 'extend') {
+      w.log.push(args);
+      const answer = ops.extend({ id: args[1], forMs: parseMs(flag(args, '--for')), door: 'cli' });
+      return answer.kind === 'ok' ? out(0, JSON.stringify({ lease_id: args[1], lock: target, device: target, expires_at: answer.body.expires_at })) : answer.kind === 'refused' ? out(76, '', 'HUB_LEASE_EXTEND_REFUSED a waiter is in line') : out(2, '', 'HUB_LEASE_NOT_FOUND');
+    }
+    if (verb === 'force-release') {
+      w.log.push(args);
+      const answer = ops.force({ id: args[1], why: flag(args, '--why') });
+      return answer.kind === 'ok' ? out(0, JSON.stringify(answer.body)) : out(2, '', 'HUB_LEASE_NOT_FOUND');
+    }
+    if (verb === 'release' && ops.knows(args[1])) {
+      w.log.push(args);
+      const answer = ops.release({ id: args[1] });
+      return out(0, answer.kind === 'released' ? `HUB_DEVICE_RELEASED ${target} ${args[1]}\n` : `HUB_DEVICE_CANCELLED ${target} ${args[1]} (it was still waiting)\n`);
+    }
+    return base(args);
+  };
+  w.hold = hold;
+  w.runHolds = (extra = {}) => w.run({ fetchImpl: w.fetch, holds: true, ...extra });
+  w.parity = (extra = {}) => holdParity({ target, tag: NAME, ref: 'v1.2.53', cli: w.cli, api: apiCaller(w.fetch, policy), now: w.now, sleep: w.sleep, log: line => w.lines.push(line), ...extra });
+  return w;
+}
+
+const nonStatus = w => verbs(w).filter(verb => verb !== 'status');
+
+test('holds, happy: the API and the CLI traces are equal, six snapshots, then retire and the unchanged OK line', async () => {
+  const w = holdsWorld();
+  const line = await w.runHolds();
+  assert.equal(line, 'HUB_SMOKE_OK v1.2.53 res-smoke-x leasable after 0 ms');
+  const holdsLine = w.lines.find(text => text.startsWith('HUB_SMOKE holds: '));
+  assert.equal(holdsLine, 'HUB_SMOKE holds: api and cli match on smoke-x (6 steps: take-a, wait-b, extend-refused, force-release, extend-b, release-b)');
+  assert.ok(w.lines.indexOf(holdsLine) > w.lines.findIndex(text => text.startsWith('HUB_SMOKE release:')) && w.lines.indexOf(holdsLine) < w.lines.findIndex(text => text.startsWith('HUB_SMOKE retire:')), 'between release and retire');
+  assert.deepEqual(nonStatus(w), ['registry list', 'registry add', 'lease', 'release', 'lease', 'lease', 'extend', 'force-release', 'extend', 'release', 'registry retire', 'lease']);
+  assert.deepEqual(w.log.find(args => args[0] === 'lease' && args.includes(`${NAME}-a-cli`)), ['lease', NAME, '--no-connect', '--wait', '0', '--for', '2m', '--why', 'hosts:smoke v1.2.53 holds', '--holder', 'hosts:smoke', '--id', `${NAME}-a-cli`, '--json']);
+  assert.deepEqual(w.log.find(args => args[0] === 'lease' && args.includes(`${NAME}-b-cli`)).slice(0, 5), ['lease', NAME, '--no-connect', '--wait', '30s']);
+  assert.deepEqual(w.log.find(args => args[0] === 'extend'), ['extend', `${NAME}-a-cli`, '--for', '1m', '--holder', 'hosts:smoke', '--json']);
+  assert.deepEqual(w.log.find(args => args[0] === 'force-release'), ['force-release', `${NAME}-a-cli`, '--why', 'hosts:smoke v1.2.53 holds', '--holder', 'hosts:smoke', '--json']);
+  assert.deepEqual(w.fetchLog.map(call => `${call.method} ${call.path}`), ['POST /leases', 'POST /leases', `POST /leases/${NAME}-a-api/extend`, `POST /leases/${NAME}-a-api/force-release`, `POST /leases/${NAME}-b-api/extend`, `POST /leases/${NAME}-b-api/release`]);
+  assert.deepEqual(w.fetchLog[0].body, { resource: NAME, for_ms: 120_000, holder: 'hosts:smoke', why: 'hosts:smoke v1.2.53 holds', id: `${NAME}-a-api` });
+  assert.deepEqual(w.fetchLog[1].body, { resource: NAME, for_ms: 120_000, holder: 'hosts:smoke', why: 'hosts:smoke v1.2.53 holds', id: `${NAME}-b-api`, wait_ms: 30_000 });
+  assert.deepEqual(w.fetchLog[2].body, { for_ms: HOLD_EXTEND_MS, holder: 'hosts:smoke' });
+  assert.deepEqual(w.fetchLog[3].body, { why: 'hosts:smoke v1.2.53 holds', holder: 'hosts:smoke' });
+  assert.ok(w.hold.lease === null && w.hold.queue.length === 0 && w.retired);
+});
+
+test('holdParity, the traces: six snapshots per door, ids mapped to A and B, the two traces deep equal', async () => {
+  const w = holdsWorld();
+  w.registered = true;
+  const { target, traces } = await w.parity();
+  assert.equal(target, NAME);
+  assert.equal(traces.api.length, 6);
+  assert.deepEqual(traces.api, traces.cli);
+  assert.deepEqual(traces.api.map(entry => entry.step), ['take-a', 'wait-b', 'extend-refused', 'force-release', 'extend-b', 'release-b']);
+  const [take, wait, refused, forced, extended, released] = traces.api;
+  assert.deepEqual([take.held, take.holder, take.why, take.lease, take.waiters], ['lease', 'hosts:smoke', 'hosts:smoke v1.2.53 holds', 'A', []]);
+  assert.deepEqual(take.answer, { lease: 'A', device: NAME, holder: 'hosts:smoke', why: 'hosts:smoke v1.2.53 holds', env: ['ANDROID_ADB_SERVER_PORT', 'HUB_DEVICE', 'HUB_LEASE_ID'] });
+  assert.deepEqual([wait.lease, wait.waiters], ['A', [{ lease: 'B', position: 1, holder: 'hosts:smoke' }]]);
+  assert.deepEqual(refused.answer, { outcome: 'refused' });
+  assert.deepEqual([forced.lease, forced.waiters, forced.answer.forced.lease, forced.answer.granted.lease], ['B', [], 'A', 'B']);
+  assert.deepEqual([extended.answer.outcome, extended.lease], ['extended', 'B']);
+  assert.deepEqual([released.held, released.lease, released.holder, released.why, released.waiters], ['free', null, null, null, []]);
+});
+
+test('holds: false is the 6.12 world: the exact call list, no Hold route, no extra status', async () => {
+  const w = holdsWorld();
+  await w.run({ fetchImpl: w.fetch });
+  assert.deepEqual(verbs(w), ['registry list', 'registry add', 'lease', 'status', 'release', 'registry retire', 'lease', 'status']);
+  assert.deepEqual(w.fetchLog, []);
+  assert.ok(!w.lines.some(text => text.startsWith('HUB_SMOKE holds')));
+  const v = holdsWorld();
+  await v.run({ fetchImpl: v.fetch, holds: false });
+  assert.deepEqual(verbs(v), verbs(w));
+});
+
+test('holds, the target is busy: HUB_SMOKE_FAILED holds, nothing was taken, the phone is retired', async () => {
+  const w = holdsWorld({ busy: true });
+  await assert.rejects(w.runHolds(), error => error.step === 'holds' && /^HUB_SMOKE_FAILED holds: smoke-x is not free \(lease by somebody, 0 waiting\)/.test(error.message));
+  assert.deepEqual(w.fetchLog, [], 'no API take');
+  assert.ok(!w.log.some(args => args[0] === 'lease' && args.includes('--id')), 'no CLI take');
+  assert.ok(w.retired && w.lines.some(text => /^HUB_SMOKE cleanup: retired res-smoke-x/.test(text)));
+});
+
+test('holds, a target someone waits on is not free either', async () => {
+  const w = holdsWorld();
+  w.hold.queue.push({ id: 'other-wait', holder: 'x', why: 'y', forMs: 1, waitMs: 1, settle: () => {} });
+  await assert.rejects(w.runHolds(), error => /not free \(free, 1 waiting\): nothing was taken/.test(error.message));
+  assert.deepEqual(w.fetchLog, []);
+});
+
+test('holds, the doors differ: status still shows B waiting on the CLI side', async () => {
+  const w = holdsWorld({ cliStaysWaiting: true });
+  await assert.rejects(w.runHolds(), error => error.step === 'holds' && /^HUB_SMOKE_FAILED holds: api and cli differ at force-release: api \{.*\}, cli \{.*"waiters":\[\{"lease":"B"/.test(error.message));
+  assert.ok(w.retired && w.hold.lease === null && w.hold.queue.length === 0, 'ids released, phone retired');
+});
+
+test('holds, the doors differ: the API extend is allowed while B waits', async () => {
+  const w = holdsWorld({ apiExtendIgnoresWaiters: true });
+  await assert.rejects(w.runHolds(), error => /^HUB_SMOKE_FAILED holds: api and cli differ at extend-refused: /.test(error.message) && /"outcome":"extended"/.test(error.message) && /"outcome":"refused"/.test(error.message));
+  assert.ok(w.retired && w.hold.lease === null);
+});
+
+test('holds, both doors equally wrong is still a failure: an extend allowed while B waits on both', async () => {
+  const w = holdsWorld({ apiExtendIgnoresWaiters: true, cliExtendIgnoresWaiters: true });
+  await assert.rejects(w.runHolds(), error => error.step === 'holds' && /^HUB_SMOKE_FAILED holds: api and cli agree at extend-refused, but the state is wrong: /.test(error.message));
+  assert.ok(w.retired && w.hold.lease === null);
+});
+
+test('holds, B never waits: HUB_SMOKE_FAILED after a bounded 10 s on the fake clock, B then A released, no status read after the deadline', async () => {
+  const w = holdsWorld({ hideWaiters: true });
+  await assert.rejects(w.runHolds(), error => error.step === 'holds' && /^HUB_SMOKE_FAILED holds: api B never waited: status did not list it within 10 s/.test(error.message));
+  assert.ok(Math.max(...w.statusAt) - Math.min(...w.statusAt) < WAITER_SHOWS_WITHIN_MS, 'no status read at or after the deadline');
+  const cleanup = w.lines.filter(text => text.startsWith('HUB_SMOKE cleanup:'));
+  assert.deepEqual(cleanup.slice(0, 2), [`HUB_SMOKE cleanup: released ${NAME}-b-api`, `HUB_SMOKE cleanup: released ${NAME}-a-api`]);
+  assert.ok(w.lines.some(text => /cleanup: retired res-smoke-x/.test(text)) && w.retired);
+  assert.ok(w.hold.lease === null && w.hold.queue.length === 0, 'the waiter is withdrawn and A is released');
+});
+
+test('holds, a clock that never advances still ends the wait (bounded tries)', async () => {
+  const w = holdsWorld({ hideWaiters: true });
+  await assert.rejects(w.runHolds({ sleep: async () => {} }), /B never waited/);
+  assert.ok(w.statusAt.length < 40);
+});
+
+test('holds, an extend that does not move expires_at by exactly 60 000 ms fails at extend, ids released', async () => {
+  const w = holdsWorld({ extendMs: 1000 });
+  await assert.rejects(w.runHolds(), error => error.step === 'holds' && /^HUB_SMOKE_FAILED holds: api extend of B moved expires_at by 1000 ms, not 60000 ms/.test(error.message));
+  assert.ok(w.hold.lease === null && w.retired);
+  assert.ok(w.lines.some(text => text === `HUB_SMOKE cleanup: released ${NAME}-b-api`));
+});
+
+test('holds, a take that is refused fails at holds and releases what it started', async () => {
+  const w = holdsWorld();
+  const inner = w.fetch;
+  w.fetch = async (url, init) => (new URL(url).pathname === '/leases' && JSON.parse(init.body).id.endsWith('-a-api') ? { status: 409, text: async () => JSON.stringify({ code: 'HUB_LOCK_TIMEOUT', detail: 'busy' }) } : inner(url, init));
+  await assert.rejects(w.runHolds(), error => /^HUB_SMOKE_FAILED holds: api take of A failed \(status 409 HUB_LOCK_TIMEOUT: busy\)/.test(error.message));
+  assert.ok(w.retired);
+});
+
+test('holds, a transport failure of the API is a failed take, not an unhandled rejection', async () => {
+  const w = holdsWorld();
+  await assert.rejects(w.runHolds({ fetchImpl: async url => { if (new URL(url).pathname === '/health') return health()(); throw new Error('socket hang up'); } }), error => /api take of A failed \(status 0 HUB_API_DOWN: socket hang up\)/.test(error.message));
+  assert.ok(w.retired);
+});
+
+test('holds on a named word: holds: s24 runs the phase on s24 and the retire is still the test phone\'s', async () => {
+  const w = holdsWorld({ target: 's24' });
+  const line = await w.run({ fetchImpl: w.fetch, holds: 's24' });
+  assert.match(line, /^HUB_SMOKE_OK /);
+  assert.ok(w.lines.includes('HUB_SMOKE holds: api and cli match on s24 (6 steps: take-a, wait-b, extend-refused, force-release, extend-b, release-b)'));
+  assert.ok(w.fetchLog.every(call => call.path !== '/leases' || call.body.resource === 's24'));
+  assert.ok(w.log.filter(args => args[0] === 'lease' && args.includes('--id')).every(args => args[1] === 's24' && args.includes('--no-connect')));
+  assert.ok(w.fetchLog[0].body.id.startsWith(`${NAME}-a-`), 'the id tag is the smoke phone\'s name');
+  assert.ok(w.retired);
+});
+
+test('holds, a status that does not list the target, or none at all, is a failure', async () => {
+  const w = holdsWorld({ target: 's26' });
+  await assert.rejects(w.run({ fetchImpl: w.fetch, holds: 's26' }), error => /status does not list s26/.test(error.message));
+  const v = holdsWorld();
+  const inner = v.cli;
+  v.cli = async args => (args[0] === 'status' && v.registered && v.leases === 1 && v.statusAt.length >= 2 ? out(1, '', 'boom') : inner(args));
+  await assert.rejects(v.runHolds(), error => error.step === 'holds' && /status --json gave no phones/.test(error.message));
+  assert.ok(v.retired);
+});
+
+test('holds, a seam that throws still cleans up and fails at holds', async () => {
+  const w = holdsWorld();
+  const inner = w.cli;
+  w.registered = true;
+  w.cli = async args => { if (args[0] === 'extend') throw new Error('cli exploded'); return inner(args); };
+  await assert.rejects(w.parity(), error => error.step === 'holds' && /cli extend of B failed \(exit 127: cli exploded\)/.test(error.message));
+  assert.ok(w.hold.lease === null && w.hold.queue.length === 0, 'ids released');
+});
+
+test('holdParity, arguments are checked, and hubSmoke refuses a holds that is neither a boolean nor a word', async () => {
+  await assert.rejects(holdParity({ tag: 'x', cli: async () => out(0), api: async () => ({}) }), TypeError);
+  await assert.rejects(holdParity({ target: 'x', cli: async () => out(0), api: async () => ({}) }), TypeError);
+  await assert.rejects(holdParity({ target: 'x', tag: 'x' }), TypeError);
+  await assert.rejects(hubSmoke({ ref: 'v1', cli: async () => out(0), holds: 3 }), TypeError);
+  await assert.rejects(hubSmoke({ ref: 'v1', cli: async () => out(0), holds: '' }), TypeError);
+});
+
+test('apiCaller: posts JSON to the policy port, answers {status, body}, never rejects, and times out at the wait plus 30 s (else 30 s)', async () => {
+  const seen = [];
+  const original = AbortSignal.timeout;
+  AbortSignal.timeout = ms => { seen.push(ms); return original.call(AbortSignal, 60_000); };
+  try {
+    const fetchImpl = async (url, init) => {
+      seen.push([url, init.method, init.headers['content-type'] ?? null, init.body ?? null]);
+      if (url.endsWith('/boom')) throw new Error('reset');
+      return { status: 409, text: async () => JSON.stringify({ code: 'X' }) };
+    };
+    const call = apiCaller(fetchImpl, policy);
+    assert.deepEqual(await call({ path: '/leases', body: { a: 1 }, waitMs: 30_000 }), { status: 409, body: { code: 'X' } });
+    assert.deepEqual(await call({ path: '/leases/x/release', body: {} }), { status: 409, body: { code: 'X' } });
+    assert.deepEqual(await call({ method: 'GET', path: '/leases/x' }), { status: 409, body: { code: 'X' } });
+    assert.deepEqual(await call({ path: '/boom', body: {} }), { status: 0, body: { code: 'HUB_API_DOWN', detail: 'reset' } });
+    assert.deepEqual(seen.filter(entry => typeof entry === 'number'), [60_000, 30_000, 30_000, 30_000]);
+    assert.deepEqual(seen.find(entry => Array.isArray(entry)), ['http://127.0.0.1:8794/leases', 'POST', 'application/json', '{"a":1}']);
+    assert.deepEqual(seen.filter(entry => Array.isArray(entry))[2], ['http://127.0.0.1:8794/leases/x', 'GET', null, null]);
+  } finally { AbortSignal.timeout = original; }
+});
+
+test('the CLI arguments: --holds-on takes a word, --no-holds turns the phase off, the default is on, a bad combination is a usage failure', () => {
+  assert.deepEqual(parseSmokeArgs([]), { hubDevice: 'hub-device', ref: undefined, holds: true });
+  assert.equal(parseSmokeArgs(['--holds-on', 's24']).holds, 's24');
+  assert.equal(parseSmokeArgs(['--no-holds']).holds, false);
+  assert.deepEqual(parseSmokeArgs(['--hub-device', 'node x.mjs', '--ref', 'v1.2.56', '--no-holds']), { hubDevice: 'node x.mjs', ref: 'v1.2.56', holds: false });
+  assert.throws(() => parseSmokeArgs(['--holds-on']), /--holds-on takes a value/);
+  assert.throws(() => parseSmokeArgs(['--holds-on', '--no-holds']), /--holds-on takes a value/);
+  assert.throws(() => parseSmokeArgs(['--holds-on', 's24', '--no-holds']), /exclude each other/);
+  assert.throws(() => parseSmokeArgs(['--no-holds', 'stray']), /unknown: stray/);
+});
+
+test('the CLI entry: --holds-on without a value, or with --no-holds, fails with exit 1 and never calls hub-device', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-smoke-holds-entry-'));
+  try {
+    const stub = join(dir, 'stub.mjs');
+    const called = join(dir, 'called');
+    writeFileSync(stub, `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(called)}, 'yes');\n`);
+    const entry = fileURLToPath(new URL('./smoke.mjs', import.meta.url));
+    for (const extra of [['--holds-on'], ['--holds-on', 's24', '--no-holds']]) {
+      const result = spawnSync(process.execPath, [entry, ...extra, '--hub-device', `${process.execPath} ${stub}`], { encoding: 'utf8', timeout: 30_000 });
+      assert.equal(result.status, 1, extra.join(' '));
+      assert.match(result.stderr, /^HUB_SMOKE_FAILED /);
+      assert.equal(result.stdout, '');
+      assert.throws(() => readFileSync(called), { code: 'ENOENT' }, 'hub-device was never called');
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('runEntry forwards holds (true by default, a word, false), the ref and the hub-device command to hubSmoke, and resolves the exit code', async () => {
+  const calls = [];
+  const makes = [];
+  const seams = fail => ({ smoke: async options => { calls.push(options); if (fail) throw fail; }, makeCli: command => { makes.push(command); return `cli:${command}`; }, defaultRef: () => 'v-default' });
+  assert.equal(await runEntry([], seams()), 0);
+  assert.equal(await runEntry(['--holds-on', 's24', '--ref', 'v1.2.56', '--hub-device', 'node x.mjs'], seams()), 0);
+  assert.equal(await runEntry(['--no-holds'], seams()), 0);
+  assert.deepEqual(calls, [
+    { ref: 'v-default', cli: 'cli:hub-device', holds: true },
+    { ref: 'v1.2.56', cli: 'cli:node x.mjs', holds: 's24' },
+    { ref: 'v-default', cli: 'cli:hub-device', holds: false },
+  ]);
+  assert.deepEqual(makes, ['hub-device', 'node x.mjs', 'hub-device']);
+  const before = calls.length;
+  assert.equal(await runEntry(['--holds-on'], seams()), 1);
+  assert.equal(calls.length, before, 'a usage failure never reaches hubSmoke');
+  assert.equal(await runEntry([], seams(Object.assign(new Error('HUB_SMOKE_FAILED holds: x'), { smoke: true }))), 1);
 });

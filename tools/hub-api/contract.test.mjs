@@ -229,6 +229,40 @@ test('the route table of the document equals ROUTES, both ways', () => {
   assert.ok(contract.routes.length > 0, 'the table parsed');
 });
 
+// Story 7.9: AD-42's Hold routes, frozen. Each route is in the document's table and in ROUTES with this shape, every field below is in the
+// shape's list and in what the route answers (the contract is additive, so a later field is not a failure; a removed or renamed one is),
+// and the live answer equals the document's whole list.
+const HOLD_ROUTES = Object.freeze([
+  ['POST', '/leases', 'Lease', ['lease_id', 'resource', 'lock', 'device', 'holder', 'why', 'claimant_kind', 'started_at', 'expires_at', 'env.*', 'emulator.*']],
+  ['GET', '/leases/{id}', 'Lease', ['lease_id', 'resource', 'lock', 'device', 'holder', 'why', 'claimant_kind', 'started_at', 'expires_at', 'env.*', 'emulator.*']],
+  ['POST', '/leases/{id}/extend', 'Lease', ['lease_id', 'resource', 'lock', 'device', 'holder', 'why', 'claimant_kind', 'started_at', 'expires_at', 'env.*', 'emulator.*']],
+  ['POST', '/leases/{id}/release', 'Release', ['lease_id', 'outcome', 'resource', 'lock', 'device']],
+  ['POST', '/leases/{id}/force-release', 'ForceRelease', ['lease_id', 'outcome', 'resource', 'lock', 'device', 'holder', 'why']],
+  ['POST', '/requests/{id}/cancel', 'Cancel', ['request_id', 'outcome', 'resource', 'pool', 'queues[].lock', 'queues[].resource', 'queues[].waiters[].place', 'queues[].waiters[].lease_id', 'queues[].waiters[].holder', 'queues[].waiters[].why', 'queues[].waiters[].kind', 'queues[].waiters[].enqueued_at', 'queues[].waiters[].deadline_at', 'queues[].waiters[].pool']],
+  ['POST', '/reservations/{run_key}/force-release', 'ReservationForceRelease', ['run_key', 'outcome', 'repo', 'run', 'released[].lock', 'released[].resource', 'released[].reserved_at', 'released[].expires_at', 'why']],
+]);
+
+test('the AD-42 Hold routes are in the document table and in ROUTES, each with its shape and its exact field list', async () => {
+  assert.equal(HOLD_ROUTES.length, 7);
+  for (const [method, path, shape, fields] of HOLD_ROUTES) {
+    const key = `${method} ${path}`;
+    assert.ok(contract.routes.includes(key), `${key} is in the document's route table`);
+    const route = ROUTES.find(candidate => routeKey(candidate) === key);
+    assert.ok(route, `${key} is in ROUTES`);
+    assert.equal(contract.shapeOf[key], shape, `${key} shape in the document`);
+    assert.equal(route.shape, shape, `${key} shape in ROUTES`);
+    for (const field of fields) assert.ok(contract.shapes[shape].includes(field), `${key}: the document lists ${field}`);
+    const s = scratch();
+    try {
+      const answer = method === 'GET' ? await callGet(route, s.ctx) : await callPost(route, s.ctx);
+      assert.equal(answer.status, 200, key);
+      const live = shapeFields(shape, answer.body);
+      for (const field of fields) assert.ok(live.includes(field), `${key}: the answer has ${field}`);
+      assert.deepEqual(fieldDiff(contract.shapes[shape], live), [], key);
+    } finally { s.cleanup(); }
+  }
+});
+
 test('the route comparison fails on a synthetic extra route on either side', () => {
   const real = ROUTES.map(routeKey);
   assert.deepEqual(routeDiff(real, real), []);

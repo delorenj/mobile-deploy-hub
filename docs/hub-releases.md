@@ -4,6 +4,41 @@ One section per hub release, headed `## vX.Y.Z`. `mise run release -- X.Y.Z` (`t
 
 A section is plain text read in a terminal: everything after its heading up to the next `## ` heading. Use `###` for sub-headings and `-` lists; do not start a section line with `## `.
 
+## v1.2.56
+
+Epic 7 (Leases through the API, cancel and force-release), on top of v1.2.55. Agents and Jarad can take, wait for, extend, release, cancel and force-release holds through the Hub API with the semantics of `hub-device`, without a shell on big-chungus: the routes and the CLI verbs are two front doors on one Claims library (`tools/device/claims.mjs`), and `lock.mjs` stays the only protocol writer. `contract` stays 1: every change to `docs/hub-api-contract.md` is additive. No service unit is added: `mobile-deploy-hub-api` is the unit v1.2.53 installed, and `mise run hosts:install` restarts it onto this release.
+
+Two limits to know before you use it:
+
+- A Job Hold (a deploy job's lock, or its place in line: a `job` or `hub-job` Hold, ids `job:...`) cannot be force-released, released, extended or cancelled through the hub, by the API or by `hub-device`. The answer names the run and points to `gh run cancel <run> --repo <repo>` (`HUB_FORCE_RELEASE_JOB`, or `HUB_DEVICE_JOB_ID` for a `job:` id; a local run or the catch-up says to stop the process). Deploy jobs never call a service to release their Reservation: `announce` and the ssh `reservation release` verb are unchanged, and `tools/deploy-path.test.mjs` fails if a deploy-path file names the force-release route or passes an actor to `releaseReservation`.
+- A Lease on a deploy target (the S26, `adb`) is capped at 60 min in total, and any Lease at 48 h; a longer request is refused naming the cap and pointing to the S24 or an emulator. An extension is refused while anyone waits (`HUB_LEASE_EXTEND_REFUSED`, `reason: waiters`; `cap`, `too-long` and `expired` also refuse), unless it is sent with an override that says why, which skips the waiters check and nothing else.
+
+Rolling back is `hosts:install` of `v1.2.55`: move `v1` back, then run `mise run hosts:install` from a clean checkout at `v1.2.55`; no `systemctl disable` step is needed, because no unit is added (the tag's computed `Roll back:` line has no stop step). An API Lease already taken keeps its expiry under `v1.2.55` (it is a lock with `holder_pid: null` and an `expires_at`) and ends at that time; `v1.2.55`'s service has no Hold routes.
+
+### What changed
+
+- Hub API routes (all additive, Lease views through `leaseView`): `POST /leases` (take, with `wait_ms` and a client-minted `id` to wait; by word, Resource id or `match`; `claimant_kind` `agent` or `person`; phones and emulators), `GET /leases/{id}`, `POST /leases/{id}/extend`, `POST /leases/{id}/release`, `POST /leases/{id}/force-release` (a Lease, or an emulator slot `emulator-<n>`), `POST /requests/{id}/cancel`, `POST /reservations/{run_key}/force-release`. Loopback only, `snake_case`, problem+json errors with `code`, `exit` and `reason`.
+- API Leases are lock-only and expiry-bound: a phone Lease is `hub-device lease <word> --no-connect` (no `adb_id`), is never reclaimed on a service restart, and status shows its `holder`, never the service pid. The service strips every `GITHUB_*` variable from its environment. A wait keeps its HTTP connection open and is bound to it: a disconnect withdraws the place in line (`cancel`, `reason: aborted`), a Hold granted after the socket closed is released at once, and `SIGTERM` answers open waits `HUB_API_RESTARTING` (`retry: requeue`).
+- `hub-device` verbs on the same library: `extend [<id>] --for <dur> [--override <why>]`, `release <id>` (refuses a `job:` id, exit 2), `cancel <id> [--resource R] [--pool P] [--why <text>]`, `force-release <id> --why <text>`, `force-release emulator-<n> --why <text>` and `force-release --reservation <run_key> --why <text> [--name adb|mac-ios]`. Every manual action records `actor {holder, via}` and `why` on its event; a force-release writes one `force-release` event (`hold_kind` `lease`, `reservation` or the emulator slot's Lease) with `lease_id` or `run_key`, `held_ms`, `actor` and `why`.
+- The emulator Pool through the API: the emulator boots and tears down in a worker thread, so no other request waits for it. The Pool's size is the `emulator-pool` file, the Registry's `pools.emulator.size`, then 2 (each 1 to 8; `HUB_EMULATOR_POOL` is the CLI's alone).
+- `mise run hosts:smoke` gains a holds phase (on by default; `--no-holds` skips it): the same Hold sequence through the API and through `hub-device` on one target, `status --json` read after every step, and the two traces required equal: take A, B waits first in line, extend A refused while B waits, force-release A and B is granted, extend B by exactly 60 s, release B and the target is free. By default it runs on the smoke phone, so it touches no real device and can run after every `hosts:install`; `hosts:smoke -- --holds-on s24` runs it on the S24 (the target must be free with nobody waiting, else nothing is taken). Its ids are `smoke-<id>-<a|b>-<api|cli>`, its holder `hosts:smoke`, and a failure releases every id it started before it retires the phone. The `HUB_SMOKE_OK` line is unchanged.
+
+### Operator-visible changes
+
+- `HUB_LEASE_EXTEND_REFUSED` now exits 76 (busy), not 1, on `hub-device extend` and in the API's `exit`; the refusal names each waiter and its place. An extension at or after `expires_at` is refused (`expired`); extending a Lease that does not exist is `HUB_LEASE_NOT_FOUND` (exit 2) with `reason` `waiting` or `unknown`, where it was `HUB_LEASE_LOST`. `HUB_LEASE_LOST` (exit 1) now means the lock changed hands between the read and the write.
+- `hub-device lease phone` with every phone held says `HUB_DEVICE_BUSY phone host lock s24 is held by ...; host lock adb is held by ... (every phone is held); gave up after <n>s`: each held member is named with the library's own `host lock <name> is held by` wording, the same text the API puts in `detail`.
+
+### Test changes you will see
+
+- `tools/device/claims.test.mjs`: `HUB_LEASE_EXTEND_REFUSED` exits 76 (it was 1); an extend of a waiting or unknown id is `HUB_LEASE_NOT_FOUND` (it was `HUB_LEASE_LOST`); `HUB_LEASE_LOST` is only a change of hands; the exit table lists the new codes; the Pool size order has its own test.
+- `tools/device/hub-device.test.mjs`: the `phone` busy line keeps `host lock <name> is held by` for each member (one assertion).
+- `tools/device/lease.test.mjs`: `claimantKind` and `actor` on the owner record and the events.
+- `tools/ci/pool-request.test.mjs`: a Pool timeout keeps the `host lock <name> is held by` wording for every held member, and tickets carry `claimant_kind`.
+- `tools/device/emulator.test.mjs`: the emulator fixtures moved to `tools/device/emulator-fixtures.mjs` (no assertion changed).
+- `tools/deploy-path.test.mjs`: no deploy-path file force-releases a Reservation or names its route (AD-25).
+- `tools/hub-api/contract.test.mjs`: the AD-42 Hold routes are frozen with their field lists.
+- New suites: `tools/ci/extend.test.mjs`, `tools/ci/cancel-request.test.mjs`, `tools/ci/force-release.test.mjs` and `tools/hub-api/{leases,waits,extend-release,cancel,force-release,reservation-force-release,emulator-lease,emulator-force-release}.test.mjs`; `tools/hosts/smoke.test.mjs` covers the holds phase.
+
 ## v1.2.55
 
 v1.2.54 plus an installer readback fix. v1.2.54 is on `v1` with all six dry runs green, but its `mise run hosts:install` reported `HOSTS_FAILED hub api on big-chungus` although the service was up and healthy: the readback waited for `/health` to say `service: hub-api`, while the server answers `mobile-deploy-hub-api` (the name in `docs/hub-api-contract.md`). The tests faked the readback with the same wrong name, so they agreed with it.
