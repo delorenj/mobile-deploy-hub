@@ -379,9 +379,44 @@ test('the HTTP table gives every library error a status; an unknown code has non
 });
 
 test('checkLeaseBody returns the normalised input, with defaults', () => {
-  assert.deepEqual(checkLeaseBody({ ...BODY }), { resource: 's24', match: null, forMs: 30 * MIN, waitMs: 0, holder: 'agent-a', why: 'proof', claimantKind: 'agent', id: null, actor: null });
+  assert.deepEqual(checkLeaseBody({ ...BODY }), { resource: 's24', match: null, forMs: 30 * MIN, waitMs: 0, holder: 'agent-a', why: 'proof', claimantKind: 'agent', id: null, actor: null, requireReachable: false });
+  assert.equal(checkLeaseBody({ ...BODY, require_reachable: true }).requireReachable, true);
+  assert.equal(checkLeaseBody({ ...BODY, require_reachable: false }).requireReachable, false);
   const full = checkLeaseBody({ match: 'kind=phone', for_ms: 1000, holder: 'h', why: 'w', claimant_kind: 'person', id: 'x-1', actor: { holder: 'jarad', via: 'cli' } });
   assert.deepEqual([full.resource, full.match, full.claimantKind, full.id, full.actor], [null, 'kind=phone', 'person', 'x-1', { holder: 'jarad', via: 'cli' }]);
+});
+
+test('require_reachable (Story 9.4): not a boolean or with a match is 400 bad-reachable, as is a Pool word or the emulator, before anything is written', async () => {
+  const s = scratch();
+  try {
+    for (const bad of ['yes', 1, null]) assert.deepEqual(problemOf(await s.post({ ...BODY, require_reachable: bad })).slice(0, 4), [400, 'HUB_USAGE', 2, 'bad-reachable'], `${bad}`);
+    const matched = await s.post({ match: 'kind=phone', for_ms: 30 * MIN, holder: 'agent-a', why: 'proof', require_reachable: true }, { readings: s.readings({}) });
+    assert.deepEqual(problemOf(matched), [400, 'HUB_USAGE', 2, 'bad-reachable']);
+    for (const word of ['phone', 'emulator']) assert.deepEqual(problemOf(await s.post({ ...BODY, resource: word, require_reachable: true }, { readings: s.readings({}) })), [400, 'HUB_USAGE', 2, 'bad-reachable'], word);
+    assert.deepEqual(s.events(), []);
+    assert.equal(s.owner('s24'), null);
+    // false is the default: a match with it is taken as before.
+    assert.equal((await s.post({ match: 'kind=phone', for_ms: 30 * MIN, holder: 'agent-a', why: 'proof', require_reachable: false }, { readings: s.readings({}) })).status, 200);
+  } finally { s.cleanup(); }
+});
+
+test('require_reachable on a phone word is gated by the service\'s reading cache: not reachable is 503 HUB_DEVICE_AWAY with the state as reason, and nothing is written', async () => {
+  const s = scratch();
+  try {
+    for (const state of ['offline', 'absent', 'unauthorized', 'unknown']) {
+      const answer = await s.post({ ...BODY, require_reachable: true }, { readings: s.readings({ s24: state }) });
+      assert.deepEqual(problemOf(answer), [503, 'HUB_DEVICE_AWAY', 75, state]);
+      assert.equal(s.owner('s24'), null, state);
+      assert.deepEqual(s.events(), [], state);
+    }
+    assert.equal(problemOf(await s.post({ ...BODY, require_reachable: true })).at(3), 'unknown', 'a service with no cache reads unknown');
+    const taken = await s.post({ ...BODY, require_reachable: true }, { readings: s.readings({ s24: 'reachable' }) });
+    assert.equal(taken.status, 200);
+    assert.equal(s.owner('s24').lease_id, taken.body.lease_id);
+    // Without the key a word is never away, as before.
+    const word = await s.post({ ...BODY, resource: 's26' }, { readings: s.readings({ s26: 'offline' }) });
+    assert.equal(word.status, 200);
+  } finally { s.cleanup(); }
 });
 
 test('requestListener answers POST /leases over the adapter, and a bad wait_ms is refused', async () => {
