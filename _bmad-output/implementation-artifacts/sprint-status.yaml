@@ -131,7 +131,7 @@ development_status:
 
   epic-10: backlog
   10-1-replicate-the-mac-s-event-log: done
-  10-2-query-history-across-both-hosts: backlog
+  10-2-query-history-across-both-hosts: done
   10-3-utilisation-per-resource: backlog
   10-4-freeze-the-contract-and-prove-nothing-leaks: backlog
   10-5-ship-v1b: backlog

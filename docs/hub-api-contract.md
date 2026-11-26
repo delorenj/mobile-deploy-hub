@@ -30,6 +30,7 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 | GET | `/discovery` | Discovery | 6.10 |
 | GET | `/status` | Status | 8.1 |
 | GET | `/stream` | StreamFrame | 8.4 |
+| GET | `/history` | History | 10.2 |
 | POST | `/agent/push` | AgentPushAck | 9.5 |
 | POST | `/registry/resources` | Resource | 6.6 |
 | POST | `/registry/resources/{id}` | Resource | 6.7 |
@@ -271,7 +272,7 @@ The age rule: a reader on the service's host computes `age_ms = age_ms_at_receip
 `GET /stream`: the change stream of the status document (FR-14, AD-43), the Candybar SSE wire. It is not JSON: the response is `text/event-stream` with `Cache-Control: no-store` and `X-Accel-Buffering: no`, and it stays open until the client or the service ends it. Loopback only, like every route.
 
 - The first bytes of every connection are `retry: 3000` (a client reconnects after 3 s). A frame is `id: <boot>-<seq>`, `event: <type>` and one line `data: <JSON>`, ended by a blank line. The id matches `^[0-9a-f]{12}-[0-9]+$`: `<boot>` is 12 hex characters the service mints at each start, `<seq>` counts the frames of that boot from 1. The data starts with `type`, `seq`, `key` and `at`.
-- Types. `ready` is the opening of a new connection (no `Last-Event-ID`) and carries the whole `/status` document in `status`. `status` is the whole document again (absolute: a client that has one needs no earlier one). `event` is one Event Log line, `event` with its id as `event_id` (its id in the Event Log, whichever way a client read it: a client dedupes on it). `reset` is the opening of a connection that cannot resume, with `reason: unresumable` and the whole document, and the client then refetches `/history` (the Event Log's read route, which is not in this contract yet).
+- Types. `ready` is the opening of a new connection (no `Last-Event-ID`) and carries the whole `/status` document in `status`. `status` is the whole document again (absolute: a client that has one needs no earlier one). `event` is one Event Log line, `event` with its id as `event_id` (its id in the Event Log, whichever way a client read it: a client dedupes on it). `reset` is the opening of a connection that cannot resume, with `reason: unresumable` and the whole document, and the client then refetches `GET /history` (the Event Log's read route, see `History`).
 - An opening frame (`ready` or `reset`) is per connection: its id is `<boot>-<cursor>` (the last seq emitted, `<boot>-0` before the first frame), it takes no seq of its own and is never replayed to another client.
 - The service keeps the last 1024 frames of its boot. A `Last-Event-ID` of this boot whose seq is still covered by them (at least the oldest kept seq minus one, at most the cursor) resumes: the connection gets `retry: 3000` and then every frame after that seq, with no opening frame and no document. Any other id (another boot, so after a restart; a malformed id; an evicted or future seq) gets `reset`.
 - A comment line `: keepalive` (no id) is sent after `api.stream_keepalive_s` (15 s) of silence on a connection, whatever else the other connections got. A client that falls far behind (more than 8 MiB buffered for it) is disconnected and reconnects with its last id; the replay of a connection's opening is not held to that bound.
@@ -289,6 +290,40 @@ The fields of a frame's data:
 - `status.*` the whole `/status` document, exactly the fields of `Status` above; on `ready`, `status` and `reset` frames
 - `event_id` the Event Log line's id; only on an `event` frame
 - `event.*` the Event Log line as its writer allowlisted it (no serials); only on an `event` frame
+
+### History
+
+`GET /history?resource&pool&claimant&repo&from&to&cursor&limit` (Story 10.2, FR-18, UJ-4, AD-40): the Event Log of both hosts, this host's own log and each peer host's replica (`replicas/<host>/`, Story 10.1), filtered, merged and paged. Everything is keyed by host key, so a further peer host needs no new field. It never compacts or deletes an event, and writes nothing of its own: its only writes are those of a peer call (the Story 9.6 mark, one `host-reachability` event in this host's log) and of the replica's own writer (settling a torn replica tail, and the pushes a sync causes).
+
+Query. Every key is optional and none may repeat or be empty; any other key is 400 `HUB_USAGE` `bad-query`. The filters are ANDed.
+
+| Key | Meaning |
+|-----|---------|
+| `resource` | a Resource id or name; an event matches by its `resource` field, or, when it has none (a v1a event), by its `lock` (`adb` is the S26, `emulator-<n>` the emulator Pool, a `res-*` lock its Registry record) |
+| `pool` | a Pool name (`phone`, `emulator`); an event matches by its own `pool` (a Pool request's events) or when its Resource is a member of the Pool (a gate Pool: its lock's Resource); a name the Registry has no Pool for matches by the event's own `pool` only |
+| `claimant` | an event's `claimant.kind` (`agent`, `person`, `deploy`, `hub-job`) or `claimant.holder` |
+| `repo` | `owner/name`: the event's `claimant.repo` or `delivery.repo` |
+| `from`, `to` | an ISO time (`2026-11-01T00:00:00Z`, or a date); an event matches when `from` <= its `ts` < `to`, and an event with no readable `ts` matches neither bound. A bad time, or `from` after `to`, is 400 `bad-range` |
+| `limit` | a whole number from 1 to 1000 (default 100); anything else is 400 `bad-limit` |
+| `cursor` | the `cursor` of an earlier answer, with the same filters; anything this API did not give out, or a position the log never had, is 400 `bad-cursor` |
+
+Order and paging. Order is total per host: the month, then the byte offset of the line (the offset is in the event's `id`, `<host_id>/<YYYY-MM>/<offset>`, the same for a replica line as for its source line). Across hosts the entries are merged by `ts` (a tie goes to the host key that comes first (`linux`, then `mac`); a line with no readable `ts` first), and the answer says `cross_host_order: display-only`: a consumer never derives an order between two hosts' events from it. The `cursor` is opaque and decodes to `{<host key>: "<month>/<offset>"}` (base64url of that JSON): where each host's next read starts, so lines that did not match are never scanned twice. Paging through with `cursor` returns every line that matches exactly once, none is ever compacted or deleted, and an answer's `cursor` is also good after `more` is `false` (it picks up the events written since).
+
+Gaps. A peer's replica holds what its Host Agent pushed, so a Mac that sleeps leaves it short. When a peer's `synced_through` is before the window's end (`to`, else the request's receipt time), the Hub API first calls that host's `POST /agent/sync` with the replica's sizes (behind the Story 9.6 marks: a host marked unreachable fails at once, with no call, and a call that fails at the ssh leg marks it), then reads the replica. A window the replica cannot be shown to cover is `partial: true`; time the peer was unreachable but later synced is complete.
+
+- `format` always `1`
+- `events[].id` the event's id (`<host_id>/<YYYY-MM>/<byte offset>`)
+- `events[].host` the host key whose log it is (`linux`, `mac`)
+- `events[].event.*` the Event Log line as its writer allowlisted it (no serials)
+- `cursor` the opaque cursor to continue from, or `null` when no host has a log and the request had no cursor
+- `more` `true` when matching lines remain after this page
+- `partial` `true` when some peer's `synced_through` is `null` or before the window's end
+- `synced_through.*` by host key: an ISO time, or `null`. The latest of the send time of a `/agent/sync` the agent answered `synced: true` (kept in memory by the service) and the `ts` of the replica's last complete line; this host's own is the request's receipt time
+- `unreachable_ranges[].host` the peer host key
+- `unreachable_ranges[].from` an ISO time, the start of a range the peer could not be asked, from the `host-reachability` events of this host's log (an `unreachable` opens it, the next `reachable` closes it), clipped to `max(from, synced_through)`
+- `unreachable_ranges[].to` an ISO time, the end of the range (the window's end for one still open)
+- `cross_host_order` always `display-only`
+- `checked_at` an ISO time, the service's clock when it received the request
 
 ### Lease
 
@@ -515,7 +550,7 @@ Applied once per `(boot, seq)`: a repeat answers 200 `{applied: false}` and chan
 
 Refusals: `HUB_USAGE` 400 for the body, with one of these reasons, checked in this order and before anything is stored: `bad-body` (not an object, a key outside the list or a missing one), `bad-format`, `bad-host` (not a host key, or this service's own), `bad-host-id`, `bad-boot`, `bad-seq`, `bad-sent-at`, `bad-status`, `bad-readings`, `bad-events`; `HUB_HOST_UNKNOWN` 503 when this service does not know its own host key.
 
-**`POST /agent/sync`** (Story 10.1) is the Host Agent's route, not the Hub API's: it hands the agent the replica sizes to push from (Story 10.2's `/history` will call it when a range the replica lacks is requested). The body is a JSON object with only this key:
+**`POST /agent/sync`** (Story 10.1) is the Host Agent's route, not the Hub API's: it hands the agent the replica sizes to push from (the Hub API's `GET /history` calls it when a range the replica lacks is requested, Story 10.2). The body is a JSON object with only this key:
 
 - `replica` (required): an object keyed by month (`YYYY-MM`), every value a whole number of bytes 0 or more — the settled sizes of the Hub API's replica of this host.
 
@@ -531,7 +566,7 @@ Refusals: `HUB_USAGE` 400 with `bad-body` (not an object, a key outside the list
 | `HUB_RESOURCE_NOT_FOUND` | 404 | 2 | No Resource has this id (`reason: unknown`), or on a read it is retired and idle (`reason: retired`). The write routes (`/registry/resources/{id}` and `/retire`) answer only `unknown`. |
 | `HUB_RESOURCE_RETIRED` | 409 | 2 | An edit of a Resource that is retired (`reason: retired`) or no longer in `devices.json` (`reason: seed-missing`). Also what `POST /leases` refuses a take of one with, with the same reasons, and what the Host Agent answers a forwarded take whose carried `retired_at` is set (`reason: retired`). |
 | `HUB_REGISTRY_SEEDED` | 409 | 2 | A retire (`reason: retire`), an edit of `id`, `lock`, `kind`, `host` or `identity` (`reason` is that key) or a different name (`reason: name`) of a seeded Resource: a hub release changes those. |
-| `HUB_USAGE` | 400, 413 | 2 | The request body is not valid JSON (`bad-json`) or is over 1 MiB (`too-large`), or a write body is wrong (`bad-body`, `bad-kind`, `bad-host`, `bad-identity`, `no-model`, `bad-capabilities`, `bad-if-rev`, `no-if-rev`, `bad-why`, `bad-actor`, `no-holder`, `no-change`), or an edit names a key a runtime Resource keeps for good (`immutable`). An extend body is wrong with `bad-body`, `bad-for`, `bad-actor`, `bad-override`, `bad-resource` or `no-holder`, a release body with `bad-body`, `bad-actor`, `bad-resource` or `no-holder`, a cancel body with `bad-body`, `no-resource`, `bad-resource`, `bad-pool`, `bad-host`, `bad-why`, `bad-actor` or `no-holder`, a force-release body with `bad-body`, `no-why`, `bad-why`, `bad-actor`, `bad-resource` or `no-holder` (`reason: emulator` for an emulator lease id, which is the slot's to force-release, and `bad-slot` for `emulator-<n>` outside 1 to 8), a Reservation force-release body with `bad-body`, `no-why`, `bad-why`, `bad-actor`, `no-holder` or `bad-name`, and a run key that is not `owner--repo--run` with `bad-run-key`. A lease body is wrong with `bad-body`, `bad-target`, `bad-for`, `bad-wait`, `bad-claimant-kind`, `bad-reachable`, `bad-id`, `no-id`, `bad-actor`, `no-holder` or `bad-why`; a request that is not a valid forward has `bad-forward` (the `X-Hub-Forwarded` header is not `cli`, `api` or `host-agent`) or `bad-resource` (a carried `resource` that is not `{id, lock, host, rev, retired_at}`, or an object `resource` with no header), and a forwarded record the Host Agent's seed does not have, sent with `rev: 0`, has `unseeded`; a lease request the library refuses (an unknown word, a bad `profile` clause, a taken `id`, a `for_ms` over a cap) has `reason: hub_usage` and a `detail` that says why. |
+| `HUB_USAGE` | 400, 413 | 2 | The request body is not valid JSON (`bad-json`) or is over 1 MiB (`too-large`), or a write body is wrong (`bad-body`, `bad-kind`, `bad-host`, `bad-identity`, `no-model`, `bad-capabilities`, `bad-if-rev`, `no-if-rev`, `bad-why`, `bad-actor`, `no-holder`, `no-change`), or an edit names a key a runtime Resource keeps for good (`immutable`). An extend body is wrong with `bad-body`, `bad-for`, `bad-actor`, `bad-override`, `bad-resource` or `no-holder`, a release body with `bad-body`, `bad-actor`, `bad-resource` or `no-holder`, a cancel body with `bad-body`, `no-resource`, `bad-resource`, `bad-pool`, `bad-host`, `bad-why`, `bad-actor` or `no-holder`, a force-release body with `bad-body`, `no-why`, `bad-why`, `bad-actor`, `bad-resource` or `no-holder` (`reason: emulator` for an emulator lease id, which is the slot's to force-release, and `bad-slot` for `emulator-<n>` outside 1 to 8), a Reservation force-release body with `bad-body`, `no-why`, `bad-why`, `bad-actor`, `no-holder` or `bad-name`, and a run key that is not `owner--repo--run` with `bad-run-key`. `GET /history` refuses its query with `bad-query` (an unknown, repeated or empty key), `bad-range` (a bad `from` or `to`, or `from` after `to`), `bad-cursor` or `bad-limit`, before anything is read. A lease body is wrong with `bad-body`, `bad-target`, `bad-for`, `bad-wait`, `bad-claimant-kind`, `bad-reachable`, `bad-id`, `no-id`, `bad-actor`, `no-holder` or `bad-why`; a request that is not a valid forward has `bad-forward` (the `X-Hub-Forwarded` header is not `cli`, `api` or `host-agent`) or `bad-resource` (a carried `resource` that is not `{id, lock, host, rev, retired_at}`, or an object `resource` with no header), and a forwarded record the Host Agent's seed does not have, sent with `rev: 0`, has `unseeded`; a lease request the library refuses (an unknown word, a bad `profile` clause, a taken `id`, a `for_ms` over a cap) has `reason: hub_usage` and a `detail` that says why. |
 | `HUB_LOCK_TIMEOUT` | 409 | 76 | `POST /leases`: the lock is held or someone waits (`reason: busy`), or a wait ran out of time; `POST /leases/emulator-<n>/force-release` while another teardown holds the `emulator-reaper` lock for 2 min (nothing was written). `detail` keeps the library's wording, `host lock <name> is held …` (for a Pool, once per held member; a full emulator Pool says `the emulator pool is full …`); a try writes no event, a wait ends with its `timeout` event. |
 | `HUB_DEVICE_AWAY` | 503 | 75 | `POST /leases` with a `match` whose every member the service's cache knows is away: `absent`, `offline` or `unauthorized` (`reason: away`); or a single-Resource take with `require_reachable: true` whose device does not read `reachable` (`reason` is the reading: `offline`, `absent`, `unauthorized` or `unknown`). |
 | `HUB_NO_MATCH` | 404 | 2 | `POST /leases` with a `match` nothing can serve, or an emulator profile that is unknown or whose image is not installed (`reason: no-match`); `detail` says what excluded each Resource, or names the image. |
@@ -553,7 +588,7 @@ Refusals: `HUB_USAGE` 400 with `bad-body` (not an object, a key outside the list
 | `HUB_REGISTRY_NAME` | 400, 409 | 2 | A register's or edit's name is not a slug (`not-slug`) or is too long (`too-long`) with 400; reserved (`reserved`), already used (`taken`) or out of `-<n>` suffixes (`exhausted`) with 409. |
 | `HUB_REGISTRY_DUPLICATE` | 409 | 2 | A live Resource already has the serial (`reason: serial`) or UDID (`reason: udid`); `holder` names it. |
 | `HUB_REGISTRY_CONFLICT` | 409 | 1 | `if_rev` is not the Registry's revision; `rev` is the current one. |
-| `HUB_HOST_UNKNOWN` | 503 | 1 | `GET /discovery` or `GET /status` on a host that does not know which host it is (`reason: host-unknown`): `~/.config/mobile-deploy-hub/host-key` is missing, empty, unknown or for another platform. `mise run hosts:install` writes it. |
+| `HUB_HOST_UNKNOWN` | 503 | 1 | `GET /discovery`, `GET /status` or `GET /history` on a host that does not know which host it is (`reason: host-unknown`): `~/.config/mobile-deploy-hub/host-key` is missing, empty, unknown or for another platform. `mise run hosts:install` writes it. |
 | `HUB_REGISTRY_FORMAT` | 409 | 1 | `registry.json` exists and cannot be read, or is a format this service does not know. It is never written. |
 | `HUB_API_ERROR` | 500 | 1 | A bug in the service. The detail is one line; the journal has the same line. |
 | `HUB_API_ALREADY_RUNNING` | none | 1 | Start only: the port is taken. Never an HTTP answer. |
@@ -747,7 +782,7 @@ The seven Hold routes take the same bodies and answer the same shapes as the Hub
 
 ### AgentSync
 
-`POST /agent/sync` (Story 10.1): the replica sizes were handed over and the agent pushed from them (Story 10.2's `/history` will call it when a range the replica lacks is requested). The body is under "Request bodies". The answer is 200:
+`POST /agent/sync` (Story 10.1): the replica sizes were handed over and the agent pushed from them (the Hub API's `GET /history` calls it when a range the replica lacks is requested, Story 10.2). The body is under "Request bodies". The answer is 200:
 
 - `pushed` `true` when the push it made was answered 2xx and drained what differed, `false` when it failed (it stays owed, as any failed push)
 - `synced` `true` when the drain left every source month replicated (its complete-line end equals its acknowledged size); `false` when the push failed, the Hub API answered no valid replica sizes, or a month was skipped (a bad size in the body is the 400, never a 200)
