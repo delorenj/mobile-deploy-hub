@@ -31,6 +31,7 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 | GET | `/status` | Status | 8.1 |
 | GET | `/stream` | StreamFrame | 8.4 |
 | GET | `/history` | History | 10.2 |
+| GET | `/utilisation` | Utilisation | 10.3 |
 | POST | `/agent/push` | AgentPushAck | 9.5 |
 | POST | `/registry/resources` | Resource | 6.6 |
 | POST | `/registry/resources/{id}` | Resource | 6.7 |
@@ -325,6 +326,65 @@ Gaps. A peer's replica holds what its Host Agent pushed, so a Mac that sleeps le
 - `cross_host_order` always `display-only`
 - `checked_at` an ISO time, the service's clock when it received the request
 
+### Utilisation
+
+`GET /utilisation?from&to` (Story 10.3, FR-18, AD-40): how each Resource spent the window `[from, to)`, as ms and as a share of the window, in five classes. Everything is keyed by host key and by Resource, so a further host, phone or `res-*` Resource is covered with no new field. It writes nothing of its own (only a peer call's mark and the replica writer's pushes, as `/history`).
+
+Query. `from` is required, `to` is optional; no key may repeat or be empty, and any other key (or a missing `from`) is 400 `HUB_USAGE` `bad-query`. `from` and `to` are ISO times as for `/history`; a bad time, or `from` not before the effective `to`, is 400 `bad-range`. `to` defaults to the request's receipt time and is never later than it (a later `to` is clipped to it).
+
+Classes. Each instant of the window is exactly one of these, checked in this order:
+
+| Class | Meaning |
+|-------|---------|
+| `unknown` | the Resource's host has not synced that far (the instant is after that host's `synced_through`, or the host has none) |
+| `held` | a Hold (a Lease or a deploy job's lock) covers it |
+| `idle_while_reserved` | a deploy run's Reservation covers it and no Hold does |
+| `idle` | the Resource reads `reachable` (an emulator slot has no readings: its free time is `idle`) |
+| `away` | the Resource reads any other state (`absent`, `offline`, `unauthorized`, ...) |
+| `unknown` | no Reachability reading covers it (before the first reading, after a probe's `registry.reachability_max_age_s`, after a `track-lost`, or a reading of `unknown`) |
+
+(`unknown` past `synced_through` wins over a Hold and a Reservation; a Hold or a Reservation wins over having no reading.) A `track` reading holds until the Resource's next `reachability` event; a `probe` reading holds until its `checked_at` plus `registry.reachability_max_age_s`. A Hold runs from its `acquire` to its release, force-release or reclaim (never past what the event's `held_ms` says), or, while open, to its Lease's `expires_at` as extended; a Reservation runs from its claim to its release, expiry or force-release, or to its ceiling. A lock-only v1a event with no `resource` field counts for the Resource its lock stands for. The `emulator` gate lock is not a Hold: the Pool's time is its slots' (`emulator-<n>`).
+
+The answer is built from one folded timeline per host source (this host's Event Log, each peer's replica) that the service keeps in memory and advances over only the bytes appended since the last request: it never walks the whole log per request. A restart forgets it and the first request rebuilds it. Gaps are as for `/history`: a peer whose replica may lack the window is asked to push first, and a window the replica cannot be shown to cover answers `partial: true`.
+
+The Resources are the Registry's live ones, plus any retired at or after `from`, in the Registry's order. The emulator Pool's row is the sum of its slots' (its `span_ms` is `window_ms` times the number of slots). The slots are `emulator-1` to the host's Pool size and any other slot the log shows. A row names no identity, serial or UDID.
+
+- `format` always `1`
+- `from` an ISO time, the window's start
+- `to` an ISO time, the window's end (clipped to the request's receipt time)
+- `window_ms` the window's length in ms
+- `resources[].id` the Resource's id
+- `resources[].name` the word a Claimant says
+- `resources[].kind` `phone`, `ios-lane` or `emulator-pool`
+- `resources[].host` the host key the Resource lives on
+- `resources[].span_ms` the ms the shares are of: `window_ms` (the emulator Pool's: `window_ms` times its slot count)
+- `resources[].ms.held` whole ms held
+- `resources[].ms.idle_while_reserved` whole ms idle while reserved
+- `resources[].ms.idle` whole ms idle
+- `resources[].ms.away` whole ms away
+- `resources[].ms.unknown` whole ms unknown; the five add up to `span_ms`
+- `resources[].shares.held` `ms.held / span_ms`, unrounded (0 when `span_ms` is 0)
+- `resources[].shares.idle_while_reserved` as above
+- `resources[].shares.idle` as above
+- `resources[].shares.away` as above
+- `resources[].shares.unknown` as above
+- `slots[].resource` the Resource id of the Pool the slot belongs to (`emulator`)
+- `slots[].slot` the slot lock (`emulator-<n>`)
+- `slots[].span_ms` `window_ms`
+- `slots[].ms.held` as for a Resource
+- `slots[].ms.idle_while_reserved` as for a Resource
+- `slots[].ms.idle` as for a Resource
+- `slots[].ms.away` as for a Resource
+- `slots[].ms.unknown` as for a Resource
+- `slots[].shares.held` as for a Resource
+- `slots[].shares.idle_while_reserved` as for a Resource
+- `slots[].shares.idle` as for a Resource
+- `slots[].shares.away` as for a Resource
+- `slots[].shares.unknown` as for a Resource
+- `partial` `true` when some peer's `synced_through` is `null` or before `to`
+- `synced_through.*` by host key, as for `History`: an ISO time, or `null`; this host's own is the request's receipt time
+- `checked_at` an ISO time, the service's clock when it received the request
+
 ### Lease
 
 `POST /leases`: status 200, the Lease that was taken (after a wait, when the body asked for one). For a phone it is the Lease `hub-device lease <word> --no-connect --json` would take; for an emulator (7.4) it is the Lease `hub-device lease emulator --json` would take, answered once the emulator is booted. It is the one view every service route that answers with a Lease uses (`leaseView` in `tools/device/claims.mjs`).
@@ -566,7 +626,7 @@ Refusals: `HUB_USAGE` 400 with `bad-body` (not an object, a key outside the list
 | `HUB_RESOURCE_NOT_FOUND` | 404 | 2 | No Resource has this id (`reason: unknown`), or on a read it is retired and idle (`reason: retired`). The write routes (`/registry/resources/{id}` and `/retire`) answer only `unknown`. |
 | `HUB_RESOURCE_RETIRED` | 409 | 2 | An edit of a Resource that is retired (`reason: retired`) or no longer in `devices.json` (`reason: seed-missing`). Also what `POST /leases` refuses a take of one with, with the same reasons, and what the Host Agent answers a forwarded take whose carried `retired_at` is set (`reason: retired`). |
 | `HUB_REGISTRY_SEEDED` | 409 | 2 | A retire (`reason: retire`), an edit of `id`, `lock`, `kind`, `host` or `identity` (`reason` is that key) or a different name (`reason: name`) of a seeded Resource: a hub release changes those. |
-| `HUB_USAGE` | 400, 413 | 2 | The request body is not valid JSON (`bad-json`) or is over 1 MiB (`too-large`), or a write body is wrong (`bad-body`, `bad-kind`, `bad-host`, `bad-identity`, `no-model`, `bad-capabilities`, `bad-if-rev`, `no-if-rev`, `bad-why`, `bad-actor`, `no-holder`, `no-change`), or an edit names a key a runtime Resource keeps for good (`immutable`). An extend body is wrong with `bad-body`, `bad-for`, `bad-actor`, `bad-override`, `bad-resource` or `no-holder`, a release body with `bad-body`, `bad-actor`, `bad-resource` or `no-holder`, a cancel body with `bad-body`, `no-resource`, `bad-resource`, `bad-pool`, `bad-host`, `bad-why`, `bad-actor` or `no-holder`, a force-release body with `bad-body`, `no-why`, `bad-why`, `bad-actor`, `bad-resource` or `no-holder` (`reason: emulator` for an emulator lease id, which is the slot's to force-release, and `bad-slot` for `emulator-<n>` outside 1 to 8), a Reservation force-release body with `bad-body`, `no-why`, `bad-why`, `bad-actor`, `no-holder` or `bad-name`, and a run key that is not `owner--repo--run` with `bad-run-key`. `GET /history` refuses its query with `bad-query` (an unknown, repeated or empty key), `bad-range` (a bad `from` or `to`, or `from` after `to`), `bad-cursor` or `bad-limit`, before anything is read. A lease body is wrong with `bad-body`, `bad-target`, `bad-for`, `bad-wait`, `bad-claimant-kind`, `bad-reachable`, `bad-id`, `no-id`, `bad-actor`, `no-holder` or `bad-why`; a request that is not a valid forward has `bad-forward` (the `X-Hub-Forwarded` header is not `cli`, `api` or `host-agent`) or `bad-resource` (a carried `resource` that is not `{id, lock, host, rev, retired_at}`, or an object `resource` with no header), and a forwarded record the Host Agent's seed does not have, sent with `rev: 0`, has `unseeded`; a lease request the library refuses (an unknown word, a bad `profile` clause, a taken `id`, a `for_ms` over a cap) has `reason: hub_usage` and a `detail` that says why. |
+| `HUB_USAGE` | 400, 413 | 2 | The request body is not valid JSON (`bad-json`) or is over 1 MiB (`too-large`), or a write body is wrong (`bad-body`, `bad-kind`, `bad-host`, `bad-identity`, `no-model`, `bad-capabilities`, `bad-if-rev`, `no-if-rev`, `bad-why`, `bad-actor`, `no-holder`, `no-change`), or an edit names a key a runtime Resource keeps for good (`immutable`). An extend body is wrong with `bad-body`, `bad-for`, `bad-actor`, `bad-override`, `bad-resource` or `no-holder`, a release body with `bad-body`, `bad-actor`, `bad-resource` or `no-holder`, a cancel body with `bad-body`, `no-resource`, `bad-resource`, `bad-pool`, `bad-host`, `bad-why`, `bad-actor` or `no-holder`, a force-release body with `bad-body`, `no-why`, `bad-why`, `bad-actor`, `bad-resource` or `no-holder` (`reason: emulator` for an emulator lease id, which is the slot's to force-release, and `bad-slot` for `emulator-<n>` outside 1 to 8), a Reservation force-release body with `bad-body`, `no-why`, `bad-why`, `bad-actor`, `no-holder` or `bad-name`, and a run key that is not `owner--repo--run` with `bad-run-key`. `GET /history` refuses its query with `bad-query` (an unknown, repeated or empty key), `bad-range` (a bad `from` or `to`, or `from` after `to`), `bad-cursor` or `bad-limit`, before anything is read. `GET /utilisation` refuses its query with `bad-query` (an unknown, repeated, empty or missing key) or `bad-range` (a bad `from` or `to`, or `from` not before the effective `to`), before anything is read. A lease body is wrong with `bad-body`, `bad-target`, `bad-for`, `bad-wait`, `bad-claimant-kind`, `bad-reachable`, `bad-id`, `no-id`, `bad-actor`, `no-holder` or `bad-why`; a request that is not a valid forward has `bad-forward` (the `X-Hub-Forwarded` header is not `cli`, `api` or `host-agent`) or `bad-resource` (a carried `resource` that is not `{id, lock, host, rev, retired_at}`, or an object `resource` with no header), and a forwarded record the Host Agent's seed does not have, sent with `rev: 0`, has `unseeded`; a lease request the library refuses (an unknown word, a bad `profile` clause, a taken `id`, a `for_ms` over a cap) has `reason: hub_usage` and a `detail` that says why. |
 | `HUB_LOCK_TIMEOUT` | 409 | 76 | `POST /leases`: the lock is held or someone waits (`reason: busy`), or a wait ran out of time; `POST /leases/emulator-<n>/force-release` while another teardown holds the `emulator-reaper` lock for 2 min (nothing was written). `detail` keeps the library's wording, `host lock <name> is held …` (for a Pool, once per held member; a full emulator Pool says `the emulator pool is full …`); a try writes no event, a wait ends with its `timeout` event. |
 | `HUB_DEVICE_AWAY` | 503 | 75 | `POST /leases` with a `match` whose every member the service's cache knows is away: `absent`, `offline` or `unauthorized` (`reason: away`); or a single-Resource take with `require_reachable: true` whose device does not read `reachable` (`reason` is the reading: `offline`, `absent`, `unauthorized` or `unknown`). |
 | `HUB_NO_MATCH` | 404 | 2 | `POST /leases` with a `match` nothing can serve, or an emulator profile that is unknown or whose image is not installed (`reason: no-match`); `detail` says what excluded each Resource, or names the image. |
@@ -588,7 +648,7 @@ Refusals: `HUB_USAGE` 400 with `bad-body` (not an object, a key outside the list
 | `HUB_REGISTRY_NAME` | 400, 409 | 2 | A register's or edit's name is not a slug (`not-slug`) or is too long (`too-long`) with 400; reserved (`reserved`), already used (`taken`) or out of `-<n>` suffixes (`exhausted`) with 409. |
 | `HUB_REGISTRY_DUPLICATE` | 409 | 2 | A live Resource already has the serial (`reason: serial`) or UDID (`reason: udid`); `holder` names it. |
 | `HUB_REGISTRY_CONFLICT` | 409 | 1 | `if_rev` is not the Registry's revision; `rev` is the current one. |
-| `HUB_HOST_UNKNOWN` | 503 | 1 | `GET /discovery`, `GET /status` or `GET /history` on a host that does not know which host it is (`reason: host-unknown`): `~/.config/mobile-deploy-hub/host-key` is missing, empty, unknown or for another platform. `mise run hosts:install` writes it. |
+| `HUB_HOST_UNKNOWN` | 503 | 1 | `GET /discovery`, `GET /status`, `GET /history` or `GET /utilisation` on a host that does not know which host it is (`reason: host-unknown`): `~/.config/mobile-deploy-hub/host-key` is missing, empty, unknown or for another platform. `mise run hosts:install` writes it. |
 | `HUB_REGISTRY_FORMAT` | 409 | 1 | `registry.json` exists and cannot be read, or is a format this service does not know. It is never written. |
 | `HUB_API_ERROR` | 500 | 1 | A bug in the service. The detail is one line; the journal has the same line. |
 | `HUB_API_ALREADY_RUNNING` | none | 1 | Start only: the port is taken. Never an HTTP answer. |

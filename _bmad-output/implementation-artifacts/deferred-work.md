@@ -220,3 +220,11 @@ source_spec: `spec-9-5-the-host-agent-pushes-changes-and-only-changes.md`
 severity: medium
 reason: createRemotes() and readings.remote() are in memory only (tools/hub-api/remotes.mjs, tools/hub-api/readings.mjs). The agent pushes only on a change, its start, or a request after a failure, and the Hub API may never call it (spec Never). So after a Hub API restart, /status has no hosts.mac and no stale.mac, and ios-lane reads unknown, until something on the Mac changes. That state is honest ("not known") but it is a gap in a service meant to be restartable at will. Possible fixes: persist the remotes store on the Hub's own disk, or have the agent learn of a new Hub boot (for example from the push ack or the stream boot) and re-push on its next request. Both need a design decision, likely alongside Story 9.6 or Epic 10's /agent/sync.
 status: open
+
+### DW-18: A cached utilisation source resumes from {month, offset} and never looks back, so bytes appended later to an EARLIER month file than the cached position are never folded.
+origin: spec-deferred f663e0675bcb
+location: tools/hub-api/utilisation.mjs:26
+source_spec: `spec-10-3-utilisation-per-resource.md`
+severity: medium
+reason: tools/hub-api/utilisation.mjs advance() opens openReader at the stored position; the host-agent push (tools/host-agent/push.mjs pick()) sends the oldest differing month first, so in normal flow an earlier month is complete before a later one starts. The open case is a month the agent skipped (HUB_AGENT_REPLICA_SKIPPED: HUB_EVENT_OFFSET or HUB_EVENT_NOT_UTF8) that is pushed later, after the cache moved into a newer month. Settle it with a test: cache a replica at month M, then append to month M-1, and check whether the next /utilisation answer includes the M-1 events; if not, rebuild a host whose earlier months' sizes changed. (declared severity: medium (unverified))
+status: open
