@@ -2,7 +2,7 @@
 title: 'Story 9.8: Ship the Mac Host Agent (pre-release half)'
 type: 'chore'
 created: '2026-11-26'
-status: 'awaiting-operator'
+status: done
 operator_actions:
   - 'Merge this story branch into main and push main to origin; the release refuses a main that is not origin/main.'
   - 'Confirm `git ls-remote origin refs/tags/v1 refs/tags/v1.2.58` shows v1 on v1.2.57 and no v1.2.58 tag; if v1 moved or 1.2.58 is taken, retitle the `## v1.2.58` section of docs/hub-releases.md (and its test in tools/ci/v11.test.mjs) first.'
@@ -253,3 +253,19 @@ HUB_SMOKE lanes: ios-lane on mac held as smoke-x-l-ios-lane (mac clock started_a
 - The plist, the Darwin units installer, `devicectl` in the Aqua session and the big-chungus → Mac relay have never run on the real pair. The operator's `hosts:install`, the literal `lease ipad --for 10m` and `hosts:smoke -- --lanes` are their first live run.
 - `--lanes` holds `mac-ios`, a deploy target, for seconds (at most 2 min if the process dies mid-phase). A deploy arriving then waits in line behind it, so run it when no iOS deploy is due.
 - local main (`bce3407`) is ahead of origin/main (`a7a6247`) by the whole of Epic 9, so the release must follow the merge and push.
+
+## Operator Confirmation
+
+Confirmed 2026-11-26: the external actions this story owed were carried out.
+
+- Merge this story branch into main and push main to origin; the release refuses a main that is not origin/main.
+- Confirm `git ls-remote origin refs/tags/v1 refs/tags/v1.2.58` shows v1 on v1.2.57 and no v1.2.58 tag; if v1 moved or 1.2.58 is taken, retitle the `## v1.2.58` section of docs/hub-releases.md (and its test in tools/ci/v11.test.mjs) first.
+- From a fresh clean clone of main on big-chungus, run `mise run release -- 1.2.58`; confirm every app strict dry run is green, v1 moved to v1.2.58, and `git show v1.2.58` carries the notes and a `Roll back:` line that names v1.2.57 and the `ssh hub-mac launchctl bootout` step for the host-agent label.
+- After the release runner confirms its runs are finished, run `mise run hosts:install` on big-chungus from a clean checkout at tag v1.2.58 (the Mac must be awake); confirm the Hub API and Host Agent /health readbacks print equal contract and hub_version, and the services agree step passes.
+- Run the literal `hub-device lease ipad --for 10m` on big-chungus with the iPad plugged in (it exercises devicectl in the Aqua session), see it in `hub-device status --json` under remote_hosts.mac with the Mac clock, and release it with `hub-device release <id> --resource ios-lane`.
+- Run `mise run hosts:smoke -- --lanes` on big-chungus when no iOS deploy holds or waits on mac-ios, and confirm HUB_SMOKE_OK v1.2.58 with a `HUB_SMOKE lanes: ios-lane on mac held as ...` line.
+- Observe the next real iOS deploy and the next iPad catch-up after the install: the deploy behaves as before (v1a AD-22), and the catch-up candybar reports any HUB_MAC_BUSY as a success, with no busy caused by the Host Agent itself (only by a deploy or a Lease someone took).
+- Put the Mac to sleep, run `hub-device lease mac --for 10m --why asleep-check` on big-chungus, and confirm it exits 75 with `HUB_DEVICE_AWAY` `host-unreachable` at once (within the 5 s connect timeout, never a place in line), and that `hub-device status --json` then reads the Mac offline.
+- If the release is red or anything regresses: move v1 back to v1.2.57, run `ssh hub-mac` with the bootout and plist removal for sh.delo.mobile-deploy-hub.host-agent, then `mise run hosts:install` from a clean checkout at v1.2.57.
+
+_Appended by the bmad-loop orchestrator (`bmad-loop confirm`, #335): a human confirmed these external actions out of band, and the story was advanced from `awaiting-operator` to `done`._
