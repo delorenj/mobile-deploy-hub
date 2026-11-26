@@ -19,8 +19,9 @@ import { acquireLease, releaseLease, withLock } from '../ci/lib/lock.mjs';
 import { readEvents } from '../ci/lib/events.mjs';
 import { compareBuild, validateLatest } from '../ci/lib/latest.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
+import { dedicatedPhones, reapQaServer } from '../ci/lib/qa-phones.mjs';
 import {
-  androidPass, androidPlan, catchupWait, compareIos, createJournal, hubWriter, iosRepairsPerDay, inCidr, iosPass, iosPlan, latestProblems, linuxContext,
+  androidPass, androidPlan, createQaState, qaPass, qaRetry, catchupWait, compareIos, createJournal, hubWriter, iosRepairsPerDay, inCidr, iosPass, iosPlan, latestProblems, linuxContext,
   loadSettings, macContext, parseRecordArgs, passLimitMs, passReserveMs, readMode, reasonText, record, recordArgs, retry, serviceAccountEnv, settingsFrom, sshRecordCommand, withFallback, writeMode,
 } from './catchup.mjs';
 import { catchupEvent, producer, sendCatchupEvent } from './report.mjs';
@@ -113,43 +114,54 @@ function script(path, body) {
 
 // The S26 as a shell script over a folder: apps/<package>.apk is what is installed; `away` hides the phone;
 // `refuse` makes every install fail the way Android refuses another signer. Every call is logged.
-const fakeAdb = state => `echo "$*" >> "${state}/calls.log"
+const fakeAdb = state => `if [ "$ANDROID_ADB_SERVER_PORT" = "5060" ]; then
+  st="${state}/qa"; log="${state}/qa-calls.log"; ser=R5CX31AEJDA; model=SM-S928U; id=R5CX31AEJDA
+else
+  st="${state}"; log="${state}/calls.log"; ser=R5GL43A7PCH; model=SM-S948U; id=adb-R5GL43A7PCH-zz._adb-tls-connect._tcp
+fi
+echo "[$ANDROID_ADB_SERVER_PORT] $*" >> "$log"
 [ "$1" = "-s" ] && shift 2
 case "$1" in
   start-server|connect) exit 0 ;;
+  kill-server) exit 0 ;;
   mdns) exit 0 ;;
-  devices) printf 'List of devices attached\\n'; [ -f "${state}/away" ] || printf 'adb-R5GL43A7PCH-zz._adb-tls-connect._tcp\\tdevice\\n'; exit 0 ;;
+  devices) printf 'List of devices attached\\n'; [ -f "$st/away" ] || printf '%s\\tdevice\\n' "$id"; exit 0 ;;
   install)
     shift; [ "$1" = "-r" ] || { echo "fake adb: refuses $*"; exit 1; }
-    apk="$2"
-    [ -f "${state}/refuse" ] && { echo "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Package signatures do not match]"; exit 1; }
-    set -- $(cat "$apk"); cp "$apk" "${state}/apps/$1.apk"; echo Success; exit 0 ;;
+    shift; user=""; if [ "$1" = "--user" ]; then user="$2"; shift 2; fi
+    apk="$1"
+    [ -f "$st/refuse" ] && { echo "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Package signatures do not match]"; exit 1; }
+    set -- $(cat "$apk"); cp "$apk" "$st/apps/$1.apk"; [ -z "$user" ] || touch "$st/user-$user-$1"; echo Success; exit 0 ;;
   shell)
     shift
     case "$1 $2" in
-      "getprop ro.serialno") echo R5GL43A7PCH ;;
-      "getprop ro.product.model") echo SM-S948U ;;
-      "dumpsys package") f="${state}/apps/$3.apk"; [ -f "$f" ] || exit 0; set -- $(cat "$f"); printf 'Packages:\\n  Package [%s] (1):\\n    versionCode=%s minSdk=24\\n    versionName=%s\\n' "$1" "$3" "$2" ;;
-      "pm path") echo "package:/data/app/$3/base.apk" ;;
-      "dumpsys activity") if [ -f "${state}/playing" ]; then echo "  topResumedActivity=ActivityRecord{1a2b u0 $(cat "${state}/playing")/com.godot.game.GodotApp t9}"; else echo "  topResumedActivity=ActivityRecord{1a2b u0 com.android.launcher3/.Launcher t1}"; fi ;;
-      "dumpsys power") if [ -f "${state}/asleep" ]; then echo "  mWakefulness=Asleep"; else echo "  mWakefulness=Awake"; fi ;;
-      "sha256sum /data/app/"*) p=\${2#/data/app/}; p=\${p%/base.apk}; sha256sum "${state}/apps/$p.apk" | cut -d' ' -f1 | sed "s#\\$#  $2#" ;;
+      "getprop ro.serialno") echo $ser ;;
+      "getprop ro.product.model") echo $model ;;
+      "dumpsys package") f="$st/apps/$3.apk"; [ -f "$f" ] || exit 0; set -- $(cat "$f"); printf 'Packages:\\n  Package [%s] (1):\\n    versionCode=%s minSdk=24\\n    versionName=%s\\n' "$1" "$3" "$2" ;;
+      "pm path") user=""; [ "$3" = "--user" ] && user="$4"; for last; do :; done
+        if [ -n "$user" ]; then [ -f "$st/user-$user-$last" ] || [ -f "$st/has-user-$user-$last" ] || exit 1; fi
+        echo "package:/data/app/$last/base.apk" ;;
+      "dumpsys activity") if [ -f "$st/playing" ]; then echo "  topResumedActivity=ActivityRecord{1a2b u0 $(cat "$st/playing")/com.godot.game.GodotApp t9}"; else echo "  topResumedActivity=ActivityRecord{1a2b u0 com.android.launcher3/.Launcher t1}"; fi ;;
+      "dumpsys power") if [ -f "$st/asleep" ]; then echo "  mWakefulness=Asleep"; else echo "  mWakefulness=Awake"; fi ;;
+      "sha256sum /data/app/"*) p=\${2#/data/app/}; p=\${p%/base.apk}; sha256sum "$st/apps/$p.apk" | cut -d' ' -f1 | sed "s#\\$#  $2#" ;;
       *) echo "fake adb: unknown shell $*" >&2; exit 1 ;;
     esac ;;
   *) echo "fake adb: unknown $*" >&2; exit 1 ;;
 esac`;
 
 // big-chungus: fake adb and build tools, a lock folder the "deploy" shares, and a linux context over the fake S3.
-function linuxHost({ mode = 'live', s3 = fakeS3(), emit, writer, pages = async () => {}, settings = settingsFrom(policy), lockWaitMs = 300 } = {}) {
+function linuxHost({ mode = 'live', s3 = fakeS3(), emit, writer, pages = async () => {}, settings = settingsFrom(policy), lockWaitMs = 300, qaUsers = [0] } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'hub-catchup-'));
   const state = join(root, 'phone');
   const bin = join(root, 'bin');
   const tools = join(root, 'sdk/build-tools/35.0.0');
-  for (const dir of [join(state, 'apps'), bin, tools]) mkdirSync(dir, { recursive: true });
+  for (const dir of [join(state, 'apps'), join(state, 'qa/apps'), bin, tools, join(root, 'config')]) mkdirSync(dir, { recursive: true });
   script(join(bin, 'adb'), fakeAdb(state));
+  // The owner's private QA file: the S24, dedicated, allowed to install to Android user 0 only.
+  writeFileSync(join(root, 'config/qa-devices.json'), JSON.stringify({ schema: 1, devices: [{ name: 'S24', model: 'SM-S928U', serial: 'R5CX31AEJDA', dedicated: true, allowed_users: qaUsers }] }));
   script(join(tools, 'apksigner'), 'set -- $(cat "$3")\necho "Signer #1 certificate SHA-256 digest: $4"');
   script(join(tools, 'aapt2'), 'set -- $(cat "$3")\necho "package: name=\'$1\' versionCode=\'$3\' versionName=\'$2\' platformBuildVersionName=\'15\'"');
-  const env = { PATH: process.env.PATH, HUB_ADB: join(bin, 'adb'), ANDROID_HOME: join(root, 'sdk'), JAVA_HOME: join(root, 'java'), HUB_LOCK_DIR: join(root, 'locks'), XDG_CONFIG_HOME: join(root, 'config'), XDG_STATE_HOME: join(root, 'state') };
+  const env = { PATH: process.env.PATH, HUB_ADB: join(bin, 'adb'), ANDROID_HOME: join(root, 'sdk'), JAVA_HOME: join(root, 'java'), HUB_LOCK_DIR: join(root, 'locks'), XDG_CONFIG_HOME: join(root, 'config'), XDG_STATE_HOME: join(root, 'state'), HUB_QA_DEVICES: join(root, 'config/qa-devices.json') };
   if (mode === 'live') writeMode('live', { env, home: root });
   const logs = [];
   const events = [];
@@ -171,8 +183,20 @@ function linuxHost({ mode = 'live', s3 = fakeS3(), emit, writer, pages = async (
     calls: () => { try { return readFileSync(join(state, 'calls.log'), 'utf8'); } catch { return ''; } },
     clearCalls: () => rmSync(join(state, 'calls.log'), { force: true }),
   };
+  // The S24: its own fake phone behind the hub's QA adb server (port 5060 in the fake adb), each Android user it has the app for a marker file.
+  const qa = {
+    install: (text, { users = [0] } = {}) => { const name = text.split(' ')[0]; writeFileSync(join(state, 'qa/apps', `${name}.apk`), text); for (const user of users) writeFileSync(join(state, 'qa', `has-user-${user}-${name}`), ''); },
+    installed: () => { try { return readFileSync(join(state, 'qa/apps', `${pkg}.apk`), 'utf8'); } catch { return null; } },
+    away: () => writeFileSync(join(state, 'qa/away'), ''),
+    back: () => rmSync(join(state, 'qa/away'), { force: true }),
+    refuse: on => (on ? writeFileSync(join(state, 'qa/refuse'), '') : rmSync(join(state, 'qa/refuse'), { force: true })),
+    playing: name => (name ? writeFileSync(join(state, 'qa/playing'), name) : rmSync(join(state, 'qa/playing'), { force: true })),
+    calls: () => { try { return readFileSync(join(state, 'qa-calls.log'), 'utf8'); } catch { return ''; } },
+    clearCalls: () => rmSync(join(state, 'qa-calls.log'), { force: true }),
+    stateFile: () => { try { return JSON.parse(readFileSync(join(root, 'state/mobile-deploy-hub/qa-delivery.json'), 'utf8')); } catch { return null; } },
+  };
   const lines = pattern => logs.filter(line => pattern.test(line));
-  return { root, env, ctx, s3, logs, lines, events, bus, phone, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  return { root, env, ctx, s3, logs, lines, events, bus, phone, qa, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 // Publishes a build the way deliver does: the versioned bytes, then latest.json.
@@ -733,7 +757,7 @@ test('watch mode reads and logs what it would do: no download, no install, no wr
 // round trip the ssh call makes.
 function macHost({ mode = 'live', linux = linuxHost(), metered = true, tunnel = 'connected' } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'hub-catchup-mac-'));
-  const env = { PATH: process.env.PATH, HUB_LOCK_DIR: join(root, 'locks'), XDG_CONFIG_HOME: join(root, 'config'), XDG_STATE_HOME: join(root, 'state') };
+  const env = { PATH: process.env.PATH, HUB_LOCK_DIR: join(root, 'locks'), XDG_CONFIG_HOME: join(root, 'config'), XDG_STATE_HOME: join(root, 'state'), HUB_QA_DEVICES: join(root, 'config/qa-devices.json') };
   if (mode === 'live') writeMode('live', { env, home: root });
   const ipadState = { tunnel, installed: null, calls: [] };
   const ipad = {
@@ -1099,7 +1123,7 @@ test('the catch-up never removes an app, clears its data or downgrades: its only
   const hits = files.flatMap(file => readFileSync(file, 'utf8').split('\n').flatMap((line, index) => forbidden.filter(pattern => pattern.test(line)).map(() => `${relative(hubRoot, file)}:${index + 1}`)));
   assert.deepEqual(hits, []);
   const source = readFileSync(join(hubRoot, 'tools/catchup/catchup.mjs'), 'utf8');
-  assert.deepEqual(source.match(/\.install\([^)]*\)/g), ['.install(id, apk)', '.install(unpacked.app)'], 'the frozen hub calls: adb install -r and devicectl device install app');
+  assert.deepEqual(source.match(/\.install\([^)]*\)/g), ['.install(id, apk)', '.install(id, apk, user)', '.install(unpacked.app)'], 'the frozen hub calls: adb install -r (the S26; a dedicated QA phone, once per allowed Android user) and devicectl device install app');
 });
 
 test('record writes through the hub\'s builds writer and re-renders the app page and the index with its publishPages', async () => {
@@ -1559,4 +1583,258 @@ test('iPad: a newer build on the iPad is refused with the Lease holder from the 
     await iosPass(mac.ctx);
     assert.equal(refusedOf(mac.env).length, 1, 'a later pass does not refuse it again');
   } finally { mac.cleanup(); }
+});
+
+// ---------------------------------------------------------------------------------------------------- dedicated QA phones (MOBI-48)
+
+// The S24 is the hub's QA phone: its own lock (`s24`), its own adb server (port 5060 in the fake adb), its own record on this host.
+// latest.json's device block stays the S26's, so none of these tests may write it.
+const qaOf = host => host.ctx.qaPhones().phones[0];
+
+test('QA: a dedicated phone behind the build is brought to it in place, under its own lock, to its allowed users only, with one event', async () => {
+  const host = linuxHost();
+  try {
+    publish(host.s3, { latest: latestDoc({ android: androidBlock({ status: 'installed', by: 'deploy' }) }), apk: apkText() });
+    host.qa.install(apkText({ version: '0.2.1', code: 3 }));
+    const result = await qaPass(host.ctx);
+    assert.equal(result.errors, 0, host.logs.join('\n'));
+    assert.equal(host.qa.installed(), apkText(), 'the S24 runs the published build');
+    assert.match(host.qa.calls(), /\[5060\] -s R5CX31AEJDA install -r --user 0 \S+\/\.cache\/mobile-deploy-hub\/catchup\/tower-of-lost-things\/tower-of-lost-things-0\.2\.2-4\.apk/);
+    assert.doesNotMatch(host.qa.calls(), /--user [1-9]|uninstall|clear|-d /);
+    assert.equal(host.phone.calls(), '', 'the S26 and its adb server are not touched');
+    assert.equal(host.lines(/^HUB_CATCHUP_INSTALLED tower-of-lost-things android 0\.2\.2 \(4\) on the S24: installed over 0\.2\.1 \(3\) on S24 \(users 0\); readback 0\.2\.2 \(4\), base\.apk sha256 matches/).length, 1);
+    assert.match(host.qa.calls().trim().split('\n').at(-1), /^\[5060\] kill-server$/, "the hub's QA server is stopped when the hold ends");
+    assert.deepEqual(host.s3.writer.writes, [], "latest.json's device block is the S26's: nothing is written");
+    assert.equal(host.events.length, 1);
+    const [event] = host.events;
+    assert.equal(event.type, 'bloodbank.project.deployment.completed');
+    assert.equal(event.correlation, correlationOf(runId), "the original deploy's correlation");
+    assert.deepEqual([event.data.trigger, event.data.run.id, event.data.target.id, event.data.target.name], ['catch-up', runId, 'R5CX31AEJDA', 'SM-S928U']);
+    assert.deepEqual(event.data.deliveries, [{ platform: 'android', target: 'SM-S928U', version: '0.2.2', build: '4', sha256: sha(apkText()), verified: true, status: 'installed', device: 'S24', by: 'catch-up' }]);
+    assert.match(event.data.summary, /^Tower of Lost Things 0\.2\.2 \(4\) 1a2b3c4: S24 installed by catch-up, verified$/);
+    const kept = host.qa.stateFile().deliveries['s24/tower-of-lost-things'];
+    assert.deepEqual([kept.status, kept.version, kept.build, kept.sha256, kept.event], ['installed', '0.2.2', '4', sha(apkText()), null]);
+
+    // The next pass finds nothing to do and says nothing new.
+    host.qa.clearCalls();
+    await qaPass(host.ctx);
+    assert.doesNotMatch(host.qa.calls(), /install|dumpsys|devices/);
+    assert.equal(host.events.length, 1, 'one event per status change');
+    assert.match(host.lines(/HUB_CATCHUP_IDLE qa S24 live/).at(-1), /nothing pending \(tower-of-lost-things 0\.2\.2 \(4\) on the S24/);
+  } finally { host.cleanup(); }
+});
+
+test('QA: an away phone is pending, never a failure: no event, no state, no download, and the hub server is not left running', async () => {
+  const host = linuxHost();
+  try {
+    publish(host.s3, { latest: latestDoc({ android: androidBlock({ status: 'installed', by: 'deploy' }) }), apk: apkText() });
+    host.qa.install(apkText({ version: '0.2.1', code: 3 }));
+    host.qa.away();
+    const result = await qaPass(host.ctx);
+    assert.equal(result.errors, 0, 'an away phone does not fail the pass');
+    assert.match(host.lines(/HUB_CATCHUP_IDLE qa S24 live/)[0], /tower-of-lost-things 0\.2\.2 \(4\) pending; the S24 is away/);
+    assert.doesNotMatch(host.qa.calls(), /install -r/);
+    assert.equal(host.events.length, 0);
+    assert.equal(host.qa.stateFile(), null);
+    assert.equal(host.s3.requests.filter(request => request.key.endsWith('.apk')).length, 0);
+    assert.match(host.qa.calls().trim().split('\n').at(-1), /kill-server/);
+    // It comes back: the next pass converges it.
+    host.qa.back();
+    await qaPass(host.ctx);
+    assert.equal(host.qa.installed(), apkText());
+    assert.equal(host.events.length, 1);
+  } finally { host.cleanup(); }
+});
+
+test('QA: a phone someone leases is busy: the pass idles on its lock and touches nothing; the deploy phone\'s lock is never taken', async () => {
+  const host = linuxHost();
+  try {
+    publish(host.s3, { latest: latestDoc({ android: androidBlock({ status: 'installed', by: 'deploy' }) }), apk: apkText() });
+    host.qa.install(apkText({ version: '0.2.1', code: 3 }));
+    await lease(host.env, 's24', 'qa-run', 'agent-qa');
+    const result = await qaPass(host.ctx);
+    assert.equal(result.errors, 0);
+    assert.match(host.lines(/HUB_CATCHUP_IDLE qa S24 live: tower-of-lost-things 0\.2\.2 \(4\) pending; s24 stayed held/)[0], /agent-qa|lease/);
+    assert.doesNotMatch(host.qa.calls(), /install|start-server|devices|kill-server/, "the leaseholder's server is not touched while the lease is held");
+    assert.equal(host.events.length, 0);
+    releaseLease('s24', 'qa-run', { env: host.env });
+    await qaPass(host.ctx);
+    assert.equal(host.qa.installed(), apkText());
+  } finally { host.cleanup(); }
+});
+
+test('QA: a phone ahead of the build is left alone (skipped, no event); an equal build installed by hand is confirmed once', async () => {
+  const host = linuxHost();
+  try {
+    publish(host.s3, { latest: latestDoc({ android: androidBlock({ status: 'installed', by: 'deploy' }) }), apk: apkText() });
+    host.qa.install(apkText({ version: '0.2.9', code: 9 }));
+    await qaPass(host.ctx);
+    assert.doesNotMatch(host.qa.calls(), /install -r/);
+    assert.equal(host.qa.installed(), apkText({ version: '0.2.9', code: 9 }));
+    assert.equal(host.events.length, 0);
+    assert.equal(host.qa.stateFile().deliveries['s24/tower-of-lost-things'].status, 'skipped');
+    host.qa.clearCalls();
+    await qaPass(host.ctx);
+    assert.doesNotMatch(host.qa.calls(), /dumpsys/, 'a skipped build is not read again');
+  } finally { host.cleanup(); }
+  const same = linuxHost();
+  try {
+    publish(same.s3, { latest: latestDoc({ android: androidBlock({ status: 'installed', by: 'deploy' }) }), apk: apkText() });
+    same.qa.install(apkText());
+    await qaPass(same.ctx);
+    assert.doesNotMatch(same.qa.calls(), /install -r/);
+    assert.equal(same.events.length, 1);
+    assert.equal(same.events[0].data.deliveries[0].by, 'manual');
+  } finally { same.cleanup(); }
+});
+
+test('QA: an app the allowed user does not have is installed for that user; a different user is never named', async () => {
+  const host = linuxHost({ qaUsers: [0] });
+  try {
+    publish(host.s3, { latest: latestDoc({ android: androidBlock({ status: 'installed', by: 'deploy' }) }), apk: apkText() });
+    // The app is on the phone for user 10 only (an owner profile): user 0 has none, and user 10 is never touched.
+    host.qa.install(apkText({ version: '0.2.1', code: 3 }), { users: [10] });
+    await qaPass(host.ctx);
+    const installs = host.qa.calls().split('\n').filter(line => / install /.test(line));
+    assert.equal(installs.length, 1);
+    assert.match(installs[0], /install -r --user 0 /);
+    assert.doesNotMatch(host.qa.calls(), /--user 10 \S+\.apk/);
+  } finally { host.cleanup(); }
+});
+
+test('QA: the third failed attempt sends one .failed event, then silence; qa-retry starts over', async () => {
+  const host = linuxHost();
+  try {
+    publish(host.s3, { latest: latestDoc({ android: androidBlock({ status: 'installed', by: 'deploy' }) }), apk: apkText() });
+    host.qa.install(apkText({ version: '0.2.1', code: 3 }));
+    host.qa.refuse(true);
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      assert.equal((await qaPass(host.ctx)).errors, 1);
+      assert.equal(host.events.length, 0, `attempt ${attempt} is not an event`);
+      assert.equal(host.qa.stateFile().deliveries['s24/tower-of-lost-things'].failures, attempt);
+    }
+    await qaPass(host.ctx);
+    assert.equal(host.events.length, 1);
+    const [event] = host.events;
+    assert.equal(event.type, 'bloodbank.project.deployment.failed');
+    assert.deepEqual([event.data.stage, event.data.deliveries[0].device, event.data.trigger, event.correlation], ['install', 'S24', 'catch-up', correlationOf(runId)]);
+    assert.match(event.data.reason, /INSTALL_FAILED_UPDATE_INCOMPATIBLE/);
+    assert.equal(host.qa.stateFile().deliveries['s24/tower-of-lost-things'].status, 'failed');
+    host.qa.clearCalls();
+    await qaPass(host.ctx);
+    assert.doesNotMatch(host.qa.calls(), /install|dumpsys/, 'a build that gave up is left alone');
+    assert.equal(host.events.length, 1);
+    host.qa.refuse(false);
+    qaRetry(host.ctx, 's24', slug);
+    await qaPass(host.ctx);
+    assert.equal(host.qa.installed(), apkText());
+    assert.equal(host.events.length, 2);
+    assert.equal(host.events[1].type, 'bloodbank.project.deployment.completed');
+  } finally { host.cleanup(); }
+});
+
+test('QA: an event the bus refused is sent by the next pass, exactly once', async () => {
+  const host = linuxHost();
+  try {
+    publish(host.s3, { latest: latestDoc({ android: androidBlock({ status: 'installed', by: 'deploy' }) }), apk: apkText() });
+    host.qa.install(apkText({ version: '0.2.1', code: 3 }));
+    host.bus.down = true;
+    const first = await qaPass(host.ctx);
+    assert.equal(first.errors, 1, 'an unsent event is visible');
+    assert.equal(host.qa.installed(), apkText());
+    assert.equal(host.events.length, 0);
+    assert.deepEqual(host.qa.stateFile().deliveries['s24/tower-of-lost-things'].event, { status: 'installed', by: 'catch-up' });
+    host.bus.down = false;
+    await qaPass(host.ctx);
+    await qaPass(host.ctx);
+    assert.equal(host.events.length, 1);
+    assert.equal(host.qa.stateFile().deliveries['s24/tower-of-lost-things'].event, null);
+  } finally { host.cleanup(); }
+});
+
+test('QA: a deploy in flight holds the phone\'s build back like the S26\'s; watch mode installs, records and sends nothing', async () => {
+  const host = linuxHost({ mode: 'watch' });
+  try {
+    publish(host.s3, { latest: latestDoc({ android: androidBlock({ status: 'installed', by: 'deploy' }) }), apk: apkText() });
+    host.qa.install(apkText({ version: '0.2.1', code: 3 }));
+    await qaPass(host.ctx);
+    assert.doesNotMatch(host.qa.calls(), /install -r/);
+    assert.equal(host.lines(/^HUB_CATCHUP_WATCH tower-of-lost-things android 0\.2\.2 \(4\) on the S24: would install: .*users 0/).length, 1);
+    assert.equal(host.qa.stateFile(), null);
+    assert.equal(host.events.length, 0);
+  } finally { host.cleanup(); }
+  const live = linuxHost();
+  try {
+    publish(live.s3, { latest: latestDoc({ android: androidBlock({ status: 'installed', by: 'deploy' }) }), apk: apkText() });
+    live.qa.install(apkText({ version: '0.2.1', code: 3 }));
+    live.s3.put(`${slug}/inflight.json`, { version: '0.2.3', run: '37950000000', started_at: '2026-10-10T11:50:00Z', platforms: ['android'] });
+    await qaPass(live.ctx);
+    assert.doesNotMatch(live.qa.calls(), /install|devices/);
+    assert.equal(live.lines(/deploy run 37950000000 is publishing 0\.2\.3/).length, 1);
+  } finally { live.cleanup(); }
+});
+
+test('QA: the app being played is not interrupted; the install waits for a pass when it is not in use', async () => {
+  const host = linuxHost();
+  try {
+    publish(host.s3, { latest: latestDoc({ android: androidBlock({ status: 'installed', by: 'deploy' }) }), apk: apkText() });
+    host.qa.install(apkText({ version: '0.2.1', code: 3 }));
+    host.qa.playing(pkg);
+    await qaPass(host.ctx);
+    assert.doesNotMatch(host.qa.calls(), /install -r/);
+    assert.match(host.lines(/HUB_CATCHUP_IDLE tower-of-lost-things android 0\.2\.2 \(4\) on the S24/)[0], /is on screen on the S24/);
+    host.qa.playing(null);
+    await qaPass(host.ctx);
+    assert.equal(host.qa.installed(), apkText());
+  } finally { host.cleanup(); }
+});
+
+test('QA: a stale hub server on a free lock is stopped; a held lock\'s server is never touched', async () => {
+  const host = linuxHost();
+  try {
+    publish(host.s3, { latest: latestDoc({ android: androidBlock({ status: 'installed', by: 'deploy' }) }), apk: apkText() });
+    host.qa.install(apkText());
+    await qaPass(host.ctx);
+    assert.match(host.qa.calls(), /\[5060\] kill-server/, 'free: swept');
+    host.qa.clearCalls();
+    await lease(host.env, 's24', 'qa-run', 'agent-qa');
+    await qaPass(host.ctx);
+    assert.doesNotMatch(host.qa.calls(), /kill-server/, 'held: the holder owns the server');
+    releaseLease('s24', 'qa-run', { env: host.env });
+  } finally { host.cleanup(); }
+});
+
+test('QA: only a declared, matching, allowed-users phone is served; the deploy phone can never be dedicated', () => {
+  const entries = [
+    { name: 'S24', model: 'SM-S928U', serial: 'R5CX31AEJDA', dedicated: true, allowed_users: [0, 10] },
+    { name: 'Deploy', model: 'SM-S948U', serial: devices.android.serial, dedicated: true, allowed_users: [0] },
+    { name: 'Stranger', model: 'X', serial: 'NOTINDEVICESJSON', dedicated: true, allowed_users: [0] },
+    { name: 'NoUsers', model: 'SM-S928U', serial: 'R5CX31AEJDA', dedicated: true, allowed_users: null },
+    { name: 'WrongModel', model: 'SM-X', serial: 'R5CX31AEJDA', dedicated: true, allowed_users: [0] },
+    { name: 'NotDedicated', model: 'SM-S928U', serial: 'R5CX31AEJDA', dedicated: false, allowed_users: [0] },
+  ];
+  const { phones, problems } = dedicatedPhones({ devices, entries, env: {} });
+  assert.deepEqual(phones, [{ name: 'S24', lock: 's24', model: 'SM-S928U', serial: 'R5CX31AEJDA', users: [0, 10], port: 5060 }]);
+  assert.equal(problems.length, 4);
+  assert.match(problems.join('\n'), /Deploy.*deploy phone/);
+  assert.match(problems.join('\n'), /Stranger.*not an \w+ phone in devices\.json/);
+  assert.match(problems.join('\n'), /NoUsers.*allowed_users/);
+  assert.match(problems.join('\n'), /WrongModel.*model/);
+  assert.doesNotMatch(problems.join('\n'), /R5CX31AEJDA|NOTINDEVICESJSON/, 'a serial is never printed');
+  assert.equal(dedicatedPhones({ devices, entries: [entries[0]], env: { HUB_QA_ADB_PORT_BASE: '5100' } }).phones[0].port, 5100);
+  assert.throws(() => reapQaServer({ port: 5037, env: {} }), /not in the hub's QA adb range/);
+  assert.throws(() => reapQaServer({ port: 5055, env: {} }), /not in the hub's QA adb range/, "a foreign server's port is never stopped");
+});
+
+test('QA: a broken QA file is an error line and a non-zero pass, never silence; a missing file means no dedicated phones', async () => {
+  const host = linuxHost();
+  try {
+    writeFileSync(host.env.HUB_QA_DEVICES, 'not json');
+    const result = await qaPass(host.ctx);
+    assert.equal(result.errors, 1);
+    assert.match(host.lines(/HUB_CATCHUP_ERROR dedicated QA phones/)[0], /not valid JSON/);
+    rmSync(host.env.HUB_QA_DEVICES);
+    assert.equal((await qaPass(host.ctx)).errors, 0);
+    assert.equal(host.qa.calls(), '');
+  } finally { host.cleanup(); }
 });

@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Catch-up installers (docs/design-hub-v1.1.md, section E). A deploy publishes every build even when a device is
 // away and marks that device `pending` in builds/<slug>/latest.json. These passes finish the job when it comes back:
-//   android  big-chungus, candybar mobile-deploy-hub-catchup every 120 s (runs the .service): the S26 on this host's adb server
+//   android  big-chungus, candybar mobile-deploy-hub-catchup every 120 s (runs the .service): the dedicated QA phones on the hub's own
+//            adb servers (MOBI-48, below), then the S26 on this host's adb server
 //   ios      the Mac, LaunchAgent in gui/502, kickstarted every 300 s by candybar mobile-deploy-hub-ios-catchup: the iPad through devicectl, from the Mac's IPA outbox
 //   record   big-chungus: one device's new status into latest.json, under the s3-<slug> lock, and the one event
 //            (the Mac calls it over ssh)
@@ -43,6 +44,7 @@ import { apkKey, compareRelease, compareSemver, inflightKey, ipaKey, isBusyPendi
 import { checkDelivery, deliveryPendingEvent, leaseHoldersSince, noteRefused, withLock } from '../ci/lib/lock.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { sha256File } from '../ci/lib/receipt.mjs';
+import { awayHint, dedicatedPhones, foreignHolders, qaAdbEnv, reapIfFree, reapQaServer } from '../ci/lib/qa-phones.mjs';
 import { createS3, publishPages, writerCredentials } from '../ci/lib/s3.mjs';
 import { presign } from '../ci/lib/sigv4.mjs';
 import { catchupEvent, sendCatchupEvent } from './report.mjs';
@@ -369,7 +371,9 @@ function idleSummary(quiet, unreadable) {
   return parts.join('; ') || 'no apps';
 }
 
-async function readApps(ctx, platform) {
+// `skip(app, block)` (a dedicated QA phone's pass) names why a build needs nothing from this device, or returns null when it does;
+// without it a build is work when its one device (the S26, the iPad) is pending.
+async function readApps(ctx, platform, { skip = null } = {}) {
   const work = [];
   const quiet = [];
   const resend = [];
@@ -399,8 +403,9 @@ async function readApps(ctx, platform) {
     for (const each of platforms) if (latest[each]?.device?.event_pending) resend.push({ app, platform: each });
     const block = latest[platform];
     if (!app.lanes.includes(platform) || !block) { quiet.push(`${app.slug} no ${platform} build`); continue; }
-    if (block.device.status !== 'pending') {
-      quiet.push(`${app.slug} ${describe(block.version, buildOf(block, platform))} ${block.device.status}`);
+    const settledAs = skip ? skip(app, block) : (block.device.status !== 'pending' ? block.device.status : null);
+    if (settledAs !== null) {
+      quiet.push(`${app.slug} ${describe(block.version, buildOf(block, platform))} ${settledAs}`);
       // The iPad pass still looks at an installed (or skipped) build once: something else may have replaced it. A
       // failed one gave up on purpose and stays silent until `retry`.
       if (platform === 'ios' && ['installed', 'skipped'].includes(block.device.status)) settled.push({ app, latest, block, settled: true });
@@ -571,6 +576,259 @@ export async function androidPass(ctx) {
   if (!results) return { errors, results: [] };
   for (const result of results) if (!await settle(ctx, result)) errors += 1;
   return { errors, results };
+}
+
+// ---------------------------------------------------------------------------------------------------- dedicated QA phones (MOBI-48)
+
+// A dedicated QA phone (lib/qa-phones.mjs: declared in the owner's private QA file, an extra phone of devices.json) is a catch-up target of its
+// own. The deploy knows nothing of it: its latest.json device block is the S26's, and a block an older hub validates cannot carry
+// another device. This host remembers what each QA phone was brought to (`qa-delivery.json`, beside the journal), so the pass finds
+// what is behind by comparing that record with latest.json's android block, and every status change sends one event.
+//
+// The pass takes the phone's own lock (`s24`) with a short attempt like the S26's: a phone someone leases, or away, is just idle (the
+// build is still pending for it, the run is never failed), and the next pass converges it. The hold also owns the hub's adb server
+// for that phone, which is started when the phone is looked for and stopped when the hold ends. Installs are `adb install -r --user N`
+// for the phone's allowed Android users only, after the same sha256, signer and no-downgrade checks as the S26. It never uninstalls,
+// clears data or touches another user.
+export const qaStateFile = (env = process.env, home = homedir()) => join(env.XDG_STATE_HOME || join(home, '.local/state'), 'mobile-deploy-hub/qa-delivery.json');
+
+export function createQaState({ env = process.env, home = homedir() } = {}) {
+  const path = qaStateFile(env, home);
+  const read = () => { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return {}; } };
+  const keyOf = (phone, slug) => `${phone.lock}/${slug}`;
+  const write = deliveries => writeAtomic(path, `${JSON.stringify({ deliveries }, null, 2)}\n`);
+  return {
+    get: (phone, slug) => read().deliveries?.[keyOf(phone, slug)] ?? null,
+    put(phone, slug, entry) { write({ ...read().deliveries, [keyOf(phone, slug)]: entry }); },
+    drop(phone, slug) { const { [keyOf(phone, slug)]: _gone, ...rest } = read().deliveries ?? {}; write(rest); },
+  };
+}
+
+const qaSame = (entry, block) => Boolean(entry) && entry.version === block.version && entry.build === String(block.code) && entry.sha256 === block.sha256;
+
+// Why a build needs nothing from the phone, or null when it does.
+const qaSkip = (ctx, phone) => (app, block) => {
+  const entry = ctx.qaState.get(phone, app.slug);
+  if (!qaSame(entry, block)) return null;
+  if (entry.status === 'installed') return `on the ${phone.name}`;
+  if (entry.status === 'skipped') return `skipped on the ${phone.name} (it runs a newer build)`;
+  if (entry.status === 'failed') return `failed on the ${phone.name} (gave up; catchup.mjs qa-retry ${phone.lock} ${app.slug})`;
+  return null;
+};
+
+// The device a QA phone's event names, in the shape the S26's `devices.android` has.
+const qaKnown = phone => ({ name: phone.name, model: phone.model, serial: phone.serial });
+
+async function qaApp(ctx, phone, adb, item, id) {
+  const { block } = item;
+  const pkg = block.package;
+  const name = phone.name;
+  const asked = `${name} (users ${phone.users.join(', ')})`;
+  let installed;
+  let missing;
+  try {
+    installed = adb.installed(id, pkg);
+    missing = phone.users.filter(user => !adb.baseApk(id, pkg, user));
+  } catch (error) {
+    return outcome(item, 'android', 'idle', { message: `the ${name} did not answer (${oneLine(error)})` });
+  }
+  const plan = androidPlan(installed, block);
+  try {
+    if (plan.action === 'ahead') return outcome(item, 'android', 'ahead', { marker: 'HUB_CATCHUP_AHEAD', was: plan.was, reason: `the ${name} runs ${plan.was}, ahead of this build`, message: `the ${name} runs ${plan.was}; not touched` });
+    if (plan.action === 'conflict') throw stageError('install', `the ${name} has versionCode ${block.code} as ${installed.versionName}, not ${block.version}; something else installed that code`);
+    let reinstall = false;
+    if (plan.action === 'compare-bytes' && missing.length === 0) {
+      const onDevice = adb.sha256(id, adb.baseApk(id, pkg, phone.users[0]));
+      if (onDevice === block.sha256) {
+        const mine = qaSame(ctx.qaState.get(phone, item.app.slug), block);
+        return outcome(item, 'android', mine ? 'installed' : 'confirmed', { message: `the ${name} already runs ${plan.was}, base.apk sha256 matches${mine ? ' (installed by an earlier catch-up pass)' : ' (installed from the link or by hand)'}` });
+      }
+      reinstall = true;
+    }
+    const over = reinstall ? `${plan.was} (other bytes of the same code, replaced in place)` : plan.was;
+    let playing = false;
+    try { playing = typeof adb.inUse === 'function' && adb.inUse(id, pkg) === true; } catch { playing = false; }
+    if (playing) return outcome(item, 'android', 'idle', { message: `${pkg} is on screen on the ${name}; the install waits for a pass when it is not in use` });
+    if (ctx.mode !== 'live') return outcome(item, 'android', 'would-install', { message: `${describe(block.version, block.code)} over ${over} on ${asked} from ${ctx.store.url(block.key)} (${block.bytes} bytes), after sha256 and signer checks` });
+    const apk = await ctx.fetchApk(item.app.slug, block);
+    ctx.checkApk(apk, block, item.app);
+    for (const user of phone.users) {
+      try { adb.install(id, apk, user); } catch (error) { throw stageError('install', error.message); }
+    }
+    const after = adb.installed(id, pkg);
+    if (!after || after.versionCode !== block.code || after.versionName !== block.version) throw stageError('verify', `readback: the ${name} reports ${after ? describe(after.versionName, after.versionCode) : 'no package'}, expected ${describe(block.version, block.code)}`);
+    for (const user of phone.users) {
+      const onDevice = adb.sha256(id, adb.baseApk(id, pkg, user));
+      if (onDevice !== block.sha256) throw stageError('verify', `readback: base.apk on the ${name} (user ${user}) has sha256 ${String(onDevice).slice(0, 12)}, the build has ${block.sha256.slice(0, 12)}`);
+    }
+    return outcome(item, 'android', 'installed', { message: `installed over ${over} on ${asked}; readback ${describe(block.version, block.code)}, base.apk sha256 matches` });
+  } catch (error) {
+    return failure(item, 'android', error);
+  }
+}
+
+// One event for a QA phone's status change, then the mark is cleared. A refused event stays marked: the next pass sends it.
+async function qaSend(ctx, phone, slug, block, entry, { name, hubRef }) {
+  if (!ctx.settings.events || !entry.event) {
+    if (entry.event) ctx.qaState.put(phone, slug, { ...entry, event: null });
+    return true;
+  }
+  const failed = entry.event.status === 'failed';
+  const device = failed ? { status: 'failed', reason: entry.reason } : { status: 'installed', by: entry.event.by };
+  const event = await eventFor({ ...ctx, devices: { ...ctx.devices, android: qaKnown(phone) } }, { name, slug, platform: 'android', block, device, hubRef });
+  try {
+    ctx.emit(event);
+  } catch (error) {
+    ctx.log(`HUB_CATCHUP_REPORTED ${slug} android on the ${phone.name}: ${event.type} not sent (${oneLine(error).slice(0, 160)}); the next pass sends it`);
+    return false;
+  }
+  ctx.qaState.put(phone, slug, { ...entry, event: null });
+  ctx.log(`HUB_CATCHUP_REPORTED ${slug} android on the ${phone.name}: ${event.type} sent: ${event.data.summary}`);
+  return true;
+}
+
+// Records one result for a QA phone and sends its event. Returns false when something went wrong that the logs must show.
+async function qaSettle(ctx, phone, result) {
+  const where = `${result.slug} android ${describe(result.version, result.build)} on the ${phone.name}`;
+  if (result.kind === 'idle') { ctx.log(`HUB_CATCHUP_IDLE ${where}: ${result.message}`); return true; }
+  if (ctx.mode !== 'live') {
+    const would = { installed: 'record installed (HUB_CATCHUP_INSTALLED)', confirmed: 'record installed by a person (HUB_CATCHUP_CONFIRMED)', ahead: `record skipped (${result.marker})`, failure: 'count a failed attempt', 'would-install': 'install' }[result.kind];
+    ctx.log(`HUB_CATCHUP_WATCH ${where}: would ${would}: ${result.message ?? result.reason}`);
+    return true;
+  }
+  if (result.kind === 'failure') ctx.log(`HUB_CATCHUP_PENDING ${where}: attempt failed at ${result.stage}: ${result.reason}`);
+  else ctx.log(`${result.marker ?? markerOf[result.kind]} ${where}: ${result.message}`);
+  const facts = factsOf(result);
+  const prior = ctx.qaState.get(phone, result.slug);
+  const since = stamp(ctx.now());
+  const same = qaSame(prior, result.block);
+  const base = { version: result.version, build: result.build, sha256: result.block.sha256 };
+  let entry;
+  if (facts.status === 'installed') {
+    entry = { ...base, status: 'installed', failures: 0, since, by: facts.by, reason: null, event: { status: 'installed', by: facts.by } };
+  } else if (facts.status === 'skipped') {
+    entry = { ...base, status: 'skipped', failures: 0, since, by: null, reason: String(result.reason ?? 'skipped').slice(0, 300), event: null };
+  } else {
+    const failures = (same && Number.isSafeInteger(prior.failures) ? prior.failures : 0) + 1;
+    const stage = facts.stage === 'verify' ? 'verify' : 'install';
+    if (failures >= ctx.settings.maxFailures) {
+      const reason = `catch-up failed ${failures} times at ${stage}: ${facts.reason ?? 'no reason given'}`.slice(0, 300);
+      ctx.log(`HUB_CATCHUP_FAILED ${where}: ${reason}; no more attempts on this build (catchup.mjs qa-retry ${phone.lock} ${result.slug} starts over)`);
+      entry = { ...base, status: 'failed', failures, since, by: null, reason, event: { status: 'failed' } };
+    } else {
+      entry = { ...base, status: 'pending', failures, since: same ? prior.since : since, by: null, reason: `catch-up attempt ${failures} of ${ctx.settings.maxFailures} failed at ${stage}: ${facts.reason ?? 'no reason given'}`.slice(0, 300), event: null };
+    }
+  }
+  ctx.qaState.put(phone, result.slug, entry);
+  const sent = await qaSend(ctx, phone, result.slug, result.block, entry, { name: facts.name, hubRef: facts.hub_ref });
+  return result.kind !== 'failure' && sent;
+}
+
+// An event the bus refused is sent by the next pass, exactly once, while latest.json still names that release.
+async function qaResend(ctx, phone) {
+  let errors = 0;
+  for (const app of ctx.settings.apps) {
+    const entry = ctx.qaState.get(phone, app.slug);
+    if (!entry?.event) continue;
+    try {
+      const latest = await ctx.store.latest(app.slug);
+      const block = latest?.android;
+      if (!block || !qaSame(entry, block) || latestProblems(latest, app.slug, ctx.settings.publicRoot, app).length > 0) {
+        ctx.qaState.put(phone, app.slug, { ...entry, event: null });
+        ctx.log(`HUB_CATCHUP_REPORTED ${app.slug} android on the ${phone.name}: the unsent ${entry.event.status} event is dropped (latest.json names another build now)`);
+        continue;
+      }
+      if (ctx.mode !== 'live') { ctx.log(`HUB_CATCHUP_WATCH ${app.slug} android on the ${phone.name}: would send the unsent catch-up event`); continue; }
+      if (!await qaSend(ctx, phone, app.slug, block, entry, { name: latest.name, hubRef: hubRefOf(latest, block) })) errors += 1;
+    } catch (error) {
+      errors += 1;
+      ctx.log(`HUB_CATCHUP_ERROR ${app.slug} android on the ${phone.name}: could not resend the event (${oneLine(error)})`);
+    }
+  }
+  return errors;
+}
+
+// One dedicated phone's pass. Never throws for a phone that is away or busy.
+async function qaPhonePass(ctx, phone) {
+  // Nobody holds the phone's lock: whatever hub QA server is still up is a leftover (a lease that expired, a pass that was killed).
+  ctx.qaReapIfFree(phone);
+  let errors = await qaResend(ctx, phone);
+  const { work: listed, quiet, errors: readErrors, unreadable } = await readApps(ctx, 'android', { skip: qaSkip(ctx, phone) });
+  errors += readErrors;
+  const held = await notInFlight(ctx, listed, 'android');
+  errors += held.errors;
+  const work = held.work;
+  if (work.length === 0) {
+    if (listed.length === 0) ctx.log(`HUB_CATCHUP_IDLE qa ${phone.name} ${ctx.mode}: nothing pending (${idleSummary(quiet, unreadable)})`);
+    return { errors, results: [] };
+  }
+  const items = work.map(item => `${item.app.slug} ${describe(item.block.version, item.block.code)}`).join(', ');
+  const waitMs = ctx.lockWaitMs ?? ctx.settings.attemptMs;
+  let results;
+  try {
+    results = await ctx.lock(phone.lock, async () => {
+      const adb = ctx.qaAdb(phone);
+      try {
+        let id;
+        try {
+          id = await ctx.qaFindPhone(phone, adb);
+        } catch (error) {
+          const hint = awayHint(phone, ctx.qaForeignHolders(phone));
+          ctx.log(`HUB_CATCHUP_IDLE qa ${phone.name} ${ctx.mode}: ${items} pending; the ${phone.name} is away (${oneLine(error).slice(0, 120)})${hint}`.slice(0, 700));
+          return null;
+        }
+        const found = [];
+        for (const item of work) found.push(await qaApp(ctx, phone, adb, item, id));
+        return found;
+      } finally {
+        ctx.qaReap(phone);
+      }
+    }, { timeoutMs: waitMs, pollMs: 100, timeoutReason: 'catchup-idle' });
+  } catch (error) {
+    if (!idleOnQueue(ctx, error, { platform: `qa ${phone.name}`, lock: phone.lock, items, waitedMs: waitMs })) throw error;
+    return { errors, results: [] };
+  }
+  if (!results) return { errors, results: [] };
+  for (const result of results) if (!await qaSettle(ctx, phone, result)) errors += 1;
+  return { errors, results };
+}
+
+// Every dedicated QA phone, one after the other, each under its own lock. A phone that cannot be served by its declaration is an error
+// line (and a non-zero pass), never silence.
+export async function qaPass(ctx) {
+  let errors = 0;
+  const results = [];
+  let declared;
+  try {
+    declared = ctx.qaPhones();
+  } catch (error) {
+    ctx.log(`HUB_CATCHUP_ERROR dedicated QA phones: ${oneLine(error)}`);
+    return { errors: 1, results };
+  }
+  for (const problem of declared.problems) { errors += 1; ctx.log(`HUB_CATCHUP_ERROR dedicated QA phones: ${problem}`); }
+  for (const phone of declared.phones) {
+    try {
+      const done = await qaPhonePass(ctx, phone);
+      errors += done.errors;
+      results.push(...done.results);
+    } catch (error) {
+      errors += 1;
+      ctx.log(`HUB_CATCHUP_ERROR qa ${phone.name}: ${oneLine(error)}`);
+    }
+  }
+  return { errors, results };
+}
+
+// A QA phone that gave up goes back to pending: the next pass tries that build again.
+export function qaRetry(ctx, lock, slug) {
+  const phone = ctx.qaPhones().phones.find(entry => entry.lock === lock);
+  if (!phone) throw new Error(`${lock} is not a dedicated QA phone here`);
+  if (!ctx.settings.apps.some(app => app.slug === slug)) throw new Error(`${slug} is not an app in the policy`);
+  const entry = ctx.qaState.get(phone, slug);
+  if (!entry || !['failed', 'pending'].includes(entry.status)) throw new Error(`${slug} on the ${phone.name} is ${entry?.status ?? 'not recorded'}; qa-retry starts over a failed or pending build only`);
+  ctx.qaState.drop(phone, slug);
+  ctx.log(`HUB_CATCHUP_REPORTED ${slug} android on the ${phone.name}: back to pending; the next pass tries again`);
+  return true;
 }
 
 // ---------------------------------------------------------------------------------------------------- the iPad pass
@@ -1049,6 +1307,14 @@ export function linuxContext({
       if (identity.package !== pin.package || identity.versionCode !== block.code || identity.versionName !== block.version) throw stageError('install', `the APK is ${identity.package} ${describe(identity.versionName, identity.versionCode)}, the policy and latest.json name ${pin.package} ${describe(block.version, block.code)}`);
     },
     emit,
+    // Dedicated QA phones (MOBI-48): each has the hub's own adb server on its own port, held by the phone's lock and stopped with it.
+    qaState: createQaState({ env, home }),
+    qaPhones: () => dedicatedPhones({ devices, env, home }),
+    qaAdb: phone => createAdb({ env: qaAdbEnv(env, phone.port), home }),
+    qaFindPhone: (phone, qaAdb) => findPhone(qaAdb, { serial: phone.serial, model: phone.model, waitMs: adbWaitMs, pollMs: Math.min(2_000, adbWaitMs), nudgeEvery: 5, label: 'HUB_QA', log }),
+    qaReap: phone => reapQaServer({ port: phone.port, env, home }),
+    qaReapIfFree: phone => reapIfFree(phone, { env, home }),
+    qaForeignHolders: phone => foreignHolders(phone, { env, home }),
   };
   // E4.3: the app page and the index, re-rendered by the hub's own publishPages (deliver calls it the same way).
   ctx.pages = pages ?? (async (slug, latest) => {
@@ -1165,7 +1431,7 @@ export function macContext({
 
 // ---------------------------------------------------------------------------------------------------- CLI
 
-const usage = 'usage: catchup.mjs android | ios | record --slug S --platform P --version V --build B --status S [...] | retry <slug> <android|ios> | mode [watch|live]';
+const usage = 'usage: catchup.mjs android | ios | record --slug S --platform P --version V --build B --status S [...] | retry <slug> <android|ios> | qa-retry <phone lock, e.g. s24> <slug> | mode [watch|live]';
 
 function requireHost(name, command) {
   if (process.platform !== name) throw new Error(`catchup.mjs ${command} runs on ${name === 'linux' ? 'big-chungus' : 'the Mac'}, not ${process.platform}`);
@@ -1184,7 +1450,11 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   watchdog.unref();
   if (command === 'android') {
     requireHost('linux', command);
-    return (await androidPass(linuxContext({ env }))).errors > 0 ? 1 : 0;
+    const ctx = linuxContext({ env });
+    // The dedicated QA phones first: their passes are short attempts, and the S26's may wait in line for most of the pass limit.
+    let qaErrors = 0;
+    try { qaErrors = (await qaPass(ctx)).errors; } catch (error) { qaErrors = 1; ctx.log(`HUB_CATCHUP_ERROR qa pass: ${oneLine(error)}`); }
+    return (await androidPass(ctx)).errors + qaErrors > 0 ? 1 : 0;
   }
   if (command === 'ios') {
     requireHost('darwin', command);
@@ -1193,6 +1463,11 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   if (command === 'record') {
     requireHost('linux', command);
     await record(linuxContext({ env }), parseRecordArgs(rest));
+    return 0;
+  }
+  if (command === 'qa-retry') {
+    requireHost('linux', command);
+    qaRetry(linuxContext({ env }), rest[0], rest[1]);
     return 0;
   }
   if (command === 'retry') {
