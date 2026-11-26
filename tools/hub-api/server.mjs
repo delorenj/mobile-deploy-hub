@@ -9,22 +9,25 @@
 // on stderr, and the next start retries. SIGTERM and SIGINT end every open lease wait (503 HUB_API_RESTARTING), close the server, print `HUB_API_STOP` and let the process end 0.
 //
 // Every seam is injected (env, policy, log, versions, onPath, createServer, now, hostId, devices, qaDevices, signals). There is no
-// timer here: the keepalive of every open stream lives in stream.mjs, the one file the no-new-clock rule names (tools/clock.test.mjs).
-import { realpathSync } from 'node:fs';
+// timer here: the keepalive of every open stream and the change debounce live in stream.mjs, the one file the no-new-clock rule names (tools/clock.test.mjs).
+import { mkdirSync, realpathSync, watch as fsWatch } from 'node:fs';
 import { createServer as nodeCreateServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
 import { onPath } from '../ci/lib/heavy.mjs';
+import { eventDir, followEvents } from '../ci/lib/events.mjs';
+import { lockDir } from '../ci/lib/lock.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { trackDevices as realTrackDevices } from '../device/adb-wire.mjs';
 import { createLeaseWaits, exitCodeOf, hostKey as realHostKey, phoneReadings, withoutDeployIdentity } from '../device/claims.mjs';
 import { observeHost, observeOffThread } from '../device/observe-thread.mjs';
 import { retirement } from '../registry/match.mjs';
 import { recoverRegistry, applySeed, readRegistry } from '../registry/store.mjs';
+import { createChangeFeed, hubPaths } from './changes.mjs';
 import { createReadings, deviceCtx } from './readings.mjs';
 import { createSnapshot } from './snapshot.mjs';
 import { createStream } from './stream.mjs';
 import { createTrack } from './track.mjs';
-import { ROUTES, SERVICE, handle } from './routes.mjs';
+import { ROUTES, SERVICE, handle, statusDocument } from './routes.mjs';
 
 export const HOST = '127.0.0.1';
 export const MIN_NODE = '24.15';
@@ -179,7 +182,11 @@ export async function startService({
 // context), and `processStart` / `liveStart`, which are the snapshot's fallback readers (a pid it has not seen), never the request
 // path's own. A test that injects `inventory` or `adbWire` gets a gather that uses them in the calling thread (a function does not
 // cross into a worker).
-export async function startHubApi({ policy, env: given = process.env, log = defaultLog(), now, hostId, devices, qaDevices, routes = ROUTES, adbWire, inventory, hostKey, sleep, devicectl, observe, snapshot: injected, adbQuery, processStart, liveStart, trackDevices, stream: injectedStream, ...seams } = {}) {
+// The change feed's watcher: the injected `watch` when a test passed one, else null when the host is faked (no real watcher on a faked
+// service's temp dirs), else node's `fs.watch`.
+export const watchFor = ({ watch, faked }) => (watch !== undefined ? watch : faked ? null : fsWatch);
+
+export async function startHubApi({ policy, env: given = process.env, log = defaultLog(), now, hostId, devices, qaDevices, routes = ROUTES, adbWire, inventory, hostKey, sleep, devicectl, observe, snapshot: injected, adbQuery, processStart, liveStart, trackDevices, stream: injectedStream, watch: injectedWatch, ...seams } = {}) {
   const env = withoutDeployIdentity(given);
   const resolved = policy ?? loadPolicy().policy;
   const afterBind = async () => {
@@ -191,6 +198,12 @@ export async function startHubApi({ policy, env: given = process.env, log = defa
     }
     // The first gather starts after the bind has won, and is never waited for here: a read that needs it awaits `snapshot.ready()`.
     Promise.resolve().then(() => snapshot.refresh()).then(() => track.ensure()).catch(error => log.err(`HUB_API_TRACK_FAILED ${oneLine(error)}`));
+    // The change feed (Story 8.5): the directories exist (a watch needs them, and a writer creates them lazily), then the watchers arm and
+    // the baseline is primed. `start()` is never waited for: it renders, and a read that needs the snapshot awaits it.
+    for (const [dir, options] of [[lockDir(env), { recursive: true }], [eventDir(env), { recursive: true, mode: 0o700 }]]) {
+      try { mkdirSync(dir, options); } catch (error) { log.err(`HUB_API_WATCH_FAILED ${dir} ${oneLine(error)}`); }
+    }
+    feed.start();
   };
   const inThread = inventory !== undefined || adbWire !== undefined;
   const snapshot = injected ?? createSnapshot({
@@ -220,10 +233,30 @@ export async function startHubApi({ policy, env: given = process.env, log = defa
   // The one stream (Story 8.4, tools/hub-api/stream.mjs): `GET /stream`'s hub. Its keepalive is the policy's, owned by each open connection.
   // A stop closes it after the track, so a stop never hangs on an open subscriber and a later `GET /stream` is 503 HUB_API_RESTARTING.
   const stream = injectedStream ?? createStream({ now, keepaliveMs: resolved.api.stream_keepalive_s * 1000 });
+  const ctx = { policy: resolved, now, hostId, devices, qaDevices, readings, snapshot, stream, onRequest: () => track.ensure(), ...device };
+  // The change feed (Story 8.5, tools/hub-api/changes.mjs): `fs.watch` on the lock dir, `emulators/`, every `<name>.lock|.queue|.reservations`
+  // and the event dir, so a change by any process (hub-device, a deploy job, this service) is one trailing re-read: the new Event Log lines
+  // as `event` frames and, when the document changed for a reason other than time, one `status` frame. Real `fs.watch` unless a test faked
+  // the host (the track socket's rule): a real watcher on a faked service's temp dirs would add frames nondeterministically, so there
+  // none runs unless the test passes `watch`. The re-read renders the one status builder at a fixed instant (`at`).
+  // Every read of the status view goes through `now: () => at`, except the stamp of the adb listing (the snapshot's own clock: a gather time,
+  // or the live clock while the track socket is open). A frame says the listing was taken no later than `at`; the steady render the feed
+  // compares pins it to `at`, so a listing that is merely re-read later is not a difference.
+  const stamped = (at, steady) => async (...args) => {
+    const answer = await ctx.adbQuery(...args);
+    return typeof answer?.checked_at === 'number' ? { ...answer, checked_at: steady ? at : Math.min(answer.checked_at, at) } : answer;
+  };
+  const feed = createChangeFeed({
+    stream, now: now ?? Date.now, log: log.err,
+    render: (at, { steady = false } = {}) => statusDocument({ ...ctx, env, now: () => at, adbQuery: stamped(at, steady) }),
+    paths: () => hubPaths(env),
+    watch: watchFor({ watch: injectedWatch, faked }),
+    follow: () => followEvents({ env, now, hostId, log: log.err }),
+  });
   return startService({
-    ...seams, service: SERVICE, port: resolved.api.hub_api_port, routes,
-    ctx: { policy: resolved, now, hostId, devices, qaDevices, readings, snapshot, stream, onRequest: () => track.ensure(), ...device },
-    afterBind, onStop: () => { try { track.stop(); } finally { stream.close(); } }, env, log,
+    ...seams, service: SERVICE, port: resolved.api.hub_api_port, routes, ctx,
+    // A stop closes the feed first (no re-read starts), then the track and the stream.
+    afterBind, onStop: () => { try { feed.close(); } finally { try { track.stop(); } finally { stream.close(); } } }, env, log,
   });
 }
 

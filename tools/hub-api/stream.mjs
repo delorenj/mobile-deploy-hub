@@ -12,7 +12,11 @@
 //
 // The keepalive (a `: keepalive` comment, no id) is the one clock of the hub's stream and lives here (tools/clock.test.mjs names this file):
 // one `setInterval` per connection, armed after every write to it, so one goes out whenever `keepaliveMs` passes with no bytes sent. The
-// interval is unref'd and cleared with the connection. Nothing here emits a frame by itself: the change sources are the caller's.
+// interval is unref'd and cleared with the connection. Nothing here emits a frame by itself: the change sources are the caller's
+// (tools/hub-api/changes.mjs).
+//
+// The second clock (Story 8.5) is `trailing`: a one-shot, poke-driven debounce for a change feed. It arms one unref'd `setTimeout` on the
+// first poke of a burst and never on its own, so nothing fires without a change, and a steady stream of pokes cannot push a run back.
 import { randomBytes } from 'node:crypto';
 
 export const STREAM_HEADERS = Object.freeze({
@@ -147,6 +151,51 @@ export function createStream({
           if (Number(entry.sink.writableLength) > 0) entry.sink.destroy?.();
         } catch { /* already closed */ }
       }
+    },
+  };
+}
+
+// The longest a change waits before the one re-read that publishes it (Story 8.5, FR-14, NFR-3: a change reaches a subscriber in 2 s).
+export const CHANGE_DEBOUNCE_MS = 250;
+
+// A trailing, fixed-window debounce for `work` (sync or async). `poke()` arms one unref'd one-shot timer of `delayMs` when none is armed and
+// no run is in flight; later pokes never push it back, so a run starts at most `delayMs` after the first poke of a burst. A poke during a
+// run marks it dirty, and the run's end pokes once, so two runs never overlap and no poke is lost. Nothing arms without a poke. `settled()`
+// resolves when no run is in flight (an armed timer is not waited for). `close()` clears the timer; later pokes do nothing. A failing
+// `work` goes to `onError` and never stops the debounce.
+export function trailing(work, { delayMs, timers = { setTimeout, clearTimeout }, onError } = {}) {
+  if (typeof work !== 'function') throw new TypeError('trailing needs a function');
+  if (!Number.isFinite(delayMs) || delayMs < 0) throw new RangeError('delayMs must be 0 or more');
+  let timer = null;
+  let running = null;
+  let dirty = false;
+  let closed = false;
+
+  const poke = () => {
+    if (closed) return;
+    if (running !== null) { dirty = true; return; }
+    if (timer !== null) return;
+    timer = timers.setTimeout(fire, delayMs);
+    timer?.unref?.();
+  };
+  function fire() {
+    timer = null;
+    if (closed) return;
+    // The bookkeeping is in `.then`, which always runs after `running` is assigned (a `work` that throws at once cannot strand it).
+    running = (async () => {
+      try { await work(); } catch (error) { try { onError?.(error); } catch { /* a broken handler never stops the debounce */ } }
+    })().then(() => {
+      running = null;
+      if (dirty) { dirty = false; poke(); }
+    });
+  }
+  return {
+    poke,
+    settled: async () => { while (running !== null) await running; },
+    close() {
+      closed = true;
+      dirty = false;
+      if (timer !== null) { timers.clearTimeout(timer); timer = null; }
     },
   };
 }

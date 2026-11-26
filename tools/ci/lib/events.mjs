@@ -203,3 +203,80 @@ export function readEventsFrom({ env = process.env, month, offset = 0, maxBytes 
     return { month, from: offset, offset: offset + end, lines, events };
   } finally { closeSync(fd); }
 }
+
+// The offset just past the last complete line of `<month>.jsonl` (the point a follower starts from: everything before it is history), or 0
+// when the file is missing or holds no complete line. Reads backwards from the end in chunks, so a month of events is never loaded.
+export function eventsEnd({ env = process.env, month } = {}) {
+  if (typeof month !== 'string' || !/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) throw new TypeError('month must be YYYY-MM');
+  let fd;
+  try { fd = openSync(join(eventDir(env), `${month}.jsonl`), 'r'); } catch (error) {
+    if (error.code === 'ENOENT') return 0;
+    throw error;
+  }
+  try {
+    const size = fstatSync(fd).size;
+    const chunk = Buffer.alloc(64 * 1024);
+    let end = size;
+    while (end > 0) {
+      const start = Math.max(0, end - chunk.length);
+      const want = end - start;
+      let got = 0;
+      while (got < want) {
+        const n = readSync(fd, chunk, got, want - got, start + got);
+        if (n === 0) break;
+        got += n;
+      }
+      const at = chunk.subarray(0, got).lastIndexOf(0x0a);
+      if (at !== -1) return start + at + 1;
+      end = start;
+    }
+    return 0;
+  } finally { closeSync(fd); }
+}
+
+const MONTH_FILE = /^(\d{4}-(?:0[1-9]|1[0-2]))\.jsonl$/;
+const FOLLOW_SKIPS = new Set(['HUB_EVENT_OFFSET', 'HUB_EVENT_LINE_TOO_LONG']);
+
+// A tail of the Event Log (Story 8.5): starts at the end of the latest month file (or `now`'s month when there is none), and each `read()`
+// returns the `{id, offset, event}` entries appended since the last call, oldest first (a line that is not an event is skipped). It drains
+// the current month through readEventsFrom, then every later month file from byte 0, so a month change loses nothing. A position the log
+// never had (the file was truncated or replaced: HUB_EVENT_OFFSET, or a line over the read bound: HUB_EVENT_LINE_TOO_LONG) is one
+// `HUB_EVENT_FOLLOW_SKIPPED <month> <code>` line, and the tail jumps to that month's end rather than stall.
+export function followEvents({ env = process.env, now = Date.now, hostId: id, log = console.error } = {}) {
+  const months = () => {
+    try {
+      return readdirSync(eventDir(env)).map(name => MONTH_FILE.exec(name)?.[1]).filter(month => month !== undefined).sort();
+    } catch { return []; }
+  };
+  let month = months().at(-1) ?? monthOf(now());
+  let offset = eventsEnd({ env, month });
+
+  const drain = out => {
+    for (;;) {
+      let read;
+      try { read = readEventsFrom({ env, month, offset, hostId: id }); } catch (error) {
+        if (!FOLLOW_SKIPS.has(error?.code)) throw error;
+        try { log(`HUB_EVENT_FOLLOW_SKIPPED ${month} ${error.code}`); } catch { /* see appendEvent */ }
+        offset = eventsEnd({ env, month });
+        return;
+      }
+      for (const entry of read.events) if (entry.id !== null) out.push(entry);
+      if (read.offset === offset) return;
+      offset = read.offset;
+    }
+  };
+
+  return {
+    read() {
+      const out = [];
+      for (;;) {
+        // List first, then drain: whatever was written before the listing is read before the tail moves on.
+        const next = months().find(name => name > month) ?? null;
+        drain(out);
+        if (next === null) return out;
+        month = next;
+        offset = 0;
+      }
+    },
+  };
+}
