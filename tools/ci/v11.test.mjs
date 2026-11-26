@@ -1024,6 +1024,32 @@ test('the v1.2.53 release notes (Epic 6) say what a reader of the tag must know:
   assert.ok(readFileSync(notesPath, 'utf8').indexOf('## v1.2.53') < readFileSync(notesPath, 'utf8').indexOf('## v1.2.52'), 'newest first');
 });
 
+test('the v1.2.60 release notes (Epic 10) say what a reader of the tag must know: the replica, history, utilisation, the frozen contract, what pinned readers ignore, v1c, the rollback, the history smoke', () => {
+  const text = readFileSync(notesPath, 'utf8');
+  const notes = releaseNotes(text, 'v1.2.60');
+  assert.ok(notes, 'docs/hub-releases.md has a v1.2.60 section');
+  const changes = notes.slice(notes.indexOf('### Test changes you will see'));
+  for (const word of [
+    /Epic 10/, /`replicas\/`/, /`HUB_EVENT_DIR\/replicas\/<host>\/<YYYY-MM>\.jsonl`/, /byte-for-byte/, /`POST \/agent\/push`/, /`events`/, /`HUB_REPLICA_GAP`/, /keeps no cursor/, /`POST \/agent\/sync`/,
+    /`GET \/history/, /opaque per-host cursor/, /`partial`/, /`synced_through`/, /`unreachable_ranges`/, /`cross_host_order: display-only`/, /Nothing is ever compacted or deleted/,
+    /`GET \/utilisation/, /`held`, `idle_while_reserved`, `idle`, `away` or `unknown`/, /never a walk of the whole log per request/,
+    /`tools\/hub-api\/contract-freeze\.json` is a floor/, /only additions pass/, /`Calls` cell/, /`GET \/capacity` is reserved for v1c and absent/, /QA leak sweep/, /`env\.ANDROID_SERIAL`/, /`dedicated_qa`/,
+    /`contract` stays 1/, /ignores the Registry \(`registry\.json`\)/, /ignores `replicas\/`/, /`registry-\*`, `reachability`, `host-reachability` and `prune`/,
+    /Deploy jobs and the catch-ups never depend on either service/, /tools\/deploy-path\.test\.mjs/, /AD-22, AD-25/,
+    /v1c adds `GET \/capacity`/, /Holocene page/, /No unit or plist is added/, /moving `v1` back/, /hosts:install -- --allow-downgrade/, /clean checkout at `v1\.2\.59`/, /Leave `replicas\/` in place/,
+    /hosts:smoke -- --lanes --history/, /`partial: false`/, /HUB_SMOKE history:/, /`HUB_SMOKE_OK` line is unchanged/, /sleep\/wake proof is by hand/, /Test changes you will see/,
+  ]) assert.match(notes, word);
+  for (const suite of [
+    'tools/device/claims.test.mjs', 'tools/device/lease-lane.test.mjs', 'tools/host-agent/push.test.mjs', 'tools/host-agent/server.test.mjs', 'tools/hub-api/agent-push.test.mjs',
+    'tools/hub-api/contract.test.mjs', 'tools/hub-api/unreachable.test.mjs', 'tools/hosts/smoke.test.mjs', 'tools/ci/v11.test.mjs',
+    'tools/device/lease-view.test.mjs', 'tools/host-agent/replicate.test.mjs', 'tools/hub-api/{history,leak,replica,utilisation}.test.mjs', 'tools/registry/{history,utilisation}.test.mjs',
+  ]) assert.ok(changes.includes(suite), `the test-changes list names ${suite}`);
+  assert.doesNotMatch(notes, /`contract` (is|becomes|moves to) 2/);
+  assert.ok(notes.split('\n').every(line => !line.startsWith('## ')), 'no line of the section may look like a heading of the next release');
+  assert.ok(Buffer.byteLength(notes) < notesMaxBytes, 'the section fits a tag annotation whole');
+  assert.ok(text.indexOf('## v1.2.60') !== -1 && text.indexOf('## v1.2.60') < text.indexOf('## v1.2.59'), 'newest first');
+});
+
 test('the v1.2.58 release notes (Epic 9) say what a reader of the tag must know: the Host Agent, the client, forwarding, the lane leases, the push, offline, the LaunchAgent, the rollback, the lanes smoke', () => {
   const text = readFileSync(notesPath, 'utf8');
   const notes = releaseNotes(text, 'v1.2.58');

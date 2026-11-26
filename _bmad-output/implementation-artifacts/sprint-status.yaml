@@ -134,5 +134,5 @@ development_status:
   10-2-query-history-across-both-hosts: done
   10-3-utilisation-per-resource: done
   10-4-freeze-the-contract-and-prove-nothing-leaks: done
-  10-5-ship-v1b: backlog
+  10-5-ship-v1b: awaiting-operator
   epic-10-retrospective: optional

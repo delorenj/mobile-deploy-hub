@@ -7,6 +7,7 @@ import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadDevices } from '../ci/lib/devices.mjs';
+import { acquireLease, releaseLease } from '../ci/lib/lock.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { hermetic } from '../ci/test-fixtures.mjs';
 import { fakeWire } from '../device/wire-fixtures.mjs';
@@ -17,6 +18,7 @@ import { createReadings } from './readings.mjs';
 import { createRemotes } from './remotes.mjs';
 import { ROUTES, handle } from './routes.mjs';
 import { createHistory, openReader, replicaLastTs } from './history.mjs';
+import { apiCaller, historyCheck } from '../hosts/smoke.mjs';
 
 hermetic();
 
@@ -451,5 +453,37 @@ test('a sync bridged to a real Host Agent fills the replica: a Mac event written
     for (const month of ['2026-10', '2026-11']) {
       assert.equal(readFileSync(join(s.env.HUB_EVENT_DIR, 'replicas/mac', `${month}.jsonl`), 'utf8'), readFileSync(join(macEnv.HUB_EVENT_DIR, `${month}.jsonl`), 'utf8'), `the replica of ${month} is the source`);
     }
+  } finally { s.cleanup(); rmSync(mac, { recursive: true, force: true }); }
+});
+
+test('hosts:smoke historyCheck reads a real Lease acquire and release of the Mac, written by lock.mjs and replicated byte for byte, back from /history: complete', async () => {
+  const mac = mkdtempSync(join(tmpdir(), 'history-smoke-mac-'));
+  const macEnv = { PATH: process.env.PATH, HOME: mac, HUB_LOCK_DIR: join(mac, 'locks'), HUB_EVENT_DIR: join(mac, 'events') };
+  const s = scratch();
+  try {
+    const id = 'smoke-x-l-ios-lane';
+    const at = { t: NOW - 4000 };
+    await acquireLease('mac-ios', { holder: 'hosts:smoke', why: 'hosts:smoke v1.2.60 lanes', forMs: 120_000, id, env: macEnv, log: () => {}, now: () => at.t, hostId: 'MAC' });
+    at.t = NOW - 2000;
+    releaseLease('mac-ios', id, { env: macEnv, now: () => at.t, hostId: 'MAC' });
+    const months = readdirSync(macEnv.HUB_EVENT_DIR).filter(name => /^\d{4}-\d{2}\.jsonl$/.test(name));
+    assert.deepEqual(months, ['2026-11.jsonl']);
+    const dir = join(s.env.HUB_EVENT_DIR, 'replicas', 'mac');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, months[0]), readFileSync(join(macEnv.HUB_EVENT_DIR, months[0])));
+    const bridge = async ({ method, path, body }) => {
+      const answer = await handle({ method, url: path, body }, s.ctx);
+      return { status: answer.status, body: answer.body };
+    };
+    const lines = [];
+    const { history } = await historyCheck({ ref: 'v1.2.60', api: bridge, lanes: [{ host: 'mac', device: 'ios-lane', id }], now: () => s.clock.t, sleep: async () => {}, log: entry => lines.push(entry) });
+    assert.equal(history.length, 1);
+    assert.deepEqual([history[0].host, history[0].device, history[0].id], ['mac', 'ios-lane', id]);
+    assert.deepEqual(history[0].eventIds, ['MAC/2026-11/0', `MAC/2026-11/${readFileSync(join(macEnv.HUB_EVENT_DIR, months[0]), 'utf8').indexOf('\n') + 1}`]);
+    assert.equal(history[0].syncedThrough, iso(NOW));
+    assert.match(lines[0], /^HUB_SMOKE history: ios-lane on mac: acquire and release of smoke-x-l-ios-lane read back from mac's log \(MAC\/2026-11\/0, MAC\/2026-11\/\d+\), partial false, mac synced_through /);
+    const raw = await s.history('claimant=hosts:smoke');
+    assert.equal(raw.body.partial, false);
+    assert.deepEqual(raw.body.events.map(entry => [entry.host, entry.event.event, entry.event.lease_id]), [['mac', 'acquire', id], ['mac', 'release', id]]);
   } finally { s.cleanup(); rmSync(mac, { recursive: true, force: true }); }
 });

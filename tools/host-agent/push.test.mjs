@@ -447,7 +447,13 @@ test('end to end: a Lease on the Mac reaches /status.hosts.mac within 250 ms wit
     await flush();
     // The lease reaches the Hub API with the triggered push. Under load the start trigger may still be draining when the
     // lease is taken; its catch-up round then replicates the lease event (status null), so wait for the view, not a count.
-    await until(async () => (await hubGet('/status')).body.hosts.mac.locks.length === 1, 'the triggered push carried the lease');
+    // A poke that lands during that drain only marks the debounce dirty, and the drain's end re-arms it on the mocked clock:
+    // keep ticking the debounce while waiting, or that re-armed push never runs (the 2026-11-26 flake under load).
+    await until(async () => {
+      const done = (await hubGet('/status')).body.hosts.mac.locks.length === 1;
+      if (!done) mock.timers.tick(CHANGE_DEBOUNCE_MS);
+      return done;
+    }, 'the triggered push carried the lease');
     assert.ok(pokes.length >= 2, 'each applied push poked the change feed');
     const sent = s.pushes.length;
     status = await hubGet('/status');
