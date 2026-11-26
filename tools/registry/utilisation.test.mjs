@@ -138,6 +138,18 @@ test('a close takes min(ts, start + held_ms); a force-release is a close; a v1a 
   ms(row(run(v1a), 's26'), { held: m(10), unknown: m(50) });
 });
 
+test('a close logged after the next holder\'s acquire never ends the new Hold; a reclaim with hold_kind null still ends the open one', () => {
+  // lock.mjs removes the lock before it logs the release, so B's acquire (-30) can land in the log before A's release (-31): fold in log order.
+  const raced = [track(-60, 's26', 'reachable'), hold(-50, 'acquire', 'adb'), hold(-30, 'acquire', 'adb', { lease_id: 'l-2', expires_at: iso(at(-10)) }), hold(-31, 'release', 'adb', { held_ms: m(19) })];
+  const timeline = createTimeline();
+  for (const event of raced) foldEvent(timeline, event);
+  // A runs -50 to -30 (ended by B's acquire), B -30 to its expiry at -10.
+  ms(row(sharesOf(timeline, registry, lockToResource(registry), WINDOW), 's26'), { idle: m(20), held: m(40) });
+  // An unreadable owner's reclaim (hold_kind null, held_ms null) closes the open job Hold at its ts.
+  const reclaimed = [track(-60, 's26', 'reachable'), hold(-40, 'acquire', 'adb', { hold_kind: 'job', lease_id: null }), hold(-25, 'reclaim', 'adb', { hold_kind: null, lease_id: null })];
+  ms(row(run(reclaimed), 's26'), { idle: m(45), held: m(15) });
+});
+
 test('Mac gap: the ios-lane Lease is held until synced_through and unknown after; a host with no synced_through is unknown throughout', () => {
   const events = [track(-60, 'ios-lane', 'reachable'), hold(-50, 'acquire', 'mac-ios', { expires_at: iso(at(60)) })];
   const answer = run(events, { syncedThrough: { linux: T, mac: at(-30) } });
@@ -164,7 +176,8 @@ test('only the part of the window counts; a Resource retired before it is left o
   const late = { from: at(-30), to: at(-10) };
   ms(row(run([track(-60, 's26', 'reachable'), hold(-40, 'acquire', 'adb', { expires_at: iso(at(-20)) })], {}, late), 's26'), { held: m(10), idle: m(10) });
   assert.equal(run([], {}, late).window_ms, m(20));
-  const retired = { ...registry, resources: [...registry.resources, { id: 'res-old', lock: 'res-old', name: 'old', kind: 'phone', host: 'linux', retired_at: iso(at(-90)) }, { id: 'res-new', lock: 'res-new', name: 'new', kind: 'phone', host: 'linux', retired_at: iso(at(-20)) }] };
+  const retired = { ...registry, resources: [...registry.resources, { id: 'res-old', lock: 'res-old', name: 'old', kind: 'phone', host: 'linux', retired_at: iso(at(-90)) }, { id: 'res-new', lock: 'res-new', name: 'new', kind: 'phone', host: 'linux', retired_at: iso(at(-20)) }, { id: 'res-gone', lock: 'res-gone', name: 'gone', kind: 'phone', host: 'linux', seed_missing: true }] };
+  // A seed-missing record with no retired_at is not live, so it has no row.
   assert.deepEqual(utilisation([], retired, lockToResource(retired), WINDOW).resources.map(entry => entry.id), ['s26', 's24', 'ios-lane', 'emulator', 'res-pixel', 'res-new']);
 });
 

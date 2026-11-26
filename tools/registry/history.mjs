@@ -283,7 +283,9 @@ function foldHold(timeline, event, ts) {
     if (open !== undefined && finite(expires)) open.expires = expires;
   } else if (HOLD_ENDS.includes(event.event)) {
     const heldMs = Number.isFinite(event.held_ms) && event.held_ms >= 0 ? event.held_ms : null;
-    if (open !== undefined) {
+    // lock.mjs logs a close after it removes the lock, so the next holder's `acquire` can land in the log first: a close older than the open Hold
+    // is the previous Hold's (already ended by that acquire) and never ends the open one.
+    if (open !== undefined && ts >= open.start) {
       push(timeline.held, lock, open.start, heldMs === null ? ts : Math.min(ts, open.start + heldMs));
       timeline.open.delete(lock);
     } else if (heldMs !== null) push(timeline.held, lock, ts - heldMs, ts);
@@ -318,6 +320,8 @@ export function foldEvent(timeline, event) {
   if (event.event === 'reachability') foldReading(timeline, event, ts);
   else if (event.hold_kind === 'reservation') foldReservation(timeline, event, ts);
   else if (HOLD_KINDS.includes(event.hold_kind)) foldHold(timeline, event, ts);
+  // A reclaim (or other close) of an owner nobody could read is logged with `hold_kind: null`; it still ends the lock's open Hold.
+  else if ((event.hold_kind === null || event.hold_kind === undefined) && HOLD_ENDS.includes(event.event)) foldHold(timeline, event, ts);
 }
 
 // One timeline of several hosts' (each host folded on its own): the union of their maps. Locks and Resources are disjoint per host in practice; a

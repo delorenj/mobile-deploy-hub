@@ -336,13 +336,14 @@ Classes. Each instant of the window is exactly one of these, checked in this ord
 
 | Class | Meaning |
 |-------|---------|
-| `unknown` | the Resource's host has not synced that far (the instant is after that host's `synced_through`, or the host has none), or no Reachability reading covers it (before the first reading, after a probe's `registry.reachability_max_age_s`, after a `track-lost`, or a reading of `unknown`) |
+| `unknown` | the Resource's host has not synced that far (the instant is after that host's `synced_through`, or the host has none) |
 | `held` | a Hold (a Lease or a deploy job's lock) covers it |
 | `idle_while_reserved` | a deploy run's Reservation covers it and no Hold does |
 | `idle` | the Resource reads `reachable` (an emulator slot has no readings: its free time is `idle`) |
 | `away` | the Resource reads any other state (`absent`, `offline`, `unauthorized`, ...) |
+| `unknown` | no Reachability reading covers it (before the first reading, after a probe's `registry.reachability_max_age_s`, after a `track-lost`, or a reading of `unknown`) |
 
-(`held` and `idle_while_reserved` are time the host has synced; `unknown` past `synced_through` wins over both.) A `track` reading holds until the Resource's next `reachability` event; a `probe` reading holds until its `checked_at` plus `registry.reachability_max_age_s`. A Hold runs from its `acquire` to its release, force-release or reclaim (never past what the event's `held_ms` says), or, while open, to its Lease's `expires_at` as extended; a Reservation runs from its claim to its release, expiry or force-release, or to its ceiling. A lock-only v1a event with no `resource` field counts for the Resource its lock stands for. The `emulator` gate lock is not a Hold: the Pool's time is its slots' (`emulator-<n>`).
+(`unknown` past `synced_through` wins over a Hold and a Reservation; a Hold or a Reservation wins over having no reading.) A `track` reading holds until the Resource's next `reachability` event; a `probe` reading holds until its `checked_at` plus `registry.reachability_max_age_s`. A Hold runs from its `acquire` to its release, force-release or reclaim (never past what the event's `held_ms` says), or, while open, to its Lease's `expires_at` as extended; a Reservation runs from its claim to its release, expiry or force-release, or to its ceiling. A lock-only v1a event with no `resource` field counts for the Resource its lock stands for. The `emulator` gate lock is not a Hold: the Pool's time is its slots' (`emulator-<n>`).
 
 The answer is built from one folded timeline per host source (this host's Event Log, each peer's replica) that the service keeps in memory and advances over only the bytes appended since the last request: it never walks the whole log per request. A restart forgets it and the first request rebuilds it. Gaps are as for `/history`: a peer whose replica may lack the window is asked to push first, and a window the replica cannot be shown to cover answers `partial: true`.
 
