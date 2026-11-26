@@ -27,6 +27,8 @@ import { pathToFileURL } from 'node:url';
 import { loadPolicy } from './ci/lib/policy.mjs';
 
 export const HUB_API_SERVICE = 'mobile-deploy-hub-api';
+// The Host Agent's service name (Story 9.2): what its `/health` answers, so an installer's readback can tell the two services apart.
+export const HOST_AGENT_SERVICE = 'mobile-deploy-hub-host-agent';
 // The one contract number the service answers with (`/health`, `/status`) and the installer's readback and the smoke check for it.
 export const HUB_API_CONTRACT = 1;
 export const HEALTH_TIMEOUT_MS = 2000;

@@ -18,6 +18,7 @@ import { loadPolicy } from '../ci/lib/policy.mjs';
 import { hermetic } from '../ci/test-fixtures.mjs';
 import { EXIT_CODES, createLeaseWaits } from '../device/claims.mjs';
 import { fakeWire } from '../device/wire-fixtures.mjs';
+import { AGENT_ROUTES } from '../host-agent/routes.mjs';
 import { CONTRACT_VERSION, PROBLEM_EXTENSIONS, ROUTES, handle } from './routes.mjs';
 import { createStream } from './stream.mjs';
 
@@ -26,9 +27,8 @@ hermetic();
 const DOC = fileURLToPath(new URL('../../docs/hub-api-contract.md', import.meta.url));
 const SNAKE = /^[a-z][a-z0-9]*(_[a-z0-9]+)*$/;
 
-// What the document says: {version, routes: ['GET /health', ...], shapes: {Health: ['ok', 'ports.hub_api', ...]}, shapeOf: {'GET /health': 'Health'}, codes}.
-export function parseContract(text) {
-  const version = Number(/^Status:\s*contract\s+(\d+)\b/m.exec(text)?.[1]);
+// The rows of the first `| Method | Path | Shape | Added |` table of `text`: {routes: ['GET /health', ...], shapeOf: {'GET /health': 'Health'}}.
+function routeTable(text) {
   const routes = [];
   const shapeOf = {};
   const table = /^\|\s*Method\s*\|\s*Path\s*\|\s*Shape\s*\|\s*Added\s*\|\s*$/m.exec(text);
@@ -41,6 +41,17 @@ export function parseContract(text) {
       shapeOf[key] = cells[2];
     }
   }
+  return { routes, shapeOf };
+}
+
+// What the document says: {version, routes: ['GET /health', ...], shapes: {Health: ['ok', 'ports.hub_api', ...]}, shapeOf: {'GET /health': 'Health'}, agentRoutes, agentShapeOf, codes, extensions}.
+// The Hub API's table is the first in the document; the Host Agent's is the first one under its own `## Host Agent` heading.
+export function parseContract(text) {
+  const version = Number(/^Status:\s*contract\s+(\d+)\b/m.exec(text)?.[1]);
+  const { routes, shapeOf } = routeTable(text);
+  const agentAt = /^## Host Agent\s*$/m.exec(text);
+  const agentSection = agentAt ? text.slice(agentAt.index + agentAt[0].length).split(/^## /m)[0] : '';
+  const { routes: agentRoutes, shapeOf: agentShapeOf } = routeTable(agentSection);
   const shapes = {};
   let current = null;
   for (const line of text.split('\n')) {
@@ -68,7 +79,7 @@ export function parseContract(text) {
       if (row) extensions[row[1]] = [...row[2].matchAll(/`([^`]+)`/g)].map(match => match[1]);
     }
   }
-  return { version, routes, shapes, shapeOf, codes, extensions };
+  return { version, routes, shapes, shapeOf, agentRoutes, agentShapeOf, codes, extensions };
 }
 
 // The key paths of an object's keys, sorted: objects recursed (`a.b`); an array of objects is the union of its items' paths under
@@ -107,6 +118,7 @@ export function mapPrefixes(fields) {
 export const openPrefixes = fields => new Set(fields.filter(field => field.endsWith('.*')).map(field => field.slice(0, -2)));
 
 // The response's fields as the document would list them, the open prefixes of that shape's own entries honoured.
+const shapeFieldsOf = (fields, body) => flatten(body, '', openPrefixes(fields), mapPrefixes(fields));
 const shapeFields = (shape, body) => flatten(body, '', openPrefixes(contract.shapes[shape]), mapPrefixes(contract.shapes[shape]));
 
 // The differences between the document's route set and the code's, as readable strings (empty when equal).
@@ -318,7 +330,7 @@ test('every route names a shape the document describes, and no shape is orphaned
     assert.equal(contract.shapeOf[routeKey(route)], route.shape, routeKey(route));
     assert.ok(contract.shapes[route.shape]?.length > 0, `${route.shape} has a field list`);
   }
-  const used = new Set([...ROUTES.map(route => route.shape), 'Problem']);
+  const used = new Set([...ROUTES.map(route => route.shape), ...AGENT_ROUTES.map(route => route.shape), 'Problem']);
   for (const name of Object.keys(contract.shapes)) assert.ok(used.has(name), `${name} is described but no route returns it`);
 });
 
@@ -420,6 +432,69 @@ test('GET /status is in the route table and its live answer\'s key set is the do
     // The sample is rich enough to pin the fields that only some rows have.
     const live = shapeFields('Status', answer.body);
     for (const field of ['hosts.{host}.locks[].expected_end', 'hosts.{host}.waiters[].request', 'hosts.{host}.waiters[].positions.*', 'hosts.{host}.reservations[].grace.*', 'hosts.{host}.emulators[].avd']) assert.ok(live.includes(field), field);
+  } finally { s.cleanup(); }
+});
+
+// Story 9.2: the Host Agent's own section. Its route table is held equal to AGENT_ROUTES (method, path and shape), `/health` answers exactly
+// AgentHealth, and `/status` answers a view whose every key is in HostView and whose root keys are exactly the six v1a lists. An empty list
+// is one leaf (`phones`), so a list counts as documented when any HostView field starts with it.
+const agentKey = route => `${route.method} ${route.path}`;
+const documented = (fields, path) => fields.includes(path) || fields.some(field => field.startsWith(`${path}[].`) || field.startsWith(`${path}.`));
+
+function agentScratch() {
+  const root = mkdtempSync(join(tmpdir(), 'host-agent-contract-'));
+  const env = { PATH: process.env.PATH, HOME: root, HUB_LOCK_DIR: join(root, 'locks'), HUB_EVENT_DIR: join(root, 'events') };
+  const { udid, model } = loadDevices({}).ios;
+  const ipad = { result: { devices: [{ identifier: 'IPAD', hardwareProperties: { udid, reality: 'physical', productType: model }, connectionProperties: { pairingState: 'paired', tunnelState: 'connected' }, deviceProperties: { developerModeStatus: 'enabled', bootState: 'booted' } }] } };
+  const ctx = { env, policy: loadPolicy().policy, routes: AGENT_ROUTES, devices: structuredClone(loadDevices({})), qaDevices: () => [], hostKey: () => 'mac', inventory: () => ({ adb_servers: [], emulators: [], xvfb: [] }), devicectl: () => ipad, log: { out: () => {}, err: () => {} } };
+  return { root, env, ctx, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+}
+
+test('the Host Agent table of the document equals AGENT_ROUTES both ways, each with its shape, and the Hold routes keep the Hub API\'s shapes', () => {
+  assert.ok(contract.agentRoutes.length > 0, 'the agent table parsed');
+  assert.deepEqual(routeDiff(contract.agentRoutes, AGENT_ROUTES.map(agentKey)), []);
+  for (const route of AGENT_ROUTES) {
+    assert.equal(contract.agentShapeOf[agentKey(route)], route.shape, agentKey(route));
+    assert.ok(contract.shapes[route.shape]?.length > 0, `${route.shape} has a field list`);
+  }
+  for (const route of AGENT_ROUTES.filter(candidate => !['AgentHealth', 'HostView'].includes(candidate.shape))) {
+    assert.equal(ROUTES.find(candidate => routeKey(candidate) === agentKey(route))?.shape, route.shape, `${agentKey(route)} is the Hub API's route`);
+  }
+  for (const route of ROUTES.filter(candidate => !candidate.path.startsWith('/registry') && !['/resources', '/resources/{id}', '/pools', '/discovery', '/stream', '/health', '/status'].includes(candidate.path))) {
+    assert.ok(AGENT_ROUTES.some(candidate => agentKey(candidate) === routeKey(route)), `${routeKey(route)} is a Hold route the agent serves`);
+  }
+});
+
+test('the agent\'s GET /health keys are exactly AgentHealth', async () => {
+  const s = agentScratch();
+  try {
+    const answer = await handle({ method: 'GET', url: '/health' }, s.ctx);
+    assert.equal(answer.status, 200);
+    assert.deepEqual(fieldDiff(contract.shapes.AgentHealth, flatten(answer.body)), []);
+    assert.ok(!('registry' in answer.body));
+  } finally { s.cleanup(); }
+});
+
+test('the agent\'s GET /status is a HostView: the six v1a lists at the root, every key in the document', async () => {
+  const s = agentScratch();
+  try {
+    const now = Date.now();
+    const iso = ms => new Date(ms).toISOString();
+    await acquireLease('mac-ios', { holder: 'contract-held', why: 'contract', forMs: 600_000, id: 'agent-held', env: s.env, log: () => {} });
+    reserve('mac-ios', { env: { ...s.env, GITHUB_REPOSITORY: 'acme/app', GITHUB_RUN_ID: '79' }, log: () => {} });
+    mkdirSync(join(s.env.HUB_LOCK_DIR, 'mac-ios.queue'), { recursive: true });
+    writeFileSync(join(s.env.HUB_LOCK_DIR, 'mac-ios.queue', `${String(now).padStart(15, '0')}-000001-00000001.json`), JSON.stringify(buildTicket('lease', { env: s.env, requested: now, lease_id: 'agent-wait', holder: 'contract-wait', why: 'contract', expires_at: iso(now + 600_000) })));
+    const answer = await handle({ method: 'GET', url: '/status' }, s.ctx);
+    assert.equal(answer.status, 200, JSON.stringify(answer.body));
+    assert.deepEqual(Object.keys(answer.body), ['phones', 'locks', 'waiters', 'reservations', 'inventory', 'emulators']);
+    const fields = contract.shapes.HostView;
+    const live = shapeFieldsOf(fields, answer.body);
+    for (const path of live) assert.ok(documented(fields, path), `${path} is in the response but not in HostView`);
+    for (const field of ['locks[].lock', 'locks[].reachability.*', 'waiters[].since', 'reservations[].run_key']) assert.ok(live.includes(field), `the sample is rich enough for ${field}`);
+    for (const root of ['phones', 'locks', 'waiters', 'reservations', 'inventory', 'emulators']) assert.ok(fields.some(field => field.startsWith(`${root}[].`) || field.startsWith(`${root}.`)), `HostView documents ${root}`);
+    // HostView is Status's `hosts.{host}.` list, unprefixed: nothing in one is missing from the other.
+    const status = contract.shapes.Status.filter(field => field.startsWith('hosts.{host}.')).map(field => field.slice('hosts.{host}.'.length));
+    assert.deepEqual(fieldDiff(status, fields), []);
   } finally { s.cleanup(); }
 });
 

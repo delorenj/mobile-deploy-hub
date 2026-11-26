@@ -113,17 +113,18 @@ export function requestListener(ctx) {
 // ---- the generic service start ----
 
 // Starts one loopback service: checks, bind (the singleton), `afterBind` (the service's own start work), then the LISTEN line.
+// `heavy` (default true) says the service boots emulators, so `heavy` must be on PATH; the Host Agent (the Mac boots none) passes false.
 // `onStop` (Story 8.3) is awaited first by a stop, before the open waits end and the server closes (the Hub API closes its track socket there).
 // Returns `{server, port, stop, stopped}`; `stopped` resolves once a signal or `stop()` has closed the server. A check that fails or
 // a lost bind throws a coded error (HUB_API_NODE, HUB_API_NO_HEAVY, HUB_API_ALREADY_RUNNING) with nothing bound or written.
 export async function startService({
-  service = SERVICE, port, routes = ROUTES, ctx = {}, afterBind, onStop,
+  service = SERVICE, port, routes = ROUTES, ctx = {}, afterBind, onStop, heavy = true,
   env: given = process.env, log = defaultLog(), versions = process.versions, onPath: hasOnPath = onPath, createServer = nodeCreateServer, signals = process,
 } = {}) {
   // A service belongs to no deploy run: whatever GITHUB_* identity its environment carries never reaches a Lease or an event.
   const env = withoutDeployIdentity(given);
   if (!nodeAtLeast(versions?.node, MIN_NODE)) throw coded('HUB_API_NODE', `${service} needs Node >= ${MIN_NODE}, this is ${versions?.node ?? 'unknown'}; run it from the release's node/24.x path`);
-  if (!hasOnPath('heavy', env)) throw coded('HUB_API_NO_HEAVY', `${service} needs \`heavy\` on PATH: emulators boot through it`);
+  if (heavy && !hasOnPath('heavy', env)) throw coded('HUB_API_NO_HEAVY', `${service} needs \`heavy\` on PATH: emulators boot through it`);
 
   // The registry of this service's lease waits (claims.mjs): a stop ends every open wait with HUB_API_RESTARTING before it closes.
   const context = { ...ctx, env, routes, log, waits: ctx.waits ?? createLeaseWaits({ now: ctx.now, ...(ctx.processStart ? { startOf: ctx.processStart } : {}) }) };

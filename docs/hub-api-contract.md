@@ -549,6 +549,132 @@ For every write route the actor is `actor` as given, else `{holder, via: 'api'}`
 
 A failure to connect (ssh exit 255), an ssh that does not start, a stdout whose first line is not a valid head, an exit with no head, or the bound plus 10 s passing, or an error head whose code starts with `HUB_` other than `HUB_RELAY_USAGE` (the relay's own refusal: no host key, no policy; the message carries the relay's message and its code), is `HUB_DEVICE_AWAY`: exit 75, `reason: host-unreachable`, `api: false`. The message names the host, its alias and `connect timeout <n> s`, plus the last line ssh wrote on stderr when there was no answer. ssh is killed on the bound path, and the heartbeat is cleared on every path.
 
+## Host Agent
+
+The Host Agent is the front door of a spoke host (design v1.1, AD-25, AD-35, AD-41; Story 9.2): the Mac's own service, so the Mac's lock dir and clock answer for the Mac. It is the Hub API's generic start with its own route table (`tools/host-agent/routes.mjs`). Everything in Conventions, Request bodies and Error codes above applies to it unchanged.
+
+Base URL: `http://127.0.0.1:8795`, loopback only, no path prefix. The port is `api.host_agent_port` in `tools/ci/policy.json`. It is keyed by the host key (`~/.config/mobile-deploy-hub/host-key`), never by a literal host name, so the same agent fronts any spoke host.
+
+| Method | Path | Shape | Added |
+|--------|------|-------|-------|
+| GET | `/health` | AgentHealth | 9.2 |
+| GET | `/status` | HostView | 9.2 |
+| POST | `/leases` | Lease | 9.2 |
+| GET | `/leases/{id}` | Lease | 9.2 |
+| POST | `/leases/{id}/extend` | Lease | 9.2 |
+| POST | `/leases/{id}/release` | Release | 9.2 |
+| POST | `/leases/{id}/force-release` | ForceRelease | 9.2 |
+| POST | `/requests/{id}/cancel` | Cancel | 9.2 |
+| POST | `/reservations/{run_key}/force-release` | ReservationForceRelease | 9.2 |
+
+The seven Hold routes take the same bodies and answer the same shapes as the Hub API's (`Lease`, `Release`, `ForceRelease`, `Cancel`, `ReservationForceRelease` above). Every other route, `/registry/*`, `/resources`, `/pools`, `/discovery` and `/stream` included, is 404 `HUB_NO_ROUTE`: only the Hub API on big-chungus reads or writes the Registry.
+
+**The host gate.** A Hold route acts only on this host's own Resources. After the route's own body check (a bad body is still `HUB_USAGE` 400), the Resource the request names is found in what the agent knows (the Hub API's last `GET /resources` answer, else the in-memory seed of `devices.json`; the seed's words, `ipad` and `mac`, and its Pools, `phone` and `emulator`, always resolve): by id, name or lock, then by word, a Pool word standing for its members, a `match` by the matcher over those Resources (a `profile=` clause names the emulator Pool). `POST /leases` names its `resource` or `match`, `POST /requests/{id}/cancel` its `resource` and `pool`, `POST /leases/{id}/force-release` the emulator Pool for an `emulator-<n>` id, and `POST /reservations/{run_key}/force-release` its `name`. A Resource on another host is `HUB_WRONG_HOST` (409, `reason: wrong-host`, exit 2), naming the Resource, its host and this host, and nothing is written. A name the agent does not know passes to the handler, which refuses it as it always does. The agent never reads `registry.json`.
+
+### AgentHealth
+
+`GET /health`: the Hub API's `Health` without `registry` (the agent has no Registry file).
+
+- `ok` always `true`
+- `service` always `mobile-deploy-hub-host-agent`
+- `contract` the contract version of this document
+- `hub_version` the hub release the agent runs from (`v1.2.60`), or `unknown`
+- `ports.hub_api` the Hub API's port
+- `ports.host_agent` the Host Agent's port
+
+### HostView
+
+`GET /status`: this host's own view, with no envelope: exactly the `hosts.{host}.` value of the Hub API's `Status`, built by this agent from its own lock dir and clock (`statusView(<its host key>, {audience: 'service', qa_ids})`; `qa_ids` are the `dedicated_qa` Resources it knows). Every field below is that of `Status`'s `hosts.{host}.` field of the same name, unprefixed. The iPad (`ios-lane`) is read through `devicectl list devices` only while a row names it, and a devicectl that cannot answer reads `unknown`. An unknown host key is 503 `HUB_HOST_UNKNOWN`.
+
+- `phones[].device` the word a Claimant says for the phone
+- `phones[].lock` the lock a Hold takes
+- `phones[].deploy` `true` for the phone deploys install to
+- `phones[].name` the phone's display name
+- `phones[].model` the phone's model, or `null`
+- `phones[].serial` the phone's serial, or `null` (always `null` for a `dedicated_qa` phone)
+- `phones[].held` `free`, `lease` or `lock` (a Job Hold)
+- `phones[].holder` the Lease's holder, or `null`
+- `phones[].lease_id` the Lease's id, or `null`
+- `phones[].why` the Lease's `why`, or `null`
+- `phones[].expires_at` the Lease's expiry (ISO), or `null`
+- `phones[].adb_id` the adb id recorded on the Lease, or `null`
+- `phones[].repo` the repo of a Job Hold, or `null`
+- `phones[].run` the run of a Job Hold, or `null`
+- `phones[].presence` what adb says: `reachable`, `unauthorized`, `offline` or `absent`
+- `phones[].resource` the Resource id
+- `phones[].deploy_target` `true` for a Resource deploys install to
+- `phones[].reachability.state` `reachable`, `unauthorized`, `offline`, `absent` or `unknown`
+- `phones[].reachability.checked_at` an ISO time, when the host read it, or `null`
+- `phones[].reachability.age_ms` the reading's age in ms as of this document, or `null`
+- `phones[].reachability.stale` `true` when the reading is older than `registry.reachability_max_age_s` or there is none: a reader never shows a stale reading as current
+- `locks[].lock` the lock
+- `locks[].device` the word for the phone it stands for, or `null`
+- `locks[].kind` `lease` or `lock` (a Job Hold)
+- `locks[].stale` `true` for a Hold the next taker reclaims (a Lease past its `expires_at`, a dead job)
+- `locks[].lease_id` the Lease's id, or `null` for a Job Hold
+- `locks[].holder` the Claimant of a Lease, or `null`
+- `locks[].why` what the Lease is for, or `null`
+- `locks[].repo` the repo of a Job Hold, or `null`
+- `locks[].run` the run of a Job Hold, or `null`
+- `locks[].pid` a Job Hold's process, or `null`
+- `locks[].holder_pid` the process a Lease is tied to, or `null` (an API Lease has none)
+- `locks[].started_at` an ISO time, when the Hold was taken, or `null`
+- `locks[].expires_at` the Lease's expiry (ISO), or `null` for a Job Hold
+- `locks[].phone.*` the phone a Lease holds (`serial`, `adb_id`, ...), or `null`
+- `locks[].emulator.*` the emulator a Lease holds, or `null`
+- `locks[].resource` the Resource id, or `null` for a lock that is no Resource
+- `locks[].deploy_target` `true` for a Resource deploys install to, or `null` with no Resource
+- `locks[].reachability.*` the Resource's Reachability as for a phone, or `null`
+- `locks[].expected_end` an ISO time: when the Hold is expected to end, from the one ETA (`tools/ci/lib/eta.mjs`), never later than the Lease's `expires_at`; `null` for a stale Hold, when the upper bound is unknown or when the ETA cannot be computed
+- `waiters[].lock` the lock the waiter queues on
+- `waiters[].device` the word for the phone, or `null`
+- `waiters[].position` its place in that queue (1 is next; a Reservation is not counted)
+- `waiters[].lease_id` the request id, or `null`
+- `waiters[].holder` who waits, or `null`
+- `waiters[].why` what for, or `null`
+- `waiters[].since` an ISO time, when it took its place
+- `waiters[].stale` `true` for a ticket nobody serves any more
+- `waiters[].kind` `lease`, `job` or `hub-job`
+- `waiters[].repo` a deploy job's repo, or `null`
+- `waiters[].run` a deploy job's run, or `null`
+- `waiters[].job` a deploy job's job name, or `null`
+- `waiters[].eta.*` the live ETA `{lo_ms, hi_ms, low_data}`, or `null`
+- `waiters[].request` a Pool request's id; only on the row of a Pool request, which is listed once
+- `waiters[].pool` the Pool the request waits on; only on the row of a Pool request
+- `waiters[].positions.*` the request's place in each member's queue, by lock; only on the row of a Pool request
+- `waiters[].resource` the Resource id, or `null`
+- `waiters[].deploy_target` `true` for a Resource deploys install to, or `null`
+- `waiters[].reachability.*` the Resource's Reachability, or `null`
+- `reservations[].lock` the lock the Reservation holds a place on
+- `reservations[].device` the word for the phone, or `null`
+- `reservations[].run_key` the run key (`owner--repo--run`)
+- `reservations[].repo` the run's repo, or `null`
+- `reservations[].run` the run's id, or `null`
+- `reservations[].place` its place in the queue
+- `reservations[].blocking` `true` while it holds the lock back from the waiters behind it
+- `reservations[].grace.*` where its grace period stands (`state`, `ends_at`, ...)
+- `reservations[].reserved_at` an ISO time
+- `reservations[].expires_at` an ISO time, its ceiling
+- `reservations[].stale` `true` once past its ceiling
+- `reservations[].resource` the Resource id, or `null`
+- `reservations[].deploy_target` `true` for a Resource deploys install to, or `null`
+- `reservations[].reachability.*` the Resource's Reachability, or `null`
+- `inventory.adb_servers.*` the adb servers running on the host
+- `inventory.emulators.*` the emulator processes running on the host
+- `inventory.xvfb.*` the Xvfb displays running on the host
+- `emulators[].lease_id` the emulator Lease's id
+- `emulators[].slot` the slot lock (`emulator-<n>`)
+- `emulators[].profile` `default` or `playstore`
+- `emulators[].serial` the adb serial (`emulator-<console port>`)
+- `emulators[].console_port` the console port
+- `emulators[].adb_server_port` the emulator's own adb server port
+- `emulators[].avd` the AVD's name, or `null`
+- `emulators[].created_at` an ISO time
+- `emulators[].pids.*` the recorded processes (`role`, `pid`, `alive`, ...)
+- `emulators[].resource` always `emulator`
+- `emulators[].deploy_target` always `false`
+- `emulators[].reachability.*` the Pool's Reachability (`unknown`: it has no transport yet)
+
 ## For the v1c module (non-binding)
 
 A Holocene module for this service would use module id `mobile-deploy-hub` and read its base URL from `MOBILE_DEPLOY_HUB_API_URL`, defaulting to `http://127.0.0.1:8794`. This is a proposal, not part of the contract (open question Q3).
