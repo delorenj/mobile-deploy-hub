@@ -221,7 +221,9 @@ function report(error, parsed, context) {
   if (code === claims.EXIT_CODES.HUB_PHONE_AWAY) {
     stdout(`HUB_DEVICE_AWAY ${device}`);
     // The reason is always said: absent is "turn it on", unauthorized is "pair it again", offline is "wake it".
-    stderr(`hub-device: ${device} is away: ${error.reason ?? error.message.split('\n')[0]}`);
+    // A host that did not answer also says why (the ssh leg's own cause), so a flaky hop is diagnosable from the one line.
+    const cause = error.reason === 'host-unreachable' && error.detail ? ` (${String(error.detail).split('\n')[0]})` : '';
+    stderr(`hub-device: ${device} is away: ${error.reason ?? error.message.split('\n')[0]}${cause}`);
     if (parsed.flags.verbose) stderr(`hub-device: ${error.message.split('\n')[0]}`);
     return code;
   }

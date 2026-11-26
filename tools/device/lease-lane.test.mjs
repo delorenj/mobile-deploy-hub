@@ -189,7 +189,7 @@ test('an asleep Mac is HUB_DEVICE_AWAY (75) with reason host-unreachable and no 
     const r = await w.linux(['lease', 'ipad', ...TAKE]);
     assert.equal(r.code, 75);
     assert.deepEqual(r.out, ['HUB_DEVICE_AWAY ipad']);
-    assert.deepEqual(r.err, ['hub-device: ipad is away: host-unreachable']);
+    assert.deepEqual(r.err, ['hub-device: ipad is away: host-unreachable (ECONNREFUSED)'], 'the cause of the ssh leg is said');
     assert.equal(w.macLocks(), false);
     assert.equal(existsSync(w.linuxEnv.HUB_LOCK_DIR), false);
     assert.equal(w.linuxCalls.length, 0, 'the Hub API is not asked');
