@@ -414,12 +414,13 @@ export function phoneWordMembers({ env = process.env } = {}) {
 // ---- bounds ----
 
 // A lease id names one lease: with more than one phone lock, the same --id could otherwise name two live leases
-// (or a waiter and a lease), and `release <id>` would free only the first it meets.
+// (or a waiter and a lease), and `release <id>` would free only the first it meets. A ticket whose process is dead (`stale`) names nothing: the
+// take that follows prunes it, and a waiter whose service crashed (Story 8.6) must be able to place the same id again.
 export function checkLeaseId(id, { fleet, env = process.env, processStart }) {
   if (id === undefined || id === null) return;
   const onPhone = fleet.find(phone => {
     const owner = readOwnerOf(phone.lock, env);
-    return (isLease(owner) && owner.lease_id === id) || queueView(phone.lock, { env, includeStale: true, ...(processStart ? { processStart } : {}) }).some(waiter => waiter.lease_id === id);
+    return (isLease(owner) && owner.lease_id === id) || queueView(phone.lock, { env, includeStale: true, ...(processStart ? { processStart } : {}) }).some(waiter => waiter.lease_id === id && waiter.stale !== true);
   });
   if (onPhone) throw usage(`--id ${id} already names a lease or a waiter on ${onPhone.device}; a lease id names one lease`);
   if (isEmulatorLease(env, id)) throw usage(`--id ${id} already names an emulator lease; a lease id names one lease`);
