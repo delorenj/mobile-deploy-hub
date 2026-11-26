@@ -1,0 +1,605 @@
+{
+  "contract": 1,
+  "frozen_at": "2026-11-26",
+  "routes": {
+    "GET /health": {
+      "shape": "Health",
+      "calls": "store.registryState"
+    },
+    "GET /resources": {
+      "shape": "ResourceList",
+      "calls": "store.readRegistry"
+    },
+    "GET /resources/{id}": {
+      "shape": "Resource",
+      "calls": "store.readRegistry"
+    },
+    "GET /pools": {
+      "shape": "PoolList",
+      "calls": "store.readRegistry"
+    },
+    "GET /discovery": {
+      "shape": "Discovery",
+      "calls": "claims.discover"
+    },
+    "GET /status": {
+      "shape": "Status",
+      "calls": "claims.statusView"
+    },
+    "GET /stream": {
+      "shape": "StreamFrame",
+      "calls": "claims.statusView"
+    },
+    "GET /history": {
+      "shape": "History",
+      "calls": "events.readEventsFrom"
+    },
+    "GET /utilisation": {
+      "shape": "Utilisation",
+      "calls": "events.readEventsFrom"
+    },
+    "POST /agent/push": {
+      "shape": "AgentPushAck",
+      "calls": "replica.createReplicas"
+    },
+    "POST /registry/resources": {
+      "shape": "Resource",
+      "calls": "store.updateRegistry"
+    },
+    "POST /registry/resources/{id}": {
+      "shape": "Resource",
+      "calls": "store.updateRegistry"
+    },
+    "POST /registry/resources/{id}/retire": {
+      "shape": "Retirement",
+      "calls": "store.updateRegistry"
+    },
+    "POST /leases": {
+      "shape": "Lease",
+      "calls": "claims.serviceLease"
+    },
+    "GET /leases/{id}": {
+      "shape": "Lease",
+      "calls": "claims.findLease"
+    },
+    "POST /leases/{id}/extend": {
+      "shape": "Lease",
+      "calls": "claims.serviceExtend"
+    },
+    "POST /leases/{id}/release": {
+      "shape": "Release",
+      "calls": "claims.serviceRelease"
+    },
+    "POST /leases/{id}/force-release": {
+      "shape": "ForceRelease",
+      "calls": "claims.serviceForceRelease"
+    },
+    "POST /requests/{id}/cancel": {
+      "shape": "Cancel",
+      "calls": "claims.cancel"
+    },
+    "POST /reservations/{run_key}/force-release": {
+      "shape": "ReservationForceRelease",
+      "calls": "claims.forceReleaseReservation"
+    }
+  },
+  "agent_routes": {
+    "GET /health": {
+      "shape": "AgentHealth",
+      "calls": "receipt.hubRef"
+    },
+    "GET /status": {
+      "shape": "HostView",
+      "calls": "claims.statusView"
+    },
+    "POST /agent/sync": {
+      "shape": "AgentSync",
+      "calls": "events.readEventsFrom"
+    },
+    "POST /leases": {
+      "shape": "Lease",
+      "calls": "claims.serviceLease"
+    },
+    "GET /leases/{id}": {
+      "shape": "Lease",
+      "calls": "claims.findLease"
+    },
+    "POST /leases/{id}/extend": {
+      "shape": "Lease",
+      "calls": "claims.serviceExtend"
+    },
+    "POST /leases/{id}/release": {
+      "shape": "Release",
+      "calls": "claims.serviceRelease"
+    },
+    "POST /leases/{id}/force-release": {
+      "shape": "ForceRelease",
+      "calls": "claims.serviceForceRelease"
+    },
+    "POST /requests/{id}/cancel": {
+      "shape": "Cancel",
+      "calls": "claims.cancel"
+    },
+    "POST /reservations/{run_key}/force-release": {
+      "shape": "ReservationForceRelease",
+      "calls": "claims.forceReleaseReservation"
+    }
+  },
+  "shapes": {
+    "Health": [
+      "ok",
+      "service",
+      "contract",
+      "hub_version",
+      "ports.hub_api",
+      "ports.host_agent",
+      "registry"
+    ],
+    "ResourceList": [
+      "rev",
+      "source",
+      "resources[].id",
+      "resources[].lock",
+      "resources[].name",
+      "resources[].kind",
+      "resources[].host",
+      "resources[].identity.*",
+      "resources[].capabilities.*",
+      "resources[].deploy_target",
+      "resources[].seeded",
+      "resources[].seed_missing",
+      "resources[].created_at",
+      "resources[].retired_at",
+      "resources[].visibility",
+      "resources[].reachability.state",
+      "resources[].reachability.checked_at",
+      "resources[].reachability.age_ms_at_receipt",
+      "resources[].reachability.received_at",
+      "resources[].reachability.source"
+    ],
+    "Resource": [
+      "rev",
+      "source",
+      "resource.id",
+      "resource.lock",
+      "resource.name",
+      "resource.kind",
+      "resource.host",
+      "resource.identity.*",
+      "resource.capabilities.*",
+      "resource.deploy_target",
+      "resource.seeded",
+      "resource.seed_missing",
+      "resource.created_at",
+      "resource.retired_at",
+      "resource.visibility"
+    ],
+    "Retirement": [
+      "rev",
+      "source",
+      "id",
+      "retired_at",
+      "visibility"
+    ],
+    "PoolList": [
+      "rev",
+      "source",
+      "pools[].name",
+      "pools[].kind",
+      "pools[].members",
+      "pools[].gate"
+    ],
+    "Discovery": [
+      "format",
+      "host",
+      "via",
+      "port",
+      "note",
+      "devices[].serial",
+      "devices[].model",
+      "devices[].id",
+      "devices[].state"
+    ],
+    "Status": [
+      "format",
+      "contract",
+      "checked_at",
+      "stale.*",
+      "hosts.{host}.phones[].device",
+      "hosts.{host}.phones[].lock",
+      "hosts.{host}.phones[].deploy",
+      "hosts.{host}.phones[].name",
+      "hosts.{host}.phones[].model",
+      "hosts.{host}.phones[].serial",
+      "hosts.{host}.phones[].held",
+      "hosts.{host}.phones[].holder",
+      "hosts.{host}.phones[].lease_id",
+      "hosts.{host}.phones[].why",
+      "hosts.{host}.phones[].expires_at",
+      "hosts.{host}.phones[].adb_id",
+      "hosts.{host}.phones[].repo",
+      "hosts.{host}.phones[].run",
+      "hosts.{host}.phones[].presence",
+      "hosts.{host}.phones[].resource",
+      "hosts.{host}.phones[].deploy_target",
+      "hosts.{host}.phones[].reachability.state",
+      "hosts.{host}.phones[].reachability.checked_at",
+      "hosts.{host}.phones[].reachability.age_ms",
+      "hosts.{host}.phones[].reachability.stale",
+      "hosts.{host}.locks[].lock",
+      "hosts.{host}.locks[].device",
+      "hosts.{host}.locks[].kind",
+      "hosts.{host}.locks[].stale",
+      "hosts.{host}.locks[].lease_id",
+      "hosts.{host}.locks[].holder",
+      "hosts.{host}.locks[].why",
+      "hosts.{host}.locks[].repo",
+      "hosts.{host}.locks[].run",
+      "hosts.{host}.locks[].pid",
+      "hosts.{host}.locks[].holder_pid",
+      "hosts.{host}.locks[].started_at",
+      "hosts.{host}.locks[].expires_at",
+      "hosts.{host}.locks[].phone.*",
+      "hosts.{host}.locks[].emulator.*",
+      "hosts.{host}.locks[].resource",
+      "hosts.{host}.locks[].deploy_target",
+      "hosts.{host}.locks[].reachability.*",
+      "hosts.{host}.locks[].expected_end",
+      "hosts.{host}.waiters[].lock",
+      "hosts.{host}.waiters[].device",
+      "hosts.{host}.waiters[].position",
+      "hosts.{host}.waiters[].lease_id",
+      "hosts.{host}.waiters[].holder",
+      "hosts.{host}.waiters[].why",
+      "hosts.{host}.waiters[].since",
+      "hosts.{host}.waiters[].stale",
+      "hosts.{host}.waiters[].kind",
+      "hosts.{host}.waiters[].repo",
+      "hosts.{host}.waiters[].run",
+      "hosts.{host}.waiters[].job",
+      "hosts.{host}.waiters[].eta.*",
+      "hosts.{host}.waiters[].request",
+      "hosts.{host}.waiters[].pool",
+      "hosts.{host}.waiters[].positions.*",
+      "hosts.{host}.waiters[].resource",
+      "hosts.{host}.waiters[].deploy_target",
+      "hosts.{host}.waiters[].reachability.*",
+      "hosts.{host}.reservations[].lock",
+      "hosts.{host}.reservations[].device",
+      "hosts.{host}.reservations[].run_key",
+      "hosts.{host}.reservations[].repo",
+      "hosts.{host}.reservations[].run",
+      "hosts.{host}.reservations[].place",
+      "hosts.{host}.reservations[].blocking",
+      "hosts.{host}.reservations[].grace.*",
+      "hosts.{host}.reservations[].reserved_at",
+      "hosts.{host}.reservations[].expires_at",
+      "hosts.{host}.reservations[].stale",
+      "hosts.{host}.reservations[].resource",
+      "hosts.{host}.reservations[].deploy_target",
+      "hosts.{host}.reservations[].reachability.*",
+      "hosts.{host}.inventory.adb_servers.*",
+      "hosts.{host}.inventory.emulators.*",
+      "hosts.{host}.inventory.xvfb.*",
+      "hosts.{host}.emulators[].lease_id",
+      "hosts.{host}.emulators[].slot",
+      "hosts.{host}.emulators[].profile",
+      "hosts.{host}.emulators[].serial",
+      "hosts.{host}.emulators[].console_port",
+      "hosts.{host}.emulators[].adb_server_port",
+      "hosts.{host}.emulators[].avd",
+      "hosts.{host}.emulators[].created_at",
+      "hosts.{host}.emulators[].pids.*",
+      "hosts.{host}.emulators[].resource",
+      "hosts.{host}.emulators[].deploy_target",
+      "hosts.{host}.emulators[].reachability.*",
+      "registry.rev",
+      "registry.source",
+      "registry.resources[].id",
+      "registry.resources[].lock",
+      "registry.resources[].name",
+      "registry.resources[].kind",
+      "registry.resources[].host",
+      "registry.resources[].identity.*",
+      "registry.resources[].capabilities.*",
+      "registry.resources[].deploy_target",
+      "registry.resources[].seeded",
+      "registry.resources[].seed_missing",
+      "registry.resources[].created_at",
+      "registry.resources[].retired_at",
+      "registry.resources[].visibility"
+    ],
+    "AgentPushAck": [
+      "applied",
+      "host",
+      "boot",
+      "seq",
+      "replica.*"
+    ],
+    "StreamFrame": [
+      "type",
+      "seq",
+      "key",
+      "at",
+      "reason",
+      "status.*",
+      "event_id",
+      "event.*"
+    ],
+    "History": [
+      "format",
+      "events[].id",
+      "events[].host",
+      "events[].event.*",
+      "cursor",
+      "more",
+      "partial",
+      "synced_through.*",
+      "unreachable_ranges[].host",
+      "unreachable_ranges[].from",
+      "unreachable_ranges[].to",
+      "cross_host_order",
+      "checked_at"
+    ],
+    "Utilisation": [
+      "format",
+      "from",
+      "to",
+      "window_ms",
+      "resources[].id",
+      "resources[].name",
+      "resources[].kind",
+      "resources[].host",
+      "resources[].span_ms",
+      "resources[].ms.held",
+      "resources[].ms.idle_while_reserved",
+      "resources[].ms.idle",
+      "resources[].ms.away",
+      "resources[].ms.unknown",
+      "resources[].shares.held",
+      "resources[].shares.idle_while_reserved",
+      "resources[].shares.idle",
+      "resources[].shares.away",
+      "resources[].shares.unknown",
+      "slots[].resource",
+      "slots[].slot",
+      "slots[].span_ms",
+      "slots[].ms.held",
+      "slots[].ms.idle_while_reserved",
+      "slots[].ms.idle",
+      "slots[].ms.away",
+      "slots[].ms.unknown",
+      "slots[].shares.held",
+      "slots[].shares.idle_while_reserved",
+      "slots[].shares.idle",
+      "slots[].shares.away",
+      "slots[].shares.unknown",
+      "partial",
+      "synced_through.*",
+      "checked_at"
+    ],
+    "Lease": [
+      "lease_id",
+      "resource",
+      "lock",
+      "device",
+      "holder",
+      "why",
+      "claimant_kind",
+      "started_at",
+      "expires_at",
+      "env.*",
+      "emulator.*"
+    ],
+    "Release": [
+      "lease_id",
+      "outcome",
+      "resource",
+      "lock",
+      "device"
+    ],
+    "ForceRelease": [
+      "lease_id",
+      "outcome",
+      "resource",
+      "lock",
+      "device",
+      "holder",
+      "why"
+    ],
+    "ReservationForceRelease": [
+      "run_key",
+      "outcome",
+      "repo",
+      "run",
+      "released[].lock",
+      "released[].resource",
+      "released[].reserved_at",
+      "released[].expires_at",
+      "why"
+    ],
+    "Cancel": [
+      "request_id",
+      "outcome",
+      "resource",
+      "pool",
+      "queues[].lock",
+      "queues[].resource",
+      "queues[].waiters[].place",
+      "queues[].waiters[].lease_id",
+      "queues[].waiters[].holder",
+      "queues[].waiters[].why",
+      "queues[].waiters[].kind",
+      "queues[].waiters[].enqueued_at",
+      "queues[].waiters[].deadline_at",
+      "queues[].waiters[].pool"
+    ],
+    "Problem": [
+      "type",
+      "title",
+      "status",
+      "detail",
+      "code",
+      "exit",
+      "reason"
+    ],
+    "AgentHealth": [
+      "ok",
+      "service",
+      "contract",
+      "hub_version",
+      "ports.hub_api",
+      "ports.host_agent"
+    ],
+    "HostView": [
+      "phones[].device",
+      "phones[].lock",
+      "phones[].deploy",
+      "phones[].name",
+      "phones[].model",
+      "phones[].serial",
+      "phones[].held",
+      "phones[].holder",
+      "phones[].lease_id",
+      "phones[].why",
+      "phones[].expires_at",
+      "phones[].adb_id",
+      "phones[].repo",
+      "phones[].run",
+      "phones[].presence",
+      "phones[].resource",
+      "phones[].deploy_target",
+      "phones[].reachability.state",
+      "phones[].reachability.checked_at",
+      "phones[].reachability.age_ms",
+      "phones[].reachability.stale",
+      "locks[].lock",
+      "locks[].device",
+      "locks[].kind",
+      "locks[].stale",
+      "locks[].lease_id",
+      "locks[].holder",
+      "locks[].why",
+      "locks[].repo",
+      "locks[].run",
+      "locks[].pid",
+      "locks[].holder_pid",
+      "locks[].started_at",
+      "locks[].expires_at",
+      "locks[].phone.*",
+      "locks[].emulator.*",
+      "locks[].resource",
+      "locks[].deploy_target",
+      "locks[].reachability.*",
+      "locks[].expected_end",
+      "waiters[].lock",
+      "waiters[].device",
+      "waiters[].position",
+      "waiters[].lease_id",
+      "waiters[].holder",
+      "waiters[].why",
+      "waiters[].since",
+      "waiters[].stale",
+      "waiters[].kind",
+      "waiters[].repo",
+      "waiters[].run",
+      "waiters[].job",
+      "waiters[].eta.*",
+      "waiters[].request",
+      "waiters[].pool",
+      "waiters[].positions.*",
+      "waiters[].resource",
+      "waiters[].deploy_target",
+      "waiters[].reachability.*",
+      "reservations[].lock",
+      "reservations[].device",
+      "reservations[].run_key",
+      "reservations[].repo",
+      "reservations[].run",
+      "reservations[].place",
+      "reservations[].blocking",
+      "reservations[].grace.*",
+      "reservations[].reserved_at",
+      "reservations[].expires_at",
+      "reservations[].stale",
+      "reservations[].resource",
+      "reservations[].deploy_target",
+      "reservations[].reachability.*",
+      "inventory.adb_servers.*",
+      "inventory.emulators.*",
+      "inventory.xvfb.*",
+      "emulators[].lease_id",
+      "emulators[].slot",
+      "emulators[].profile",
+      "emulators[].serial",
+      "emulators[].console_port",
+      "emulators[].adb_server_port",
+      "emulators[].avd",
+      "emulators[].created_at",
+      "emulators[].pids.*",
+      "emulators[].resource",
+      "emulators[].deploy_target",
+      "emulators[].reachability.*"
+    ],
+    "AgentSync": [
+      "pushed",
+      "synced",
+      "replica.*"
+    ]
+  },
+  "codes": {
+    "HUB_NO_ROUTE": 2,
+    "HUB_RESOURCE_NOT_FOUND": 2,
+    "HUB_RESOURCE_RETIRED": 2,
+    "HUB_REGISTRY_SEEDED": 2,
+    "HUB_USAGE": 2,
+    "HUB_LOCK_TIMEOUT": 76,
+    "HUB_DEVICE_AWAY": 75,
+    "HUB_NO_MATCH": 2,
+    "HUB_EMULATOR_FAILED": 1,
+    "HUB_POOL_CROSS_HOST": 2,
+    "HUB_LEASE_NOT_FOUND": 2,
+    "HUB_LEASE_EXTEND_REFUSED": 76,
+    "HUB_LEASE_CANCELLED": 1,
+    "HUB_LEASE_LOST": 1,
+    "HUB_REQUEST_NOT_FOUND": 2,
+    "HUB_CANCEL_RESERVATION": 2,
+    "HUB_WRONG_HOST": 2,
+    "HUB_DEVICE_JOB_ID": 2,
+    "HUB_FORCE_RELEASE_JOB": 2,
+    "HUB_RESERVATION_NOT_FOUND": 2,
+    "HUB_REPLICA_GAP": 1,
+    "HUB_LEASE_SUPERSEDED": 1,
+    "HUB_API_RESTARTING": 1,
+    "HUB_REGISTRY_NAME": 2,
+    "HUB_REGISTRY_DUPLICATE": 2,
+    "HUB_REGISTRY_CONFLICT": 1,
+    "HUB_HOST_UNKNOWN": 1,
+    "HUB_REGISTRY_FORMAT": 1,
+    "HUB_API_ERROR": 1,
+    "HUB_API_ALREADY_RUNNING": 1,
+    "HUB_API_NODE": 1,
+    "HUB_API_NO_HEAVY": 1,
+    "HUB_API_DOWN": 1,
+    "HUB_API_UNKNOWN": 1
+  },
+  "extensions": {
+    "HUB_REGISTRY_CONFLICT": [
+      "rev"
+    ],
+    "HUB_REGISTRY_DUPLICATE": [
+      "holder"
+    ],
+    "HUB_API_RESTARTING": [
+      "retry"
+    ],
+    "HUB_FORCE_RELEASE_JOB": [
+      "repo",
+      "run",
+      "job"
+    ],
+    "HUB_REPLICA_GAP": [
+      "size"
+    ]
+  }
+}

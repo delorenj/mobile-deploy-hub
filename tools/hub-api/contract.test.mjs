@@ -10,8 +10,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { loadDevices } from '../ci/lib/devices.mjs';
 import { acquireLease, buildTicket, listWaiters, noteReachability, reserve } from '../ci/lib/lock.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
@@ -28,11 +28,13 @@ hermetic();
 const DOC = fileURLToPath(new URL('../../docs/hub-api-contract.md', import.meta.url));
 const SNAKE = /^[a-z][a-z0-9]*(_[a-z0-9]+)*$/;
 
-// The rows of the first `| Method | Path | Shape | Added |` table of `text`: {routes: ['GET /health', ...], shapeOf: {'GET /health': 'Health'}}.
+// The rows of the first `| Method | Path | Shape | Added | Calls |` table of `text` (`Calls` is optional): {routes: ['GET /health', ...], shapeOf: {'GET /health': 'Health'},
+// callsOf: {'GET /health': 'store.registryState'}} (a row with no Calls cell has no entry in `callsOf`).
 function routeTable(text) {
   const routes = [];
   const shapeOf = {};
-  const table = /^\|\s*Method\s*\|\s*Path\s*\|\s*Shape\s*\|\s*Added\s*\|\s*$/m.exec(text);
+  const callsOf = {};
+  const table = /^\|\s*Method\s*\|\s*Path\s*\|\s*Shape\s*\|\s*Added\s*\|(?:\s*Calls\s*\|)?\s*$/m.exec(text);
   if (table) {
     for (const line of text.slice(table.index + table[0].length).split('\n').slice(2)) {
       if (!line.startsWith('|')) break;
@@ -40,19 +42,20 @@ function routeTable(text) {
       const key = `${cells[0]} ${cells[1].replace(/`/g, '')}`;
       routes.push(key);
       shapeOf[key] = cells[2];
+      if (cells[4] !== undefined) callsOf[key] = cells[4].replace(/`/g, '');
     }
   }
-  return { routes, shapeOf };
+  return { routes, shapeOf, callsOf };
 }
 
-// What the document says: {version, routes: ['GET /health', ...], shapes: {Health: ['ok', 'ports.hub_api', ...]}, shapeOf: {'GET /health': 'Health'}, agentRoutes, agentShapeOf, codes, extensions}.
+// What the document says: {version, routes: ['GET /health', ...], shapes: {Health: ['ok', 'ports.hub_api', ...]}, shapeOf: {'GET /health': 'Health'}, callsOf, agentRoutes, agentShapeOf, agentCallsOf, codes, extensions}.
 // The Hub API's table is the first in the document; the Host Agent's is the first one under its own `## Host Agent` heading.
 export function parseContract(text) {
   const version = Number(/^Status:\s*contract\s+(\d+)\b/m.exec(text)?.[1]);
-  const { routes, shapeOf } = routeTable(text);
+  const { routes, shapeOf, callsOf } = routeTable(text);
   const agentAt = /^## Host Agent\s*$/m.exec(text);
   const agentSection = agentAt ? text.slice(agentAt.index + agentAt[0].length).split(/^## /m)[0] : '';
-  const { routes: agentRoutes, shapeOf: agentShapeOf } = routeTable(agentSection);
+  const { routes: agentRoutes, shapeOf: agentShapeOf, callsOf: agentCallsOf } = routeTable(agentSection);
   const shapes = {};
   let current = null;
   for (const line of text.split('\n')) {
@@ -80,7 +83,7 @@ export function parseContract(text) {
       if (row) extensions[row[1]] = [...row[2].matchAll(/`([^`]+)`/g)].map(match => match[1]);
     }
   }
-  return { version, routes, shapes, shapeOf, agentRoutes, agentShapeOf, codes, extensions };
+  return { version, routes, shapes, shapeOf, callsOf, agentRoutes, agentShapeOf, agentCallsOf, codes, extensions };
 }
 
 // The key paths of an object's keys, sorted: objects recursed (`a.b`); an array of objects is the union of its items' paths under
@@ -258,7 +261,8 @@ export function samplePath(path, samples = PARAM_SAMPLES) {
 }
 
 // Calls a POST route as its sample says: the setup routes first (their answers must be successes), then the route itself. Returns the answer.
-async function callPost(route, ctx) {
+// `inspect(answer, state)` runs before `after`, while what `prepare` started is still there (a readback of the state the call left).
+async function callPost(route, ctx, inspect) {
   const sample = sampleOf(route);
   for (const path of sample.setup ?? []) {
     const earlier = ROUTES.find(candidate => candidate.method === 'POST' && candidate.path === path);
@@ -269,6 +273,7 @@ async function callPost(route, ctx) {
   let answer = null;
   try {
     answer = await handle({ method: 'POST', url: samplePath(route.path, { ...PARAM_SAMPLES, ...sample.params }), body: sampleBody(route) }, ctx);
+    await inspect?.(answer, state);
     return answer;
   } finally { await sample.after?.(state, answer); }
 }
@@ -634,4 +639,361 @@ test('the document gives the base URL and the Holocene proposal', () => {
   assert.match(text, /http:\/\/127\.0\.0\.1:8794/);
   assert.match(text, /`mobile-deploy-hub`/);
   assert.match(text, /MOBILE_DEPLOY_HUB_API_URL/);
+});
+
+// ---- Story 10.4: contract 1 is frozen, a floor under the document ----
+
+// What a freeze file holds, projected from a parsed document: every route (with its shape and `Calls`), every shape's field list, every error code
+// with its exit and every problem extension's members. `contract-freeze.json` was written once from this (and is hand-owned since: the test never
+// writes it, so a document that loses something cannot take the baseline down with it).
+export function freezeOf(parsed, frozenAt) {
+  const rows = (routes, shapeOf, callsOf) => Object.fromEntries(routes.map(key => [key, { shape: shapeOf[key], calls: callsOf[key] }]));
+  return {
+    contract: parsed.version,
+    frozen_at: frozenAt,
+    routes: rows(parsed.routes, parsed.shapeOf, parsed.callsOf),
+    agent_routes: rows(parsed.agentRoutes, parsed.agentShapeOf, parsed.agentCallsOf),
+    shapes: Object.fromEntries(Object.entries(parsed.shapes).map(([name, fields]) => [name, [...fields]])),
+    codes: { ...parsed.codes },
+    extensions: Object.fromEntries(Object.entries(parsed.extensions).map(([code, members]) => [code, [...members]])),
+  };
+}
+
+// What the document lost of a freeze, as readable strings (empty when every frozen route, shape field, code and extension member is still there; an
+// addition is never a difference). A document of another contract version is one difference and nothing else: a new version needs a new freeze file.
+export function freezeDiff(frozen, parsed) {
+  if (parsed.version !== frozen.contract) return [`the document is contract ${parsed.version} but the freeze is contract ${frozen.contract}: a new contract version needs a new freeze file (contract-freeze.json is contract ${frozen.contract}'s, and is never edited to follow the document)`];
+  const out = [];
+  const routes = (label, frozenRows, routesOf, shapeOf, callsOf) => {
+    for (const [key, row] of Object.entries(frozenRows)) {
+      if (!routesOf.includes(key)) { out.push(`${label} route ${key} is frozen but missing from the document`); continue; }
+      if (shapeOf[key] !== row.shape) out.push(`${label} route ${key} was frozen with shape ${row.shape}, the document says ${shapeOf[key]}`);
+      if (callsOf[key] !== row.calls) out.push(`${label} route ${key} was frozen calling ${row.calls}, the document says ${callsOf[key]}`);
+    }
+  };
+  routes('Hub API', frozen.routes, parsed.routes, parsed.shapeOf, parsed.callsOf);
+  routes('Host Agent', frozen.agent_routes, parsed.agentRoutes, parsed.agentShapeOf, parsed.agentCallsOf);
+  for (const [name, fields] of Object.entries(frozen.shapes)) {
+    if (!Object.hasOwn(parsed.shapes, name)) { out.push(`shape ${name} is frozen but missing from the document`); continue; }
+    for (const field of fields) if (!parsed.shapes[name].includes(field)) out.push(`shape ${name} lost the field ${field}`);
+  }
+  for (const [code, exit] of Object.entries(frozen.codes)) {
+    if (!Object.hasOwn(parsed.codes, code)) out.push(`error code ${code} is frozen but missing from the document`);
+    else if (parsed.codes[code] !== exit) out.push(`error code ${code} was frozen with exit ${exit}, the document says ${parsed.codes[code]}`);
+  }
+  for (const [code, members] of Object.entries(frozen.extensions)) {
+    if (!Object.hasOwn(parsed.extensions, code)) { out.push(`problem extension ${code} is frozen but missing from the document`); continue; }
+    for (const member of members) if (!parsed.extensions[code].includes(member)) out.push(`problem extension ${code} lost the member ${member}`);
+  }
+  return out;
+}
+
+const FREEZE = JSON.parse(readFileSync(fileURLToPath(new URL('./contract-freeze.json', import.meta.url)), 'utf8'));
+
+// The routes of contract 1 as v1b shipped them (the epic's set): the freeze file may not shrink below it.
+const V1B_HUB = ['GET /health', 'GET /resources', 'GET /resources/{id}', 'GET /pools', 'GET /discovery', 'GET /status', 'GET /stream', 'GET /history', 'GET /utilisation', 'POST /agent/push', 'POST /registry/resources', 'POST /registry/resources/{id}', 'POST /registry/resources/{id}/retire', 'POST /leases', 'GET /leases/{id}', 'POST /leases/{id}/extend', 'POST /leases/{id}/release', 'POST /leases/{id}/force-release', 'POST /requests/{id}/cancel', 'POST /reservations/{run_key}/force-release'];
+const V1B_AGENT = ['GET /health', 'GET /status', 'POST /agent/sync', 'POST /leases', 'GET /leases/{id}', 'POST /leases/{id}/extend', 'POST /leases/{id}/release', 'POST /leases/{id}/force-release', 'POST /requests/{id}/cancel', 'POST /reservations/{run_key}/force-release'];
+
+test('contract 1 is frozen: the document still has everything contract-freeze.json lists, and the freeze lists the whole v1b set', () => {
+  assert.equal(FREEZE.contract, 1);
+  assert.match(FREEZE.frozen_at, /^\d{4}-\d{2}-\d{2}$/);
+  assert.deepEqual(freezeDiff(FREEZE, contract), []);
+  assert.deepEqual(Object.keys(FREEZE.routes).sort(), [...V1B_HUB].sort(), 'the frozen Hub API routes are the v1b set');
+  assert.deepEqual(Object.keys(FREEZE.agent_routes).sort(), [...V1B_AGENT].sort(), 'the frozen Host Agent routes are the v1b set');
+  for (const row of [...Object.values(FREEZE.routes), ...Object.values(FREEZE.agent_routes)]) assert.ok(row.shape && row.calls, JSON.stringify(row));
+  for (const name of new Set([...Object.values(FREEZE.routes), ...Object.values(FREEZE.agent_routes)].map(row => row.shape))) assert.ok(FREEZE.shapes[name]?.length > 0, `${name} is frozen with its fields`);
+  assert.ok(Object.keys(FREEZE.codes).length > 0 && Object.keys(FREEZE.extensions).length > 0);
+});
+
+test('the freeze is a floor: a removed field, a renamed route, a lost code or member is named, an addition passes, another version is refused', () => {
+  const doc = () => structuredClone(contract);
+  assert.deepEqual(freezeDiff(FREEZE, doc()), []);
+  const some = (shape) => FREEZE.shapes[shape].at(-1);
+  // A field removed from the document.
+  const removed = doc();
+  const field = some('Lease');
+  removed.shapes.Lease = removed.shapes.Lease.filter(entry => entry !== field);
+  assert.deepEqual(freezeDiff(FREEZE, removed), [`shape Lease lost the field ${field}`]);
+  // A shape removed with its section.
+  const gone = doc();
+  delete gone.shapes.Cancel;
+  assert.deepEqual(freezeDiff(FREEZE, gone), ['shape Cancel is frozen but missing from the document']);
+  // A route renamed (the document and the table both say the new path).
+  const renamed = doc();
+  renamed.routes = renamed.routes.map(key => (key === 'GET /leases/{id}' ? 'GET /leases/{lease}' : key));
+  assert.deepEqual(freezeDiff(FREEZE, renamed), ['Hub API route GET /leases/{id} is frozen but missing from the document']);
+  const agentRenamed = doc();
+  agentRenamed.agentRoutes = agentRenamed.agentRoutes.filter(key => key !== 'POST /agent/sync');
+  assert.deepEqual(freezeDiff(FREEZE, agentRenamed), ['Host Agent route POST /agent/sync is frozen but missing from the document']);
+  // A route whose shape or Calls changed is no longer the frozen one.
+  const moved = doc();
+  moved.shapeOf = { ...moved.shapeOf, 'GET /pools': 'Other' };
+  moved.callsOf = { ...moved.callsOf, 'GET /pools': 'claims.statusView' };
+  assert.equal(freezeDiff(FREEZE, moved).length, 2);
+  // A code lost or its exit changed, an extension lost or one of its members.
+  const code = Object.keys(FREEZE.codes)[0];
+  const codes = doc();
+  delete codes.codes[code];
+  assert.deepEqual(freezeDiff(FREEZE, codes), [`error code ${code} is frozen but missing from the document`]);
+  const exit = doc();
+  exit.codes[code] += 1;
+  assert.equal(freezeDiff(FREEZE, exit).length, 1);
+  const [extension, [member]] = Object.entries(FREEZE.extensions)[0];
+  const lost = doc();
+  lost.extensions[extension] = lost.extensions[extension].filter(entry => entry !== member);
+  assert.deepEqual(freezeDiff(FREEZE, lost), [`problem extension ${extension} lost the member ${member}`]);
+  delete lost.extensions[extension];
+  assert.deepEqual(freezeDiff(FREEZE, lost), [`problem extension ${extension} is frozen but missing from the document`]);
+  // Additions pass: a new route (with its row), shape, field, code and extension member.
+  const added = doc();
+  added.routes.push('GET /ghost');
+  added.shapeOf['GET /ghost'] = 'Ghost';
+  added.callsOf['GET /ghost'] = 'claims.discover';
+  added.shapes.Ghost = ['a'];
+  added.shapes.Lease = [...added.shapes.Lease, 'new_field'];
+  added.codes.HUB_NEW = 2;
+  added.extensions[extension] = [...added.extensions[extension], 'new_member'];
+  assert.deepEqual(freezeDiff(FREEZE, added), []);
+  // Another version fails with one message that says a new version needs a new freeze file.
+  const next = doc();
+  next.version = 2;
+  const refusal = freezeDiff(FREEZE, next);
+  assert.equal(refusal.length, 1);
+  assert.match(refusal[0], /a new contract version needs a new freeze file/);
+});
+
+// ---- Calls: each route runs one named library export ----
+
+const CALLS_CELL = /^(claims|store|events|replica|receipt)\.([A-Za-z_$][\w$]*)$/;
+const CALLS_MODULES = Object.freeze({
+  claims: '../device/claims.mjs',
+  store: '../registry/store.mjs',
+  events: '../ci/lib/events.mjs',
+  replica: './replica.mjs',
+  receipt: '../ci/lib/receipt.mjs',
+});
+const HERE = dirname(fileURLToPath(import.meta.url));
+const modulePath = key => resolve(HERE, CALLS_MODULES[key]);
+
+// The non-test .mjs modules of the two services: what `Calls` must be imported by.
+const serviceModules = () => ['hub-api', 'host-agent'].flatMap(dir => readdirSync(resolve(HERE, '..', dir)).filter(name => name.endsWith('.mjs') && !name.endsWith('.test.mjs')).map(name => resolve(HERE, '..', dir, name)));
+
+// Every `import { a, b as c } from '<spec>'` of a source, as [{names: ['a', 'b'], from: <absolute path>}]: the imported name, never the local alias.
+export function importsOf(file, source = readFileSync(file, 'utf8')) {
+  const out = [];
+  for (const match of source.matchAll(/import\s*\{([^}]*)\}\s*from\s*'([^']+)'/g)) {
+    const names = match[1].replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '').split(',').map(part => part.trim().split(/\s+as\s+/)[0].trim()).filter(Boolean);
+    out.push({ names, from: resolve(dirname(file), match[2]) });
+  }
+  return out;
+}
+
+test('importsOf reads named imports, multi-line lists and aliases', () => {
+  const source = "import { a, b as c } from './x.mjs';\nimport {\n  d, // note\n  e as f,\n} from '../y.mjs';\nimport z from './z.mjs';";
+  assert.deepEqual(importsOf('/r/s/m.mjs', source), [{ names: ['a', 'b'], from: '/r/s/x.mjs' }, { names: ['d', 'e'], from: '/r/y.mjs' }]);
+});
+
+test('every route of both tables has a Calls cell equal to its `calls`, an exported function that a service module imports', async () => {
+  const imported = new Map();
+  for (const file of serviceModules()) {
+    for (const { names, from } of importsOf(file)) for (const name of names) imported.set(`${from}#${name}`, file);
+  }
+  const modules = Object.fromEntries(await Promise.all(Object.keys(CALLS_MODULES).map(async key => [key, await import(pathToFileURL(modulePath(key)).href)])));
+  const tables = [
+    ['Hub API', ROUTES, contract.routes, contract.callsOf],
+    ['Host Agent', AGENT_ROUTES, contract.agentRoutes, contract.agentCallsOf],
+  ];
+  for (const [label, routes, docRoutes, docCalls] of tables) {
+    assert.deepEqual(Object.keys(docCalls).sort(), [...docRoutes].sort(), `${label}: every row of the document table has a Calls cell`);
+    for (const route of routes) {
+      const key = routeKey(route);
+      assert.equal(typeof route.calls, 'string', `${label} ${key} has \`calls\``);
+      assert.equal(docCalls[key], route.calls, `${label} ${key}: the document's Calls cell equals the route's calls`);
+      const cell = CALLS_CELL.exec(route.calls);
+      assert.ok(cell, `${label} ${key}: "${route.calls}" is <module>.<export> of claims, store, events, replica or receipt`);
+      const [, module, name] = cell;
+      assert.equal(typeof modules[module][name], 'function', `${label} ${key}: ${route.calls} is an exported function`);
+      assert.ok(imported.has(`${modulePath(module)}#${name}`), `${label} ${key}: no service module imports ${name} from ${CALLS_MODULES[module]}`);
+    }
+  }
+  assert.deepEqual(contract.callsOf['POST /leases/{id}/force-release'], 'claims.serviceForceRelease');
+  // The Calls legend names the five modules.
+  const text = readFileSync(DOC, 'utf8');
+  for (const [key, path] of Object.entries(CALLS_MODULES)) assert.ok(text.includes(`\`${key}\` (\`tools/${path.replace(/^\.\.\//, '').replace(/^\.\//, 'hub-api/')}\`)`), `the legend names ${key}`);
+});
+
+// ---- GET /capacity is reserved for v1c: documented under Reserved, answered 404 by both services, absent from code ----
+
+const walkSources = dir => readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
+  if (entry.name === 'node_modules' || entry.name.startsWith('.')) return [];
+  const path = join(dir, entry.name);
+  return entry.isDirectory() ? walkSources(path) : entry.name.endsWith('.mjs') && !entry.name.endsWith('.test.mjs') ? [path] : [];
+});
+
+test('GET /capacity is reserved: only under Reserved in the document, 404 HUB_NO_ROUTE on both services, and in no route table or non-test module', async () => {
+  const text = readFileSync(DOC, 'utf8');
+  const sections = text.split(/^## /m).filter(section => section.includes('/capacity'));
+  assert.deepEqual(sections.map(section => section.split('\n')[0]), ['Reserved'], '/capacity is only under ## Reserved');
+  assert.ok(!contract.routes.some(key => key.includes('/capacity')) && !contract.agentRoutes.some(key => key.includes('/capacity')));
+  assert.ok(![...ROUTES, ...AGENT_ROUTES].some(route => route.path.includes('/capacity')));
+  const tools = resolve(HERE, '..');
+  const files = walkSources(tools);
+  assert.ok(files.length > 20, 'the tools tree was walked');
+  assert.deepEqual(files.filter(file => readFileSync(file, 'utf8').includes('/capacity')), [], 'no non-test module under tools/ mentions /capacity');
+  const hub = scratch();
+  const agent = agentScratch();
+  try {
+    for (const [label, ctx] of [['Hub API', hub.ctx], ['Host Agent', agent.ctx]]) {
+      const answer = await handle({ method: 'GET', url: '/capacity' }, ctx);
+      assert.equal(answer.status, 404, label);
+      assert.equal(answer.body.code, 'HUB_NO_ROUTE', label);
+    }
+  } finally { hub.cleanup(); agent.cleanup(); }
+});
+
+// ---- every refusal is the same envelope, on every route ----
+
+const PROBLEM_KEYS = new Set(contract.shapes.Problem);
+function assertProblem(answer, label) {
+  assert.ok(answer.status >= 400 && answer.status < 600, `${label}: status ${answer.status} ${JSON.stringify(answer.body)}`);
+  assert.equal(answer.headers['Content-Type'], 'application/problem+json', label);
+  const { body } = answer;
+  assert.deepEqual(fieldDiff([...PROBLEM_KEYS, ...(contract.extensions[body.code] ?? [])], flatten(body)), [], `${label}: the keys are Problem plus the code's extensions`);
+  assert.ok(typeof body.code === 'string' && body.code !== '', `${label}: code`);
+  assert.ok(Number.isInteger(body.exit), `${label}: exit`);
+  assert.ok(typeof body.reason === 'string' && body.reason !== '', `${label}: reason`);
+  assert.equal(body.status, answer.status, label);
+}
+
+const POST_REFUSAL_PARAMS = Object.freeze({ id: 'contract-1', run_key: 'acme--app--77' });
+const unknownHost = () => { throw Object.assign(new Error('this host does not know which host it is'), { code: 'HUB_HOST_UNKNOWN' }); };
+// How each GET route refuses (a GET route with no entry fails): its `url`, over PARAM_SAMPLES, and `ctx` (what to change in the scratch); null for a route that has no refusal
+// to give (it answers whatever state it is in).
+const GET_REFUSALS = Object.freeze({
+  hub: {
+    '/health': null,
+    '/resources': null,
+    '/resources/{id}': { url: '/resources/ghost' },
+    '/pools': null,
+    '/discovery': { ctx: { hostKey: unknownHost } },
+    '/status': { ctx: { hostKey: unknownHost } },
+    '/stream': { ctx: { hostKey: unknownHost } },
+    '/history': { url: '/history?bogus=1' },
+    '/utilisation': { url: '/utilisation' },
+    '/leases/{id}': { url: '/leases/ghost' },
+  },
+  agent: {
+    '/health': null,
+    '/status': { ctx: { hostKey: unknownHost } },
+    '/leases/{id}': { url: '/leases/ghost' },
+  },
+});
+
+test('every refusal of every route is application/problem+json with exactly the Problem fields: POST with a body that is no object, GET of a missing thing, GET /nope, a wrong method', async () => {
+  const sides = [['hub', 'Hub API', ROUTES, scratch], ['agent', 'Host Agent', AGENT_ROUTES, agentScratch]];
+  for (const [side, label, routes, make] of sides) {
+    const s = make();
+    try {
+      for (const route of routes) {
+        const key = `${label} ${routeKey(route)}`;
+        const path = samplePath(route.path, { ...PARAM_SAMPLES, ...POST_REFUSAL_PARAMS });
+        if (route.method === 'POST') assertProblem(await handle({ method: 'POST', url: path, body: [] }, s.ctx), `${key} with []`);
+        else {
+          assert.ok(Object.hasOwn(GET_REFUSALS[side], route.path), `no refusal entry for ${key}: add it to GET_REFUSALS`);
+          const entry = GET_REFUSALS[side][route.path];
+          if (entry !== null) assertProblem(await handle({ method: 'GET', url: entry.url ?? path, headers: {} }, { ...s.ctx, ...entry.ctx }), `${key} refusal`);
+        }
+        const wrong = await handle({ method: 'DELETE', url: path }, s.ctx);
+        assertProblem(wrong, `${key} with DELETE`);
+        assert.equal(wrong.status, 405, `${key} with DELETE`);
+        assert.ok(wrong.headers.Allow, `${key} with DELETE names its Allow`);
+        assert.equal(wrong.body.reason, 'method');
+      }
+      const missing = await handle({ method: 'GET', url: '/nope' }, s.ctx);
+      assertProblem(missing, `${label} GET /nope`);
+      assert.deepEqual([missing.status, missing.body.code, missing.body.reason], [404, 'HUB_NO_ROUTE', 'no-route']);
+    } finally { s.cleanup(); }
+  }
+});
+
+// ---- every write answers the state a fresh read shows ----
+
+const readJson = async (ctx, url) => handle({ method: 'GET', url }, ctx);
+const statusOf = async ctx => (await readJson(ctx, '/status')).body.hosts.linux;
+
+// What a fresh read shows after each POST route's sample (a POST route with no entry fails). `check({ctx, answer})` runs on the scratch the sample ran on.
+const READBACKS = Object.freeze({
+  '/agent/push': async ({ ctx, answer }) => {
+    // The same push again is a duplicate: nothing applied, the same replica sizes; the sample carried no status, so no host view exists for the Mac.
+    assert.equal(answer.body.applied, true);
+    const again = await handle({ method: 'POST', url: '/agent/push', body: sampleBody({ method: 'POST', path: '/agent/push' }) }, ctx);
+    assert.equal(again.status, 200);
+    assert.equal(again.body.applied, false);
+    assert.deepEqual(again.body.replica, answer.body.replica);
+    assert.ok(!('mac' in (await readJson(ctx, '/status')).body.hosts), 'a push with no status adds no host view');
+  },
+  '/registry/resources': async ({ ctx, answer }) => {
+    const read = await readJson(ctx, `/resources/${answer.body.resource.id}`);
+    assert.equal(read.status, 200);
+    assert.deepEqual(read.body.resource, answer.body.resource);
+    assert.equal((await readJson(ctx, '/resources')).body.rev, answer.body.rev);
+  },
+  '/registry/resources/{id}': async ({ ctx, answer }) => {
+    const read = await readJson(ctx, `/resources/${answer.body.resource.id}`);
+    assert.deepEqual(read.body.resource, answer.body.resource);
+    assert.equal(read.body.rev, answer.body.rev);
+    assert.equal((await readJson(ctx, '/resources')).body.rev, answer.body.rev);
+  },
+  '/registry/resources/{id}/retire': async ({ ctx, answer }) => {
+    const read = await readJson(ctx, `/resources/${answer.body.id}`);
+    if (answer.body.visibility === 'hidden') {
+      assert.equal(read.status, 404);
+      assert.equal(read.body.reason, 'retired');
+    } else {
+      assert.equal(read.body.resource.retired_at, answer.body.retired_at);
+      assert.equal(read.body.resource.visibility, answer.body.visibility);
+    }
+    assert.equal((await readJson(ctx, '/resources')).body.rev, answer.body.rev);
+  },
+  '/leases': async ({ ctx, answer }) => assert.deepEqual((await readJson(ctx, `/leases/${answer.body.lease_id}`)).body, answer.body),
+  '/leases/{id}/extend': async ({ ctx, answer }) => assert.deepEqual((await readJson(ctx, `/leases/${answer.body.lease_id}`)).body, answer.body),
+  '/leases/{id}/release': async ({ ctx, answer }) => {
+    assert.equal(answer.body.outcome, 'released');
+    assert.equal((await readJson(ctx, `/leases/${answer.body.lease_id}`)).status, 404);
+    assert.ok(!(await statusOf(ctx)).locks.some(lock => lock.lock === answer.body.lock), 'the lock is free in /status');
+  },
+  '/leases/{id}/force-release': async ({ ctx, answer }) => {
+    assert.equal(answer.body.outcome, 'force-released');
+    assert.equal((await readJson(ctx, `/leases/${answer.body.lease_id}`)).status, 404);
+    assert.ok(!(await statusOf(ctx)).locks.some(lock => lock.lock === answer.body.lock), 'the lock is free in /status');
+  },
+  '/requests/{id}/cancel': async ({ ctx, answer }) => {
+    assert.ok(answer.body.queues.length > 0);
+    const waiters = (await statusOf(ctx)).waiters;
+    for (const queue of answer.body.queues) {
+      const shown = waiters.filter(waiter => waiter.lock === queue.lock).sort((a, b) => a.position - b.position).map(waiter => waiter.lease_id);
+      assert.deepEqual(queue.waiters.slice().sort((a, b) => a.place - b.place).map(waiter => waiter.lease_id), shown, `the queue of ${queue.lock}`);
+      assert.ok(!shown.includes(answer.body.request_id), 'the cancelled request is gone from /status');
+    }
+  },
+  '/reservations/{run_key}/force-release': async ({ ctx, answer }) => {
+    assert.ok(!(await statusOf(ctx)).reservations.some(entry => entry.run_key === answer.body.run_key), 'the Reservation is gone from /status');
+  },
+});
+
+test('every POST route\'s success answers the state a following read shows', async () => {
+  for (const route of postRoutes()) {
+    assert.ok(Object.hasOwn(READBACKS, route.path), `no readback for ${routeKey(route)}: add it to READBACKS`);
+    const s = scratch();
+    try {
+      let checked = false;
+      const answer = await callPost(route, s.ctx, async answered => {
+        assert.equal(answered.status, sampleOf(route).status, routeKey(route));
+        await READBACKS[route.path]({ ctx: s.ctx, answer: answered });
+        checked = true;
+      });
+      assert.ok(checked && answer.status < 300, routeKey(route));
+    } finally { s.cleanup(); }
+  }
+  assert.deepEqual(Object.keys(READBACKS).sort(), postRoutes().map(route => route.path).sort(), 'no readback for a route that is gone');
 });

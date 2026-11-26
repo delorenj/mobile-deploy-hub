@@ -408,7 +408,7 @@ async function forceRelease(parsed, context) {
   const id = parsed.words[1];
   const input = { why: parsed.flags.why ?? null, actor: cliActor(parsed, env) };
   const slot = claims.namesEmulatorSlot(id);
-  const answer = slot ? await claims.forceReleaseEmulator(id, input, context) : claims.forceReleaseLease(id, input, context);
+  const answer = await claims.serviceForceRelease(id, input, context);
   if (parsed.flags.json) stdout(JSON.stringify(answer));
   else stdout(`HUB_DEVICE_FORCE_RELEASED ${slot ? answer.lock : answer.device ?? answer.lock} ${answer.lease_id} holder=${answer.holder ?? '-'}`);
   return claims.EXIT_OK;

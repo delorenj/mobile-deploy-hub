@@ -24,6 +24,9 @@ function knownOf(ctx) {
   return fallbacks.get(ctx);
 }
 
+// The `dedicated_qa` ids a Lease view is redacted by here: what the agent knows (the Hub API's last answer, else the seed), never a Registry file it does not read.
+const withQa = ctx => ({ ...ctx, qaIds: () => knownOf(ctx).qaIds() });
+
 // This host's key. An unknown host throws HUB_HOST_UNKNOWN, which the HTTP table answers 503 `host-unknown`.
 const ownKey = ctx => (ctx.hostKey ?? realHostKey)({ env: ctx.env ?? process.env });
 
@@ -100,11 +103,11 @@ function forwarding(route) {
         if (carried.rev === 0 && !view.seeded.includes(carried.id)) throw unseeded(carried);
         if (carried.retired_at !== null && key === 'POST /leases') throw retiredCarried(carried);
         const at = placed(fleetOf(view, own), carried, request, view, policy);
-        return local({ ...ctx, fleet: at.fleet }, at.request);
+        return local({ ...withQa(ctx), fleet: at.fleet }, at.request);
       }
       const foreign = namedRecords(key, input, request, view, policy).records.find(record => record.host !== own);
       if (foreign) throw wrongHost(foreign, own);
-      return local({ ...ctx, fleet: holdFleet(view, own, policy) }, request);
+      return local({ ...withQa(ctx), fleet: holdFleet(view, own, policy) }, request);
     }
     if (ctx.request && named.names(input, request).length > 0) await known.refresh({ request: ctx.request });
     const view = known.current();
@@ -114,9 +117,9 @@ function forwarding(route) {
     if (single && key === 'POST /leases' && single.retired_at) throw retiredCarried(single);
     if (single) {
       const at = placed(fleetOf(view, own), single, request, view, policy);
-      return local({ ...ctx, fleet: at.fleet }, at.request);
+      return local({ ...withQa(ctx), fleet: at.fleet }, at.request);
     }
-    return local({ ...ctx, fleet: holdFleet(view, own, policy) }, request);
+    return local({ ...withQa(ctx), fleet: holdFleet(view, own, policy) }, request);
   };
 }
 
@@ -130,7 +133,7 @@ function gated(route) {
     const view = knownOf(ctx).current();
     const foreign = namedRecords(key, input, request, view, ctx.policy ?? null).records.find(record => record.host !== own);
     if (foreign) throw wrongHost(foreign, own);
-    return route.handler({ ...ctx, fleet: holdFleet(view, own, ctx.policy ?? null) }, request);
+    return route.handler({ ...withQa(ctx), fleet: holdFleet(view, own, ctx.policy ?? null) }, request);
   };
 }
 
@@ -159,8 +162,8 @@ export async function agentSync(ctx, { body }) {
 const HOLD_ROUTES = Object.freeze(Object.keys(NAMED));
 
 export const AGENT_ROUTES = Object.freeze([
-  Object.freeze({ method: 'GET', path: '/health', shape: 'AgentHealth', handler: agentHealth }),
-  Object.freeze({ method: 'GET', path: '/status', shape: 'HostView', handler: agentStatus }),
-  Object.freeze({ method: 'POST', path: '/agent/sync', shape: 'AgentSync', handler: agentSync }),
+  Object.freeze({ method: 'GET', path: '/health', calls: 'receipt.hubRef', shape: 'AgentHealth', handler: agentHealth }),
+  Object.freeze({ method: 'GET', path: '/status', calls: 'claims.statusView', shape: 'HostView', handler: agentStatus }),
+  Object.freeze({ method: 'POST', path: '/agent/sync', calls: 'events.readEventsFrom', shape: 'AgentSync', handler: agentSync }),
   ...ROUTES.filter(route => HOLD_ROUTES.includes(keyOfRoute(route))).map(route => Object.freeze({ ...route, handler: NAMED[keyOfRoute(route)].forward ? forwarding(route) : gated(route) })),
 ]);

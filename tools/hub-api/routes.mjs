@@ -14,7 +14,7 @@
 // handler as `request.params`; a literal route wins over a parameterised one.
 import { STATUS_CODES } from 'node:http';
 import { idMatchesSerial } from '../ci/lib/adb.mjs';
-import { HOST_PLATFORMS, cancel, checkCancelBody, checkExtendBody, checkForceReleaseBody, checkLeaseBody, checkReleaseBody, checkReservationForceReleaseBody, createContext, discover as discoverHost, exitCodeOf, findLease, forceReleaseEmulator, forceReleaseLease, forceReleaseReservation, hostKey as realHostKey, httpAnswerOf, leaseRequestId, loadFleet, lockActivity, namesEmulatorSlot, restartingError, serviceExtend, serviceLease, serviceRelease, statusView } from '../device/claims.mjs';
+import { HOST_PLATFORMS, cancel, checkCancelBody, checkExtendBody, checkForceReleaseBody, checkLeaseBody, checkReleaseBody, checkReservationForceReleaseBody, createContext, discover as discoverHost, exitCodeOf, findLease, forceReleaseReservation, hostKey as realHostKey, httpAnswerOf, leaseRequestId, loadFleet, lockActivity, restartingError, serviceExtend, serviceForceRelease, serviceLease, serviceRelease, statusView } from '../device/claims.mjs';
 import { hubRef } from '../ci/lib/receipt.mjs';
 import { NAMED, forwardHold, hubView, namedRecords, placeOf, transportOf, unwrapCarried, wrongHost } from '../device/forward.mjs';
 import { NO_READING, serve as serveReading } from '../registry/reachability.mjs';
@@ -474,10 +474,14 @@ function readingsOf(ctx) {
 
 // The context the Claims library's service functions take, from the service's own: the lock dir environment, the policy and clock seams, a
 // log that never changes an answer, the reading of a Pool's members (a `match`) and the `devicectl` seam (the Host Agent's lane gate reads the iPad through it: Story 9.4).
+// The `dedicated_qa` Resource ids a Lease view is redacted by (AD-30): the caller's own (the Host Agent's, from the Hub API's last answer), else the Registry's,
+// read lazily so a request that builds no Lease view never reads it.
+const qaIdsOf = ctx => ctx.qaIds ?? (() => dedicatedQaIds(readIt(ctx)));
+
 function serviceContext(ctx) {
   const out = line => { try { ctx.log?.out?.(line); } catch { /* a broken log seam never changes the answer */ } };
   return {
-    env: ctx.env ?? process.env, policy: ctx.policy, now: ctx.now, sleep: ctx.sleep, qaDevices: ctx.qaDevices,
+    env: ctx.env ?? process.env, policy: ctx.policy, now: ctx.now, sleep: ctx.sleep, qaDevices: ctx.qaDevices, qaIds: qaIdsOf(ctx),
     ...(ctx.processStart ? { processStart: ctx.processStart } : {}), ...(ctx.fleet ? { fleet: ctx.fleet } : {}),
     log: out, warn: () => {}, readingsOf: readingsOf(ctx), ...(ctx.hostKey ? { hostKey: ctx.hostKey } : {}), ...(ctx.devicectl ? { devicectl: ctx.devicectl } : {}),
     ...(ctx.provisionOffThread ? { provisionOffThread: ctx.provisionOffThread } : {}), ...(ctx.releaseOffThread ? { releaseOffThread: ctx.releaseOffThread } : {}), ...(ctx.forceReleaseOffThread ? { forceReleaseOffThread: ctx.forceReleaseOffThread } : {}),
@@ -494,7 +498,7 @@ export async function takeLease(ctx, { body, signal }) {
 // GET /leases/{id}: the Lease an id names, a phone's or an emulator's (Story 7.2, 7.4), the same `Lease` the take answered with: how a client whose connection dropped
 // after the grant finds its Hold. A waiter that holds nothing yet and an unknown id are 404 HUB_LEASE_NOT_FOUND (`waiting`, `unknown`).
 export function getLease(ctx, { params }) {
-  return findLease(params.id, { env: ctx.env ?? process.env, warn: () => {}, ...(ctx.processStart ? { processStart: ctx.processStart } : {}), ...(ctx.fleet ? { fleet: ctx.fleet } : {}) });
+  return findLease(params.id, { env: ctx.env ?? process.env, warn: () => {}, qaIds: qaIdsOf(ctx), ...(ctx.processStart ? { processStart: ctx.processStart } : {}), ...(ctx.fleet ? { fleet: ctx.fleet } : {}) });
 }
 
 // POST /leases/{id}/extend: extends a phone or emulator Lease (Story 7.3), exactly `hub-device extend <id> --for ...`: `serviceExtend` is the one function
@@ -523,15 +527,14 @@ export function cancelRequestRoute(ctx, { body, params }) {
   return cancel(params.id, { ...input, actor }, serviceContext(ctx));
 }
 
-// POST /leases/{id}/force-release: ends a Lease by force (Story 7.6), exactly `hub-device force-release <id> --why ...`: `forceReleaseLease` is the one function every
+// POST /leases/{id}/force-release: ends a Lease by force (Story 7.6), exactly `hub-device force-release <id> --why ...`: `serviceForceRelease` is the one function every
 // front door calls, and the status of a refusal comes from its HTTP table. The body is checked first (`checkForceReleaseBody`); the actor is the body's `actor`, else
 // `{holder, via: 'api'}`. No holder check and no confirmation (that is the page's). 200 `ForceRelease`. An `{id}` of `emulator-<n>` (Story 7.8) is a slot:
-// `forceReleaseEmulator` ends its Lease and tears the emulator down, in a worker thread (AD-44); every other id is a Lease id.
+// `serviceForceRelease` sends it to `forceReleaseEmulator`, which ends its Lease and tears the emulator down, in a worker thread (AD-44); every other id is a Lease id.
 export function forceReleaseLeaseRoute(ctx, { body, params }) {
   const input = checkForceReleaseBody(body);
   const actor = input.actor ?? { holder: input.holder, via: 'api' };
-  if (namesEmulatorSlot(params.id)) return forceReleaseEmulator(params.id, { why: input.why, actor }, { ...serviceContext(ctx), offThread: true });
-  return forceReleaseLease(params.id, { why: input.why, actor }, serviceContext(ctx));
+  return serviceForceRelease(params.id, { why: input.why, actor }, { ...serviceContext(ctx), offThread: true });
 }
 
 // POST /reservations/{run_key}/force-release: ends a deploy run's Reservation by force (Story 7.7), exactly `hub-device force-release --reservation <run_key> --why ...`:
@@ -612,29 +615,30 @@ export async function streamRoute(ctx, { headers = {} } = {}) {
   return streamReply(sink => stream.attach(sink, { ...plan, after, status }));
 }
 
-// `shape` names the `### <Shape>` section of the contract document that lists the response's fields.
+// `shape` names the `### <Shape>` section of the contract document that lists the response's fields; `calls` names the one Claims or store export the
+// route runs (`<module>.<export>`, the document's `Calls` column; contract.test.mjs checks it is imported here).
 export const ROUTES = Object.freeze([
-  Object.freeze({ method: 'GET', path: '/health', shape: 'Health', handler: health }),
-  Object.freeze({ method: 'GET', path: '/resources', shape: 'ResourceList', handler: listResources }),
-  Object.freeze({ method: 'GET', path: '/resources/{id}', shape: 'Resource', handler: getResource }),
-  Object.freeze({ method: 'GET', path: '/pools', shape: 'PoolList', handler: listPools }),
-  Object.freeze({ method: 'GET', path: '/discovery', shape: 'Discovery', handler: discovery }),
-  Object.freeze({ method: 'GET', path: '/status', shape: 'Status', handler: statusDocument }),
-  Object.freeze({ method: 'GET', path: '/stream', shape: 'StreamFrame', handler: streamRoute, stream: true }),
-  Object.freeze({ method: 'GET', path: '/history', shape: 'History', handler: historyRoute }),
-  Object.freeze({ method: 'GET', path: '/utilisation', shape: 'Utilisation', handler: utilisationRoute }),
-  Object.freeze({ method: 'POST', path: '/agent/push', shape: 'AgentPushAck', handler: agentPush }),
-  Object.freeze({ method: 'POST', path: '/registry/resources', shape: 'Resource', handler: registerResource }),
-  Object.freeze({ method: 'POST', path: '/registry/resources/{id}', shape: 'Resource', handler: editResource }),
-  Object.freeze({ method: 'POST', path: '/registry/resources/{id}/retire', shape: 'Retirement', handler: retireResource }),
+  Object.freeze({ method: 'GET', path: '/health', calls: 'store.registryState', shape: 'Health', handler: health }),
+  Object.freeze({ method: 'GET', path: '/resources', calls: 'store.readRegistry', shape: 'ResourceList', handler: listResources }),
+  Object.freeze({ method: 'GET', path: '/resources/{id}', calls: 'store.readRegistry', shape: 'Resource', handler: getResource }),
+  Object.freeze({ method: 'GET', path: '/pools', calls: 'store.readRegistry', shape: 'PoolList', handler: listPools }),
+  Object.freeze({ method: 'GET', path: '/discovery', calls: 'claims.discover', shape: 'Discovery', handler: discovery }),
+  Object.freeze({ method: 'GET', path: '/status', calls: 'claims.statusView', shape: 'Status', handler: statusDocument }),
+  Object.freeze({ method: 'GET', path: '/stream', calls: 'claims.statusView', shape: 'StreamFrame', handler: streamRoute, stream: true }),
+  Object.freeze({ method: 'GET', path: '/history', calls: 'events.readEventsFrom', shape: 'History', handler: historyRoute }),
+  Object.freeze({ method: 'GET', path: '/utilisation', calls: 'events.readEventsFrom', shape: 'Utilisation', handler: utilisationRoute }),
+  Object.freeze({ method: 'POST', path: '/agent/push', calls: 'replica.createReplicas', shape: 'AgentPushAck', handler: agentPush }),
+  Object.freeze({ method: 'POST', path: '/registry/resources', calls: 'store.updateRegistry', shape: 'Resource', handler: registerResource }),
+  Object.freeze({ method: 'POST', path: '/registry/resources/{id}', calls: 'store.updateRegistry', shape: 'Resource', handler: editResource }),
+  Object.freeze({ method: 'POST', path: '/registry/resources/{id}/retire', calls: 'store.updateRegistry', shape: 'Retirement', handler: retireResource }),
   // `requestId` names the id a route echoes in `X-Request-Id` (from the request and its answer; the answer is null for an error).
-  hold({ method: 'POST', path: '/leases', shape: 'Lease', handler: takeLease, requestId: ({ body }, view) => leaseRequestId(body, view) }),
-  hold({ method: 'GET', path: '/leases/{id}', shape: 'Lease', handler: getLease }),
-  hold({ method: 'POST', path: '/leases/{id}/extend', shape: 'Lease', handler: extendLeaseRoute }),
-  hold({ method: 'POST', path: '/leases/{id}/release', shape: 'Release', handler: releaseLeaseRoute }),
-  hold({ method: 'POST', path: '/leases/{id}/force-release', shape: 'ForceRelease', handler: forceReleaseLeaseRoute }),
-  hold({ method: 'POST', path: '/requests/{id}/cancel', shape: 'Cancel', handler: cancelRequestRoute }),
-  Object.freeze({ method: 'POST', path: '/reservations/{run_key}/force-release', shape: 'ReservationForceRelease', handler: forceReleaseReservationRoute }),
+  hold({ method: 'POST', path: '/leases', calls: 'claims.serviceLease', shape: 'Lease', handler: takeLease, requestId: ({ body }, view) => leaseRequestId(body, view) }),
+  hold({ method: 'GET', path: '/leases/{id}', calls: 'claims.findLease', shape: 'Lease', handler: getLease }),
+  hold({ method: 'POST', path: '/leases/{id}/extend', calls: 'claims.serviceExtend', shape: 'Lease', handler: extendLeaseRoute }),
+  hold({ method: 'POST', path: '/leases/{id}/release', calls: 'claims.serviceRelease', shape: 'Release', handler: releaseLeaseRoute }),
+  hold({ method: 'POST', path: '/leases/{id}/force-release', calls: 'claims.serviceForceRelease', shape: 'ForceRelease', handler: forceReleaseLeaseRoute }),
+  hold({ method: 'POST', path: '/requests/{id}/cancel', calls: 'claims.cancel', shape: 'Cancel', handler: cancelRequestRoute }),
+  Object.freeze({ method: 'POST', path: '/reservations/{run_key}/force-release', calls: 'claims.forceReleaseReservation', shape: 'ReservationForceRelease', handler: forceReleaseReservationRoute }),
 ]);
 
 // ---- dispatch ----
