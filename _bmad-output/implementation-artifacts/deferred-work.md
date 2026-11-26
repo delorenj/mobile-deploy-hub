@@ -196,3 +196,19 @@ source_spec: `spec-8-2-reads-and-waits-never-block-the-event-loop.md`
 severity: medium
 reason: `createSnapshot.gather()` calls `observe({ env })` with no signal or deadline. `ready()` awaits `refresh()` while `current === null`, and single flight keeps `inflight` set. After one success, a hang only freezes the snapshot: reads still answer from it and the fallback readers. Before this story the same `inventory()` scan ran on the main thread, so a hang stalled every request. The change narrows the hang's reach rather than adding it, which makes it pre-existing. A fix needs a gather deadline, and that is a timer, which this spec's Never forbids. That needs a decision: an AbortSignal deadline on `observeOffThread`, or an exemption in tools/clock.test.mjs.
 status: open
+
+### DW-15: A Hold handler on the agent still reads retirement and the Resource record from the host's own lock-dir Registry file, not from what the agent knows.
+origin: spec-deferred 9111ab281b0a
+location: tools/device/claims.mjs:247
+source_spec: `spec-9-2-the-host-agent-serves-the-mac-s-own-state.md`
+severity: medium
+reason: refuseRetired and the cancel and force-release paths call readRegistryFile or readRegistry on ctx.env (tools/device/claims.mjs:247, :258, :1271). On a spoke host there is no registry.json, so those paths see the seed. A Resource the Hub API retired would not be refused there. This is Claims behaviour from before this story, and the spec forbids Claims changes. It cannot happen in 9.2, because a Mac agent can take no Resource until 9.4 (the ios-lane take). It matters from 9.4 on. (declared severity: medium (unverified))
+status: open
+
+### DW-16: No test runs the agent's real Hub API client wiring (the default send built from hub-client request, with the agent's hostKey and devices).
+origin: spec-deferred 8b0055e81282
+location: tools/host-agent/server.mjs
+source_spec: `spec-9-2-the-host-agent-serves-the-mac-s-own-state.md`
+severity: medium
+reason: Every start in tools/host-agent/server.test.mjs injects a request seam. Broken wiring degrades to one HUB_AGENT_REGISTRY_FAILED line, and the seed keeps answering, so the start test's expected outcome hides it. It would be settled by a start test that leaves request out but injects the ssh and fetch seams, or by the live /health readback that Story 9.7's install adds.
+status: open

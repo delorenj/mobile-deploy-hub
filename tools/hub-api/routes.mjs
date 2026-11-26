@@ -307,7 +307,7 @@ function serviceContext(ctx) {
   const out = line => { try { ctx.log?.out?.(line); } catch { /* a broken log seam never changes the answer */ } };
   return {
     env: ctx.env ?? process.env, policy: ctx.policy, now: ctx.now, sleep: ctx.sleep, qaDevices: ctx.qaDevices,
-    ...(ctx.processStart ? { processStart: ctx.processStart } : {}),
+    ...(ctx.processStart ? { processStart: ctx.processStart } : {}), ...(ctx.fleet ? { fleet: ctx.fleet } : {}),
     log: out, warn: () => {}, readingsOf: readingsOf(ctx), ...(ctx.hostKey ? { hostKey: ctx.hostKey } : {}),
     ...(ctx.provisionOffThread ? { provisionOffThread: ctx.provisionOffThread } : {}), ...(ctx.releaseOffThread ? { releaseOffThread: ctx.releaseOffThread } : {}), ...(ctx.forceReleaseOffThread ? { forceReleaseOffThread: ctx.forceReleaseOffThread } : {}),
   };
@@ -323,7 +323,7 @@ export async function takeLease(ctx, { body, signal }) {
 // GET /leases/{id}: the Lease an id names, a phone's or an emulator's (Story 7.2, 7.4), the same `Lease` the take answered with: how a client whose connection dropped
 // after the grant finds its Hold. A waiter that holds nothing yet and an unknown id are 404 HUB_LEASE_NOT_FOUND (`waiting`, `unknown`).
 export function getLease(ctx, { params }) {
-  return findLease(params.id, { env: ctx.env ?? process.env, warn: () => {}, ...(ctx.processStart ? { processStart: ctx.processStart } : {}) });
+  return findLease(params.id, { env: ctx.env ?? process.env, warn: () => {}, ...(ctx.processStart ? { processStart: ctx.processStart } : {}), ...(ctx.fleet ? { fleet: ctx.fleet } : {}) });
 }
 
 // POST /leases/{id}/extend: extends a phone or emulator Lease (Story 7.3), exactly `hub-device extend <id> --for ...`: `serviceExtend` is the one function
