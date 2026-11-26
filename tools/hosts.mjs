@@ -6,11 +6,15 @@
 //   - the Mac's handoff cache is seeded from the newest handoff tarball already there (0 bytes over the link);
 //   - each host's key (AD-47), `linux` on big-chungus and `mac` on the Mac, in ~/.config/mobile-deploy-hub/host-key, read back;
 //   - the catch-up units, CATCHUP's tools/catchup/units/install.sh, on big-chungus and (through hub-mac) on the Mac;
-//   - the Hub API on big-chungus only (Story 6.11, AD-45): tools/hosts/units/install.sh renders its unit for this release, then the
-//     service is enabled, restarted and /health read back (at most 10 s, one invocation) until it answers as this release. The
-//     Mac gets nothing (its Host Agent is Epic 7). A release directory is never removed or replaced by this step: when
-//     releases/<ref> already exists the catch-up installer runs from that copy, so a same-ref reinstall never swaps the tree a
-//     running service reads.
+//   - the Hub API on big-chungus (Story 6.11, AD-45): tools/hosts/units/install.sh renders its unit for this release, then the
+//     service is enabled, restarted and /health read back (at most 10 s, one invocation) until it answers as this release;
+//   - the Host Agent on the Mac (Story 9.7, AD-45): the same installer, run on the Mac over ssh, renders and bootstraps its
+//     LaunchAgent (sh.delo.mobile-deploy-hub.host-agent) for this release, and its /health is read back through hub-client (at most
+//     20 s) until it answers as this release;
+//   - the two services agree: /health is read once from each, and the step fails when their `contract` or `hub_version` differ.
+//     A release directory is never removed or replaced by any step: when releases/<ref> already exists on a host the installers run
+//     from that copy (on the Mac it is copied only when missing, into <ref>.part and then moved), so a same-ref reinstall never
+//     swaps the tree a running service reads. The services switch only at the installer's own restart or bootout and bootstrap.
 // Writes to the bucket use the hub writer's keys from 1Password, as deliver does.
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
@@ -24,8 +28,8 @@ import { indexData, indexPage } from './ci/lib/pages.mjs';
 import { pause, sleep as realSleep } from './ci/lib/pause.mjs';
 import { loadPolicy } from './ci/lib/policy.mjs';
 import { createS3, readObject, writerCredentials } from './ci/lib/s3.mjs';
-import { HOST_KEY_FILE, HOST_PLATFORMS } from './device/claims.mjs';
-import { HUB_API_CONTRACT, HUB_API_SERVICE } from './hub-client.mjs';
+import { HOST_KEY_FILE, HOST_PLATFORMS, hostKey as claimsHostKey } from './device/claims.mjs';
+import { HOST_AGENT_SERVICE, HUB_API_CONTRACT, HUB_API_SERVICE, request } from './hub-client.mjs';
 
 const hubRoot = fileURLToPath(new URL('..', import.meta.url));
 const ssh = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20'];
@@ -81,14 +85,46 @@ printf 'HOST_KEY=%s\\n' "$(cat "${file}")"
 }
 
 export const HUB_API_UNIT = 'mobile-deploy-hub-api.service';
+export const HOST_AGENT_LABEL = 'sh.delo.mobile-deploy-hub.host-agent';
+export const HOST_AGENT_ERR_LOG = '~/Library/Logs/mobile-deploy-hub/host-agent.err.log';
 export const READBACK_MS = 10_000;
+export const AGENT_READBACK_MS = 20_000;
+export const AGREE_MS = 10_000;
 const READBACK_RETRY_MS = 500;
 const releasesDir = home => join(home, '.local/share/mobile-deploy-hub/releases');
 
+// One line for why a read failed: a transport's cause code, a host that did not answer (`reason: detail`), or the error's own first line.
+const whyOf = error => String(error?.cause?.code ?? (error?.reason ? `${error.reason}: ${error.message}` : error?.message ?? error)).split('\n')[0];
+
+// The one /health readback, for either service: `read(signal)` makes one attempt and returns a `Response` (a loopback `fetch`, or `request` for the
+// other host). Retried in this one call, within `windowMs` by the injected clock (AD-19: no timer outlives it), each attempt bounded by an abort
+// signal of `attemptMs` and never past the deadline; no attempt starts after the deadline. An answer is `ok`, `service` the one named, `hub_version`
+// equal to `ref` and `contract` equal to HUB_API_CONTRACT. `onWait(last)` hears each miss. Returns `{body}` for an answer, `{last}` (why the final attempt
+// missed) for none.
+async function readBack({ read, service, ref, windowMs, attemptMs = 2000, sleep, now, onWait = () => {} }) {
+  const deadline = now() + windowMs;
+  let last = 'no answer';
+  for (;;) {
+    try {
+      const response = await read(AbortSignal.timeout(Math.max(1, Math.min(attemptMs, deadline - now()))));
+      const body = response.ok ? await response.json() : null;
+      if (body?.ok === true && body.service === service && body.hub_version === ref && body.contract === HUB_API_CONTRACT) return { body };
+      last = body ? `hub_version ${body.hub_version ?? 'missing'}, service ${body.service ?? 'missing'}, contract ${body.contract ?? 'missing'}` : `HTTP ${response.status}`;
+    } catch (error) {
+      last = whyOf(error);
+    }
+    onWait(last);
+    if (now() >= deadline) break;
+    await pause(READBACK_RETRY_MS, { sleep });
+    if (now() >= deadline) break;
+  }
+  return { last };
+}
+
 // The Hub API on this host (Story 6.11): the units installer from the release copy (rendered unit + daemon-reload only), then
 // enable, restart, and a bounded readback of /health: ok, service HUB_API_SERVICE (the name the server answers with) and hub_version equal to `ref` and `contract` equal to HUB_API_CONTRACT (the service runs from
-// releases/<ref>, so its answer names the release). The retry is one loop in this call, within READBACK_MS by the injected clock
-// (AD-19: no timer outlives it); no attempt starts after the deadline. Returns a one-line summary or throws.
+// releases/<ref>, so its answer names the release). The retry is one loop in this call, within READBACK_MS (see `readBack`).
+// Returns a one-line summary or throws.
 export async function installHubApi({ ref, run = sh, fetchImpl = fetch, sleep = realSleep, now = Date.now, home = homedir(), port, log = () => {} } = {}) {
   const installer = join(releasesDir(home), ref, 'tools/hosts/units/install.sh');
   if (!existsSync(installer)) throw new Error(`release copy missing: ${installer} (the catch-up step puts releases/${ref} there)`);
@@ -98,26 +134,49 @@ export async function installHubApi({ ref, run = sh, fetchImpl = fetch, sleep = 
     const result = run('systemctl', ['--user', verb, HUB_API_UNIT], { timeout: 2 * 60_000 });
     if (!result.ok) throw new Error(`systemctl --user ${verb} ${HUB_API_UNIT}: ${result.out.slice(-200)}`);
   }
-  const deadline = now() + READBACK_MS;
-  let last = 'no answer';
-  for (;;) {
-    try {
-      const response = await fetchImpl(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(Math.max(1, Math.min(2000, deadline - now()))), headers: { 'Cache-Control': 'no-cache' } });
-      const body = response.ok ? await response.json() : null;
-      if (body?.ok === true && body.service === HUB_API_SERVICE && body.hub_version === ref && body.contract === HUB_API_CONTRACT) return `${ref} serves 127.0.0.1:${port}, contract ${body.contract} (${installed.out.split('\n').slice(-1)[0]})`;
-      last = body ? `hub_version ${body.hub_version ?? 'missing'}, service ${body.service ?? 'missing'}, contract ${body.contract ?? 'missing'}` : `HTTP ${response.status}`;
-    } catch (error) {
-      last = String(error?.cause?.code ?? error?.message ?? error).split('\n')[0];
-    }
-    log(`HOSTS hub api: not ready yet (${last})`);
-    if (now() >= deadline) break;
-    await pause(READBACK_RETRY_MS, { sleep });
-    if (now() >= deadline) break;
-  }
+  const read = signal => fetchImpl(`http://127.0.0.1:${port}/health`, { signal, headers: { 'Cache-Control': 'no-cache' } });
+  const { body, last } = await readBack({ read, service: HUB_API_SERVICE, ref, windowMs: READBACK_MS, sleep, now, onWait: why => log(`HOSTS hub api: not ready yet (${why})`) });
+  if (body) return `${ref} serves 127.0.0.1:${port}, contract ${body.contract} (${installed.out.split('\n').slice(-1)[0]})`;
   throw new Error(`/health on 127.0.0.1:${port} did not report ${HUB_API_SERVICE} ${ref} within ${READBACK_MS / 1000}s (last: ${last}); see journalctl --user -u ${HUB_API_UNIT}`);
 }
 
-export async function hostsInstall({ log = console.log, run = sh, fetchImpl = fetch, sleep = realSleep, now = Date.now, home = homedir(), credentials = writerCredentials } = {}) {
+// The Host Agent on the Mac (Story 9.7): the units installer from the Mac's release copy, run there over ssh (it renders the LaunchAgent and
+// bootstraps it into the GUI session), then /health read back through `hub-client` `request` until the agent answers as this release (`readBack`,
+// AGENT_READBACK_MS). `seams` are `request`'s (policy, devices, hostKey, fetchImpl, sshImpl, timers). Returns a one-line summary or throws.
+export async function installHostAgent({ ref, host, run = sh, seams = {}, sleep = realSleep, now = Date.now, port, log = () => {} } = {}) {
+  const installed = run('ssh', [...ssh, host, `bash '.local/share/mobile-deploy-hub/releases/${ref}/tools/hosts/units/install.sh' '${ref}'`], { timeout: 2 * 60_000 });
+  if (!installed.ok) throw new Error(installed.out.slice(-300));
+  const read = signal => request({ host: 'mac', path: '/health', signal }, seams);
+  const { body, last } = await readBack({ read, service: HOST_AGENT_SERVICE, ref, windowMs: AGENT_READBACK_MS, attemptMs: 8000, sleep, now, onWait: why => log(`HOSTS host agent: not ready yet (${why})`) });
+  if (body) return `${ref} serves 127.0.0.1:${port} on mac, contract ${body.contract} (${installed.out.split('\n').slice(-1)[0]})`;
+  throw new Error(`/health on the Mac (127.0.0.1:${port}, through ssh ${host}) did not report ${HOST_AGENT_SERVICE} ${ref} within ${AGENT_READBACK_MS / 1000}s (last: ${last}); see ${HOST_AGENT_ERR_LOG} on the Mac`);
+}
+
+// The two services run one release: /health read once from each, through `request` (a loopback fetch for this host's own service, ssh for the other's,
+// so the same check works from either host), each bounded at AGREE_MS. Each must name its own service; `contract` and `hub_version` must be equal.
+export async function servicesAgree({ seams = {} } = {}) {
+  const services = { linux: HUB_API_SERVICE, mac: HOST_AGENT_SERVICE };
+  const read = async host => {
+    try {
+      const response = await request({ host, path: '/health', signal: AbortSignal.timeout(AGREE_MS) }, seams);
+      const body = response.ok ? await response.json() : null;
+      if (!body) return { host, problem: `HTTP ${response.status}` };
+      if (body.ok !== true || body.service !== services[host]) return { host, problem: `answered ok ${body.ok}, service ${body.service ?? 'missing'}, not ${services[host]}` };
+      return { host, body };
+    } catch (error) {
+      return { host, problem: whyOf(error) };
+    }
+  };
+  const answers = await Promise.all(Object.keys(services).map(read));
+  const missing = answers.filter(answer => !answer.body);
+  if (missing.length > 0) throw new Error(missing.map(answer => `${answer.host} did not give a ${services[answer.host]} /health (${answer.problem})`).join('; '));
+  const [first, second] = answers;
+  const differ = ['contract', 'hub_version'].filter(key => first.body[key] !== second.body[key]);
+  if (differ.length > 0) throw new Error(`${differ.map(key => `${key} ${first.body[key] ?? 'missing'} on ${first.host} but ${second.body[key] ?? 'missing'} on ${second.host}`).join('; ')}; the two services must run one release`);
+  return `contract ${first.body.contract}, hub_version ${first.body.hub_version} on ${first.host} and ${second.host}`;
+}
+
+export async function hostsInstall({ log = console.log, run = sh, fetchImpl = fetch, sleep = realSleep, now = Date.now, home = homedir(), credentials = writerCredentials, sshImpl, hostKey = () => claimsHostKey({ home }), timers } = {}) {
   const { policy } = loadPolicy();
   const devices = loadDevices();
   const failures = [];
@@ -126,6 +185,8 @@ export async function hostsInstall({ log = console.log, run = sh, fetchImpl = fe
   };
   const ref = releaseName(run);
   const host = devices.mac.host;
+  // The seams `request` takes (hub-client): the Mac is reached over ssh, this host's own service by a loopback fetch.
+  const seams = { policy, devices, hostKey, fetchImpl, ...(sshImpl ? { sshImpl } : {}), ...(timers ? { timers } : {}) };
 
   await step('build directory', async () => {
     const health = await fetchImpl(`${policy.delivery.s3.write}/minio/health/live`, { signal: AbortSignal.timeout(10_000) });
@@ -192,17 +253,29 @@ export async function hostsInstall({ log = console.log, run = sh, fetchImpl = fe
   await step('hub api on big-chungus', () => installHubApi({ ref, run, fetchImpl, sleep, now, home, port: policy.api.hub_api_port, log }));
   if (existsSync(installer)) {
     await step('catch-up on the Mac', async () => {
-      const target = `.local/share/mobile-deploy-hub/releases/${ref}/tools/`;
-      const mk = run('ssh', [...ssh, host, `mkdir -p '${target}'`]);
-      if (!mk.ok) throw new Error(mk.out.slice(-200));
-      const copy = run('rsync', ['-az', '--delete', '--stats', '-e', `ssh ${ssh.join(' ')}`, `${resolve(hubRoot, 'tools')}/`, `${host}:${target}`], { timeout: 10 * 60_000 });
-      if (!copy.ok) throw new Error(copy.out.slice(-300));
-      const sent = /Total bytes sent:\s*([\d,]+)/.exec(copy.out)?.[1] ?? '?';
-      const install = run('ssh', [...ssh, host, `bash '.local/share/mobile-deploy-hub/releases/${ref}/tools/catchup/units/install.sh' '${ref}'`], { timeout: 5 * 60_000 });
+      const release = `.local/share/mobile-deploy-hub/releases/${ref}`;
+      // The Mac's release copy is made only when it is missing: a running Host Agent reads its code from there, and rsync --delete into
+      // that tree can remove a module it imports later. A new copy is built beside it (<ref>.part) and moved in.
+      const probe = run('ssh', [...ssh, host, `if [ -e '${release}/tools' ]; then echo RELEASE_PRESENT; else echo RELEASE_MISSING; fi`]);
+      if (!probe.ok) throw new Error(probe.out.slice(-200));
+      let copied = 'release copy already on the Mac, not copied';
+      if (!/\bRELEASE_PRESENT\b/.test(probe.out)) {
+        const mk = run('ssh', [...ssh, host, `mkdir -p '${release}.part/tools'`]);
+        if (!mk.ok) throw new Error(mk.out.slice(-200));
+        const copy = run('rsync', ['-az', '--delete', '--stats', '-e', `ssh ${ssh.join(' ')}`, `${resolve(hubRoot, 'tools')}/`, `${host}:${release}.part/tools/`], { timeout: 10 * 60_000 });
+        if (!copy.ok) throw new Error(copy.out.slice(-300));
+        const move = run('ssh', [...ssh, host, `[ -e '${release}' ] || mv '${release}.part' '${release}'`]);
+        if (!move.ok) throw new Error(move.out.slice(-200));
+        copied = `${/Total bytes sent:\s*([\d,]+)/.exec(copy.out)?.[1] ?? '?'} bytes sent`;
+      }
+      const install = run('ssh', [...ssh, host, `bash '${release}/tools/catchup/units/install.sh' '${ref}'`], { timeout: 5 * 60_000 });
       if (!install.ok) throw new Error(install.out.slice(-300));
-      return `${ref} (${sent} bytes sent): ${install.out.split('\n').slice(-2).join('; ')}`;
+      return `${ref} (${copied}): ${install.out.split('\n').slice(-2).join('; ')}`;
     });
   }
+  // Always run: a Mac with no release copy fails loudly here (the installer is not there), and the agreement step reports what it can read.
+  await step('host agent on the Mac', () => installHostAgent({ ref, host, run, seams, sleep, now, port: policy.api.host_agent_port, log }));
+  await step('services agree', () => servicesAgree({ seams }));
   if (failures.length > 0) throw new Error(`hosts:install: ${failures.join(', ')} failed`);
   log(`HOSTS_OK ${ref}`);
 }

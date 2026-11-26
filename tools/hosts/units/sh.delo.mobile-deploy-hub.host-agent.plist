@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The Host Agent (mobile-deploy-hub, docs/design-hub-v1.1.md, Epic 9, AD-45): the Mac's own service on 127.0.0.1 (port:
+  policy.json api.host_agent_port). It is a service, not a job: RunAtLoad starts it at login, and KeepAlive with
+  SuccessfulExit false restarts it only after a failure, so a second copy that finds the port taken (it exits 0 on
+  HUB_API_ALREADY_RUNNING when started with the launchd flag) is never respawned. It has no interval, calendar or watch
+  trigger on purpose: the agent pushes on a change and on its own start, and candybar is the only clock.
+  units/install.sh renders the three placeholders (the release ref, the node 24 directory and the home directory) and
+  bootstraps this into gui/uid, the logged-in GUI session that devicectl needs. It runs from the release directory the
+  install named, so the code switches only at hosts:install, and it shares the default lock dir with deploys and hub-device.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>sh.delo.mobile-deploy-hub.host-agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@NODE@/bin/node</string>
+    <string>@HOME@/.local/share/mobile-deploy-hub/releases/@REF@/tools/host-agent/server.mjs</string>
+    <string>--launchd</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>WorkingDirectory</key>
+  <string>@HOME@</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>@HOME@</string>
+    <key>PATH</key>
+    <string>@NODE@/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>@HOME@/Library/Logs/mobile-deploy-hub/host-agent.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>@HOME@/Library/Logs/mobile-deploy-hub/host-agent.err.log</string>
+</dict>
+</plist>

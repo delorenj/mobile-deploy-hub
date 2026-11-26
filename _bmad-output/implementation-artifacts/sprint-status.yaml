@@ -125,7 +125,7 @@ development_status:
   9-4-lease-ipad-and-lease-mac-take-the-ios-lane: done
   9-5-the-host-agent-pushes-changes-and-only-changes: done
   9-6-an-asleep-mac-reads-offline-and-fails-fast: done
-  9-7-the-host-agent-runs-on-the-mac-as-its-own-launchagent: backlog
+  9-7-the-host-agent-runs-on-the-mac-as-its-own-launchagent: done
   9-8-ship-the-mac-host-agent: backlog
   epic-9-retrospective: optional
 

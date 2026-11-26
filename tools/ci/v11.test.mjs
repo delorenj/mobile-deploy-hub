@@ -722,7 +722,7 @@ test('the train dispatches Tower, then Green In Between, then Gruvato, and stops
 // ---------------------------------------------------------------------------------------------------- conformance and release
 
 import { checkApp, miseTasks, scriptsOf } from '../conformance.mjs';
-import { flipInnerRefs, notesMaxBytes, notesPath, pinTag, releaseNotes, remoteTag, rollbackLine, stopUnitsOf, tagArgs, tagMessage, unitsIn } from '../release.mjs';
+import { flipInnerRefs, notesMaxBytes, notesPath, pinTag, releaseNotes, remoteTag, rollbackFor, rollbackLine, stopUnitsOf, tagArgs, tagMessage, unitsIn } from '../release.mjs';
 
 test('conformance: the template caller and a clean app pass; uploads, bumps, tags and announcements outside the hub fail', () => {
   const app = { slug: 'gruvato', lanes: ['android', 'ios'] };
@@ -884,6 +884,58 @@ test('rollback: git ls-tree of the real repo names the Hub API unit at HEAD and 
   try { execFileSync('git', ['rev-parse', '--verify', '-q', 'v1.2.52^{commit}'], { cwd: repoRoot, stdio: 'ignore' }); } catch { t.skip('v1.2.52 is not fetched here'); return; }
   assert.deepEqual(unitsIn(lookup('v1.2.52')), []);
   assert.ok(stopUnitsOf('HEAD', 'v1.2.52').includes('mobile-deploy-hub-api.service'));
+});
+
+// Story 9.7: a release that adds a LaunchAgent says to boot it out of the Mac before the rollback target's hosts:install.
+test('rollback: unitsIn takes the suffix of what it lists (.plist for the Mac\'s LaunchAgents) and defaults to .service', () => {
+  const listing = 'tools/hosts/units/install.sh\ntools/hosts/units/b.service\ntools/hosts/units/sh.delo.mobile-deploy-hub.host-agent.plist\ntools/hosts/units/a.plist';
+  assert.deepEqual(unitsIn(listing, '.plist'), ['a.plist', 'sh.delo.mobile-deploy-hub.host-agent.plist']);
+  assert.deepEqual(unitsIn(listing), ['b.service']);
+  assert.deepEqual(unitsIn({ ok: true, out: listing }, '.plist').length, 2);
+  for (const failed of [null, undefined, { ok: false, out: '' }]) assert.equal(unitsIn(failed, '.plist'), null);
+});
+
+test('rollback: stopAgents is one quoted ssh hub-mac command: launchctl bootout and the plist to remove, and none is byte-identical to before', () => {
+  const previous = { object: 'a'.repeat(40), commit: 'b'.repeat(40) };
+  const before = rollbackLine({ major: 'v1', previous, previousTag: 'v1.2.52' });
+  assert.equal(rollbackLine({ major: 'v1', previous, previousTag: 'v1.2.52', stopAgents: [] }), before);
+  assert.equal(rollbackLine({ major: 'v1', previous, previousTag: 'v1.2.52', stopAgents: undefined }), before);
+  assert.equal(rollbackLine({ major: 'v1', previous, previousTag: 'v1.2.52', stopUnits: ['mobile-deploy-hub-api.service'] }), rollbackLine({ major: 'v1', previous, previousTag: 'v1.2.52', stopUnits: ['mobile-deploy-hub-api.service'], stopAgents: [] }));
+  const label = 'sh.delo.mobile-deploy-hub.host-agent';
+  assert.equal(rollbackLine({ major: 'v1', previous, previousTag: 'v1.2.52', stopAgents: [`${label}.plist`] }),
+    `Roll back: move v1 back to v1.2.52 (git tag -f v1 'v1.2.52^{commit}' && git push -f origin refs/tags/v1), then stop what this release added and v1.2.52 does not install (on the Mac, run ssh hub-mac 'launchctl bootout gui/$(id -u)/${label}; rm -f ~/Library/LaunchAgents/${label}.plist'), then run mise run hosts:install on big-chungus from a clean checkout at v1.2.52 (it installs the Mac through hub-mac).`);
+  const both = rollbackLine({ major: 'v1', previous, previousTag: 'v1.2.52', stopUnits: ['mobile-deploy-hub-api.service'], stopAgents: [`${label}.plist`] });
+  assert.ok(both.includes(`(systemctl --user disable --now mobile-deploy-hub-api.service on big-chungus; on the Mac, run ssh hub-mac 'launchctl bootout gui/$(id -u)/${label}; rm -f ~/Library/LaunchAgents/${label}.plist'), then run mise run hosts:install`), both);
+  assert.equal(rollbackLine({ major: 'v1', previous: null, stopAgents: [`${label}.plist`] }), 'Roll back: none: v1 is new with this release.');
+});
+
+test('rollback: stopUnitsOf with the .plist suffix is the LaunchAgents at HEAD that the rollback target lacks', () => {
+  const lookups = answers => (args, options) => { assert.deepEqual([args[0], args[1], args[3], options], ['ls-tree', '--name-only', 'tools/hosts/units/', { allowFail: true }]); return answers[args[2]] ?? { ok: false, out: '' }; };
+  const listing = (...names) => ({ ok: true, out: ['install.sh', 'x.service', ...names].map(name => `tools/hosts/units/${name}`).join('\n') });
+  const head = listing('sh.delo.mobile-deploy-hub.host-agent.plist');
+  assert.deepEqual(stopUnitsOf('HEAD', 'prev', lookups({ HEAD: head, prev: listing() }), '.plist'), ['sh.delo.mobile-deploy-hub.host-agent.plist']);
+  assert.deepEqual(stopUnitsOf('HEAD', 'prev', lookups({ HEAD: head, prev: head }), '.plist'), []);
+  assert.deepEqual(stopUnitsOf('HEAD', 'prev', lookups({ HEAD: head }), '.plist'), ['sh.delo.mobile-deploy-hub.host-agent.plist'], 'a failed target lookup lists every agent at HEAD');
+  assert.deepEqual(stopUnitsOf('HEAD', 'prev', lookups({ prev: head }), '.plist'), []);
+  assert.deepEqual(stopUnitsOf('HEAD', 'prev', lookups({ HEAD: head, prev: listing() })), [], 'the default suffix still lists services only, and x.service is in both');
+});
+
+test('rollback: rollbackFor reads .service and .plist at HEAD against the target and names both stops, several agents in one quoted command', () => {
+  const previous = { object: 'a'.repeat(40), commit: 'prev' };
+  const files = (...names) => ({ ok: true, out: ['install.sh', ...names].map(name => `tools/hosts/units/${name}`).join('\n') });
+  const run = answers => args => answers[args[2]] ?? { ok: false, out: '' };
+  const label = 'sh.delo.mobile-deploy-hub.host-agent';
+  const line = rollbackFor({ major: 'v1', previous, previousTag: 'v1.2.52', run: run({ HEAD: files('mobile-deploy-hub-api.service', `${label}.plist`, 'sh.delo.mobile-deploy-hub.next.plist', 'old.service'), prev: files('old.service') }) });
+  assert.ok(line.includes("(systemctl --user disable --now mobile-deploy-hub-api.service on big-chungus; on the Mac, run ssh hub-mac 'launchctl bootout gui/$(id -u)/sh.delo.mobile-deploy-hub.host-agent; rm -f ~/Library/LaunchAgents/sh.delo.mobile-deploy-hub.host-agent.plist; launchctl bootout gui/$(id -u)/sh.delo.mobile-deploy-hub.next; rm -f ~/Library/LaunchAgents/sh.delo.mobile-deploy-hub.next.plist'), then run mise run hosts:install"), line);
+  const none = rollbackFor({ major: 'v1', previous, previousTag: 'v1.2.52', run: run({ HEAD: files('old.service'), prev: files('old.service') }) });
+  assert.equal(none, rollbackLine({ major: 'v1', previous, previousTag: 'v1.2.52' }));
+  assert.equal(rollbackFor({ major: 'v1', previous: null, run: () => assert.fail('no lookup for a new major') }), 'Roll back: none: v1 is new with this release.');
+});
+
+test('rollback: the real units directory holds exactly the Host Agent LaunchAgent as a .plist (and the Hub API unit as a .service)', () => {
+  const names = readdirSync(join(repoRoot, 'tools/hosts/units')).join('\n');
+  assert.deepEqual(unitsIn(names, '.plist'), ['sh.delo.mobile-deploy-hub.host-agent.plist']);
+  assert.deepEqual(unitsIn(names), ['mobile-deploy-hub-api.service']);
 });
 
 test('remoteTag: a failed ls-remote throws (never "the tag is new"); a successful lookup of nothing is null', () => {

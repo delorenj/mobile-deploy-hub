@@ -9,8 +9,9 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import * as claims from './device/claims.mjs';
 import { hostKeyScript, hostsInstall } from './hosts.mjs';
-import { HUB_API_CONTRACT, HUB_API_SERVICE } from './hub-client.mjs';
-import { hermetic } from './ci/test-fixtures.mjs';
+import { HOST_AGENT_SERVICE, HUB_API_CONTRACT, HUB_API_SERVICE } from './hub-client.mjs';
+import { loadPolicy } from './ci/lib/policy.mjs';
+import { hermetic, peerSsh } from './ci/test-fixtures.mjs';
 
 hermetic();
 
@@ -184,6 +185,13 @@ const offline = async url => {
   throw new Error('offline');
 };
 
+// The Mac's Host Agent answers its own /health through a fake sshImpl that runs the real relay (Story 9.7), so the Mac steps pass and these
+// tests stay about the build directory and the host keys. `hostKey` is big-chungus's own key, for `request`.
+const agent = () => ({
+  hostKey: () => 'linux',
+  sshImpl: peerSsh({ key: 'mac', policy: loadPolicy().policy, fetchImpl: async () => new Response(JSON.stringify({ ok: true, service: HOST_AGENT_SERVICE, contract: HUB_API_CONTRACT, hub_version: 'main-ok' }), { status: 200 }) }),
+});
+
 function fakeHosts({ macOs = 'Darwin' } = {}) {
   const linux = shimmed('Linux');
   const mac = shimmed(macOs);
@@ -209,7 +217,7 @@ test('hostsInstall writes and reads back each host key, and other steps fail on 
   const lines = [];
   try {
     await assert.rejects(
-      hostsInstall({ home: fake.linux.home, log: line => lines.push(line), run: fake.run, fetchImpl: offline }),
+      hostsInstall({ home: fake.linux.home, log: line => lines.push(line), run: fake.run, fetchImpl: offline, ...agent() }),
       error => { assert.equal(error.message, 'hosts:install: build directory failed'); return true; },
     );
     assert.equal(readFileSync(claims.hostKeyPath(fake.linux.home), 'utf8'), 'linux\n');
@@ -228,7 +236,7 @@ test('hostsInstall fails a host key step whose readback disagrees, and only that
   const run = (command, args, options) => (command === 'ssh' && args.at(-1) === 'sh -s' ? { ok: true, out: 'HOST_KEY=linux' } : fake.run(command, args, options));
   try {
     await assert.rejects(
-      hostsInstall({ home: fake.linux.home, log: line => lines.push(line), run, fetchImpl: offline }),
+      hostsInstall({ home: fake.linux.home, log: line => lines.push(line), run, fetchImpl: offline, ...agent() }),
       /hosts:install: build directory, host key on the Mac failed/,
     );
     assert.ok(lines.some(line => line.startsWith('HOSTS_FAILED host key on the Mac: read back')), lines.join('\n'));
@@ -240,7 +248,7 @@ test('hostsInstall fails the Mac key step when the alias reaches a Linux box, wr
   const lines = [];
   try {
     await assert.rejects(
-      hostsInstall({ home: fake.linux.home, log: line => lines.push(line), run: fake.run, fetchImpl: offline }),
+      hostsInstall({ home: fake.linux.home, log: line => lines.push(line), run: fake.run, fetchImpl: offline, ...agent() }),
       /hosts:install: build directory, host key on the Mac failed/,
     );
     assert.ok(lines.some(line => /^HOSTS_FAILED host key on the Mac: .*darwin host but this is linux/.test(line)), lines.join('\n'));
@@ -258,7 +266,7 @@ test('hostsInstall accepts a correct Mac write when ssh adds notices around the 
   };
   try {
     await assert.rejects(
-      hostsInstall({ home: fake.linux.home, log: line => lines.push(line), run, fetchImpl: offline }),
+      hostsInstall({ home: fake.linux.home, log: line => lines.push(line), run, fetchImpl: offline, ...agent() }),
       error => { assert.equal(error.message, 'hosts:install: build directory failed'); return true; },
     );
     assert.ok(lines.some(line => /^HOSTS host key on the Mac: .*"mac"/.test(line)), lines.join('\n'));
