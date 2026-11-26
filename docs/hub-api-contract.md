@@ -2,6 +2,8 @@
 
 Status: contract 1, 2026-11-25
 
+Additive note, 2026-11-26 (Story 10.4): contract 1 is frozen in `tools/hub-api/contract-freeze.json`, which `contract.test.mjs` holds as a floor (a route, shape field, error code or problem extension member listed there can never leave this document; additions pass). Every route row gained a `Calls` cell, a route name is reserved for v1c (see Reserved), and a `Lease` on a `dedicated_qa` Resource serves `env.ANDROID_SERIAL` as `null`. No route, shape or meaning changed, so `contract` stays 1.
+
 The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's page and every other client code against this document. `tools/hub-api/contract.test.mjs` parses it and fails when a route or a field exists in only one of this document and `tools/hub-api/routes.mjs`, so a route-adding story updates both.
 
 ## Base URL
@@ -21,28 +23,38 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 
 ## Routes
 
-| Method | Path | Shape | Added |
-|--------|------|-------|-------|
-| GET | `/health` | Health | 6.4 |
-| GET | `/resources` | ResourceList | 6.5 |
-| GET | `/resources/{id}` | Resource | 6.5 |
-| GET | `/pools` | PoolList | 6.5 |
-| GET | `/discovery` | Discovery | 6.10 |
-| GET | `/status` | Status | 8.1 |
-| GET | `/stream` | StreamFrame | 8.4 |
-| GET | `/history` | History | 10.2 |
-| GET | `/utilisation` | Utilisation | 10.3 |
-| POST | `/agent/push` | AgentPushAck | 9.5 |
-| POST | `/registry/resources` | Resource | 6.6 |
-| POST | `/registry/resources/{id}` | Resource | 6.7 |
-| POST | `/registry/resources/{id}/retire` | Retirement | 6.7 |
-| POST | `/leases` | Lease | 7.1 |
-| GET | `/leases/{id}` | Lease | 7.2 |
-| POST | `/leases/{id}/extend` | Lease | 7.3 |
-| POST | `/leases/{id}/release` | Release | 7.3 |
-| POST | `/leases/{id}/force-release` | ForceRelease | 7.6, 7.8 |
-| POST | `/requests/{id}/cancel` | Cancel | 7.5 |
-| POST | `/reservations/{run_key}/force-release` | ReservationForceRelease | 7.7 |
+| Method | Path | Shape | Added | Calls |
+|--------|------|-------|-------|-------|
+| GET | `/health` | Health | 6.4 | `store.registryState` |
+| GET | `/resources` | ResourceList | 6.5 | `store.readRegistry` |
+| GET | `/resources/{id}` | Resource | 6.5 | `store.readRegistry` |
+| GET | `/pools` | PoolList | 6.5 | `store.readRegistry` |
+| GET | `/discovery` | Discovery | 6.10 | `claims.discover` |
+| GET | `/status` | Status | 8.1 | `claims.statusView` |
+| GET | `/stream` | StreamFrame | 8.4 | `claims.statusView` |
+| GET | `/history` | History | 10.2 | `events.readEventsFrom` |
+| GET | `/utilisation` | Utilisation | 10.3 | `events.readEventsFrom` |
+| POST | `/agent/push` | AgentPushAck | 9.5 | `replica.createReplicas` |
+| POST | `/registry/resources` | Resource | 6.6 | `store.updateRegistry` |
+| POST | `/registry/resources/{id}` | Resource | 6.7 | `store.updateRegistry` |
+| POST | `/registry/resources/{id}/retire` | Retirement | 6.7 | `store.updateRegistry` |
+| POST | `/leases` | Lease | 7.1 | `claims.serviceLease` |
+| GET | `/leases/{id}` | Lease | 7.2 | `claims.findLease` |
+| POST | `/leases/{id}/extend` | Lease | 7.3 | `claims.serviceExtend` |
+| POST | `/leases/{id}/release` | Release | 7.3 | `claims.serviceRelease` |
+| POST | `/leases/{id}/force-release` | ForceRelease | 7.6, 7.8 | `claims.serviceForceRelease` |
+| POST | `/requests/{id}/cancel` | Cancel | 7.5 | `claims.cancel` |
+| POST | `/reservations/{run_key}/force-release` | ReservationForceRelease | 7.7 | `claims.forceReleaseReservation` |
+
+`Calls` names the one library export a route runs, as `<module>.<export>`, so a client reads what a route does from the code that does it. The modules are `claims` (`tools/device/claims.mjs`), `store` (`tools/registry/store.mjs`), `events` (`tools/ci/lib/events.mjs`), `replica` (`tools/hub-api/replica.mjs`) and `receipt` (`tools/ci/lib/receipt.mjs`). `contract.test.mjs` checks each cell equals the route's `calls`, that the export is a function and that a service module imports it.
+
+## Reserved
+
+Names a later release will add, recorded here so v1c can claim them and nothing else uses them. They are not routes of contract 1: the services answer them 404 `HUB_NO_ROUTE`, and no code mentions them.
+
+| Reserved | For | Release |
+|----------|-----|---------|
+| `GET /capacity` | the Capacity Estimate (how many Leases a Pool can take now) | v1c |
 
 ## Shapes
 
@@ -402,7 +414,7 @@ The Resources are the Registry's live ones, plus any retired at or after `from`,
 - `claimant_kind` `agent` or `person`
 - `started_at` an ISO time, when the Lease was taken
 - `expires_at` an ISO time. An API Lease lives until then or until it is released: it is tied to no process, so a restart of the service never reclaims it
-- `env.*` what a Claimant exports to use it: the same keys `hub-device lease --json` prints under `env`. A phone's are `HUB_LEASE_ID`, `HUB_DEVICE`, `ANDROID_ADB_SERVER_PORT`, and no `ANDROID_SERIAL`: a phone Lease taken here never finds the phone on adb. A lane's (the iPad lane, Story 9.4) are `HUB_LEASE_ID` and `HUB_DEVICE` only: it is the lock and never adb. An emulator's are `HUB_LEASE_ID`, `ANDROID_ADB_SERVER_PORT` (the emulator's own adb server) and `ANDROID_SERIAL` (`emulator-<console port>`)
+- `env.*` what a Claimant exports to use it: the same keys `hub-device lease --json` prints under `env`. A phone's are `HUB_LEASE_ID`, `HUB_DEVICE`, `ANDROID_ADB_SERVER_PORT`, and no `ANDROID_SERIAL`: a phone Lease taken here never finds the phone on adb. On a `dedicated_qa` Resource the key stays and its value is `null`, whoever took the Lease: a Lease a CLI took with a connect records the phone's adb id, which embeds its serial, and a service never serves it (AD-30: keys stay, values become `null`; every `env` value equal to that adb id is `null` too). A lane's (the iPad lane, Story 9.4) are `HUB_LEASE_ID` and `HUB_DEVICE` only: it is the lock and never adb. An emulator's are `HUB_LEASE_ID`, `ANDROID_ADB_SERVER_PORT` (the emulator's own adb server) and `ANDROID_SERIAL` (`emulator-<console port>`)
 - `emulator.*` `null` for a phone. For an emulator an object with exactly `slot` (the slot lock, as `lock`), `serial` (the adb serial), `profile` (`default`, `playstore`), `console_port` and `adb_server_port`
 
 ### Release
@@ -715,20 +727,20 @@ The Host Agent is the front door of a spoke host (design v1.1, AD-25, AD-35, AD-
 
 Base URL: `http://127.0.0.1:8795`, loopback only, no path prefix. The port is `api.host_agent_port` in `tools/ci/policy.json`. It is keyed by the host key (`~/.config/mobile-deploy-hub/host-key`), never by a literal host name, so the same agent fronts any spoke host.
 
-| Method | Path | Shape | Added |
-|--------|------|-------|-------|
-| GET | `/health` | AgentHealth | 9.2 |
-| GET | `/status` | HostView | 9.2 |
-| POST | `/agent/sync` | AgentSync | 10.1 |
-| POST | `/leases` | Lease | 9.2 |
-| GET | `/leases/{id}` | Lease | 9.2 |
-| POST | `/leases/{id}/extend` | Lease | 9.2 |
-| POST | `/leases/{id}/release` | Release | 9.2 |
-| POST | `/leases/{id}/force-release` | ForceRelease | 9.2 |
-| POST | `/requests/{id}/cancel` | Cancel | 9.2 |
-| POST | `/reservations/{run_key}/force-release` | ReservationForceRelease | 9.2 |
+| Method | Path | Shape | Added | Calls |
+|--------|------|-------|-------|-------|
+| GET | `/health` | AgentHealth | 9.2 | `receipt.hubRef` |
+| GET | `/status` | HostView | 9.2 | `claims.statusView` |
+| POST | `/agent/sync` | AgentSync | 10.1 | `events.readEventsFrom` |
+| POST | `/leases` | Lease | 9.2 | `claims.serviceLease` |
+| GET | `/leases/{id}` | Lease | 9.2 | `claims.findLease` |
+| POST | `/leases/{id}/extend` | Lease | 9.2 | `claims.serviceExtend` |
+| POST | `/leases/{id}/release` | Release | 9.2 | `claims.serviceRelease` |
+| POST | `/leases/{id}/force-release` | ForceRelease | 9.2 | `claims.serviceForceRelease` |
+| POST | `/requests/{id}/cancel` | Cancel | 9.2 | `claims.cancel` |
+| POST | `/reservations/{run_key}/force-release` | ReservationForceRelease | 9.2 | `claims.forceReleaseReservation` |
 
-The seven Hold routes take the same bodies and answer the same shapes as the Hub API's (`Lease`, `Release`, `ForceRelease`, `Cancel`, `ReservationForceRelease` above). Every other route, `/registry/*`, `/resources`, `/pools`, `/discovery` and `/stream` included, is 404 `HUB_NO_ROUTE`: only the Hub API on big-chungus reads or writes the Registry.
+`Calls` reads as under Routes. The seven Hold routes take the same bodies and answer the same shapes as the Hub API's (`Lease`, `Release`, `ForceRelease`, `Cancel`, `ReservationForceRelease` above). Every other route, `/registry/*`, `/resources`, `/pools`, `/discovery` and `/stream` included, is 404 `HUB_NO_ROUTE`: only the Hub API on big-chungus reads or writes the Registry.
 
 **Forwarding, not a gate (Story 9.3).** A Hold route acts here only on this host's own Resources, and forwards the rest. After the route's own body check (a bad body is still `HUB_USAGE` 400), the Resource the request names is found in what the agent knows (the Hub API's last `GET /resources` answer, refreshed once per public request that names something, else the in-memory seed of `devices.json`; the seed's words, `ipad` and `mac`, and its Pools, `phone` and `emulator`, always resolve): by id, name or lock, then by word, a Pool word standing for its members, a `match` by the matcher over those Resources (a `profile=` clause names the emulator Pool). `POST /leases` names its `resource` or `match`, `POST /requests/{id}/cancel` its `resource` and `pool`, `POST /leases/{id}/extend`, `/release` and `/force-release` their optional `resource` (a force-release of an `emulator-<n>` id names the emulator Pool), and `POST /reservations/{run_key}/force-release` its `name`. What lives on one other host is forwarded there as the door `host-agent`; what lives here runs here, on the carried or the known record; a forward (the `X-Hub-Forwarded` header) is acted on as described under Forwarding, and one that names another host's Resource is `HUB_WRONG_HOST` 409 (`reason: wrong-host`, exit 2), naming the Resource, its host and this host, and nothing is written. A Reservation's force-release is never forwarded: another host's lock is `HUB_WRONG_HOST`. A name the agent does not know passes to the handler, which refuses it as it always does. The agent never reads `registry.json`.
 
