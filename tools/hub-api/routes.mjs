@@ -25,9 +25,9 @@ import { viewPools, viewRecord } from '../registry/view.mjs';
 import { deviceCtx } from './readings.mjs';
 import { STREAM_HEADERS } from './stream.mjs';
 
-export const CONTRACT_VERSION = 1;
-// One name for the service: the server answers with it, and the installer's readback and the smoke check for it.
-import { HUB_API_SERVICE } from '../hub-client.mjs';
+// One name and one contract number for the service: the server answers with them, and the installer's readback and the smoke check for them.
+import { HUB_API_CONTRACT, HUB_API_SERVICE } from '../hub-client.mjs';
+export const CONTRACT_VERSION = HUB_API_CONTRACT;
 export const SERVICE = HUB_API_SERVICE;
 
 const JSON_TYPE = 'application/json; charset=utf-8';

@@ -16,6 +16,8 @@
 // It does not import claims.mjs (which imports it), so the exit codes of its own three errors are written here and held equal to the
 // exit table by claims.test.mjs (a thrown error's `.exit` against EXIT_CODES).
 export const HUB_API_SERVICE = 'mobile-deploy-hub-api';
+// The one contract number the service answers with (`/health`, `/status`) and the installer's readback and the smoke check for it.
+export const HUB_API_CONTRACT = 1;
 export const HEALTH_TIMEOUT_MS = 2000;
 export const CALL_MARGIN_MS = 30_000;
 export const DOWN_MESSAGE = 'the Hub API is not answering; registry changes are unavailable, holds still work';

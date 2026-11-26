@@ -8,7 +8,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hermetic } from '../ci/test-fixtures.mjs';
-import { HOLD_EXTEND_MS, LEASABLE_WITHIN_MS, TRY_EVERY_MS, WAITER_SHOWS_WITHIN_MS, apiCaller, holdParity, hubDeviceCli, hubSmoke, parseSmokeArgs, runEntry } from './smoke.mjs';
+import { HOLD_EXTEND_MS, LEASABLE_WITHIN_MS, RESTART_WITHIN_MS, STATUS_WITHIN_MS, TRY_EVERY_MS, WAITER_SHOWS_WITHIN_MS, apiCaller, holdParity, hubDeviceCli, hubSmoke, parseSmokeArgs, runEntry, sseReader, streamCheck } from './smoke.mjs';
+import { ID_PATTERN, createStream } from '../hub-api/stream.mjs';
 import { phoneWordMembers } from '../device/claims.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
 import { planRegister } from '../registry/changes.mjs';
@@ -17,11 +18,11 @@ import { writeRegistry } from '../registry/store.mjs';
 
 hermetic();
 
-const policy = { api: { hub_api_port: 8794 } };
+const policy = { api: { hub_api_port: 8794, stream_keepalive_s: 15 } };
 const NAME = 'smoke-x';
 const ID = 'res-smoke-x';
 
-const health = (overrides = {}) => async () => ({ status: 200, text: async () => JSON.stringify({ ok: true, service: 'mobile-deploy-hub-api', contract: '1.0', hub_version: 'v1.2.53', registry: 'ok', ...overrides }) });
+const health = (overrides = {}) => async () => ({ status: 200, text: async () => JSON.stringify({ ok: true, service: 'mobile-deploy-hub-api', contract: 1, hub_version: 'v1.2.53', registry: 'ok', ...overrides }) });
 const out = (code, stdout = '', stderr = '') => ({ code, stdout, stderr });
 
 // A fake hub-device: `lease` answers from `leaseAnswers` (a function of the try number), and the Registry state follows add and retire.
@@ -119,6 +120,9 @@ test('smoke, API down, a wrong ref or a foreign service: HUB_SMOKE_FAILED health
     ['other service', health({ service: 'something-else' }), /not mobile-deploy-hub-api/],
     ['registry unreadable', health({ registry: 'unreadable' }), /Registry is unreadable/],
     ['ok false', health({ ok: false }), /does not say ok/],
+    ['contract 2', health({ contract: 2 }), /speaks contract 2, not 1/],
+    ['contract as text', health({ contract: '1.0' }), /speaks contract 1\.0, not 1/],
+    ['no contract', health({ contract: undefined }), /speaks contract unknown, not 1/],
     ['no registry field', health({ registry: undefined }), /Registry is not reported/],
   ]) {
     const w = world();
@@ -543,10 +547,10 @@ test('apiCaller: posts JSON to the policy port, answers {status, body}, never re
 });
 
 test('the CLI arguments: --holds-on takes a word, --no-holds turns the phase off, the default is on, a bad combination is a usage failure', () => {
-  assert.deepEqual(parseSmokeArgs([]), { hubDevice: 'hub-device', ref: undefined, holds: true });
+  assert.deepEqual(parseSmokeArgs([]), { hubDevice: 'hub-device', ref: undefined, holds: true, stream: true, restart: false });
   assert.equal(parseSmokeArgs(['--holds-on', 's24']).holds, 's24');
   assert.equal(parseSmokeArgs(['--no-holds']).holds, false);
-  assert.deepEqual(parseSmokeArgs(['--hub-device', 'node x.mjs', '--ref', 'v1.2.56', '--no-holds']), { hubDevice: 'node x.mjs', ref: 'v1.2.56', holds: false });
+  assert.deepEqual(parseSmokeArgs(['--hub-device', 'node x.mjs', '--ref', 'v1.2.56', '--no-holds']), { hubDevice: 'node x.mjs', ref: 'v1.2.56', holds: false, stream: true, restart: false });
   assert.throws(() => parseSmokeArgs(['--holds-on']), /--holds-on takes a value/);
   assert.throws(() => parseSmokeArgs(['--holds-on', '--no-holds']), /--holds-on takes a value/);
   assert.throws(() => parseSmokeArgs(['--holds-on', 's24', '--no-holds']), /exclude each other/);
@@ -578,13 +582,385 @@ test('runEntry forwards holds (true by default, a word, false), the ref and the 
   assert.equal(await runEntry(['--holds-on', 's24', '--ref', 'v1.2.56', '--hub-device', 'node x.mjs'], seams()), 0);
   assert.equal(await runEntry(['--no-holds'], seams()), 0);
   assert.deepEqual(calls, [
-    { ref: 'v-default', cli: 'cli:hub-device', holds: true },
-    { ref: 'v1.2.56', cli: 'cli:node x.mjs', holds: 's24' },
-    { ref: 'v-default', cli: 'cli:hub-device', holds: false },
+    { ref: 'v-default', cli: 'cli:hub-device', holds: true, stream: true, restart: false },
+    { ref: 'v1.2.56', cli: 'cli:node x.mjs', holds: 's24', stream: true, restart: false },
+    { ref: 'v-default', cli: 'cli:hub-device', holds: false, stream: true, restart: false },
   ]);
   assert.deepEqual(makes, ['hub-device', 'node x.mjs', 'hub-device']);
   const before = calls.length;
   assert.equal(await runEntry(['--holds-on'], seams()), 1);
   assert.equal(calls.length, before, 'a usage failure never reaches hubSmoke');
   assert.equal(await runEntry([], seams(Object.assign(new Error('HUB_SMOKE_FAILED holds: x'), { smoke: true }))), 1);
+});
+
+// ---------------------------------------------------------------------------------------------------- Story 8.7: the stream phase
+
+const encoder = new TextEncoder();
+const tick = () => new Promise(done => setImmediate(done));
+const frameText = (id, type, data) => `id: ${id}\nevent: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+const BOOT_A = 'aaaaaaaaaaaa';
+const BOOT_B = 'bbbbbbbbbbbb';
+const LEASE = `${NAME}-s`;
+
+// A fake service for `/stream`, `/health` and the CLI's Lease on one phone. `/stream` answers a Response over a ReadableStream that the
+// fake pushes into. The fake clock lives in `w.clock`: `w.sleep` yields (setImmediate), honours an abort, and then either runs the next
+// scheduled push that falls inside the wait (moving the clock to it, so a read and a timeout race deterministically) or moves the clock by
+// the whole wait.
+function streamWorld(knobs = {}) {
+  const {
+    opening = null, statusAfterMs = 0, noStatus = false, neverIdle = false, silent = false, restartEndsStream = true, reconnect = 'reset',
+    leaseLostOnRestart = false, healthAfterTries = 1, restartCode = 0, leaseRefused = false, streamEnds = false, staleStatus = null,
+  } = knobs;
+  const w = world({ status: wd => out(0, JSON.stringify({ phones: [{ device: 's24' }, ...(wd.registered && !wd.retired ? [{ device: NAME, held: srv.held ? 'lease' : 'free', lease_id: srv.held }] : [])] })) });
+  const srv = { boot: BOOT_A, seq: 0, held: null, ctrl: null, closed: true, timers: [], connections: 0, requests: [], restarts: 0, healthTries: 0, restarted: false };
+  w.srv = srv;
+  const doc = (held = srv.held) => ({ format: 1, contract: 1, hosts: { linux: { phones: [{ device: 's24', held: 'free', lease_id: null }, { device: NAME, held: held ? 'lease' : 'free', lease_id: held }] } }, registry: {}, stale: false, checked_at: 'x' });
+  const push = text => { if (!srv.closed) srv.ctrl.enqueue(encoder.encode(text)); };
+  const emit = (type, extra = {}) => { srv.seq += 1; push(frameText(`${srv.boot}-${srv.seq}`, type, { type, seq: srv.seq, key: type, at: 'x', ...extra })); };
+  const idle = () => {
+    srv.timers = srv.timers.filter(timer => timer.tag !== 'idle');
+    if (silent || srv.closed) return;
+    srv.timers.push(neverIdle ? { tag: 'idle', at: w.clock + 10_000, run: () => { emit('status', { status: doc() }); idle(); } } : { tag: 'idle', at: w.clock + 15_000, run: () => { push(': keepalive\n\n'); idle(); } });
+  };
+  const changed = kind => {
+    if (srv.closed) return;
+    const send = () => { if (noStatus) emit('event', { event_id: 'e1', event: { type: 'lease' } }); else emit('status', { status: staleStatus === kind ? doc(kind === 'lease' ? null : LEASE) : doc() }); idle(); };
+    if (statusAfterMs > 0) srv.timers.push({ tag: 'change', at: w.clock + statusAfterMs, run: send }); else send();
+  };
+  w.sleep = async (ms, signal) => {
+    await tick();
+    if (signal?.aborted) return;
+    const target = w.clock + ms;
+    const due = srv.timers.filter(timer => timer.at <= target).sort((a, b) => a.at - b.at)[0];
+    if (due) { srv.timers.splice(srv.timers.indexOf(due), 1); w.clock = Math.max(w.clock, due.at); due.run(); await tick(); return; }
+    w.clock = target;
+  };
+
+  const sse = (head, signal) => {
+    const body = new ReadableStream({ start(ctrl) { srv.ctrl = ctrl; srv.closed = false; }, cancel() { srv.closed = true; } });
+    signal?.addEventListener('abort', () => { srv.closed = true; try { srv.ctrl.error(new Error('aborted')); } catch { /* done */ } });
+    srv.connections += 1;
+    push(head);
+    return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  };
+  const open = (init, lastEventId) => {
+    const kind = lastEventId === undefined ? opening : null;
+    if (kind === 'status503') return new Response('{}', { status: 503, headers: { 'content-type': 'application/problem+json' } });
+    if (kind === 'type') return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+    const response = sse(kind === 'noRetry' ? '' : 'retry: 3000\n\n', init.signal);
+    const type = lastEventId === undefined ? 'ready' : reconnect;
+    if (kind === 'notReady') emit('status', { status: doc() });
+    else if (kind === 'badId') push(frameText('nope', 'ready', { type: 'ready', status: doc() }));
+    else if (kind === 'noHosts') push(frameText(`${srv.boot}-${srv.seq}`, 'ready', { type: 'ready', status: {} }));
+    else if (kind === 'noRetry') push(frameText(`${srv.boot}-${srv.seq}`, 'ready', { type: 'ready', status: doc() }));
+    else push(frameText(`${srv.boot}-${srv.seq}`, type, { type, seq: srv.seq, key: type, at: 'x', ...(type === 'reset' ? { reason: 'unresumable' } : {}), status: doc() }));
+    if (streamEnds) { srv.ctrl.close(); srv.closed = true; }
+    idle();
+    return response;
+  };
+
+  w.fetchLog = [];
+  w.fetch = async (url, init = {}) => {
+    const path = new URL(url).pathname;
+    w.fetchLog.push({ path, headers: init.headers ?? {} });
+    if (path === '/stream') {
+      srv.requests.push(init.headers?.['Last-Event-ID']);
+      return open(init, init.headers?.['Last-Event-ID']);
+    }
+    if (path === '/health' && srv.restarted) {
+      srv.healthTries += 1;
+      if (srv.healthTries <= healthAfterTries) throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } });
+    }
+    return health()();
+  };
+  w.restartUnit = async () => {
+    srv.restarts += 1;
+    if (restartCode !== 0) return out(restartCode, '', 'Failed to restart');
+    srv.restarted = true;
+    if (restartEndsStream) { srv.timers = []; try { srv.ctrl.close(); } catch { /* done */ } srv.closed = true; }
+    srv.boot = BOOT_B;
+    srv.seq = 0;
+    if (leaseLostOnRestart) srv.held = null;
+    return out(0);
+  };
+
+  const base = w.cli;
+  w.cli = async args => {
+    if (args[0] === 'lease' && args.includes('--id')) {
+      w.log.push(args);
+      if (leaseRefused) return out(76, '', 'HUB_LOCK_TIMEOUT busy');
+      srv.held = args[args.indexOf('--id') + 1];
+      changed('lease');
+      return out(0, JSON.stringify({ lease_id: srv.held, device: NAME }));
+    }
+    if (args[0] === 'release' && args[1] === LEASE) {
+      w.log.push(args);
+      srv.held = null;
+      changed('release');
+      return out(0, `HUB_DEVICE_RELEASED ${NAME} ${LEASE}\n`);
+    }
+    return base(args);
+  };
+  w.runStream = (extra = {}) => w.run({ fetchImpl: w.fetch, stream: true, restartUnit: w.restartUnit, ...extra });
+  w.check = (extra = {}) => streamCheck({ tag: NAME, ref: 'v1.2.53', cli: w.cli, fetchImpl: w.fetch, policy, restartUnit: w.restartUnit, now: w.now, sleep: w.sleep, log: line => w.lines.push(line), ...extra });
+  return w;
+}
+
+const streamLines = w => w.lines.filter(line => /^HUB_SMOKE (stream|restart):/.test(line));
+
+test('stream, happy: /stream opens, a CLI Lease shows in a status frame, a keepalive arrives idle; the line, then retire and the unchanged OK line', async () => {
+  const w = streamWorld({ statusAfterMs: 300 });
+  const line = await w.runStream();
+  assert.equal(line, 'HUB_SMOKE_OK v1.2.53 res-smoke-x leasable after 0 ms');
+  assert.deepEqual(streamLines(w), ['HUB_SMOKE stream: status frame 300 ms after the lease, keepalive after 15000 ms idle']);
+  assert.ok(w.lines.indexOf(streamLines(w)[0]) > w.lines.findIndex(text => text.startsWith('HUB_SMOKE release:')) && w.lines.indexOf(streamLines(w)[0]) < w.lines.findIndex(text => text.startsWith('HUB_SMOKE retire:')), 'between release and retire');
+  assert.deepEqual(verbs(w), ['registry list', 'registry add', 'lease', 'status', 'release', 'lease', 'release', 'registry retire', 'lease', 'status']);
+  assert.deepEqual(w.log.find(args => args.includes('--id')), ['lease', NAME, '--no-connect', '--wait', '0', '--for', '2m', '--why', 'hosts:smoke v1.2.53 stream', '--holder', 'hosts:smoke', '--id', LEASE, '--json']);
+  assert.deepEqual(w.log.filter(args => args[0] === 'release').at(-1), ['release', LEASE]);
+  const stream = w.fetchLog.find(call => call.path === '/stream');
+  assert.equal(stream.headers.accept, 'text/event-stream');
+  assert.equal(w.fetchLog.filter(call => call.path === '/stream').length, 1, 'one connection without --restart');
+  assert.equal(w.srv.restarts, 0, 'the service is not restarted unasked');
+  assert.ok(w.srv.closed, 'the stream is closed at the end');
+  assert.ok(w.retired && w.srv.held === null);
+});
+
+test('stream: false is the 7.9 world: no /stream fetch, no extra lease or release', async () => {
+  const w = streamWorld();
+  await w.run({ fetchImpl: w.fetch });
+  assert.deepEqual(verbs(w), ['registry list', 'registry add', 'lease', 'status', 'release', 'registry retire', 'lease', 'status']);
+  assert.ok(w.fetchLog.every(call => call.path === '/health'));
+  assert.ok(!w.lines.some(text => /^HUB_SMOKE (stream|restart)/.test(text)));
+});
+
+test('stream, an event frame ahead of the status frame is skipped', async () => {
+  const w = streamWorld();
+  const inner = w.cli;
+  w.cli = async args => {
+    if (args.includes('--id') && args[0] === 'lease') { w.srv.ctrl.enqueue(encoder.encode(frameText(`${BOOT_A}-9`, 'event', { type: 'event', event_id: 'x' }))); }
+    return inner(args);
+  };
+  assert.match(await w.runStream(), /^HUB_SMOKE_OK /);
+  assert.deepEqual(streamLines(w), ['HUB_SMOKE stream: status frame 0 ms after the lease, keepalive after 15000 ms idle']);
+});
+
+test('stream, no status frame within 2 s (only event frames): HUB_SMOKE_FAILED stream, the Lease released, the phone retired', async () => {
+  const w = streamWorld({ noStatus: true });
+  await assert.rejects(w.runStream(), error => error.step === 'stream' && error.message === `HUB_SMOKE_FAILED stream: no status frame showed ${LEASE} within 2 s`);
+  assert.ok(w.lines.includes(`HUB_SMOKE cleanup: released ${LEASE}`), 'the Lease is released and logged');
+  assert.equal(w.srv.held, null);
+  assert.ok(w.retired && w.srv.closed);
+});
+
+test('stream, a status frame later than 2 s after the CLI answered is too late, by the fake clock', async () => {
+  const w = streamWorld({ statusAfterMs: STATUS_WITHIN_MS + 500 });
+  const before = w.clock;
+  await assert.rejects(w.runStream(), error => error.message === `HUB_SMOKE_FAILED stream: no status frame showed ${LEASE} within 2 s`);
+  assert.ok(w.clock - before <= STATUS_WITHIN_MS + 1000, 'the wait stops at the deadline');
+  assert.ok(w.retired && w.srv.held === null);
+});
+
+test('stream, a status frame that does not show the Lease (still free) is not the frame: fails, the Lease released, the phone retired', async () => {
+  const w = streamWorld({ staleStatus: 'lease' });
+  await assert.rejects(w.runStream(), error => error.step === 'stream' && error.message === `HUB_SMOKE_FAILED stream: no status frame showed ${LEASE} within 2 s`);
+  assert.ok(w.lines.includes(`HUB_SMOKE cleanup: released ${LEASE}`));
+  assert.ok(w.retired && w.srv.held === null);
+});
+
+test('stream, a status frame after the release that still shows the Lease is not the frame: fails naming it, the phone retired', async () => {
+  const w = streamWorld({ staleStatus: 'release' });
+  await assert.rejects(w.runStream(), error => error.step === 'stream' && error.message === `HUB_SMOKE_FAILED stream: no status frame showed ${NAME} without ${LEASE} within 2 s`);
+  assert.ok(w.retired && w.srv.held === null);
+});
+
+test('stream, a bad opening is named, no Lease is taken, and the phone is retired', async () => {
+  for (const [opening, pattern] of [
+    ['status503', /^HUB_SMOKE_FAILED stream: \/stream answered 503, not 200/],
+    ['type', /content-type application\/json, not text\/event-stream/],
+    ['noRetry', /did not open with retry: 3000 \(it sent a ready frame /],
+    ['notReady', /opened with a status frame .*, not a ready frame/],
+    ['badId', /the ready frame has the id nope, not <boot>-<n>/],
+    ['noHosts', /the ready frame carries no status\.hosts document/],
+  ]) {
+    const w = streamWorld({ opening });
+    await assert.rejects(w.runStream(), error => error.step === 'stream' && pattern.test(error.message), opening);
+    assert.ok(!w.log.some(args => args.includes('--id')), `${opening}: no Lease was taken`);
+    assert.ok(!w.lines.some(text => text.startsWith('HUB_SMOKE cleanup: released')), `${opening}: nothing to release`);
+    assert.ok(w.retired, `${opening}: retired`);
+  }
+});
+
+test('stream, /stream that never answers, or answers nothing, fails within 5 s and a refused connect is named', async () => {
+  const w = streamWorld();
+  await assert.rejects(w.runStream({ fetchImpl: async url => { if (new URL(url).pathname === '/health') return health()(); throw new Error('connect ECONNREFUSED'); } }), /stream: \/stream did not answer \(connect ECONNREFUSED\)/);
+  const v = streamWorld();
+  await assert.rejects(v.runStream({ fetchImpl: async url => (new URL(url).pathname === '/health' ? health()() : new Promise(() => {})) }), /stream: \/stream did not answer within 5 s/);
+  const x = streamWorld({ silent: true });
+  const inner = x.fetch;
+  x.fetch = async (url, init) => { const response = await inner(url, init); return new URL(url).pathname === '/stream' ? new Response(new ReadableStream({ start() {} }), { status: 200, headers: response.headers }) : response; };
+  await assert.rejects(x.runStream({ fetchImpl: x.fetch }), /stream: \/stream did not open with retry: 3000 \(it sent nothing\)/);
+});
+
+test('stream, the Lease is refused by the CLI: fails with what it said, the (unknown) id is released anyway', async () => {
+  const w = streamWorld({ leaseRefused: true });
+  await assert.rejects(w.runStream(), error => error.step === 'stream' && /^HUB_SMOKE_FAILED stream: the Lease smoke-x-s on smoke-x was refused \(exit 76: HUB_LOCK_TIMEOUT busy\)/.test(error.message));
+  assert.ok(w.retired);
+});
+
+test('stream, never idle: a frame every 10 s with keepalive 15 s fails after 3 windows, the Lease already released', async () => {
+  const w = streamWorld({ neverIdle: true });
+  const start = w.clock;
+  await assert.rejects(w.runStream(), error => error.step === 'stream' && /^HUB_SMOKE_FAILED stream: the stream was never idle: a frame arrived in each of 3 windows of 20 s/.test(error.message));
+  assert.ok(w.clock - start >= 30_000 && w.clock - start < 40_000, `three windows, not more (${w.clock - start} ms)`);
+  assert.ok(!w.lines.some(text => text.startsWith('HUB_SMOKE cleanup: released smoke-x-s')), 'already released: nothing to undo');
+  assert.ok(w.retired);
+});
+
+test('stream, no keepalive and no frame within keepalive + 5 s fails, naming the window', async () => {
+  const w = streamWorld({ silent: true });
+  const start = w.clock;
+  await assert.rejects(w.runStream(), error => error.step === 'stream' && error.message === 'HUB_SMOKE_FAILED stream: no keepalive arrived within 20 s of the last item');
+  assert.equal(w.clock - start, 20_000, 'the window is exactly 20 s of the fake clock');
+  assert.ok(w.retired);
+});
+
+test('stream, a stream that ends under the check fails and releases the Lease', async () => {
+  const w = streamWorld({ streamEnds: true });
+  await assert.rejects(w.runStream(), error => error.step === 'stream' && /^HUB_SMOKE_FAILED stream: the stream ended while waiting for a status frame that shows smoke-x-s/.test(error.message));
+  assert.ok(w.retired && w.srv.held === null);
+});
+
+test('restart, happy: the unit restarts, the old stream ends, /health answers again, the Lease is held, the reconnect (Last-Event-ID = last id) gets reset of a new boot', async () => {
+  const w = streamWorld();
+  const line = await w.runStream({ restart: true });
+  assert.match(line, /^HUB_SMOKE_OK /);
+  assert.deepEqual(streamLines(w), [
+    'HUB_SMOKE stream: status frame 0 ms after the lease, keepalive after 15000 ms idle',
+    `HUB_SMOKE restart: ${LEASE} held across the restart; the reconnect got reset (boot ${BOOT_A} -> ${BOOT_B})`,
+  ]);
+  assert.equal(w.srv.restarts, 1);
+  assert.deepEqual(w.srv.requests, [undefined, `${BOOT_A}-1`], 'the second connection resumes from the last frame id seen');
+  assert.equal(w.fetchLog.filter(call => call.path === '/health').length, 1 + 2, 'one health at the start, then one refused try and one answer');
+  const order = verbs(w);
+  assert.deepEqual(order, ['registry list', 'registry add', 'lease', 'status', 'release', 'lease', 'status', 'release', 'registry retire', 'lease', 'status']);
+  assert.equal(w.srv.held, null);
+  assert.ok(w.retired && w.srv.closed);
+});
+
+test('restart, the health retry is one try every 500 ms within 30 s, then it fails and releases the Lease', async () => {
+  const w = streamWorld({ healthAfterTries: 1000 });
+  const statusReads = () => w.log.filter(args => args[0] === 'status').length;
+  const before = w.clock;
+  await assert.rejects(w.runStream({ restart: true }), error => error.step === 'restart' && /^HUB_SMOKE_FAILED restart: \/health did not answer as mobile-deploy-hub-api v1\.2\.53, contract 1 within 30 s of the restart \(last: ECONNREFUSED\)/.test(error.message));
+  assert.ok(w.clock - before >= RESTART_WITHIN_MS && w.clock - before < RESTART_WITHIN_MS + 2 * TRY_EVERY_MS + 20_000);
+  const healthTries = w.fetchLog.filter(call => call.path === '/health').length - 1;
+  assert.ok(healthTries > 10 && healthTries <= Math.ceil(RESTART_WITHIN_MS / 500) + 2, `${healthTries} tries`);
+  assert.equal(statusReads(), 1, 'only the smoke\'s own listed() read, none after the deadline');
+  assert.ok(w.lines.includes(`HUB_SMOKE cleanup: released ${LEASE}`) && w.retired);
+});
+
+test('restart, /health that answers another hub_version or contract is not an answer', async () => {
+  for (const wrong of [{ hub_version: 'v1.2.52' }, { contract: 2 }, { service: 'x' }, { ok: false }]) {
+    const w = streamWorld({ healthAfterTries: 0 });
+    const inner = w.fetch;
+    let calls = 0;
+    w.fetch = async (url, init) => { if (new URL(url).pathname === '/health' && w.srv.restarted) { calls += 1; if (calls <= 2) return health(wrong)(); } return inner(url, init); };
+    const line = await w.runStream({ restart: true, fetchImpl: w.fetch });
+    assert.match(line, /^HUB_SMOKE_OK /, JSON.stringify(wrong));
+    assert.equal(calls, 3);
+  }
+});
+
+test('restart, the Lease did not survive: HUB_SMOKE_FAILED restart naming what status shows; release attempted, phone retired', async () => {
+  const w = streamWorld({ leaseLostOnRestart: true });
+  await assert.rejects(w.runStream({ restart: true }), error => error.step === 'restart' && /^HUB_SMOKE_FAILED restart: smoke-x-s did not survive the restart: status shows smoke-x held free/.test(error.message));
+  assert.ok(w.lines.includes(`HUB_SMOKE cleanup: released ${LEASE}`) && w.retired);
+});
+
+test('restart, the reconnect opens ready, or reset with the same boot: both fail naming it', async () => {
+  const ready = streamWorld({ reconnect: 'ready' });
+  await assert.rejects(ready.runStream({ restart: true }), error => error.step === 'restart' && new RegExp(`^HUB_SMOKE_FAILED restart: the reconnect opened with a ready frame ${BOOT_B}-0, not a reset frame`).test(error.message));
+  assert.ok(ready.retired && ready.srv.held === null);
+  const same = streamWorld();
+  const inner = same.restartUnit;
+  same.restartUnit = async () => { const answer = await inner(); same.srv.boot = BOOT_A; return answer; };
+  await assert.rejects(same.runStream({ restart: true, restartUnit: same.restartUnit }), error => error.step === 'restart' && new RegExp(`the reconnect got reset, but its boot is still ${BOOT_A}`).test(error.message));
+  assert.ok(same.retired && same.srv.held === null);
+});
+
+test('restart, the old stream never ends: fails after 30 s; a systemctl failure fails at once; neither skips the cleanup', async () => {
+  const stuck = streamWorld({ restartEndsStream: false, silent: true });
+  const before = stuck.clock;
+  await assert.rejects(stuck.runStream({ restart: true }), error => error.step === 'restart' && /^HUB_SMOKE_FAILED restart: the old stream did not end within 30 s of the restart/.test(error.message));
+  assert.ok(stuck.clock - before >= RESTART_WITHIN_MS);
+  assert.ok(stuck.retired && stuck.srv.held === null);
+  const broken = streamWorld({ restartCode: 5 });
+  await assert.rejects(broken.runStream({ restart: true }), error => error.step === 'restart' && /restarting mobile-deploy-hub-api\.service failed \(exit 5: Failed to restart\)/.test(error.message));
+  assert.ok(broken.retired && broken.srv.held === null);
+});
+
+test('stream, arguments: restart needs stream, both are booleans; the default seam is never reached by the tests', async () => {
+  await assert.rejects(hubSmoke({ ref: 'v1', cli: async () => out(0), restart: true }), TypeError);
+  await assert.rejects(hubSmoke({ ref: 'v1', cli: async () => out(0), stream: 'yes' }), TypeError);
+  await assert.rejects(hubSmoke({ ref: 'v1', cli: async () => out(0), stream: true, restart: 1 }), TypeError);
+  await assert.rejects(streamCheck({ ref: 'v1', cli: async () => out(0) }), TypeError);
+  await assert.rejects(streamCheck({ tag: 'x', cli: async () => out(0) }), TypeError);
+  await assert.rejects(streamCheck({ tag: 'x', ref: 'v1' }), TypeError);
+  await assert.rejects(streamCheck({ tag: 'x', ref: 'v1', cli: async () => out(0), policy: { api: { hub_api_port: 1 } } }), /stream: policy\.api\.stream_keepalive_s/);
+});
+
+test('the CLI arguments: the stream phase is on by default, --no-stream skips it, --restart turns the restart on, both together are a usage failure', () => {
+  assert.deepEqual(parseSmokeArgs(['--no-stream']), { hubDevice: 'hub-device', ref: undefined, holds: true, stream: false, restart: false });
+  assert.deepEqual(parseSmokeArgs(['--restart']), { hubDevice: 'hub-device', ref: undefined, holds: true, stream: true, restart: true });
+  assert.deepEqual(parseSmokeArgs(['--no-holds', '--restart', '--ref', 'v1.2.57']), { hubDevice: 'hub-device', ref: 'v1.2.57', holds: false, stream: true, restart: true });
+  assert.throws(() => parseSmokeArgs(['--restart', '--no-stream']), /--restart and --no-stream exclude each other/);
+  assert.throws(() => parseSmokeArgs(['--no-stream', '--restart']), /exclude each other/);
+  assert.throws(() => parseSmokeArgs(['--stream']), /unknown: --stream/);
+});
+
+test('runEntry forwards stream and restart to hubSmoke; --restart with --no-stream never reaches it', async () => {
+  const calls = [];
+  const seams = { smoke: async options => { calls.push(options); }, makeCli: command => `cli:${command}`, defaultRef: () => 'v-default' };
+  assert.equal(await runEntry(['--no-stream'], seams), 0);
+  assert.equal(await runEntry(['--restart'], seams), 0);
+  assert.deepEqual(calls.map(({ stream, restart }) => ({ stream, restart })), [{ stream: false, restart: false }, { stream: true, restart: true }]);
+  assert.equal(await runEntry(['--restart', '--no-stream'], seams), 1);
+  assert.equal(calls.length, 2, 'a usage failure never reaches hubSmoke');
+});
+
+test('the CLI entry: --restart with --no-stream fails with exit 1 and never calls hub-device', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hub-smoke-stream-entry-'));
+  try {
+    const stub = join(dir, 'stub.mjs');
+    const called = join(dir, 'called');
+    writeFileSync(stub, `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(called)}, 'yes');\n`);
+    const entry = fileURLToPath(new URL('./smoke.mjs', import.meta.url));
+    const result = spawnSync(process.execPath, [entry, '--restart', '--no-stream', '--hub-device', `${process.execPath} ${stub}`], { encoding: 'utf8', timeout: 30_000 });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /^HUB_SMOKE_FAILED --restart and --no-stream exclude each other/);
+    assert.equal(result.stdout, '');
+    assert.throws(() => readFileSync(called), { code: 'ENOENT' }, 'hub-device was never called');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('sseReader reads what the real createStream writes: retry 3000, ready, a status frame, then the keepalive comment, in that order', async () => {
+  const intervals = [];
+  const timers = { setInterval: callback => { intervals.push(callback); return { unref() {} }; }, clearInterval: () => {} };
+  const stream = createStream({ boot: 'abcdef012345', timers, keepaliveMs: 15_000 });
+  const written = [];
+  const sink = { write: text => { written.push(text); return true; }, on() {}, destroy() {}, writableLength: 0 };
+  const opening = { hosts: { linux: { phones: [] } } };
+  stream.attach(sink, { kind: 'ready', after: stream.cursor(), status: opening });
+  stream.status({ hosts: { linux: { phones: [{ device: NAME, lease_id: null }] } } });
+  intervals.at(-1)();
+  const body = new ReadableStream({ start(controller) { controller.enqueue(encoder.encode(written.join(''))); controller.close(); } });
+  const reader = sseReader(body, { race: work => work, now: () => 0 });
+  const items = [];
+  for (let index = 0; index < 4; index += 1) items.push(await reader.next(1000));
+  assert.deepEqual(items.map(item => item.kind), ['retry', 'frame', 'frame', 'comment']);
+  assert.equal(items[0].ms, 3000);
+  assert.deepEqual([items[1].type, ID_PATTERN.test(items[1].id), items[1].data.status], ['ready', true, opening]);
+  assert.deepEqual([items[2].type, ID_PATTERN.test(items[2].id), items[2].data.status.hosts.linux.phones[0].device], ['status', true, NAME]);
+  assert.equal(items[3].text, 'keepalive');
+  assert.equal((await reader.next(1000)).kind, 'end');
 });
