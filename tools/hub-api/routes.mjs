@@ -14,7 +14,7 @@
 // handler as `request.params`; a literal route wins over a parameterised one.
 import { STATUS_CODES } from 'node:http';
 import { idMatchesSerial } from '../ci/lib/adb.mjs';
-import { HOST_PLATFORMS, cancel, checkCancelBody, checkExtendBody, checkForceReleaseBody, checkLeaseBody, checkReleaseBody, checkReservationForceReleaseBody, createContext, discover as discoverHost, exitCodeOf, findLease, forceReleaseEmulator, forceReleaseLease, forceReleaseReservation, hostKey as realHostKey, httpAnswerOf, leaseRequestId, loadFleet, lockActivity, namesEmulatorSlot, serviceExtend, serviceLease, serviceRelease, statusView } from '../device/claims.mjs';
+import { HOST_PLATFORMS, cancel, checkCancelBody, checkExtendBody, checkForceReleaseBody, checkLeaseBody, checkReleaseBody, checkReservationForceReleaseBody, createContext, discover as discoverHost, exitCodeOf, findLease, forceReleaseEmulator, forceReleaseLease, forceReleaseReservation, hostKey as realHostKey, httpAnswerOf, leaseRequestId, loadFleet, lockActivity, namesEmulatorSlot, restartingError, serviceExtend, serviceLease, serviceRelease, statusView } from '../device/claims.mjs';
 import { hubRef } from '../ci/lib/receipt.mjs';
 import { NO_READING } from '../registry/reachability.mjs';
 import { dedicatedQaIds, loadQaDevices } from '../registry/seed.mjs';
@@ -23,6 +23,7 @@ import { checkEditBody, checkRegisterBody, checkRetireBody, planEdit, planRegist
 import { REGISTRY_ERRORS, applySeed, readRegistry, registryState, updateRegistry } from '../registry/store.mjs';
 import { viewPools, viewRecord } from '../registry/view.mjs';
 import { deviceCtx } from './readings.mjs';
+import { STREAM_HEADERS } from './stream.mjs';
 
 export const CONTRACT_VERSION = 1;
 // One name for the service: the server answers with it, and the installer's readback and the smoke check for it.
@@ -36,6 +37,11 @@ const BASE_HEADERS = Object.freeze({ 'Cache-Control': 'no-store' });
 // A handler returns its body (an object, status 200), or `reply(status, body)` for another success status (201 for a register).
 const REPLY = Symbol('reply');
 export const reply = (status, body) => ({ [REPLY]: true, status, body });
+
+// A streaming route (its row carries `stream: true`) returns `streamReply(open)`: `handle()` answers it with the event-stream headers and
+// no body, and the adapter calls `open(sink)` with the response once the head is written (tools/hub-api/stream.mjs owns the wire).
+const STREAM = Symbol('stream');
+export const streamReply = open => ({ [STREAM]: true, open });
 
 const respond = (status, body, extra = {}) => ({ status, headers: { ...BASE_HEADERS, 'Content-Type': JSON_TYPE, ...extra }, body });
 
@@ -366,6 +372,25 @@ export function forceReleaseReservationRoute(ctx, { body, params }) {
   return forceReleaseReservation(params.run_key, { why: input.why, actor, name: input.name }, serviceContext(ctx));
 }
 
+// GET /stream: the Candybar SSE wire (Story 8.4, AD-43): the connection's opening (`ready`, or `reset` for an id it cannot resume) carries
+// the one `statusDocument`, then the ring's frames after its `Last-Event-ID`, then live frames. The cursor is taken before the document
+// is awaited, so a frame emitted meanwhile is replayed, never lost. An exact resume needs no document. A host that does not know its key
+// answers as a problem and opens no stream; a stream that is closed (the service is stopping) is 503 HUB_API_RESTARTING.
+export async function streamRoute(ctx, { headers = {} } = {}) {
+  const { stream } = ctx;
+  if (!stream) throw new Error('this service has no stream');
+  if (stream.closed) throw restartingError();
+  const plan = stream.plan(headers['last-event-id']);
+  let { after } = plan;
+  let status;
+  if (plan.kind !== 'resume') {
+    after = stream.cursor();
+    status = await statusDocument(ctx);
+    if (stream.closed) throw restartingError();
+  }
+  return streamReply(sink => stream.attach(sink, { ...plan, after, status }));
+}
+
 // `shape` names the `### <Shape>` section of the contract document that lists the response's fields.
 export const ROUTES = Object.freeze([
   Object.freeze({ method: 'GET', path: '/health', shape: 'Health', handler: health }),
@@ -374,6 +399,7 @@ export const ROUTES = Object.freeze([
   Object.freeze({ method: 'GET', path: '/pools', shape: 'PoolList', handler: listPools }),
   Object.freeze({ method: 'GET', path: '/discovery', shape: 'Discovery', handler: discovery }),
   Object.freeze({ method: 'GET', path: '/status', shape: 'Status', handler: statusDocument }),
+  Object.freeze({ method: 'GET', path: '/stream', shape: 'StreamFrame', handler: streamRoute, stream: true }),
   Object.freeze({ method: 'POST', path: '/registry/resources', shape: 'Resource', handler: registerResource }),
   Object.freeze({ method: 'POST', path: '/registry/resources/{id}', shape: 'Resource', handler: editResource }),
   Object.freeze({ method: 'POST', path: '/registry/resources/{id}/retire', shape: 'Retirement', handler: retireResource }),
@@ -414,10 +440,11 @@ function matchPath(pattern, path) {
   return params;
 }
 
-// One request: `{method, url, body, bodyError}` (url as sent: path and query; body already parsed, or undefined; bodyError the error
+// One request: `{method, url, headers, body, bodyError}` (url as sent: path and query; headers the request's, lower-cased, handed to the
+// handler; body already parsed, or undefined; bodyError the error
 // of a body that could not be read, answered only once the route is known, so a wrong path or method is still a 404 or 405) to
-// `{status, headers, body}`. Never throws. `signal` (optional) is the connection's abort signal, handed to the handler. `ctx.routes` (default ROUTES) is the route table; a handler error is logged once on `ctx.log.err` and answered as a 500.
-export async function handle({ method, url, body, bodyError, signal } = {}, ctx = {}) {
+// `{status, headers, body}` (a streaming route's answer has `stream: {open}` and no body). Never throws. `signal` (optional) is the connection's abort signal, handed to the handler. `ctx.routes` (default ROUTES) is the route table; a handler error is logged once on `ctx.log.err` and answered as a 500.
+export async function handle({ method, url, headers = {}, body, bodyError, signal } = {}, ctx = {}) {
   const routes = ctx.routes ?? ROUTES;
   const path = pathOf(url);
   const verb = String(method ?? '').toUpperCase();
@@ -442,7 +469,12 @@ export async function handle({ method, url, body, bodyError, signal } = {}, ctx 
   try {
     const query = String(url ?? '').slice(path.length).replace(/^\?/, '').split('#')[0];
     const params = found.find(entry => entry.route === route).params;
-    const result = await route.handler(ctx, { method: verb, path, query: new URLSearchParams(query), body, params, signal });
+    const result = await route.handler(ctx, { method: verb, path, query: new URLSearchParams(query), headers, body, params, signal });
+    if (route.stream === true) {
+      if (result?.[STREAM] !== true) throw new TypeError(`the stream handler for ${verb} ${path} did not return streamReply(open)`);
+      return { status: 200, headers: { ...BASE_HEADERS, ...STREAM_HEADERS }, stream: { open: result.open } };
+    }
+    if (result?.[STREAM] === true) throw new TypeError(`the handler for ${verb} ${path} returned a stream, but its route is not a stream route`);
     if (result?.[REPLY] === true) return respond(result.status, result.body, echo(result.body));
     if (result === null || typeof result !== 'object') throw new TypeError(`the handler for ${verb} ${path} returned ${result === null ? 'null' : typeof result}, not an object`);
     return respond(200, result, echo(result));

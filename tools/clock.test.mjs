@@ -1,7 +1,7 @@
 // Story 6.4 (AD-19, the no-new-clock rule): recurring work belongs to a candybar, not to a timer in the hub's code. Three checks over the
 // non-test .mjs files under tools/:
-//   1. `setInterval` appears only in CLOCK_FILES (today the lock heartbeat; the stream's keepalive and the hub client's wait are the
-//      other two files the rule names, not yet written).
+//   1. `setInterval` appears only in CLOCK_FILES (today the lock heartbeat; the stream's keepalive (tools/hub-api/stream.mjs) and the
+//      hub client's wait are the other two files the rule names).
 //   2. `setTimeout` appears in tools/hub-api/, tools/host-agent/ and tools/hub-client.mjs only in CLOCK_FILES.
 //   3. No function reschedules itself with `setTimeout` (a named function whose own body passes itself to it): that is a hand-made
 //      interval. This one applies to every file, CLOCK_FILES included.
