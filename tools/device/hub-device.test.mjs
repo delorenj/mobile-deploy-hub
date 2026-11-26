@@ -11,6 +11,7 @@ import { createAdb, findPhone } from '../ci/lib/adb.mjs';
 import { loadDevices } from '../ci/lib/devices.mjs';
 import { acquireLease, releaseLease, reserve, withLock } from '../ci/lib/lock.mjs';
 import { readEvents } from '../ci/lib/events.mjs';
+import { writeMonthOfEvents } from '../ci/test-fixtures.mjs';
 import { createAsyncAdb, runAdb } from './async-adb.mjs';
 import { inventory } from './inventory.mjs';
 import { leaseSupport, main, parseArgs, parseDuration } from './hub-device.mjs';
@@ -1148,20 +1149,7 @@ test('status with a month of events (~15k lines) and waiters answers under 200 m
   const f = fixture();
   try {
     const events = join(f.root, 'events');
-    mkdirSync(events, { recursive: true });
-    const nowMs = Date.now();
-    const months = new Map();
-    for (let i = 0; i < 15_000; i += 1) {
-      const ts = new Date(nowMs - 60_000 - Math.floor(i * (30 * 86_400_000 - 120_000) / 15_000)).toISOString();
-      const lease = i % 3 === 0;
-      const line = JSON.stringify({
-        format: 1, ts, event: 'release', lock: 'adb', hold_kind: lease ? 'lease' : 'job', held_ms: 60_000 + (i % 40) * 30_000, for_ms: lease ? 3_600_000 : null, last_alive_at: null,
-        claimant: { kind: lease ? 'agent' : 'deploy', holder: 'x', repo: lease ? null : 'o/a', run: String(i), attempt: '1', job: lease ? null : 'android' },
-      });
-      const month = ts.slice(0, 7);
-      months.set(month, `${months.get(month) ?? ''}${line}\n`);
-    }
-    for (const [month, text] of months) writeFileSync(join(events, `${month}.jsonl`), text);
+    writeMonthOfEvents(events);
     const bytes = () => readdirSync(events).sort().map(name => `${name}:${statSync(join(events, name)).size}`).join();
     await acquireLease('adb', { holder: 'agent-a', why: 'hold', forMs: 3600_000, id: 'held', env: f.env, log: () => {} });
     const jobEnv = { ...f.env, GITHUB_REPOSITORY: 'o/a', GITHUB_RUN_ID: '9', GITHUB_RUN_ATTEMPT: '1', GITHUB_JOB: 'android' };

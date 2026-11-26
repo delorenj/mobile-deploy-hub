@@ -146,11 +146,11 @@ const readOwnerOf = (name, env) => readOwner(join(lockDir(env), `${name}.lock`))
 // Whether the lock `lock` is held (an owner record is there) and whether anyone waits on it (any non-stale queue entry): the two facts
 // a Registry reader needs to tell a retiring Resource (still held or waited on) from a hidden one (AD-31). Read only; never throws
 // (a lock dir that cannot be read is idle).
-export function lockActivity(lock, { env = process.env, now = Date.now } = {}) {
+export function lockActivity(lock, { env = process.env, now = Date.now, processStart } = {}) {
   let held = false;
   let queued = false;
   try { held = readOwnerOf(lock, env) !== null; } catch { /* idle */ }
-  try { queued = queueView(lock, { env, now }).length > 0; } catch { /* idle */ }
+  try { queued = queueView(lock, { env, now, ...(processStart ? { processStart } : {}) }).length > 0; } catch { /* idle */ }
   return { held, queued };
 }
 
@@ -182,9 +182,9 @@ export const isLocal = (record, { hostKey: keyOf = hostKey } = {}) => record?.ho
 // ---- context ----
 
 // Timing and emulator settings from the environment, as the CLI always read them; every key can be overridden by a seam.
-export function createContext({ env = process.env, sleep = realSleep, now = Date.now, log = () => {}, warn = () => {}, adbFactory, adbWire, devicectl, hostKey: hostKeyOf, inventory, policy = null, fleet, qaDevices, registry, fetchImpl, timeout } = {}) {
+export function createContext({ env = process.env, sleep = realSleep, now = Date.now, log = () => {}, warn = () => {}, adbFactory, adbWire, devicectl, hostKey: hostKeyOf, inventory, policy = null, fleet, qaDevices, registry, fetchImpl, timeout, processStart, liveStart, adbQuery } = {}) {
   return {
-    env, log, warn, policy, adbFactory, adbWire, devicectl, hostKey: hostKeyOf, inventory, fleet, qaDevices, registry, fetchImpl, timeout,
+    env, log, warn, policy, adbFactory, adbWire, devicectl, hostKey: hostKeyOf, inventory, fleet, qaDevices, registry, fetchImpl, timeout, processStart, liveStart, adbQuery,
     timing: { sleep, now, leasePollMs: Number(env.HUB_DEVICE_POLL_MS) || 1000, phonePollMs: Number(env.HUB_DEVICE_POLL_MS) || 3000 },
     emulator: {
       graceMs: Number(env.HUB_EMULATOR_KILL_GRACE_MS) || 15_000,
@@ -282,7 +282,9 @@ function withoutRetired(target, env) {
 // ---- resolve ----
 
 const phoneOwning = (fleet, env, id) => fleet.find(phone => { const owner = readOwnerOf(phone.lock, env); return isLease(owner) && owner.lease_id === id; }) ?? null;
-const phoneWaiting = (fleet, env, id) => fleet.find(phone => queueView(phone.lock, { env, includeStale: true }).some(waiter => waiter.lease_id === id)) ?? null;
+// The optional process-start reader of a context (the service's host snapshot, AD-44), as the option the lock library takes; none is the CLI's own.
+const readerOf = ctx => (ctx?.processStart ? { processStart: ctx.processStart } : {});
+const phoneWaiting = (fleet, env, id, processStart) => fleet.find(phone => queueView(phone.lock, { env, includeStale: true, ...(processStart ? { processStart } : {}) }).some(waiter => waiter.lease_id === id)) ?? null;
 
 // The `phone` word's members, in order: the matcher's named list over the Registry (the file, else the seed of devices.json; never the QA
 // file, no warning), as fleet entries: the S24, then the S26, then every runtime `linux` phone that is not dedicated_qa, by created_at.
@@ -369,7 +371,7 @@ export function registryList({ audience = 'local' } = {}, ctx) {
   const registry = readRegistry({ env, qaDevices: ctx.qaDevices ?? (() => loadQaDevices({ env })), warn: ctx.warn });
   const policy = ctx.policy ?? loadPolicy().policy;
   const resources = registry.resources.map(record => {
-    const activity = retirement(record) !== null ? lockActivity(record.lock, { env, now: ctx.timing?.now ?? ctx.now }) : {};
+    const activity = retirement(record) !== null ? lockActivity(record.lock, { env, now: ctx.timing?.now ?? ctx.now, ...readerOf(ctx) }) : {};
     return viewRecord(record, { audience, held: activity.held === true, queued: activity.queued === true });
   }).filter(Boolean);
   return { rev: registry.rev, source: registry.source, resources, pools: viewPools(registry, policy) };
@@ -378,12 +380,12 @@ export function registryList({ audience = 'local' } = {}, ctx) {
 // A target names one lease (an id: an emulator lease, then the phone holding it, then the phone it waits on) or a device word
 // (a fleet phone, the `phone` Pool, `emulator`). An id wins over a word; `words`/`ids` narrow what is tried. An unknown
 // word is HUB_USAGE. An id nothing holds resolves to null with `words: false`; otherwise it is read as a word (and refused).
-export function resolve(target, { fleet, env = process.env, words = true, ids = true } = {}) {
+export function resolve(target, { fleet, env = process.env, words = true, ids = true, processStart } = {}) {
   if (ids && typeof target === 'string' && target) {
     if (isEmulatorLease(env, target)) return { kind: EMULATOR, by: 'id', id: target };
     const owner = phoneOwning(fleet, env, target);
     if (owner) return { kind: 'phone', by: 'owner', id: target, entry: owner };
-    const waiter = phoneWaiting(fleet, env, target);
+    const waiter = phoneWaiting(fleet, env, target, processStart);
     if (waiter) return { kind: 'phone', by: 'waiter', id: target, entry: waiter };
   }
   if (!words) return null;
@@ -413,11 +415,11 @@ export function phoneWordMembers({ env = process.env } = {}) {
 
 // A lease id names one lease: with more than one phone lock, the same --id could otherwise name two live leases
 // (or a waiter and a lease), and `release <id>` would free only the first it meets.
-export function checkLeaseId(id, { fleet, env = process.env }) {
+export function checkLeaseId(id, { fleet, env = process.env, processStart }) {
   if (id === undefined || id === null) return;
   const onPhone = fleet.find(phone => {
     const owner = readOwnerOf(phone.lock, env);
-    return (isLease(owner) && owner.lease_id === id) || queueView(phone.lock, { env, includeStale: true }).some(waiter => waiter.lease_id === id);
+    return (isLease(owner) && owner.lease_id === id) || queueView(phone.lock, { env, includeStale: true, ...(processStart ? { processStart } : {}) }).some(waiter => waiter.lease_id === id);
   });
   if (onPhone) throw usage(`--id ${id} already names a lease or a waiter on ${onPhone.device}; a lease id names one lease`);
   if (isEmulatorLease(env, id)) throw usage(`--id ${id} already names an emulator lease; a lease id names one lease`);
@@ -539,7 +541,7 @@ function noPhoneError(fleet, states, waitMs, ctx) {
   const held = fleet.filter(phone => states.get(phone.device) === 'held');
   if (held.length === fleet.length) {
     // AD-5's wording for each held member (`host lock <lock> is held by ...`), the one every timeout of a Queued lock uses.
-    const locks = listLocks({ env: ctx.env });
+    const locks = listLocks({ env: ctx.env, ...readerOf(ctx) });
     const by = held.map(phone => heldText(phone.lock, locks.find(entry => entry.name === phone.lock)?.owner ?? null)).join('; ');
     return failure('HUB_LOCK_TIMEOUT', `${by} (every phone is held); gave up after ${Math.round(waitMs / 1000)}s`);
   }
@@ -633,7 +635,7 @@ async function reachableMembers(members, ctx, statesOf = null) {
     try { key = (ctx.hostKey ?? hostKey)({ env: ctx.env }); } catch (error) { if (error?.code !== 'HUB_HOST_UNKNOWN') throw error; }
     if (key !== 'linux') return members;
     const found = (ctx.inventory ?? realInventory)({ lockRoot: lockDir(ctx.env), hubAdbPort: Number(ctx.env.HUB_ADB_SERVER_PORT) || 5037 });
-    const observed = await phoneObservations(members, ctx, found);
+    const { observed } = await phoneObservations(members, ctx, found);
     states = new Map(members.map(phone => [phone.device, phoneReachability(observed.get(phone.device) ?? null)]));
   }
   const gone = new Set([REACHABILITY.absent, REACHABILITY.offline, REACHABILITY.unauthorized]);
@@ -654,7 +656,7 @@ async function reachableMembers(members, ctx, statesOf = null) {
 // message: `--for` by default).
 export async function take(resolved, options, ctx) {
   if (!resolved || typeof resolved !== 'object') throw usage('take needs a resolved target (resolve a device word first)');
-  checkLeaseId(options.id, { fleet: ctx.fleet, env: ctx.env });
+  checkLeaseId(options.id, { fleet: ctx.fleet, env: ctx.env, ...readerOf(ctx) });
   const bounded = checkBounds(resolved, { forMs: options.forMs, fleet: resolved.members, policy: ctx.policy, ...(options.flag ? { flag: options.flag } : {}) });
   if (!options.why) throw usage('--why <text> is required');
   if (!Number.isFinite(options.waitMs) || options.waitMs < 0) throw usage('--wait must be a duration of 0 or more');
@@ -787,13 +789,13 @@ export function findLease(id, ctx) {
   const fleet = ctx.fleet ?? loadFleet(env, { warn: ctx.warn });
   const held = heldLease(id, { ...ctx, env, fleet });
   if (held) return leaseView(held);
-  throw leaseNotFound(id, fleet, env);
+  throw leaseNotFound(id, fleet, env, ctx.processStart);
 }
 
 // The refusal for an id that holds nothing: HUB_LEASE_NOT_FOUND, `reason: waiting` when a waiter has it (it holds nothing yet; an emulator
 // request counts from its first place in line until it is ready), else `unknown`.
-function leaseNotFound(id, fleet, env) {
-  const waiting = typeof id === 'string' && id !== '' ? phoneWaiting(fleet, env, id) : null;
+function leaseNotFound(id, fleet, env, processStart) {
+  const waiting = typeof id === 'string' && id !== '' ? phoneWaiting(fleet, env, id, processStart) : null;
   if (waiting) return Object.assign(failure('HUB_LEASE_NOT_FOUND', `lease ${id} is waiting for ${waiting.device}; it holds nothing yet`), { reason: 'waiting' });
   if (isEmulatorLease(env, id)) return Object.assign(failure('HUB_LEASE_NOT_FOUND', `lease ${id} is waiting for ${EMULATOR}; it holds nothing yet`), { reason: 'waiting' });
   return Object.assign(failure('HUB_LEASE_NOT_FOUND', `no lease or waiter has the id "${id}"`), { reason: 'unknown' });
@@ -1011,7 +1013,7 @@ const lockExists = (lock, env) => { try { statSync(join(lockDir(env), `${lock}.l
 export function releasePhone(id, ctx, actor = null) {
   const { env, fleet } = ctx;
   const owning = phoneOwning(fleet, env, id);
-  const waiting = fleet.filter(phone => queueView(phone.lock, { env, includeStale: true }).some(waiter => waiter.lease_id === id));
+  const waiting = fleet.filter(phone => queueView(phone.lock, { env, includeStale: true, ...readerOf(ctx) }).some(waiter => waiter.lease_id === id));
   const found = owning ?? waiting[0] ?? null;
   if (!found) {
     const notes = [];
@@ -1099,8 +1101,8 @@ export function extendHeld(id, { forMs, actor = null, override = null }, ctx) {
   const job = jobTicket(id);
   if (job) throw failure(job.code, job.message);
   const lock = readRecord(env, id)?.slot ?? phoneOwning(fleet, env, id)?.lock;
-  if (!lock) throw leaseNotFound(id, fleet, env);
-  const record = extendLease(lock, id, { forMs, env, now: timing?.now, policy, actor, override });
+  if (!lock) throw leaseNotFound(id, fleet, env, ctx.processStart);
+  const record = extendLease(lock, id, { forMs, env, now: timing?.now, policy, actor, override, ...readerOf(ctx) });
   return { lock, device: nameOf(fleet, lock), record };
 }
 
@@ -1180,7 +1182,7 @@ function serviceHold(id, ctx) {
 export function serviceExtend(id, input, ctx) {
   const local = serviceHold(id, ctx);
   // An emulator still booting holds nothing yet (GET says `waiting` too): its expiry is set when it is ready, so an extension now would be lost.
-  if (isEmulatorLease(local.env, id) && phoneOwning(local.fleet, local.env, id) === null && heldEmulator(id, local.env) === null) throw leaseNotFound(id, local.fleet, local.env);
+  if (isEmulatorLease(local.env, id) && phoneOwning(local.fleet, local.env, id) === null && heldEmulator(id, local.env) === null) throw leaseNotFound(id, local.fleet, local.env, local.processStart);
   const override = input.override ? { why: input.override.why, actor: input.override.actor ?? input.actor } : null;
   const { lock, record } = extendHeld(id, { forMs: input.forMs, actor: input.actor, override }, local);
   // Built from what the extension wrote: no second read, so a committed extension is never answered as lost.
@@ -1279,7 +1281,7 @@ const queuedLocks = env => {
 
 // One lock's waiters after the cancel, as a `Cancel` carries them (the tickets only: a Reservation is not a request). Read only.
 function queueAnswer(lock, ctx) {
-  const waiters = queueView(lock, { env: ctx.env, now: ctx.timing?.now })
+  const waiters = queueView(lock, { env: ctx.env, now: ctx.timing?.now, ...readerOf(ctx) })
     .filter(entry => entry.kind !== 'reservation')
     .map(entry => ({
       place: entry.place, lease_id: entry.lease_id ?? null, holder: entry.holder ?? null, why: entry.why ?? null, kind: entry.kind,
@@ -1380,8 +1382,8 @@ export function forceReleaseLease(id, input, ctx) {
   const emulatorSlot = typeof id === 'string' && id !== '' ? readRecord(env, id)?.slot ?? slotHolding(env, id) ?? (readOwnerOf(GATE, env)?.lease_id === id ? GATE : null) : null;
   const refuseEmulator = slot => Object.assign(usage(`lease ${id} holds ${slot === GATE ? 'the emulator gate' : slot}, part of an emulator: force-releasing it tears the emulator down, so that is the slot's force-release (hub-device force-release ${slot === GATE ? 'emulator-<n>' : slot}, POST /leases/${slot === GATE ? 'emulator-<n>' : slot}/force-release), never this one`), { reason: EMULATOR });
   if (emulatorSlot !== null) throw refuseEmulator(emulatorSlot);
-  const found = typeof id === 'string' ? listLocks({ env, now: local.timing.now }).find(lock => lock.kind === 'lease' && lock.owner.lease_id === id) : undefined;
-  if (!found) throw leaseNotFound(id, local.fleet, env);
+  const found = typeof id === 'string' ? listLocks({ env, now: local.timing.now, ...readerOf(local) }).find(lock => lock.kind === 'lease' && lock.owner.lease_id === id) : undefined;
+  if (!found) throw leaseNotFound(id, local.fleet, env, local.processStart);
   if (isEmulatorLock(found.name)) throw refuseEmulator(found.name);
   const result = forceRelease(found.name, { actor, why, lease_id: id, env, now: local.timing.now, log: local.log, ...(local.beforeRetire ? { beforeRetire: local.beforeRetire } : {}) });
   if (!result.released) {
@@ -1495,15 +1497,25 @@ export function forceReleaseReservation(runKey, input, ctx) {
 // client). Returns each fleet phone's observation: the state adb lists it in, null when the server does not list it, or a note saying
 // why nobody could look. Only asked when the inventory shows the hub's server already running, so status can never start one (and a
 // Mac, with no /proc, asks nothing). An id that cannot be read (unauthorized, offline) is not matched, so that phone reads absent.
+//
+// `ctx.adbQuery` is the query seam (Story 8.2, AD-44): a service passes its host snapshot's, which answers from the last gather and adds
+// `checked_at` (ms: when the snapshot was taken, null when no gather ever succeeded). Returns `{observed, at}`: `at` is when the
+// observation was made (the answer's own `checked_at`, so a reading made from an old snapshot shows its age; null when nobody observed
+// anything), and undefined for a query this asked itself, which a reader stamps with its own clock as it always did.
 async function phoneObservations(fleet, ctx, found) {
   const { env, adbWire, timing } = ctx;
   const hubPort = Number(env.HUB_ADB_SERVER_PORT) || 5037;
-  const { note, listed, serials } = await queryAdb({ port: hubPort, running: found.adb_servers.some(server => server.port === hubPort), wire: adbWire ?? createAdbWire, sleep: timing.sleep });
-  if (note !== null) return new Map(fleet.map(phone => [phone.device, note]));
-  return new Map(fleet.map(phone => {
-    const entry = listed.find(device => idMatchesSerial(device.id, phone.serial) || (Boolean(serials.get(device.id)) && serials.get(device.id) === phone.serial));
-    return [phone.device, entry ? entry.state : null];
-  }));
+  const adb = await (ctx.adbQuery ?? queryAdb)({ port: hubPort, running: found.adb_servers.some(server => server.port === hubPort), wire: adbWire ?? createAdbWire, sleep: timing.sleep });
+  const { note, listed, serials } = adb;
+  const at = adb.checked_at;
+  if (note !== null) return { observed: new Map(fleet.map(phone => [phone.device, note])), at };
+  return {
+    observed: new Map(fleet.map(phone => {
+      const entry = listed.find(device => idMatchesSerial(device.id, phone.serial) || (Boolean(serials.get(device.id)) && serials.get(device.id) === phone.serial));
+      return [phone.device, entry ? entry.state : null];
+    })),
+    at,
+  };
 }
 
 // The one adb-to-Reachability path (AD-35): the hub's adb server over the wire (inventory first, so a server nobody started is never
@@ -1512,7 +1524,7 @@ async function phoneObservations(fleet, ctx, found) {
 export async function phoneReadings(phones, ctx) {
   const { env } = ctx;
   const found = (ctx.inventory ?? realInventory)({ lockRoot: lockDir(env), hubAdbPort: Number(env.HUB_ADB_SERVER_PORT) || 5037 });
-  const observed = await phoneObservations(phones, ctx, found);
+  const { observed } = await phoneObservations(phones, ctx, found);
   return new Map(phones.map(phone => [phone.device, phoneReachability(observed.get(phone.device) ?? null)]));
 }
 
@@ -1564,7 +1576,8 @@ export async function statusView(key, options, ctx) {
   if (!AUDIENCES.includes(audience)) throw usage(`status audience is one of ${AUDIENCES.join(', ')}, not "${audience}"`);
   const { env, timing, fleet } = ctx;
   const nowMs = timing.now();
-  const listed = listLocks({ env, now: timing.now });
+  const startOf = ctx.processStart ? { processStart: ctx.processStart } : {};
+  const listed = listLocks({ env, now: timing.now, ...startOf });
   const locks = listed.map(entry => {
     const owner = entry.owner ?? {};
     const lease = isLease(owner);
@@ -1595,7 +1608,7 @@ export async function statusView(key, options, ctx) {
     try { history = policyOf() ? etaHistory({ env, now: nowMs, policy: policyOf() }) : false; } catch { history = false; }
   };
   for (const name of walkSet(fleet, env, locks.map(entry => entry.lock))) {
-    const view = queueView(name, { env, includeStale: true, now: timing.now });
+    const view = queueView(name, { env, includeStale: true, now: timing.now, ...startOf });
     const device = nameOf(fleet, name);
     // A run's Reservation holds a place but is no waiter: it has its own section, and the tickets are numbered without it.
     const tickets = view.filter(entry => entry.kind !== 'reservation');
@@ -1635,12 +1648,12 @@ export async function statusView(key, options, ctx) {
   }
   for (const { row, etas } of pooled.values()) row.eta = row.stale ? null : earliest(etas);
   const found = (ctx.inventory ?? realInventory)({ lockRoot: lockDir(env), hubAdbPort: Number(env.HUB_ADB_SERVER_PORT) || 5037 });
-  const observed = await phoneObservations(fleet, ctx, found);
+  const { observed, at: observedAt } = await phoneObservations(fleet, ctx, found);
   // A retired or seed-missing phone that nobody holds or waits on is gone from the list; a retiring one stays (AD-31).
   const records = readRegistryFile(env)?.resources ?? [];
   const shown = fleet.filter(phone => {
     const record = records.find(entry => entry.lock === phone.lock);
-    return !record || visibility(record, lockActivity(phone.lock, { env, now: timing.now })) !== 'hidden';
+    return !record || visibility(record, lockActivity(phone.lock, { env, now: timing.now, ...startOf })) !== 'hidden';
   });
   const phones = shown.map(phone => {
     const lock = locks.find(entry => entry.lock === phone.lock) ?? null;
@@ -1653,7 +1666,7 @@ export async function statusView(key, options, ctx) {
     };
   });
   // The pool's own processes are managed and carry their lease id: a pid counts only while it is still the recorded process.
-  const emulators = emulatorStatus(env);
+  const emulators = emulatorStatus(env, ctx.liveStart ? { liveStart: ctx.liveStart } : {});
   const owners = new Map(emulators.flatMap(entry => entry.pids.filter(pid => pid.alive).map(pid => [pid.pid, entry.lease_id])));
   for (const list of [found.adb_servers, found.emulators, found.xvfb]) {
     for (const item of list) if (owners.has(item.pid)) Object.assign(item, { managed: true, lease_id: owners.get(item.pid) });
@@ -1673,7 +1686,12 @@ export async function statusView(key, options, ctx) {
     const readAt = timing.now();
     for (const phone of fleet) {
       const resource = resourceOf(phone.lock);
-      if (resource !== null) readings.set(resource, stamp(phoneReachability(observed.get(phone.device) ?? null), { checkedAt: readAt, receivedAt: readAt }));
+      if (resource === null) continue;
+      // Stamped with when adb was observed, never with this request's time: a reading made from an old snapshot shows its age (Story 8.2).
+      // No observation (a snapshot no gather ever filled) is no reading: the row shows unknown and stale.
+      if (observedAt === null) continue;
+      const taken = observedAt ?? readAt;
+      readings.set(resource, stamp(phoneReachability(observed.get(phone.device) ?? null), { checkedAt: taken, receivedAt: readAt, ageMsAtReceipt: Math.max(0, readAt - taken) }));
     }
   }
   if (key === 'mac' && rowsOf.some(([rows]) => rows.some(row => row.resource === 'ios-lane'))) {
@@ -1727,6 +1745,6 @@ export async function discover(key, ctx, { devices, qaDevices } = {}) {
   }
   const hubPort = Number(env.HUB_ADB_SERVER_PORT) || 5037;
   const found = (ctx.inventory ?? realInventory)({ lockRoot: lockDir(env), hubAdbPort: hubPort });
-  const adb = await queryAdb({ port: hubPort, running: found.adb_servers.some(server => server.port === hubPort), wire: ctx.adbWire ?? createAdbWire, sleep: timing.sleep });
+  const adb = await (ctx.adbQuery ?? queryAdb)({ port: hubPort, running: found.adb_servers.some(server => server.port === hubPort), wire: ctx.adbWire ?? createAdbWire, sleep: timing.sleep });
   return discoverDevices({ seed: live, host: 'linux', adb });
 }

@@ -103,11 +103,11 @@ const expiresAt = owner => (isLease(owner) ? Date.parse(owner.expires_at) : NaN)
 
 // The live Lease holding `name`, or null (AD-13): the owner record when a Lease holds it and its expiry and holder have not
 // passed. A Lease is judged by expiry and holder only, never by age (staleMs Infinity). Reads only; never throws.
-export function liveLease(name, { env = process.env, now = Date.now, host = hostname(), hostId = machineId() } = {}) {
+export function liveLease(name, { env = process.env, now = Date.now, host = hostname(), hostId = machineId(), processStart: startOf } = {}) {
   try {
     const path = join(lockDir(env), `${name}.lock`);
     const owner = readOwner(path);
-    return isLease(owner) && staleness(path, owner, { now, staleMs: Infinity, host, hostId }) === null ? owner : null;
+    return isLease(owner) && staleness(path, owner, { now, staleMs: Infinity, host, hostId, ...(startOf ? { startOf } : {}) }) === null ? owner : null;
   } catch { return null; }
 }
 
@@ -121,7 +121,7 @@ const describe = owner => {
 // names one) is gone or is now another process (holder_process_start differs). A lease is not judged by pid (the
 // process that took it is long gone) or by age. Returns why (`gone`, `abandoned`, `expired`, `holder-gone`, `too-old`),
 // or null while the lock is live.
-function staleness(path, owner, { now, staleMs, host = hostname(), hostId = machineId() }) {
+function staleness(path, owner, { now, staleMs, host = hostname(), hostId = machineId(), startOf = processStart }) {
   let age = 0;
   try { age = now() - statSync(path).mtimeMs; } catch { return 'gone'; }
   // owner.json is written right after mkdir; a lock without one for a minute was abandoned mid-creation.
@@ -132,7 +132,7 @@ function staleness(path, owner, { now, staleMs, host = hostname(), hostId = mach
     if (expiresAt(owner) <= now()) return 'expired';
     if (!here || !Number.isSafeInteger(owner.holder_pid)) return null;
     if (!alive(owner.holder_pid)) return 'holder-gone';
-    return owner.holder_process_start && processStart(owner.holder_pid) !== owner.holder_process_start ? 'holder-gone' : null;
+    return owner.holder_process_start && startOf(owner.holder_pid) !== owner.holder_process_start ? 'holder-gone' : null;
   }
   if (here && Number.isSafeInteger(owner.pid) && !alive(owner.pid)) return 'holder-gone';
   return age > staleMs ? 'too-old' : null;
@@ -392,7 +392,7 @@ export async function withLock(name, fn, {
       if (error.code !== 'EEXIST') throw error;
     }
     const owner = readOwner(path);
-    const verdict = staleness(path, owner, { now, staleMs, host, hostId });
+    const verdict = staleness(path, owner, { now, staleMs, host, hostId, startOf });
     // `gone`: the lock vanished between the mkdir and this read (its holder just released it). Nothing is left to retire, and a
     // retire would rename whatever a third taker made there since (a try writes no ticket, so takers race the mkdir). Go round
     // again; after a few such rounds it waits like any held lock, so a path that is not a lock at all never spins.
@@ -1392,7 +1392,7 @@ export async function acquirePool(pool, members, {
           }
           if (blockers.length === 0) {
             const owner = readOwner(path);
-            const verdict = staleness(path, owner, { now, staleMs, host, hostId });
+            const verdict = staleness(path, owner, { now, staleMs, host, hostId, startOf });
             if (verdict && (verdict !== 'gone' || (vanished += 1) <= VANISHED_RETRIES)) {
               if (verdict !== 'gone' && retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, hostId })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
               continue;
@@ -1530,7 +1530,7 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
   };
   // With `yieldToLease`, a live Lease on the lock ends the wait: the ticket leaves with a cancel event and the caller reads around it.
   const yieldTo = owner => {
-    if (!yieldToLease || !isLease(owner) || staleness(path, owner, { now, staleMs: Infinity, host, hostId }) !== null) return;
+    if (!yieldToLease || !isLease(owner) || staleness(path, owner, { now, staleMs: Infinity, host, hostId, startOf }) !== null) return;
     if (ticketFile && !leave('cancel', { reason: 'yield-to-lease', blocked_by: describe(owner) })) throw cancelled('was released while it waited for');
     throw yielded(name, owner);
   };
@@ -1587,7 +1587,7 @@ async function queuedLock(name, fn, { env, timeoutMs, pollMs, staleMs, log, slee
         }
         if (blockers.length === 0) {
           const owner = readOwner(path);
-          const verdict = staleness(path, owner, { now, staleMs, host, hostId });
+          const verdict = staleness(path, owner, { now, staleMs, host, hostId, startOf });
           if (verdict && (verdict !== 'gone' || (vanished += 1) <= VANISHED_RETRIES)) {
             // `gone`: see withLock's bare path. Nothing is left to retire; round again.
             if (verdict !== 'gone' && retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, hostId, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
@@ -1768,7 +1768,7 @@ export async function acquireLease(name, {
         }
         if (blockers.length === 0) {
           const owner = readOwner(path);
-          const verdict = staleness(path, owner, { now, staleMs, host, hostId });
+          const verdict = staleness(path, owner, { now, staleMs, host, hostId, startOf });
           if (verdict && (verdict !== 'gone' || (vanished += 1) <= VANISHED_RETRIES)) {
             // `gone`: see withLock. Nothing is left to retire; round again.
             if (verdict !== 'gone' && retire(name, path, owner, { as: 'reclaim', reason: verdict, env, now, log, hostId, beforeRetire })) log(`HUB_LOCK_RECLAIMED ${name} from ${describe(owner)}`);
@@ -1997,7 +1997,7 @@ export function updateLease(name, id, fields, { env = process.env, ino = null } 
 export function waitersBehind(name, id, { env = process.env, now = Date.now, hostId, host, processStart: startOf } = {}) {
   let holding = null;   // lease ids that hold a lock other than the gate, read once and only when a Pool request is seen
   const holdsMember = request => {
-    holding ??= new Set(listLocks({ env, now, host, hostId })
+    holding ??= new Set(listLocks({ env, now, host, hostId, processStart: startOf })
       .filter(lock => lock.name !== EMULATOR_POOL && lock.kind === 'lease' && !lock.stale)
       .map(lock => lock.owner.lease_id));
     return holding.has(request);
@@ -2006,7 +2006,7 @@ export function waitersBehind(name, id, { env = process.env, now = Date.now, hos
   const view = lock => queueView(lock, { env, now, hostId, host, processStart: startOf }).filter(entry => entry.blocking && !served(entry));
   const own = view(name);
   if (!/^emulator-\d+$/.test(name)) return { own, gate: [] };
-  const holder = liveLease(EMULATOR_POOL, { env, now, host, hostId });
+  const holder = liveLease(EMULATOR_POOL, { env, now, host, hostId, processStart: startOf });
   const shift = holder ? 1 : 0;
   const gate = [];
   if (holder && holder.lease_id !== id && !holdsMember(holder.lease_id)) gate.push({ place: 1, holder: holder.holder, lease_id: holder.lease_id, why: holder.why });
@@ -2137,13 +2137,13 @@ export function noteRefused(name, { delivery = null, installed, installedBy = []
 }
 
 // Every lock in the directory, read only: leases and jobs' locks, each with whether it is stale now.
-export function listLocks({ env = process.env, now = Date.now, staleMs = 4 * 3600_000, host, hostId } = {}) {
+export function listLocks({ env = process.env, now = Date.now, staleMs = 4 * 3600_000, host, hostId, processStart: startOf } = {}) {
   const dir = lockDir(env);
   let entries = [];
   try { entries = readdirSync(dir).filter(entry => entry.endsWith('.lock')).sort(); } catch { return []; }
   return entries.map(entry => {
     const path = join(dir, entry);
     const owner = readOwner(path);
-    return { name: entry.slice(0, -'.lock'.length), kind: isLease(owner) ? 'lease' : 'lock', owner, stale: stale(path, owner, { now, staleMs, ...(host === undefined ? {} : { host }), ...(hostId === undefined ? {} : { hostId }) }), describe: describe(owner) };
+    return { name: entry.slice(0, -'.lock'.length), kind: isLease(owner) ? 'lease' : 'lock', owner, stale: stale(path, owner, { now, staleMs, ...(host === undefined ? {} : { host }), ...(hostId === undefined ? {} : { hostId }), ...(startOf ? { startOf } : {}) }), describe: describe(owner) };
   });
 }

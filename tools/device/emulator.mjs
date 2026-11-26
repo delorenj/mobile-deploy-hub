@@ -403,12 +403,13 @@ export async function forceReleaseSlot(slot, { lease_id, actor, why, env = proce
   }, { env, log: () => {}, timeoutMs: reaperWaitMs, pollMs: 200 });
 }
 
-// The pool as status shows it: each record with whether each of its processes is still alive.
-export function emulatorStatus(env = process.env) {
+// The pool as status shows it: each record with whether each of its processes is still alive. `liveStart` is the reader seam (Story 8.2): a
+// service passes its host snapshot's, so a status read never reads /proc per pid on the request path.
+export function emulatorStatus(env = process.env, { liveStart: startOf = liveStart } = {}) {
   return listRecords(env).map(record => ({
     lease_id: record.lease_id, slot: record.slot, profile: record.profile, serial: record.serial, console_port: record.console_port,
     adb_server_port: record.adb_server_port, avd: record.avd?.name ?? null, created_at: record.created_at,
-    pids: record.pids.map(entry => ({ ...entry, alive: sameProcess(entry) })),
+    pids: record.pids.map(entry => ({ ...entry, alive: Boolean(entry.start) && startOf(entry.pid) === entry.start })),
   }));
 }
 

@@ -19,9 +19,9 @@ const oneLine = value => String(value?.message ?? value).replace(/\s+/g, ' ').tr
 // The context the Claims library's read-only device calls take (`phoneReadings`, `discover`), from a service context's seams.
 export function deviceCtx(ctx = {}) {
   const env = ctx.env ?? process.env;
-  const { adbWire, inventory, devicectl } = ctx;
+  const { adbWire, inventory, devicectl, adbQuery, processStart, liveStart } = ctx;
   const warn = line => { try { ctx.log?.err?.(line); } catch { /* a broken log seam never changes an answer */ } };
-  return { env, timing: { sleep: ctx.sleep ?? realSleep, now: ctx.now ?? Date.now }, adbWire, inventory, devicectl, warn };
+  return { env, timing: { sleep: ctx.sleep ?? realSleep, now: ctx.now ?? Date.now }, adbWire, inventory, devicectl, adbQuery, processStart, liveStart, warn };
 }
 
 // `log` is a line function, or the service's `{out, err}` pair (its `err` is used).
