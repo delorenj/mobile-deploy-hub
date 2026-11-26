@@ -259,7 +259,7 @@ test('the CLI: finds the request on this host without --resource, takes --pool a
     assert.equal((await s.cli(['cancel'])).code, 2);
     assert.equal((await s.cli(['cancel', 'a', 'b'])).code, 2);
     assert.equal((await s.cli(['cancel', 'b-1', '--why', ' '])).code, 2);
-    assert.equal((await s.cli(['release', 'a-1', '--resource', 's24'])).code, 2, '--resource belongs to cancel');
+    assert.equal((await s.cli(['status', '--resource', 's24'])).code, 2, '--resource belongs to the Hold verbs that name a Resource (Story 9.3), not status');
     assert.equal((await s.cli(['cancel', 'b-1', '--host', 'linux'])).code, 2, '--host belongs to registry');
   } finally { s.cleanup(); }
 });

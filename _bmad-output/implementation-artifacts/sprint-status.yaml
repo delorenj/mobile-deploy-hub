@@ -121,7 +121,7 @@ development_status:
   epic-9: backlog
   9-1-cross-host-calls-go-through-one-client: done
   9-2-the-host-agent-serves-the-mac-s-own-state: done
-  9-3-forwarded-actions-reach-the-right-host: backlog
+  9-3-forwarded-actions-reach-the-right-host: done
   9-4-lease-ipad-and-lease-mac-take-the-ios-lane: backlog
   9-5-the-host-agent-pushes-changes-and-only-changes: backlog
   9-6-an-asleep-mac-reads-offline-and-fails-fast: backlog

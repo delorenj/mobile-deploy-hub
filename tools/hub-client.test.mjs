@@ -736,7 +736,7 @@ test('main relay GET /health: stdout is the JSON head with status 200, then exac
 });
 
 test('main with no relay, or bad arguments, prints the usage on stderr and is 2; the CLI does the same', async () => {
-  for (const argv of [[], ['relay'], ['relay', 'GET'], ['status', 'GET', '/x'], ['relay', 'GET', '/x', 'extra']]) {
+  for (const argv of [[], ['relay'], ['relay', 'GET'], ['status', 'GET', '/x'], ['relay', 'GET', '/x', 'api', 'extra']]) {
     const stderr = new PassThrough();
     let text = '';
     stderr.on('data', chunk => { text += chunk; });

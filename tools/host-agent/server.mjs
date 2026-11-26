@@ -28,7 +28,7 @@ export async function startHostAgent({ policy, env: given = process.env, log = d
   const resolved = policy ?? loadPolicy().policy;
   const known = injected ?? createKnown({ env, devices, qaDevices, log });
   const send = request ?? (args => hubRequest(args, { policy: resolved, ...(hostKey ? { hostKey: () => hostKey({ env }) } : {}), ...(devices ? { devices } : {}) }));
-  const ctx = { policy: resolved, now, devices, qaDevices, hostKey, devicectl, inventory, processStart, liveStart, known };
+  const ctx = { policy: resolved, now, devices, qaDevices, hostKey, devicectl, inventory, processStart, liveStart, known, request: send };
   // After the bind has won, one request for the Registry's resources, started and never waited for (`refresh` never rejects).
   const afterBind = () => { known.refresh({ request: send }); };
   return startService({ ...seams, service: HOST_AGENT_SERVICE, port: resolved.api.host_agent_port, routes, ctx, heavy: false, afterBind, env, log });

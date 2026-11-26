@@ -58,6 +58,7 @@ function scratch({ busy = false, qaList = [], key = 'mac', devicectl } = {}) {
   const err = [];
   const servers = [];
   const requests = [];
+  const forwards = [];
   const calls = [];
   const clock = { t: FAR };
   const signals = new EventEmitter();
@@ -71,12 +72,18 @@ function scratch({ busy = false, qaList = [], key = 'mac', devicectl } = {}) {
     request: async args => { requests.push(args); return new Response(JSON.stringify({ rev: 0, source: 'seed', resources: seed(devices, { qaDevices: () => qaList }).resources }), { status: 200 }); },
     createServer: listener => { const server = new FakeServer(listener, { busy }); servers.push(server); return server; },
   };
-  const ctx = (more = {}) => ({ env, policy, routes: AGENT_ROUTES, now: () => clock.t, devices, qaDevices: () => qaList, hostKey: () => key, devicectl: fakeDevicectl, inventory: noServer, log, known, ...more });
+  // The agent's one transport (`ctx.request`): the Hub API's `GET /resources` answers the seed; any other call is a forward, recorded and answered 200.
+  const send = async args => {
+    if (args.path === '/resources') return requests.push(args) && new Response(JSON.stringify({ rev: 0, source: 'seed', resources: seed(devices, { qaDevices: () => qaList }).resources }), { status: 200, headers: { 'content-type': 'application/json' } });
+    forwards.push(args);
+    return new Response(JSON.stringify({ forwarded_to: args.host }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  const ctx = (more = {}) => ({ env, policy, routes: AGENT_ROUTES, now: () => clock.t, devices, qaDevices: () => qaList, hostKey: () => key, devicectl: fakeDevicectl, inventory: noServer, log, known, request: send, ...more });
   const s = {
-    root, env, out, err, servers, requests, calls, clock, signals, known, devices, ctx, seams, log,
+    root, env, out, err, servers, requests, forwards, calls, clock, signals, known, devices, ctx, seams, log,
     start: (more = {}) => startHostAgent({ ...seams, log, ...more }),
     get: (url, more) => handle({ method: 'GET', url }, ctx(more)),
-    post: (url, body, more) => handle({ method: 'POST', url, body }, ctx(more)),
+    post: (url, body, more, extra = {}) => handle({ method: 'POST', url, body, ...extra }, ctx(more)),
     lockDirExists: () => existsSync(env.HUB_LOCK_DIR),
     cleanup: () => rmSync(root, { recursive: true, force: true }),
   };
@@ -223,7 +230,7 @@ test('an unknown host key is 503 HUB_HOST_UNKNOWN on /status and on a Hold route
   } finally { s.cleanup(); }
 });
 
-test('a Resource on another host is HUB_WRONG_HOST 409 (exit 2) and nothing is written', async () => {
+test('a public request naming a Resource on another host is forwarded there (door host-agent), and nothing is written here', async () => {
   const s = scratch();
   try {
     const lease = { for_ms: 60_000, holder: 'agent', why: 'x' };
@@ -237,26 +244,124 @@ test('a Resource on another host is HUB_WRONG_HOST 409 (exit 2) and nothing is w
       ['/leases', { ...lease, match: 'profile=default' }],
       ['/leases/emulator-1/force-release', { why: 'x', holder: 'ops' }],
       ['/requests/r-1/cancel', { resource: 's24', holder: 'ops' }],
-      ['/requests/r-1/cancel', { resource: 'mac-ios', pool: 'phone', holder: 'ops' }],
-      ['/reservations/acme--app--1/force-release', { why: 'x', holder: 'ops', name: 'adb' }],
+      ['/requests/r-1/cancel', { resource: 'phone', pool: 'phone', holder: 'ops' }],
     ];
     for (const [url, body] of cases) {
       const answer = await s.post(url, body);
-      assert.deepEqual(problemOf(answer), [409, 'HUB_WRONG_HOST', 2, 'wrong-host'], `${url} ${JSON.stringify(body)}`);
-      assert.match(answer.body.detail, /is on host linux; this is host mac/);
+      assert.equal(answer.status, 200, `${url} ${JSON.stringify(body)}: ${JSON.stringify(answer.body)}`);
+      assert.deepEqual(answer.body, { forwarded_to: 'linux' }, `${url} ${JSON.stringify(body)}`);
+      const sent = s.forwards.at(-1);
+      assert.equal(sent.forwarded, 'host-agent');
+      assert.equal(sent.host, 'linux');
+      assert.equal(sent.path, url);
+      assert.equal(sent.body.actor.via, 'host-agent');
+      assert.equal(sent.body.actor.holder, body.holder);
     }
+    assert.equal(s.forwards.length, cases.length);
     assert.equal(s.lockDirExists(), false, 'nothing was written to the lock dir');
   } finally { s.cleanup(); }
 });
 
-test('the gate is the agent\'s key, not a literal mac: a linux-keyed agent refuses the iPad and serves its phones', async () => {
+test('a lone word forwards with the carried record at the rev the agent knows; a cancel carries host and pool', async () => {
+  const s = scratch();
+  try {
+    await s.post('/leases', { for_ms: 60_000, holder: 'agent', why: 'x', resource: 's24' });
+    const sent = s.forwards.at(-1);
+    assert.deepEqual(sent.body.resource, { id: 's24', lock: 's24', host: 'linux', rev: 0, retired_at: null });
+    assert.match(sent.body.id, /^l-/);
+    await s.post('/requests/r-1/cancel', { resource: 's24', pool: 'phone', holder: 'ops' });
+    const cancel = s.forwards.at(-1);
+    assert.equal(cancel.body.host, 'linux');
+    assert.equal(cancel.body.pool, 'phone');
+    assert.equal(cancel.body.resource, 's24', 'a cancel that names a Pool carries no record: the words go as they are');
+    await s.post('/requests/r-2/cancel', { resource: 's24', holder: 'ops' });
+    assert.deepEqual(s.forwards.at(-1).body.resource, { id: 's24', lock: 's24', host: 'linux', rev: 0, retired_at: null });
+    assert.ok(s.requests.length >= 2, 'each public Hold call refreshed the Hub API view first');
+  } finally { s.cleanup(); }
+});
+
+test('a forward naming a Resource on another host is HUB_WRONG_HOST 409 (exit 2), never forwarded again, and nothing is written', async () => {
+  const s = scratch();
+  const forwarded = { headers: { 'x-hub-forwarded': 'api' } };
+  try {
+    const lease = { for_ms: 60_000, holder: 'agent', why: 'x' };
+    const record = { id: 's24', lock: 's24', host: 'linux', rev: 3, retired_at: null };
+    const cases = [
+      ['/leases', { ...lease, resource: record }],
+      ['/leases', { ...lease, resource: 's26' }],
+      ['/leases', { ...lease, resource: 'phone' }],
+      ['/leases', { ...lease, match: 'kind=phone' }],
+      ['/leases/emulator-1/force-release', { why: 'x', holder: 'ops' }],
+      ['/requests/r-1/cancel', { resource: record, holder: 'ops' }],
+      ['/leases/l-1/release', { holder: 'ops', resource: record }],
+      ['/leases/l-1/extend', { holder: 'ops', for_ms: 1000, resource: record }],
+    ];
+    for (const [url, body] of cases) {
+      const answer = await s.post(url, body, {}, forwarded);
+      assert.deepEqual(problemOf(answer), [409, 'HUB_WRONG_HOST', 2, 'wrong-host'], `${url} ${JSON.stringify(body)}`);
+      assert.match(answer.body.detail, /is on host linux; this is host mac/);
+    }
+    assert.equal(s.forwards.length, 0, 'a forward is never forwarded again');
+    assert.equal(s.lockDirExists(), false, 'nothing was written to the lock dir');
+  } finally { s.cleanup(); }
+});
+
+test('a Reservation on another host is HUB_WRONG_HOST: its force-release is gated by name and never forwarded', async () => {
+  const s = scratch();
+  try {
+    const answer = await s.post('/reservations/acme--app--1/force-release', { why: 'x', holder: 'ops', name: 'adb' });
+    assert.deepEqual(problemOf(answer), [409, 'HUB_WRONG_HOST', 2, 'wrong-host']);
+    assert.match(answer.body.detail, /is on host linux; this is host mac/);
+    assert.equal(s.forwards.length, 0);
+    assert.equal(s.lockDirExists(), false);
+  } finally { s.cleanup(); }
+});
+
+test('the agent acts on a carried record: the carried lock is taken, extended and released; rev 0 only for a seeded Resource; a retired take is refused', async () => {
+  const s = scratch();
+  const forwarded = { headers: { 'x-hub-forwarded': 'api' } };
+  try {
+    const ios = { id: 'ios-lane', lock: 'mac-ios', host: 'mac', rev: 7, retired_at: null };
+    const taken = await s.post('/leases', { for_ms: 60_000, holder: 'jarad', why: 'ipad proof', resource: ios, id: 'f-1', actor: { holder: 'jarad', via: 'api' } }, {}, forwarded);
+    assert.equal(taken.status, 200, JSON.stringify(taken.body));
+    assert.equal(existsSync(join(s.env.HUB_LOCK_DIR, 'mac-ios.lock')), true);
+    const again = await s.post('/leases', { for_ms: 60_000, holder: 'jarad', why: 'ipad proof', resource: ios, id: 'f-1', actor: { holder: 'jarad', via: 'api' } }, {}, forwarded);
+    assert.equal(again.body.lease_id, taken.body.lease_id);
+    assert.equal(s.forwards.length, 0);
+    const released = await s.post(`/leases/${taken.body.lease_id}/release`, { holder: 'jarad', resource: ios }, {}, forwarded);
+    assert.equal(released.status, 200, JSON.stringify(released.body));
+    assert.deepEqual(problemOf(await s.post('/leases', { for_ms: 60_000, holder: 'a', why: 'x', resource: { ...ios, retired_at: '2031-01-01T00:00:00Z' }, id: 'f-2' }, {}, forwarded)).slice(0, 2), [409, 'HUB_RESOURCE_RETIRED']);
+    const unseeded = { id: 'qa-phone', lock: 'qa-phone', host: 'mac', rev: 0, retired_at: null };
+    assert.deepEqual(problemOf(await s.post('/leases', { for_ms: 60_000, holder: 'a', why: 'x', resource: unseeded }, {}, forwarded)).slice(0, 2), [400, 'HUB_USAGE']);
+    assert.equal(problemOf(await s.post('/leases', { for_ms: 60_000, holder: 'a', why: 'x', resource: unseeded }, {}, forwarded))[3], 'unseeded');
+    const seededZero = await s.post('/leases', { for_ms: 60_000, holder: 'jarad', why: 'x', resource: { ...ios, rev: 0 }, id: 'f-3' }, {}, forwarded);
+    assert.equal(seededZero.status, 200, JSON.stringify(seededZero.body));
+  } finally { s.cleanup(); }
+});
+
+test('a bad forward is 400 HUB_USAGE: a header that is not a door, a malformed record, an object resource without the header', async () => {
+  const s = scratch();
+  try {
+    const lease = { for_ms: 60_000, holder: 'a', why: 'x' };
+    const reasonOf = answer => [answer.status, answer.body.code, answer.body.reason];
+    assert.deepEqual(reasonOf(await s.post('/leases', { ...lease, resource: 's26' }, {}, { headers: { 'x-hub-forwarded': 'nope' } })), [400, 'HUB_USAGE', 'bad-forward']);
+    assert.deepEqual(reasonOf(await s.post('/leases', { ...lease, resource: { id: 's26' } }, {}, { headers: { 'x-hub-forwarded': 'api' } })), [400, 'HUB_USAGE', 'bad-resource']);
+    assert.deepEqual(reasonOf(await s.post('/leases', { ...lease, resource: { id: 's26', lock: 's26', host: 'linux', rev: 1, retired_at: null } })), [400, 'HUB_USAGE', 'bad-resource']);
+  } finally { s.cleanup(); }
+});
+
+test('the gate is the agent\'s key, not a literal mac: a linux-keyed agent forwards the iPad to the Mac and serves its phones', async () => {
   const s = scratch({ key: 'linux' });
   try {
-    assert.deepEqual(problemOf(await s.post('/leases', { for_ms: 60_000, holder: 'a', why: 'x', resource: 'ipad' })), [409, 'HUB_WRONG_HOST', 2, 'wrong-host']);
-    assert.deepEqual(problemOf(await s.post('/leases', { for_ms: 60_000, holder: 'a', why: 'x', resource: 'mac' })), [409, 'HUB_WRONG_HOST', 2, 'wrong-host']);
+    await s.post('/leases', { for_ms: 60_000, holder: 'a', why: 'x', resource: 'ipad' });
+    assert.equal(s.forwards.at(-1).host, 'mac');
+    await s.post('/leases', { for_ms: 60_000, holder: 'a', why: 'x', resource: 'mac' });
+    assert.equal(s.forwards.at(-1).host, 'mac');
+    const before = s.forwards.length;
     const taken = await s.post('/leases', { for_ms: 60_000, holder: 'a', why: 'x', resource: 's24', id: 'own-1' });
     assert.equal(taken.status, 200, JSON.stringify(taken.body));
     assert.equal(taken.body.device, 's24');
+    assert.equal(s.forwards.length, before);
   } finally { s.cleanup(); }
 });
 
@@ -265,7 +370,10 @@ test('a Hold handler\'s fleet is what the agent knows, never the lock dir\'s Reg
   try {
     // The Hub API's last answer lacks s24; the lock dir has no registry.json, so a handler reading it would fall back to the seed (s24 included).
     s.known.note({ rev: 9, source: 'file', resources: seed(s.devices, { qaDevices: () => [] }).resources.filter(record => record.id !== 's24') });
-    const refused = await s.post('/leases', { for_ms: 60_000, holder: 'a', why: 'x', resource: 's24', id: 'gone-1' });
+    // The refresh the agent makes before it acts answers the same list.
+    const gone = seed(s.devices, { qaDevices: () => [] }).resources.filter(record => record.id !== 's24');
+    const request = async () => new Response(JSON.stringify({ rev: 9, source: 'file', resources: gone }), { status: 200 });
+    const refused = await s.post('/leases', { for_ms: 60_000, holder: 'a', why: 'x', resource: 's24', id: 'gone-1' }, { request });
     assert.ok(refused.status >= 400 && refused.status < 500, JSON.stringify(refused.body));
     assert.notEqual(refused.body.code, 'HUB_WRONG_HOST');
     const taken = await s.post('/leases', { for_ms: 60_000, holder: 'a', why: 'x', resource: 's26', id: 'own-2' });
@@ -337,6 +445,29 @@ test('the route table is the Hub API\'s Hold routes plus Health and Status, and 
   } finally { s.cleanup(); }
 });
 
+test('a public take of a retired Resource of this host is 409 HUB_RESOURCE_RETIRED and writes no lock', async () => {
+  const s = scratch();
+  try {
+    const resources = seed(s.devices, { qaDevices: () => [] }).resources.map(record => (record.id === 'ios-lane' ? { ...record, retired_at: '2026-11-01T00:00:00Z' } : record));
+    const request = async () => new Response(JSON.stringify({ rev: 5, source: 'file', resources }), { status: 200 });
+    const answer = await s.post('/leases', { for_ms: 60_000, holder: 'a', why: 'x', resource: 'ipad', id: 'ret-1' }, { request });
+    assert.deepEqual([answer.status, answer.body.code, answer.body.reason], [409, 'HUB_RESOURCE_RETIRED', 'retired']);
+    assert.equal(s.lockDirExists(), false);
+    assert.equal(s.forwards.length, 0);
+  } finally { s.cleanup(); }
+});
+
+test('the agent\'s forward carries the rev the Hub API answered, not 0', async () => {
+  const s = scratch();
+  try {
+    const resources = seed(s.devices, { qaDevices: () => [] }).resources;
+    const refresh = async args => (args.path === '/resources' ? new Response(JSON.stringify({ rev: 9, source: 'file', resources }), { status: 200 }) : s.ctx().request(args));
+    await s.post('/leases', { for_ms: 60_000, holder: 'a', why: 'x', resource: 's24' }, { request: refresh });
+    assert.equal(s.forwards.length, 1);
+    assert.deepEqual(s.forwards[0].body.resource, { id: 's24', lock: 's24', host: 'linux', rev: 9, retired_at: null });
+  } finally { s.cleanup(); }
+});
+
 test('known: the last Hub API answer wins for Resources, the seed keeps the Pools and words; a failed refresh is one line and the seed answers', async () => {
   const devices = structuredClone(loadDevices({}));
   const serial = devices.android_extra[0].serial;
@@ -372,7 +503,7 @@ test('a Hub API that is unreachable at start is one HUB_AGENT_REGISTRY_FAILED li
   } finally { s.cleanup(); }
 });
 
-test('no timer, interval or poll runs across a start, /health, /status, a gate refusal and a stop', async () => {
+test('no timer, interval or poll runs across a start, /health, /status, a forward to the other host and a stop', async () => {
   const s = scratch();
   const real = { timeout: globalThis.setTimeout, interval: globalThis.setInterval };
   const spied = [];
@@ -385,8 +516,11 @@ test('no timer, interval or poll runs across a start, /health, /status, a gate r
     for (const [method, url, body] of [['GET', '/health'], ['GET', '/status'], ['POST', '/leases', { resource: 's26', for_ms: 60_000, holder: 'a', why: 'x' }]]) {
       const e = exchange(method, url, body);
       await listener(e.req, e.res);
-      assert.ok(e.res.head.status === 200 || e.res.head.status === 409, `${method} ${url} ${e.res.text}`);
+      assert.equal(e.res.head.status, 200, `${method} ${url} ${e.res.text}`);
     }
+    // The Mac's take of the S26 (a linux phone) is a forward: it reached the injected request seam as the door host-agent, and no lock was written here.
+    assert.ok(s.requests.some(args => args.method === 'POST' && args.path === '/leases' && args.host === 'linux' && args.forwarded === 'host-agent'), 'the take was forwarded');
+    assert.equal(s.lockDirExists(), false);
     await running.stop();
   } finally {
     globalThis.setTimeout = real.timeout;

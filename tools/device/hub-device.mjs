@@ -29,9 +29,9 @@
 //                    dedicated_qa, and the first that serves it is taken as one Pool request that holds a place in every match's queue; no match is HUB_NO_MATCH (exit 2) with a reason for each
 //                    Resource left out, every match away is HUB_DEVICE_AWAY (75); report lines say `match:<query>` where a device word goes;
 //                    `run --match <query> ... -- <cmd...>` is the same for run)
-//   hub-device release [<lease_id>|--any] [--holder WHO]    (--holder is recorded as the actor; no id: $HUB_LEASE_ID; --any: whichever lease holds a phone; a `job:` id is a deploy job's place in
+//   hub-device release [<lease_id>|--any] [--resource R] [--holder WHO]    (--resource R names the Resource, so a lease on another host is forwarded there (with no id word and no --resource, $HUB_DEVICE, which `lease` exported beside $HUB_LEASE_ID, names it; same for extend); --holder is recorded as the actor; no id: $HUB_LEASE_ID; --any: whichever lease holds a phone; a `job:` id is a deploy job's place in
 //                    line, not a lease: exit 2, HUB_DEVICE_JOB_ID names the run to cancel)
-//   hub-device extend [<lease_id>] --for <dur> [--override <why>] [--holder WHO] [--json]   (no id: $HUB_LEASE_ID; moves the expiry later by
+//   hub-device extend [<lease_id>] --for <dur> [--override <why>] [--resource R] [--holder WHO] [--json]   (no id: $HUB_LEASE_ID; moves the expiry later by
 //                    --for; refused with HUB_LEASE_EXTEND_REFUSED (exit 76) while anyone waits, past the deploy phone's 60 min or 48 h in total,
 //                    or at/after expiry. --override <why> skips only the waiters check and records who and why on the `extend` event; prints
 //                    HUB_DEVICE_EXTENDED <device> <id> until <iso>)
@@ -61,7 +61,7 @@
 //   hub-device cancel <request_id> [--resource R] [--pool P] [--why TEXT] [--holder WHO] [--json]   (takes a waiting request out of the line, in every member's queue
 //                    for a Pool request (`--pool phone`); never touches a Hold: one that holds its lock is `release`'s. Without --resource it looks on this host.
 //                    The waiter's own wait ends HUB_DEVICE_CANCELLED naming the canceller; prints `HUB_DEVICE_CANCELLED <resource> <id>`)
-//   hub-device force-release <lease_id> --why TEXT [--holder WHO] [--json]   (ends a Lease by force, whoever holds it, on any lock of this host (a phone, a registered
+//   hub-device force-release <lease_id> --why TEXT [--resource R] [--holder WHO] [--json]   (ends a Lease by force, whoever holds it, on any lock of this host (a phone, a registered
 //                    phone, the iOS lane); --why is required and, with the actor, recorded on the one `force-release` event; no holder check, no confirmation. A
 //                    deploy job's Hold is never ended from outside its run: HUB_FORCE_RELEASE_JOB (exit 2) names `gh run cancel`. An emulator lease id is refused (exit 2):
 //                    force-release its slot (`force-release emulator-<n>`, below). A waiter is `cancel`'s. Prints `HUB_DEVICE_FORCE_RELEASED <device|lock> <id> holder=<holder>`)
@@ -77,6 +77,14 @@
 //   hub-device registry list [--json]   (read only, from registry.json on disk or the seed: no service is called)
 //                    With the Hub API down a registry write fails plainly (HUB_API_DOWN, exit 1: nothing was sent; HUB_API_UNKNOWN, exit 1: it
 //                    was sent and may have applied); leases, runs, releases and status never call the API.
+//
+// Other hosts (Story 9.3, AD-25, AD-48): a Hold verb on a Resource that lives on another host is forwarded to that host's front door (door `cli`, through
+// hub-client.mjs; tools/device/forward.mjs has the rules) instead of being run here, so this host never writes another host's lock dir. `lease` forwards a
+// device word, `emulator` or `--match` whose Resources live on one other host (not `lease ipad|mac`: Story 9.4), and `release`, `extend`, `cancel` and
+// `force-release` forward when `--resource <R>` names one (`force-release emulator-<n>` names the emulator slot). The answers print as the local verb's;
+// a problem from the far side prints with its code, reason and exit; a host that does not answer is HUB_DEVICE_AWAY (75). `--pid`, `--env-serial`,
+// `--no-connect`, `--profile` and `--pool` have no meaning there (exit 2), and `run` on a foreign target is HUB_WRONG_HOST (exit 2). The Linux host reads its own
+// Registry; any other host asks the Hub API (`GET /resources`), else its seed at `rev: 0`. A host that does not know its key forwards nothing.
 //
 // This file is argument parsing and output only: every action and every rule lives in claims.mjs (AD-24), which the Hub API
 // and the Host Agent call too, so no front door can take, refuse or report one action differently.
@@ -96,6 +104,7 @@ import { canonical, parseQuery } from '../registry/match.mjs';
 import { NO_ANSWER, NO_DEVICECTL, NO_SERVER } from '../registry/reachability.mjs';
 import { call } from '../hub-client.mjs';
 import * as claims from './claims.mjs';
+import { NAMED, forwardHold, hubView, namedRecords, peerView, placeOf, transportOf, wrongHost } from './forward.mjs';
 
 // This tool's own parse and usage refusals; the library's carry the same code, so both exit 2 through the table.
 class Usage extends Error { code = 'HUB_USAGE'; }
@@ -136,7 +145,7 @@ export function parseArgs(argv) {
 
 const shellQuote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
 
-const USAGE = 'usage: hub-device lease s24|s26|phone --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | lease emulator [--profile NAME] --for <dur> --why <text> [--wait <dur>] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] | release [emulator] [<lease_id>|--any] [--holder WHO] | extend [<lease_id>] --for <dur> [--override <why>] [--holder WHO] [--json] | cancel <request_id> [--resource R] [--pool P] [--why <text>] [--holder WHO] [--json] | force-release <lease_id> --why <text> [--holder WHO] [--json] | force-release emulator-<n> --why <text> [--holder WHO] [--json] | force-release --reservation <run_key> --why <text> [--name adb|mac-ios] [--holder WHO] [--json] | status [--json] | discover [--json] | reservation release --run <key> [--name adb|mac-ios] [--json] | run s24|s26|phone|emulator [--profile NAME] [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...> | lease --match <query> --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | run --match <query> [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...> | registry add --kind K --name N [--model M] [--serial S] [--udid U] [--profile P] [--host H] [--cap k=v]... [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry edit <id> [--name N] [--cap k=v]... [--uncap k]... [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry retire <id> [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry list [--json]';
+const USAGE = 'usage: hub-device lease s24|s26|phone --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | lease emulator [--profile NAME] --for <dur> --why <text> [--wait <dur>] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] | release [emulator] [<lease_id>|--any] [--resource R] [--holder WHO] | extend [<lease_id>] --for <dur> [--override <why>] [--resource R] [--holder WHO] [--json] | cancel <request_id> [--resource R] [--pool P] [--why <text>] [--holder WHO] [--json] | force-release <lease_id> --why <text> [--resource R] [--holder WHO] [--json] | force-release emulator-<n> --why <text> [--holder WHO] [--json] | force-release --reservation <run_key> --why <text> [--name adb|mac-ios] [--holder WHO] [--json] | status [--json] | discover [--json] | reservation release --run <key> [--name adb|mac-ios] [--json] | run s24|s26|phone|emulator [--profile NAME] [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...> | lease --match <query> --for <dur> --why <text> [--wait <dur>] [--no-connect] [--id ID] [--pid N] [--holder WHO] [--env-serial NAME]... [--json] [--verbose] | run --match <query> [--for <dur>] [--why <text>] [--wait <dur>] [--holder WHO] [--env-serial NAME]... [--verbose] -- <cmd...> | registry add --kind K --name N [--model M] [--serial S] [--udid U] [--profile P] [--host H] [--cap k=v]... [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry edit <id> [--name N] [--cap k=v]... [--uncap k]... [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry retire <id> [--if-rev N] [--why <text>] [--holder WHO] [--json] | registry list [--json]';
 
 // Leases are honoured only by a hub whose lock.mjs knows them. The catch-up runs from the installed release, and an
 // older one sees a lease's short-lived pid as a dead job and reclaims the lock at once, so lease and run say so.
@@ -796,6 +805,153 @@ async function registryCommand(parsed, context) {
   return claims.EXIT_OK;
 }
 
+// ---- forwarding (Story 9.3, AD-25, AD-47, AD-48) ----
+
+// A Hold verb on a Resource that lives on another host is sent to that host's front door (tools/device/forward.mjs has the rules, hub-client.mjs the
+// one transport) instead of being run in this process, so no host writes another host's lock dir. The door is `cli`; the answers print as the local verb's.
+// What a verb names: `lease` and `run` a device word, `emulator` or `--match`; `release`, `extend`, `cancel` and `force-release` the Resource of `--resource`
+// (a force-release of `emulator-<n>` names the emulator slot); a verb that names nothing, or one on this host, runs here. This host's view of the Registry is
+// `registry.json` on the Linux host (`hubView`) and the Hub API's last answer, else the seed at `rev: 0`, on any other (`peerView`). A host that does not
+// know its key does not forward (v1a). `lease ipad|mac` is not forwarded (Story 9.4); `run` on a foreign target is HUB_WRONG_HOST (it needs a local child).
+const FORWARD_KEYS = Object.freeze({ lease: 'POST /leases', run: 'POST /leases', release: 'POST /leases/{id}/release', extend: 'POST /leases/{id}/extend', cancel: 'POST /requests/{id}/cancel', 'force-release': 'POST /leases/{id}/force-release' });
+
+// What the command names and the Hold route key it is checked as, or null when it names nothing (or something this front door does not forward).
+function namingOf(parsed, context) {
+  const { flags, words } = parsed;
+  const verb = words[0];
+  const key = FORWARD_KEYS[verb];
+  if (key === undefined) return null;
+  if (verb === 'lease' || verb === 'run') {
+    if ((flags.match === undefined) === (words[1] === undefined)) return null;
+    return { key, input: { match: flags.match ?? null, resource: words[1] ?? null }, params: {} };
+  }
+  // With no lease id word the id is $HUB_LEASE_ID, and `lease` exported $HUB_DEVICE with it: that is the Resource when `--resource` is not given.
+  const heldResource = () => flags.resource ?? (words[1] === undefined && !flags.any && context.env.HUB_LEASE_ID && context.env.HUB_DEVICE ? context.env.HUB_DEVICE : undefined);
+  if (verb === 'release') return heldResource() === undefined || words[1] === 'emulator' ? null : { key, input: { resource: heldResource() }, params: {} };
+  if (verb === 'extend') return heldResource() === undefined ? null : { key, input: { resource: heldResource() }, params: {} };
+  if (verb === 'cancel') return flags.resource === undefined ? null : { key, input: { resource: flags.resource, pool: flags.pool ?? null }, params: {} };
+  if (flags.reservation !== undefined) return null;
+  const id = words[1];
+  if (claims.namesEmulatorSlot(id)) return { key, input: {}, params: { id } };
+  return flags.resource === undefined ? null : { key, input: { resource: flags.resource }, params: { id } };
+}
+
+// Where the command lives: `{host, records, single, view, own, key}` for a Resource on one other host, else null.
+async function placeOfCommand(parsed, context) {
+  const naming = namingOf(parsed, context);
+  if (naming === null || NAMED[naming.key].names(naming.input, { params: naming.params }).length === 0) return null;
+  const { env } = context;
+  let own;
+  try { own = (context.hostKey ?? claims.hostKey)({ env }); } catch (error) {
+    if (error?.code === 'HUB_HOST_UNKNOWN') return null;
+    throw error;
+  }
+  const qaDevices = context.qaDevices ?? (() => []);
+  const view = own === 'linux'
+    ? hubView({ env, registry: context.registry, qaDevices, warn: context.warn })
+    : await peerView({ env, qaDevices, request: transportOf(context) });
+  const { records, single } = namedRecords(naming.key, naming.input, { params: naming.params }, view, context.policy);
+  const host = placeOf(records, own);
+  return host === null ? null : { ...naming, host, records, single, view, own };
+}
+
+// The answers, printed as the local verbs print them.
+function printForwarded(verb, answer, { id, holder, json, label }, context) {
+  const { stdout } = context;
+  if (verb === 'lease') {
+    if (json) stdout(JSON.stringify({ lease_id: answer.lease_id, device: answer.device, holder: answer.holder ?? holder, why: answer.why, expires_at: answer.expires_at, env: answer.env }));
+    else for (const [name, value] of Object.entries(answer.env ?? {})) stdout(`export ${name}=${shellQuote(value)}`);
+  } else if (verb === 'extend') {
+    if (json) stdout(JSON.stringify({ lease_id: id, lock: answer.lock, device: answer.device, expires_at: answer.expires_at }));
+    else stdout(`HUB_DEVICE_EXTENDED ${answer.device ?? answer.lock} ${id} until ${answer.expires_at}`);
+  } else if (verb === 'cancel') {
+    if (json) stdout(JSON.stringify(answer)); else stdout(`HUB_DEVICE_CANCELLED ${answer.resource} ${id}`);
+  } else if (verb === 'force-release') {
+    if (json) stdout(JSON.stringify(answer));
+    else stdout(`HUB_DEVICE_FORCE_RELEASED ${claims.namesEmulatorSlot(id) ? answer.lock : answer.device ?? answer.lock} ${answer.lease_id} holder=${answer.holder ?? '-'}`);
+  } else if (answer.outcome === 'released') stdout(`HUB_DEVICE_RELEASED ${answer.device} ${answer.lease_id}`);
+  else if (answer.outcome === 'cancelled') stdout(`HUB_DEVICE_CANCELLED ${answer.device} ${id} (it was still waiting)`);
+  else stdout(`HUB_DEVICE_NOT_HELD ${label} ${id} (no lease by that id)`);
+}
+
+const LOCAL_LINES = Object.freeze(['HUB_PHONE_AWAY', 'HUB_DEVICE_AWAY', 'HUB_LOCK_TIMEOUT', 'HUB_LEASE_CANCELLED']);
+
+// Forwards the command when it names a Resource on another host and answers its exit code, else null (the verb runs here).
+async function forwardCommand(parsed, context) {
+  const place = await placeOfCommand(parsed, context);
+  if (place === null) return null;
+  const { flags, words } = parsed;
+  const verb = words[0];
+  const { env, signals } = context;
+  if (verb === 'run') throw wrongHost(place.records.find(record => record.host !== place.own), place.own);
+  // `lease ipad|mac` is the iOS lane's take, which is Story 9.4's: it keeps its v1 behaviour here.
+  if (verb === 'lease' && place.records.some(record => record.kind === 'ios-lane')) return null;
+  if (flags.pid !== undefined || parsed.envSerial.length > 0) throw usage(`${flags.pid !== undefined ? '--pid' : '--env-serial'} names this machine's own process or environment, so it cannot go with a ${verb} on another host (${place.host})`);
+  const actor = cliActor(parsed, env);
+  const json = Boolean(flags.json);
+  let id = null;
+  let path;
+  const body = { holder: actor.holder, actor };
+  if (verb === 'lease') {
+    for (const flag of ['no-connect', 'profile', 'pool']) if (flags[flag] !== undefined) throw usage(`--${flag} is not forwarded: a ${verb} on another host (${place.host}) takes a device word or --match, --for, --why, --wait and --id`);
+    if (flags.for === undefined) throw usage('--for <duration> is required');
+    if (!flags.why) throw usage('--why <text> is required');
+    if (flags.match !== undefined) body.match = flags.match; else body.resource = words[1];
+    Object.assign(body, { for_ms: parseDuration(flags.for, '--for'), wait_ms: flags.wait !== undefined ? parseDuration(flags.wait, '--wait') : 120_000, why: flags.why });
+    body.id = flags.id ?? claims.newLeaseId(place.records.some(record => record.kind === 'emulator-pool') ? 'emulator' : 'lease');
+    path = '/leases';
+  } else if (verb === 'cancel') {
+    if (words.length !== 2) throw usage('cancel takes one request id');
+    if (flags.why !== undefined && flags.why.trim() === '') throw usage('--why says why: a non-empty reason');
+    id = words[1];
+    Object.assign(body, { resource: flags.resource, ...(flags.pool === undefined ? {} : { pool: flags.pool }), ...(flags.why === undefined ? {} : { why: flags.why }) });
+    path = `/requests/${encodeURIComponent(id)}/cancel`;
+  } else if (verb === 'force-release') {
+    if (flags.name !== undefined) throw usage('force-release --name goes with --reservation');
+    if (words.length !== 2) throw usage('force-release takes one lease id');
+    id = words[1];
+    Object.assign(body, { why: flags.why ?? null, ...(flags.resource === undefined ? {} : { resource: flags.resource }) });
+    if (body.why === null) delete body.why;
+    path = `/leases/${encodeURIComponent(id)}/force-release`;
+  } else {
+    if (words.length > 2) throw usage(`${verb} takes at most one lease id`);
+    if (flags.any) throw usage(`${verb} --any cannot go with --resource on another host (${place.host}): name the lease id`);
+    id = words[1] ?? env.HUB_LEASE_ID ?? null;
+    if (!id) throw usage(`${verb} needs a lease id or $HUB_LEASE_ID`);
+    const job = verb === 'release' ? claims.jobTicket(id) : null;
+    if (job) { context.stderr(`HUB_DEVICE_JOB_ID ${job.message}`); return claims.exitCodeOf(job); }
+    body.resource = place.input.resource;
+    if (verb === 'extend') {
+      if (flags.for === undefined) throw usage('--for <duration> is required');
+      body.for_ms = parseDuration(flags.for, '--for');
+      if (flags.override !== undefined) {
+        if (flags.override.trim() === '') throw usage('--override says why: a non-empty reason');
+        body.override = { why: flags.override, actor };
+      }
+    }
+    path = `/leases/${encodeURIComponent(id)}/${verb}`;
+  }
+  const abort = new AbortController();
+  let received = null;
+  const onSignal = signal => { received ??= signal; abort.abort(); };
+  const names = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+  for (const name of names) signals.on(name, onSignal);
+  try {
+    const request = { method: 'POST', path, body, signal: abort.signal };
+    const input = NAMED[place.key].check(body);
+    const answer = await forwardHold({ key: place.key, request, input, place: { host: place.host, records: place.records, single: place.single }, rev: place.view.rev, door: 'cli', ctx: context });
+    printForwarded(verb, answer.body, { id, holder: actor.holder, json, label: place.input.resource ?? 'phone' }, context);
+    return claims.EXIT_OK;
+  } catch (error) {
+    if (received) return 128 + constants.signals[received];
+    // A far problem whose local verb prints a HUB_DEVICE_* line (busy, away, cancelled) is reported as the local verb reports it, with the same exit.
+    if (error?.api === true && LOCAL_LINES.includes(error.code)) error.api = false;
+    throw error;
+  } finally {
+    for (const name of names) signals.off(name, onSignal);
+  }
+}
+
 // Who owns each flag that not every command takes: any other command refuses it as an unknown flag (AD-17: exit 2 stays exit 2).
 const FLAG_OWNERS = Object.freeze({
   run: ['reservation'],
@@ -810,7 +966,7 @@ const FLAG_OWNERS = Object.freeze({
   uncap: ['registry'],
   'if-rev': ['registry'],
   override: ['extend'],
-  resource: ['cancel'],
+  resource: ['cancel', 'release', 'extend', 'force-release'],
   reservation: ['force-release'],
 });
 
@@ -836,6 +992,7 @@ export async function main(argv, {
   registry,
   fetchImpl,
   timeout,
+  request,
 } = {}) {
   let parsed = { flags: {}, words: [], envSerial: [], cap: [], uncap: [], command: null };
   // Each distinct warning prints once per invocation: the fleet, `--match` and `registry list` each read the Registry, and an unreadable
@@ -849,6 +1006,7 @@ export async function main(argv, {
   const context = {
     ...claims.createContext({ env, sleep, now, log: line => stderr(line), warn, adbFactory, adbWire, devicectl, hostKey, inventory: inventoryImpl, policy, qaDevices, registry, fetchImpl, timeout }),
     stdout, stderr, signals, killGraceMs: Number(env.HUB_DEVICE_KILL_GRACE_MS) || 10_000,
+    ...(request ? { request } : {}),
   };
   try {
     parsed = parseArgs(argv);
@@ -856,6 +1014,9 @@ export async function main(argv, {
     // The phones the Registry names (registry.json in the lock dir, read fresh), else the ones this checkout's devices.json names; a
     // broken devices.json is a tool failure, named like any other.
     context.fleet = claims.loadFleet(env, { warn: context.warn });
+    // A Hold verb on a Resource of another host is forwarded there (Story 9.3); null means it runs here.
+    const forwarded = await forwardCommand(parsed, context);
+    if (forwarded !== null) return forwarded;
     switch (parsed.words[0]) {
       case 'lease': return await lease(parsed, context);
       case 'release': return await release(parsed, context);
