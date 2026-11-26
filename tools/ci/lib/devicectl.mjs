@@ -44,13 +44,16 @@ export function inspectIpad(document, { udid, model }) {
   // another model) stays a hard error.
   if (hardware.reality === undefined && (hardware.productType === undefined || hardware.productType === model)) {
     if (connection.pairingState !== undefined && connection.pairingState !== 'paired') throw refuse('unpaired', `the iPad is not paired with this Mac (pairingState ${connection.pairingState})`);
-    if (properties.developerModeStatus && properties.developerModeStatus !== 'enabled') throw refuse('developer-mode', 'Developer Mode is off on the iPad (Settings > Privacy & Security > Developer Mode)');
+    if (properties.developerModeStatus === 'disabled') throw refuse('developer-mode', 'Developer Mode is off on the iPad (Settings > Privacy & Security > Developer Mode)');
     return { identifier: device.identifier, name: properties.name ?? null, os: properties.osVersionNumber ?? null, transport: connection.transportType ?? null, tunnel: 'unavailable', proven: false, boot_state };
   }
   if (hardware.reality !== 'physical' || hardware.productType !== model) throw refuse('identity', `devicectl lists ${udid} as ${hardware.reality} ${hardware.productType}, not the physical ${model}`);
   if (connection.pairingState !== 'paired') throw refuse('unpaired', `the iPad is not paired with this Mac (pairingState ${connection.pairingState})`);
-  if (properties.developerModeStatus && properties.developerModeStatus !== 'enabled') throw refuse('developer-mode', 'Developer Mode is off on the iPad (Settings > Privacy & Security > Developer Mode)');
-  return { identifier: device.identifier, name: properties.name ?? null, os: properties.osVersionNumber ?? null, transport: connection.transportType ?? null, tunnel: connection.tunnelState ?? null, proven: true, boot_state };
+  if (properties.developerModeStatus === 'disabled') throw refuse('developer-mode', 'Developer Mode is off on the iPad (Settings > Privacy & Security > Developer Mode)');
+  // 'unknown' (seen 2026-11-26 with the iPad off the Mac's network: tunnel unavailable, no DDI) is unreachable, not off;
+  // reporting it as 'Developer Mode is off' sent the owner to a setting that was already on.
+  const unread = properties.developerModeStatus !== undefined && properties.developerModeStatus !== 'enabled';
+  return { identifier: device.identifier, name: properties.name ?? null, os: properties.osVersionNumber ?? null, transport: connection.transportType ?? null, tunnel: unread ? 'unavailable' : (connection.tunnelState ?? null), proven: true, boot_state };
 }
 
 // The approved iPad as the deploy path has always had it: inspectIpad without the two Registry-only fields.

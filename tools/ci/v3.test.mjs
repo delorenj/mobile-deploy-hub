@@ -13,7 +13,7 @@ import { parseConfig } from './lib/config.mjs';
 import { checkBump, levels, nextVersion, parseVersionInfo } from './lib/version.mjs';
 import { bumpTransaction, createGit, parseRemoteTag, parseStatus } from './lib/git.mjs';
 import { createAdb, findPhone, parseBaseApk, parseDeviceList, parseMdnsEndpoint, parsePackage, parseSha256, peekInstalled } from './lib/adb.mjs';
-import { createIpad, pickApp, pickIpad } from './lib/devicectl.mjs';
+import { createIpad, inspectIpad, pickApp, pickIpad } from './lib/devicectl.mjs';
 import { reachIpad } from './commands/common.mjs';
 import { bbEmitPath, correlationFor, deploymentEvent, emitArgs, sanitizeReason, targetOf, uuidv5 } from './lib/announce.mjs';
 import { loadDevices, parseDevices } from './lib/devices.mjs';
@@ -504,6 +504,10 @@ test('devicectl output is read by UDID: the physical, paired iPad with Developer
   assert.throws(() => pickIpad(devicectlList({ hardware: { reality: undefined, productType: 'iPad13,1' } }), { udid: devices.ios.udid, model: 'iPad14,5' }), /not the physical iPad14,5/, 'a cached record of another model is still wrong');
   assert.throws(() => pickIpad(devicectlList({ hardware: { reality: undefined }, connection: { pairingState: 'unpaired' } }), { udid: devices.ios.udid, model: 'iPad14,5' }), /not paired/, 'a sparse record that says unpaired is still a failure');
   assert.throws(() => pickIpad(devicectlList({ hardware: { reality: undefined }, device: { developerModeStatus: 'disabled' } }), { udid: devices.ios.udid, model: 'iPad14,5' }), /Developer Mode is off/, 'a sparse record that says Developer Mode is off is still a failure');
+  // 2026-11-26: the iPad off the Mac's network reads developerModeStatus 'unknown'. That is unreachable, never 'off'.
+  assert.equal(inspectIpad(devicectlList({ device: { developerModeStatus: 'unknown' }, connection: { tunnelState: 'unavailable' } }), { udid: devices.ios.udid, model: 'iPad14,5' }).tunnel, 'unavailable');
+  assert.equal(inspectIpad(devicectlList({ device: { developerModeStatus: 'unknown' }, connection: { tunnelState: 'connected' } }), { udid: devices.ios.udid, model: 'iPad14,5' }).tunnel, 'unavailable', 'an unread Developer Mode is never treated as reachable');
+  assert.equal(inspectIpad(devicectlList({ hardware: { reality: undefined }, device: { developerModeStatus: 'unknown' } }), { udid: devices.ios.udid, model: 'iPad14,5' }).tunnel, 'unavailable');
 });
 
 test('an iPad that devicectl lists without its live hardware details is unavailable (pending), not a failure', async () => {
