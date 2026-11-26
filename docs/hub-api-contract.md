@@ -14,7 +14,7 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 - Keys are `snake_case`.
 - A success is `application/json; charset=utf-8`. An error is `application/problem+json` with exactly the `Problem` fields below.
 - Paths match exactly: no trailing-slash folding, and the query string is ignored for routing. A `{name}` segment in a path below is a parameter: one non-empty segment, URI-decoded (a bad escape is no route). A literal path wins over a parameterised one, and the literal routes are then the whole answer for a path they match: a method none of them has is 405 with an `Allow` naming only the literal routes' methods, even when a parameterised route would have taken it.
-- In a shape's field list, `a.b` is a key of the object `a`; `a[].b` is a key of the objects in the array `a`; `a.*` is an open object whose keys this document does not list (a client reads what it knows and ignores the rest). An array of plain values is listed as the array itself.
+- In a shape's field list, `a.b` is a key of the object `a`; `a[].b` is a key of the objects in the array `a`; `a.*` is an open object whose keys this document does not list (a client reads what it knows and ignores the rest); `a.{name}` is an object keyed by values such as host keys, and every value of it has the fields listed under `a.{name}.` (`hosts.{host}.phones[].device` is the `device` of each phone of each host in `hosts`). An array of plain values is listed as the array itself.
 - The contract is additive only: a later release adds routes and fields, never removes or renames one, and never changes what a field means. A client ignores fields it does not know. `contract` in `/health` is the version, and rises only on a change that cannot be additive.
 - `exit` in an error is the exit code a CLI front door uses for the same error, so `hub-device` and a Holocene button agree.
 - An error the Claims library throws has no HTTP status of its own: it takes its `status` (and, for busy, away, no-match and host-unknown, its `reason`) from the library's one table (`HTTP_ANSWERS` in `tools/device/claims.mjs`), so every service answers the same error the same way. An error code the table does not know is a bug of the service: 500 `HUB_API_ERROR`.
@@ -28,6 +28,7 @@ The Hub API is the one writer of the Registry (design v1.1, AD-42). Holocene's p
 | GET | `/resources/{id}` | Resource | 6.5 |
 | GET | `/pools` | PoolList | 6.5 |
 | GET | `/discovery` | Discovery | 6.10 |
+| GET | `/status` | Status | 8.1 |
 | POST | `/registry/resources` | Resource | 6.6 |
 | POST | `/registry/resources/{id}` | Resource | 6.7 |
 | POST | `/registry/resources/{id}/retire` | Retirement | 6.7 |
@@ -138,6 +139,120 @@ The age rule: a reader on the service's host computes `age_ms = age_ms_at_receip
 - `devices[].model` the model adb lists, or `null`
 - `devices[].id` the adb id: the serial over USB, the mDNS service name, or `host:port`
 - `devices[].state` the state adb lists it in (`device`, `unauthorized`, `offline`, ...)
+
+### Status
+
+`GET /status`: every Resource's Reachability, Hold and Queue in one document (FR-14, AD-41), so a reader never recomputes a queue. `hosts` holds one view for each host the service has: today only its own (`linux`), and a later release adds the Mac's key with no change to any key here. A host's view is exactly what `hub-device status --json` would print on that host for a service reader: the v1a lists (`phones`, `locks`, `waiters`, `reservations`, `inventory`, `emulators`), each row naming its `resource`, `deploy_target` (a Resource deploys install to is visibly marked) and `reachability`. A Resource's Registry fields (names, Capabilities, retired and seed-missing visibility) are under `registry` only, never in a view. Nothing is cached: every answer is derived from the lock dir, the Registry file and the clock at the moment of the request, so a Lease past its `expires_at` reads `stale: true` and has no `expected_end` with no file changed. For a `dedicated_qa` Resource the `serial`, `udid` and `adb_id` of its rows, and a Lease's `phone` and `device` serial and adb id, are `null` (the keys stay). An unknown host key is 503 `HUB_HOST_UNKNOWN`.
+
+- `format` always `1`
+- `contract` the contract version of this document
+- `checked_at` an ISO time, the service's clock when it built the document
+- `stale.*` the views the service shows from an earlier read, keyed by host key, each `{since}` (an ISO time). Always `{}` today: the service reads its own host fresh on every request
+- `hosts.{host}.phones[].device` the word a Claimant says for the phone
+- `hosts.{host}.phones[].lock` the lock a Hold takes
+- `hosts.{host}.phones[].deploy` `true` for the phone deploys install to
+- `hosts.{host}.phones[].name` the phone's display name
+- `hosts.{host}.phones[].model` the phone's model, or `null`
+- `hosts.{host}.phones[].serial` the phone's serial, or `null` (always `null` for a `dedicated_qa` phone)
+- `hosts.{host}.phones[].held` `free`, `lease` or `lock` (a Job Hold)
+- `hosts.{host}.phones[].holder` the Lease's holder, or `null`
+- `hosts.{host}.phones[].lease_id` the Lease's id, or `null`
+- `hosts.{host}.phones[].why` the Lease's `why`, or `null`
+- `hosts.{host}.phones[].expires_at` the Lease's expiry (ISO), or `null`
+- `hosts.{host}.phones[].adb_id` the adb id recorded on the Lease, or `null`
+- `hosts.{host}.phones[].repo` the repo of a Job Hold, or `null`
+- `hosts.{host}.phones[].run` the run of a Job Hold, or `null`
+- `hosts.{host}.phones[].presence` what adb says: `reachable`, `unauthorized`, `offline` or `absent`
+- `hosts.{host}.phones[].resource` the Resource id
+- `hosts.{host}.phones[].deploy_target` `true` for a Resource deploys install to
+- `hosts.{host}.phones[].reachability.state` `reachable`, `unauthorized`, `offline`, `absent` or `unknown`
+- `hosts.{host}.phones[].reachability.checked_at` an ISO time, when the host read it, or `null`
+- `hosts.{host}.phones[].reachability.age_ms` the reading's age in ms as of this document, or `null`
+- `hosts.{host}.phones[].reachability.stale` `true` when the reading is older than `registry.reachability_max_age_s` or there is none: a reader never shows a stale reading as current
+- `hosts.{host}.locks[].lock` the lock
+- `hosts.{host}.locks[].device` the word for the phone it stands for, or `null`
+- `hosts.{host}.locks[].kind` `lease` or `lock` (a Job Hold)
+- `hosts.{host}.locks[].stale` `true` for a Hold the next taker reclaims (a Lease past its `expires_at`, a dead job)
+- `hosts.{host}.locks[].lease_id` the Lease's id, or `null` for a Job Hold
+- `hosts.{host}.locks[].holder` the Claimant of a Lease, or `null`
+- `hosts.{host}.locks[].why` what the Lease is for, or `null`
+- `hosts.{host}.locks[].repo` the repo of a Job Hold, or `null`
+- `hosts.{host}.locks[].run` the run of a Job Hold, or `null`
+- `hosts.{host}.locks[].pid` a Job Hold's process, or `null`
+- `hosts.{host}.locks[].holder_pid` the process a Lease is tied to, or `null` (an API Lease has none)
+- `hosts.{host}.locks[].started_at` an ISO time, when the Hold was taken, or `null`
+- `hosts.{host}.locks[].expires_at` the Lease's expiry (ISO), or `null` for a Job Hold
+- `hosts.{host}.locks[].phone.*` the phone a Lease holds (`serial`, `adb_id`, ...), or `null`
+- `hosts.{host}.locks[].emulator.*` the emulator a Lease holds, or `null`
+- `hosts.{host}.locks[].resource` the Resource id, or `null` for a lock that is no Resource
+- `hosts.{host}.locks[].deploy_target` `true` for a Resource deploys install to, or `null` with no Resource
+- `hosts.{host}.locks[].reachability.*` the Resource's Reachability as for a phone, or `null`
+- `hosts.{host}.locks[].expected_end` an ISO time: when the Hold is expected to end, from the one ETA (`tools/ci/lib/eta.mjs`), never later than the Lease's `expires_at`; `null` for a stale Hold, when the upper bound is unknown or when the ETA cannot be computed
+- `hosts.{host}.waiters[].lock` the lock the waiter queues on
+- `hosts.{host}.waiters[].device` the word for the phone, or `null`
+- `hosts.{host}.waiters[].position` its place in that queue (1 is next; a Reservation is not counted)
+- `hosts.{host}.waiters[].lease_id` the request id, or `null`
+- `hosts.{host}.waiters[].holder` who waits, or `null`
+- `hosts.{host}.waiters[].why` what for, or `null`
+- `hosts.{host}.waiters[].since` an ISO time, when it took its place
+- `hosts.{host}.waiters[].stale` `true` for a ticket nobody serves any more
+- `hosts.{host}.waiters[].kind` `lease`, `job` or `hub-job`
+- `hosts.{host}.waiters[].repo` a deploy job's repo, or `null`
+- `hosts.{host}.waiters[].run` a deploy job's run, or `null`
+- `hosts.{host}.waiters[].job` a deploy job's job name, or `null`
+- `hosts.{host}.waiters[].eta.*` the live ETA `{lo_ms, hi_ms, low_data}`, or `null`
+- `hosts.{host}.waiters[].request` a Pool request's id; only on the row of a Pool request, which is listed once
+- `hosts.{host}.waiters[].pool` the Pool the request waits on; only on the row of a Pool request
+- `hosts.{host}.waiters[].positions.*` the request's place in each member's queue, by lock; only on the row of a Pool request
+- `hosts.{host}.waiters[].resource` the Resource id, or `null`
+- `hosts.{host}.waiters[].deploy_target` `true` for a Resource deploys install to, or `null`
+- `hosts.{host}.waiters[].reachability.*` the Resource's Reachability, or `null`
+- `hosts.{host}.reservations[].lock` the lock the Reservation holds a place on
+- `hosts.{host}.reservations[].device` the word for the phone, or `null`
+- `hosts.{host}.reservations[].run_key` the run key (`owner--repo--run`)
+- `hosts.{host}.reservations[].repo` the run's repo, or `null`
+- `hosts.{host}.reservations[].run` the run's id, or `null`
+- `hosts.{host}.reservations[].place` its place in the queue
+- `hosts.{host}.reservations[].blocking` `true` while it holds the lock back from the waiters behind it
+- `hosts.{host}.reservations[].grace.*` where its grace period stands (`state`, `ends_at`, ...)
+- `hosts.{host}.reservations[].reserved_at` an ISO time
+- `hosts.{host}.reservations[].expires_at` an ISO time, its ceiling
+- `hosts.{host}.reservations[].stale` `true` once past its ceiling
+- `hosts.{host}.reservations[].resource` the Resource id, or `null`
+- `hosts.{host}.reservations[].deploy_target` `true` for a Resource deploys install to, or `null`
+- `hosts.{host}.reservations[].reachability.*` the Resource's Reachability, or `null`
+- `hosts.{host}.inventory.adb_servers.*` the adb servers running on the host
+- `hosts.{host}.inventory.emulators.*` the emulator processes running on the host
+- `hosts.{host}.inventory.xvfb.*` the Xvfb displays running on the host
+- `hosts.{host}.emulators[].lease_id` the emulator Lease's id
+- `hosts.{host}.emulators[].slot` the slot lock (`emulator-<n>`)
+- `hosts.{host}.emulators[].profile` `default` or `playstore`
+- `hosts.{host}.emulators[].serial` the adb serial (`emulator-<console port>`)
+- `hosts.{host}.emulators[].console_port` the console port
+- `hosts.{host}.emulators[].adb_server_port` the emulator's own adb server port
+- `hosts.{host}.emulators[].avd` the AVD's name, or `null`
+- `hosts.{host}.emulators[].created_at` an ISO time
+- `hosts.{host}.emulators[].pids.*` the recorded processes (`role`, `pid`, `alive`, ...)
+- `hosts.{host}.emulators[].resource` always `emulator`
+- `hosts.{host}.emulators[].deploy_target` always `false`
+- `hosts.{host}.emulators[].reachability.*` the Pool's Reachability (`unknown`: it has no transport yet)
+- `registry.rev` the Registry's revision (`0` when the in-memory seed answers)
+- `registry.source` `file` or `seed`
+- `registry.resources[].id` as in `ResourceList`
+- `registry.resources[].lock` as in `ResourceList`
+- `registry.resources[].name` as in `ResourceList`
+- `registry.resources[].kind` as in `ResourceList`
+- `registry.resources[].host` as in `ResourceList`
+- `registry.resources[].identity.*` as in `ResourceList` (QA redacted)
+- `registry.resources[].capabilities.*` as in `ResourceList`
+- `registry.resources[].deploy_target` as in `ResourceList`
+- `registry.resources[].seeded` as in `ResourceList`
+- `registry.resources[].seed_missing` as in `ResourceList`
+- `registry.resources[].created_at` as in `ResourceList`
+- `registry.resources[].retired_at` as in `ResourceList`
+- `registry.resources[].visibility` as in `ResourceList`
+
+`registry.resources` is the same list `GET /resources` serves (visible and retiring Resources, in the Registry's order), with no `reachability`: a Resource's Reachability is in its host's view only.
 
 ### Lease
 
@@ -374,7 +489,7 @@ For every write route the actor is `actor` as given, else `{holder, via: 'api'}`
 | `HUB_REGISTRY_NAME` | 400, 409 | 2 | A register's or edit's name is not a slug (`not-slug`) or is too long (`too-long`) with 400; reserved (`reserved`), already used (`taken`) or out of `-<n>` suffixes (`exhausted`) with 409. |
 | `HUB_REGISTRY_DUPLICATE` | 409 | 2 | A live Resource already has the serial (`reason: serial`) or UDID (`reason: udid`); `holder` names it. |
 | `HUB_REGISTRY_CONFLICT` | 409 | 1 | `if_rev` is not the Registry's revision; `rev` is the current one. |
-| `HUB_HOST_UNKNOWN` | 503 | 1 | `GET /discovery` on a host that does not know which host it is (`reason: host-unknown`): `~/.config/mobile-deploy-hub/host-key` is missing, empty, unknown or for another platform. `mise run hosts:install` writes it. |
+| `HUB_HOST_UNKNOWN` | 503 | 1 | `GET /discovery` or `GET /status` on a host that does not know which host it is (`reason: host-unknown`): `~/.config/mobile-deploy-hub/host-key` is missing, empty, unknown or for another platform. `mise run hosts:install` writes it. |
 | `HUB_REGISTRY_FORMAT` | 409 | 1 | `registry.json` exists and cannot be read, or is a format this service does not know. It is never written. |
 | `HUB_API_ERROR` | 500 | 1 | A bug in the service. The detail is one line; the journal has the same line. |
 | `HUB_API_ALREADY_RUNNING` | none | 1 | Start only: the port is taken. Never an HTTP answer. |

@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { earliest, eta, etaMoved, formatEta, percentile } from './lib/eta.mjs';
+import { earliest, eta, etaMoved, expectedEnd, formatEta, percentile } from './lib/eta.mjs';
 import { acquireLease, releaseLease, reserve, waiterEtas, withLock } from './lib/lock.mjs';
 import { appendEvent, readEvents } from './lib/events.mjs';
 import { loadPolicy } from './lib/policy.mjs';
@@ -446,4 +446,32 @@ test('earliest(): least lo, least known hi, low_data if any, nulls ignored, null
   earliest(input);
   assert.deepEqual(input, [a, b], 'pure: nothing is mutated');
   assert.equal(formatEta(earliest([a, b])), '2m-20m low-data');
+});
+
+test('expectedEnd (Story 8.1): now plus the holder\'s upper bound, never past a Lease\'s expires_at, null when unknown, pure', () => {
+  const owner = leaseOwner(10 * MIN, 60 * MIN);
+  const expires = Date.parse(owner.expires_at);
+  // no history: the stated duration, so exactly the expiry
+  assert.equal(expectedEnd(owner, [], policy, NOW), expires);
+  // agent Leases that used half their time: the end is the median-ish share of the stated time, before the expiry
+  const history = many(3, () => leaseHold(30 * MIN, 60 * MIN));
+  const end = expectedEnd(owner, history, withMin(1), NOW);
+  assert.ok(end > NOW && end < expires, `${end}`);
+  assert.equal(end, NOW + eta({ owner, view: [], file: null }, history, withMin(1), NOW).hi_ms);
+  // a job past its allowance, or with none, has no known end
+  assert.equal(expectedEnd(jobOwner(20 * MIN), [], policy, NOW), null);
+  assert.equal(expectedEnd(jobOwner(2 * MIN, { job: 'unlisted' }), [], policy, NOW), null);
+  // a job inside its allowance ends at the allowance
+  assert.equal(expectedEnd(jobOwner(2 * MIN), [], policy, NOW), NOW + 13 * MIN);
+  // a Lease already past its expiry is clipped to it (status shows no end for a stale Hold at all)
+  const over = leaseOwner(70 * MIN, 60 * MIN);
+  assert.equal(expectedEnd(over, [], policy, NOW), Date.parse(over.expires_at));
+  // a Hold with no owner record (mid-creation, or an unreadable owner.json) has no known end, never "now"
+  assert.equal(expectedEnd(null, history, withMin(1), NOW), null);
+  assert.equal(expectedEnd(undefined, [], policy, NOW), null);
+  // a bad policy throws, as eta does
+  assert.throws(() => expectedEnd(owner, [], { queue: {} }, NOW), TypeError);
+  const events = [...history];
+  expectedEnd(owner, events, withMin(1), NOW);
+  assert.deepEqual(events, history, 'nothing is mutated');
 });

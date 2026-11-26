@@ -35,8 +35,9 @@
 //                    --for; refused with HUB_LEASE_EXTEND_REFUSED (exit 76) while anyone waits, past the deploy phone's 60 min or 48 h in total,
 //                    or at/after expiry. --override <why> skips only the waiters check and records who and why on the `extend` event; prints
 //                    HUB_DEVICE_EXTENDED <device> <id> until <iso>)
-//   hub-device status [--json]   (read only: locks, every waiter with its position and live ETA, the Reservations, the inventory; --json
-//                    gives every row its `resource` and its `reachability` {state, checked_at, age_ms, stale}, read over the adb wire on the
+//   hub-device status [--json]   (read only: locks, every waiter with its position and live ETA, the Reservations, the inventory; on the Linux host also the
+//                    other hosts' views from the Hub API's `GET /status` (`remote_hosts` in --json; `unavailable` with a reason when the API does not answer or has no view); --json
+//                    gives each lock its `expected_end` (text output has none) and every row its `resource` and its `reachability` {state, checked_at, age_ms, stale}, read over the adb wire on the
 //                    Linux host and through devicectl on the Mac, and none at all on a host that does not know its key)
 //   hub-device discover [--json]   (read only: the devices this host can see that no Resource names, with model, serial and adb id; the hub's
 //                    adb server over its wire on the Linux host (never started or connected), devicectl on the Mac; exits 1 when the transport
@@ -89,9 +90,11 @@ import { constants, homedir, hostname } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { formatEta } from '../ci/lib/eta.mjs';
+import { loadPolicy } from '../ci/lib/policy.mjs';
 import { sleep as realSleep } from '../ci/lib/pause.mjs';
 import { canonical, parseQuery } from '../registry/match.mjs';
 import { NO_ANSWER, NO_DEVICECTL, NO_SERVER } from '../registry/reachability.mjs';
+import { call } from '../hub-client.mjs';
 import * as claims from './claims.mjs';
 
 // This tool's own parse and usage refusals; the library's carry the same code, so both exit 2 through the table.
@@ -439,6 +442,40 @@ function age(ms) {
   return `${(s / 3600).toFixed(1)}h`;
 }
 
+// The hosts other than this one, as the Hub API's status document shows them (Story 8.1, FR-14). Only the Linux host asks: it is where the
+// API runs, and the Mac's own status is its own. One read-only `GET /status` through the same-host client (`/health` probe first); every
+// failure is a reason, never an error: `api-down` (the client could not get an answer), `bad-answer` (the body is no status document) or
+// `not-served` (the document does not carry that host: until Epic 9 the Mac). The keys are `HOST_PLATFORMS`'s, so a new host appears with no
+// change here. Other keys (null, `mac`) make no call and list nothing.
+const REMOTE_WHY = Object.freeze({
+  'api-down': 'the Hub API is not answering',
+  'not-served': 'the Hub API has no view of it',
+  'bad-answer': 'the Hub API answered something that is not a status document',
+});
+const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+async function remoteHosts(key, context) {
+  if (key !== 'linux') return {};
+  const others = Object.keys(claims.HOST_PLATFORMS).filter(host => host !== key);
+  const gone = reason => Object.fromEntries(others.map(host => [host, { state: 'unavailable', reason, view: null, stale: null }]));
+  let answer;
+  try {
+    answer = await call({ method: 'GET', path: '/status' }, { policy: context.policy ?? loadPolicy().policy, fetchImpl: context.fetchImpl, timeout: context.timeout ?? (ms => AbortSignal.timeout(Math.min(ms, 5000))) });
+  } catch { return gone('api-down'); }
+  const body = answer.body;
+  if (!isObject(body) || body.format !== 1 || !isObject(body.hosts) || (body.stale !== undefined && !isObject(body.stale))) return gone('bad-answer');
+  return Object.fromEntries(others.map(host => [host, isObject(body.hosts[host])
+    ? { state: 'available', reason: null, view: body.hosts[host], stale: body.stale?.[host] ?? null }
+    : { state: 'unavailable', reason: 'not-served', view: null, stale: null }]));
+}
+
+const remoteLine = (host, entry) => {
+  if (entry.state !== 'available') return `  ${host}  unavailable (${REMOTE_WHY[entry.reason] ?? entry.reason})`;
+  const count = list => (Array.isArray(list) ? list.filter(row => row?.stale !== true).length : 0);
+  const since = isObject(entry.stale) && entry.stale.since !== undefined ? `  [stale since ${entry.stale.since}]` : entry.stale ? '  [stale]' : '';
+  return `  ${host}  ${count(entry.view.locks)} held, ${count(entry.view.waiters)} waiting (from the Hub API)${since}`;
+};
+
 async function status(parsed, context) {
   const { stdout, timing } = context;
   const nowMs = timing.now();
@@ -448,7 +485,8 @@ async function status(parsed, context) {
   try { key = (context.hostKey ?? claims.hostKey)({ env: context.env }); } catch (error) { if (error?.code !== 'HUB_HOST_UNKNOWN') throw error; }
   const result = await claims.statusView(key, { audience: 'local' }, context);
   const { phones, locks, waiters, reservations, inventory: found, emulators } = result;
-  if (parsed.flags.json) { stdout(JSON.stringify(result, null, 2)); return 0; }
+  const remote = await remoteHosts(key, context);
+  if (parsed.flags.json) { stdout(JSON.stringify({ ...result, remote_hosts: remote }, null, 2)); return 0; }
   stdout('PHONES (read only; adb is queried, never connected)');
   for (const phone of phones) {
     const held = phone.held === 'free' ? 'free'
@@ -527,6 +565,10 @@ async function status(parsed, context) {
   if (emulators.length > 0) {
     stdout('EMULATORS (the pool\'s own)');
     for (const entry of emulators) stdout(`  ${entry.lease_id}  ${entry.slot}  ${entry.serial}  adb server ${entry.adb_server_port}  avd ${entry.avd}  pids ${entry.pids.map(pid => `${pid.role}:${pid.pid}${pid.alive ? '' : '(gone)'}`).join(' ')}`);
+  }
+  if (key === 'linux') {
+    stdout('REMOTE HOSTS (from the Hub API)');
+    for (const [host, entry] of Object.entries(remote)) stdout(remoteLine(host, entry));
   }
   return 0;
 }

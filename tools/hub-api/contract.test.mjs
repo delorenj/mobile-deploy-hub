@@ -8,12 +8,12 @@
 // whatever the value, even null); `{name}` in a route path is a parameter.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadDevices } from '../ci/lib/devices.mjs';
-import { acquireLease, listWaiters, reserve } from '../ci/lib/lock.mjs';
+import { acquireLease, buildTicket, listWaiters, reserve } from '../ci/lib/lock.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { hermetic } from '../ci/test-fixtures.mjs';
 import { EXIT_CODES, createLeaseWaits } from '../device/claims.mjs';
@@ -73,24 +73,40 @@ export function parseContract(text) {
 // The key paths of an object's keys, sorted: objects recursed (`a.b`); an array of objects is the union of its items' paths under
 // `a[]` (`a[].b`); an empty array or an array with a scalar is a leaf; a path in `open` (a doc entry `x.*`, given as `x`) is the leaf
 // `x.*` whatever its value.
-export function flatten(value, prefix = '', open = new Set()) {
+export function flatten(value, prefix = '', open = new Set(), maps = new Map()) {
   const out = [];
+  // An object whose path is a map prefix is keyed by values (host keys): each child is flattened at `<prefix>.{name}`, whatever its key.
+  const named = maps.get(prefix);
   for (const [key, child] of Object.entries(value)) {
-    const path = prefix ? `${prefix}.${key}` : key;
+    const path = named === undefined ? (prefix ? `${prefix}.${key}` : key) : `${prefix ? `${prefix}.` : ''}{${named}}`;
     if (open.has(path)) out.push(`${path}.*`);
-    else if (child !== null && typeof child === 'object' && !Array.isArray(child)) out.push(...flatten(child, path, open));
+    else if (child !== null && typeof child === 'object' && !Array.isArray(child)) out.push(...flatten(child, path, open, maps));
     else if (Array.isArray(child) && child.length > 0 && child.every(item => item !== null && typeof item === 'object' && !Array.isArray(item))) {
-      out.push(...new Set(child.flatMap(item => flatten(item, `${path}[]`, open))));
+      out.push(...new Set(child.flatMap(item => flatten(item, `${path}[]`, open, maps))));
     } else out.push(path);
   }
-  return out.sort();
+  return [...new Set(out)].sort();
+}
+
+// The map prefixes of a document field list (prefix -> name): every `a.{name}.…` entry says the object at `a` is keyed by values, each
+// of which has the fields listed under `a.{name}.`. `hosts.{host}.phones[].device` gives `hosts` -> `host`.
+export function mapPrefixes(fields) {
+  const maps = new Map();
+  for (const field of fields) {
+    const segments = field.split('.');
+    segments.forEach((segment, index) => {
+      const name = /^\{([a-z_]+)\}$/.exec(segment)?.[1];
+      if (name !== undefined) maps.set(segments.slice(0, index).join('.'), name);
+    });
+  }
+  return maps;
 }
 
 // The open prefixes of a document field list: every `x.*` entry names `x`.
 export const openPrefixes = fields => new Set(fields.filter(field => field.endsWith('.*')).map(field => field.slice(0, -2)));
 
 // The response's fields as the document would list them, the open prefixes of that shape's own entries honoured.
-const shapeFields = (shape, body) => flatten(body, '', openPrefixes(contract.shapes[shape]));
+const shapeFields = (shape, body) => flatten(body, '', openPrefixes(contract.shapes[shape]), mapPrefixes(contract.shapes[shape]));
 
 // The differences between the document's route set and the code's, as readable strings (empty when equal).
 export function routeDiff(docRoutes, codeRoutes) {
@@ -150,6 +166,23 @@ function prepareReservation(ctx) {
   reserve('adb', { env: { ...ctx.env, GITHUB_REPOSITORY: 'acme/app', GITHUB_RUN_ID: '77' }, log: () => {} });
 }
 
+// The live state `GET /status` needs, on `adb` (the S26) only, so s24 stays free for the `/leases/{id}` sample: a Lease, a Lease waiter, a
+// Pool request's ticket, a Reservation and an emulator record. The tickets are files of this very process (it is alive, so they are live).
+function prepareStatus(ctx) {
+  const now = Date.now();
+  const iso = ms => new Date(ms).toISOString();
+  const locks = ctx.env.HUB_LOCK_DIR;
+  return acquireLease('adb', { holder: 'contract-held', why: 'contract', forMs: 600_000, id: 'status-held', env: ctx.env, log: () => {} }).then(() => {
+    reserve('adb', { env: { ...ctx.env, GITHUB_REPOSITORY: 'acme/app', GITHUB_RUN_ID: '78' }, log: () => {} });
+    mkdirSync(join(locks, 'adb.queue'), { recursive: true });
+    const ticket = (index, fields) => writeFileSync(join(locks, 'adb.queue', `${String(now).padStart(15, '0')}-00000${index}-0000000${index}.json`), JSON.stringify(buildTicket('lease', { env: ctx.env, requested: now, holder: 'contract-wait', why: 'contract', ...fields })));
+    ticket(1, { lease_id: 'status-wait', expires_at: iso(now + 600_000) });
+    ticket(2, { lease_id: 'status-pool', request: 'status-request', pool: 'phone', expires_at: iso(now + 600_000) });
+    mkdirSync(join(locks, 'emulators'), { recursive: true });
+    writeFileSync(join(locks, 'emulators', 'e-aaaaaaaaaaaa.json'), JSON.stringify({ lease_id: 'e-aaaaaaaaaaaa', slot: 'emulator-1', profile: 'default', serial: 'emulator-5554', console_port: 5554, adb_server_port: 15170, avd: { name: 'hub-a' }, created_at: iso(now), pids: [] }));
+  });
+}
+
 const POST_SAMPLES = Object.freeze({
   '/registry/resources': { status: 201, body: { kind: 'phone', name: 'pixel', host: 'linux', identity: { serial: 'PX9', model: 'Pixel 9' }, capabilities: { api_level: 35 }, holder: 'contract-test' } },
   // After the seed (rev 1) and the setup register (rev 2), the edit is based on rev 2.
@@ -167,6 +200,7 @@ const POST_SAMPLES = Object.freeze({
 // paths of POST samples called first, in order, on the same scratch). `/leases/{id}` needs a Lease the setup took.
 const GET_SAMPLES = Object.freeze({
   '/leases/{id}': { params: { id: 'contract-1' }, setup: ['/leases'] },
+  '/status': { prepare: prepareStatus },
 });
 const sampleOf = (route, samples = POST_SAMPLES) => {
   if (!Object.hasOwn(samples, route.path)) throw new Error(`no request body sample for ${route.method} ${route.path}: add it to POST_SAMPLES`);
@@ -199,7 +233,7 @@ async function callPost(route, ctx) {
   } finally { await sample.after?.(state, answer); }
 }
 
-// Calls a GET route as its sample says (setup POSTs first, their answers successes). Returns the answer.
+// Calls a GET route as its sample says (setup POSTs first, their answers successes, then `prepare` and `after` as for a POST). Returns the answer.
 async function callGet(route, ctx) {
   const sample = GET_SAMPLES[route.path] ?? {};
   for (const path of sample.setup ?? []) {
@@ -207,7 +241,12 @@ async function callGet(route, ctx) {
     const answer = await handle({ method: 'POST', url: samplePath(path, { ...PARAM_SAMPLES, ...sampleOf(earlier).params }), body: sampleBody(earlier) }, ctx);
     assert.equal(answer.status, sampleOf(earlier).status, `setup ${path}`);
   }
-  return handle({ method: 'GET', url: samplePath(route.path, { ...PARAM_SAMPLES, ...sample.params }) }, ctx);
+  const state = await sample.prepare?.(ctx);
+  let answer = null;
+  try {
+    answer = await handle({ method: 'GET', url: samplePath(route.path, { ...PARAM_SAMPLES, ...sample.params }) }, ctx);
+    return answer;
+  } finally { await sample.after?.(state, answer); }
 }
 
 function scratch() {
@@ -350,6 +389,38 @@ test('flatten: arrays of objects are unions of item paths, scalar and empty arra
   assert.equal(fieldDiff(['rows[].id'], flatten({ rows: [{ id: 1, extra: 2 }] })).length, 1);
 });
 
+test('flatten: a map prefix names its keys, so any keyed object is pinned exactly', () => {
+  const doc = ['hosts.{host}.phones[].device', 'hosts.{host}.inventory.*', 'hosts.{host}.locks[].phone.*', 'stale.*', 'format'];
+  const maps = mapPrefixes(doc);
+  assert.deepEqual([...maps], [['hosts', 'host']]);
+  const open = openPrefixes(doc);
+  assert.deepEqual(flatten({ hosts: { linux: { phones: [{ device: 's24' }], inventory: { xvfb: [] }, locks: [{ phone: null }] } } }, '', open, maps), ['hosts.{host}.inventory.*', 'hosts.{host}.locks[].phone.*', 'hosts.{host}.phones[].device']);
+  // Every host is held to the same fields: a second host adds nothing, and a field one host lacks or adds is a difference.
+  const two = flatten({ hosts: { linux: { phones: [{ device: 's24' }] }, mac: { phones: [{ device: 'ipad' }] } } }, '', open, maps);
+  assert.deepEqual(two, ['hosts.{host}.phones[].device']);
+  assert.deepEqual(fieldDiff(['hosts.{host}.phones[].device'], flatten({ hosts: { linux: { phones: [{ device: 's24' }] }, mac: { phones: [{ device: 'i', extra: 1 }] } } }, '', new Set(), maps)), ['hosts.{host}.phones[].extra is in the response but not in the document']);
+  assert.deepEqual(flatten({ hosts: {}, stale: {} }, '', open, maps), ['stale.*']);
+  assert.deepEqual(flatten({ a: { b: 1 } }, '', new Set(), new Map([['', 'k']])), ['{k}.b']);
+  assert.deepEqual([...mapPrefixes(['a.b', 'x[].{id}.y'])], [['x[]', 'id']]);
+});
+
+test('GET /status is in the route table and its live answer\'s key set is the document\'s list exactly, hosts.linux the one host', async () => {
+  const route = ROUTES.find(candidate => routeKey(candidate) === 'GET /status');
+  assert.equal(contract.shapeOf['GET /status'], 'Status');
+  assert.equal(route.shape, 'Status');
+  const s = scratch();
+  try {
+    const answer = await callGet(route, s.ctx);
+    assert.equal(answer.status, 200);
+    assert.deepEqual(Object.keys(answer.body), ['format', 'contract', 'hosts', 'registry', 'stale', 'checked_at']);
+    assert.deepEqual(Object.keys(answer.body.hosts), ['linux']);
+    assert.deepEqual(fieldDiff(contract.shapes.Status, shapeFields('Status', answer.body)), []);
+    // The sample is rich enough to pin the fields that only some rows have.
+    const live = shapeFields('Status', answer.body);
+    for (const field of ['hosts.{host}.locks[].expected_end', 'hosts.{host}.waiters[].request', 'hosts.{host}.waiters[].positions.*', 'hosts.{host}.reservations[].grace.*', 'hosts.{host}.emulators[].avd']) assert.ok(live.includes(field), field);
+  } finally { s.cleanup(); }
+});
+
 test('samplePath substitutes route parameters and fails on one it has no sample for', () => {
   assert.equal(samplePath('/resources/{id}'), '/resources/s26');
   assert.equal(samplePath('/health'), '/health');
@@ -370,8 +441,8 @@ test('an error answers with exactly the Problem field list', async () => {
 test('every key, in the document and in a response, is snake_case', async () => {
   const s = scratch();
   try {
-    // `[]` and `*` are notation, not keys.
-    const keysOf = path => path.split('.').map(key => key.replace(/\[\]$/, '')).filter(key => key !== '*');
+    // `[]`, `*` and `{name}` are notation, not keys.
+    const keysOf = path => path.split('.').filter(key => !/^\{[a-z_]+\}$/.test(key)).map(key => key.replace(/\[\]$/, '')).filter(key => key !== '*');
     const keys = new Set(Object.values(contract.shapes).flat().flatMap(keysOf));
     for (const route of ROUTES.filter(candidate => candidate.method === 'GET')) {
       const body = (await callGet(route, s.ctx)).body;
