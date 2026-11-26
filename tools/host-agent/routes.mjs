@@ -134,10 +134,11 @@ function gated(route) {
   };
 }
 
-// POST /agent/sync (Story 10.1): hands the agent the Hub API's replica sizes and makes it push from them (`/history` calls it
-// when a range the replica lacks is requested). The body is `{replica: {<YYYY-MM>: <a whole number of bytes, 0 or more>}}` and
-// nothing else (`HUB_USAGE` 400 `bad-body`; a `replica` that is not such a map is `bad-replica`). `ctx.sync` is the pusher's:
-// it adopts the sizes, pushes (draining the oldest differing month first) and answers `{pushed, synced, replica}`.
+// POST /agent/sync (Story 10.1): hands the agent the Hub API's replica sizes and makes it push from them (Story 10.2's
+// `/history` will call it when a range the replica lacks is requested). The body is `{replica: {<YYYY-MM>: <a whole number
+// of bytes, 0 or more>}}` and nothing else (`HUB_USAGE` 400 `bad-body`; a `replica` that is not such a map is `bad-replica`).
+// `ctx.sync` is the pusher's: it adopts the sizes, pushes (draining the oldest differing month first) and answers
+// `{pushed, synced, replica}`.
 const SYNC_MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
 const badSync = (reason, message) => Object.assign(new Error(message), { status: 400, code: 'HUB_USAGE', exit: exitCodeOf({ code: 'HUB_USAGE' }), reason });
 const isPlain = value => value !== null && typeof value === 'object' && !Array.isArray(value);

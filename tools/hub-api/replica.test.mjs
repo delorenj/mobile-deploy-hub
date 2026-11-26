@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadDevices } from '../ci/lib/devices.mjs';
+import { readEvents } from '../ci/lib/events.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
 import { strip } from '../ci/lib/source-scan.mjs';
 import { hermetic } from '../ci/test-fixtures.mjs';
@@ -56,6 +57,9 @@ test('checkEvents: null stays null, a valid events is returned as checked', () =
   assert.equal(checkEvents(null), null);
   const events = { month: '2026-11', from_offset: 0, lines: ['{"a":1}\n', '{"b":2}\n'] };
   assert.deepEqual(checkEvents(events), events);
+  // A blank source line is a complete line: a lone newline qualifies.
+  const blank = { month: '2026-11', from_offset: 0, lines: ['\n', '{"a":1}\n'] };
+  assert.deepEqual(checkEvents(blank), blank);
 });
 
 test('checkEvents: every bad shape is HUB_USAGE 400 bad-events with exit 2', () => {
@@ -66,7 +70,7 @@ test('checkEvents: every bad shape is HUB_USAGE 400 bad-events with exit 2', () 
     ['a bad month', { ...good, month: '2026-13' }], ['a bare year', { ...good, month: '2026' }],
     ['a negative offset', { ...good, from_offset: -1 }], ['a fractional offset', { ...good, from_offset: 1.5 }],
     ['empty lines', { ...good, lines: [] }], ['a non-string line', { ...good, lines: [7] }],
-    ['an empty line', { ...good, lines: ['\n'] }], ['no trailing newline', { ...good, lines: ['x'] }],
+    ['an empty string', { ...good, lines: [''] }], ['no trailing newline', { ...good, lines: ['x'] }],
     ['two trailing newlines', { ...good, lines: ['x\n\n'] }], ['an embedded newline', { ...good, lines: ['x\ny\n'] }],
     ['over the body limit', { ...good, lines: [`${'x'.repeat(1024 * 1024)}\n`] }],
   ];
@@ -248,6 +252,17 @@ test('the route settles a torn replica tail before the compare, and resumes from
 
 test('REPLICA_PUSH_MAX_BYTES is 256 KiB, under the API\'s 1 MiB body limit', () => {
   assert.equal(REPLICA_PUSH_MAX_BYTES, 256 * 1024);
+});
+
+test('a populated replica is invisible to readEvents: only the top-level month\'s events come back', async () => {
+  const s = scratch();
+  try {
+    mkdirSync(s.env.HUB_EVENT_DIR, { recursive: true });
+    writeFileSync(join(s.env.HUB_EVENT_DIR, '2026-11.jsonl'), lineOf(1));
+    await s.replicas.exclusive('mac', () => s.replicas.append('mac', { month: '2026-11', from_offset: 0, lines: [lineOf(2), lineOf(3)] }));
+    const events = [...readEvents({ env: s.env, log: () => {} })];
+    assert.deepEqual(events.map(event => event.n), ['1'], 'the replica\'s lines are never read as the Hub\'s own');
+  } finally { s.cleanup(); }
 });
 
 // ---- conformance ----

@@ -515,7 +515,7 @@ Applied once per `(boot, seq)`: a repeat answers 200 `{applied: false}` and chan
 
 Refusals: `HUB_USAGE` 400 for the body, with one of these reasons, checked in this order and before anything is stored: `bad-body` (not an object, a key outside the list or a missing one), `bad-format`, `bad-host` (not a host key, or this service's own), `bad-host-id`, `bad-boot`, `bad-seq`, `bad-sent-at`, `bad-status`, `bad-readings`, `bad-events`; `HUB_HOST_UNKNOWN` 503 when this service does not know its own host key.
 
-**`POST /agent/sync`** (Story 10.1) is the Host Agent's route, not the Hub API's: it hands the agent the replica sizes to push from (`/history` calls it when a range the replica lacks is requested). The body is a JSON object with only this key:
+**`POST /agent/sync`** (Story 10.1) is the Host Agent's route, not the Hub API's: it hands the agent the replica sizes to push from (Story 10.2's `/history` will call it when a range the replica lacks is requested). The body is a JSON object with only this key:
 
 - `replica` (required): an object keyed by month (`YYYY-MM`), every value a whole number of bytes 0 or more — the settled sizes of the Hub API's replica of this host.
 
@@ -747,10 +747,10 @@ The seven Hold routes take the same bodies and answer the same shapes as the Hub
 
 ### AgentSync
 
-`POST /agent/sync` (Story 10.1): the replica sizes were handed over and the agent pushed from them (`/history` calls it when a range the replica lacks is requested). The body is under "Request bodies". The answer is 200:
+`POST /agent/sync` (Story 10.1): the replica sizes were handed over and the agent pushed from them (Story 10.2's `/history` will call it when a range the replica lacks is requested). The body is under "Request bodies". The answer is 200:
 
 - `pushed` `true` when the push it made was answered 2xx and drained what differed, `false` when it failed (it stays owed, as any failed push)
-- `synced` always `true`: the sizes the body carried were adopted (a bad one is the 400, never a 200)
+- `synced` `true` when the drain left every source month replicated (its complete-line end equals its acknowledged size); `false` when the push failed, the Hub API answered no valid replica sizes, or a month was skipped (a bad size in the body is the 400, never a 200)
 - `replica.*` the replica sizes the agent holds after the push, keyed by month; `{}` when it holds none
 
 ## For the v1c module (non-binding)

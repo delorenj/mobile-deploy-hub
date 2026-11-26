@@ -9,7 +9,8 @@
 // from those acknowledged sizes, including at its start: on each trigger it compares every source month's complete-line end
 // (eventsEnd) with the acknowledged size and pushes the oldest month that differs, one month per push, at most
 // REPLICA_PUSH_MAX_BYTES, until nothing differs. A month whose acknowledged size is past its source end, or not at a line
-// start (or holds a line too long to push), is skipped with one `HUB_AGENT_REPLICA_SKIPPED <month> <code>` line and is not
+// start (or holds a line too long to push, or bytes that are not valid UTF-8), is skipped with one
+// `HUB_AGENT_REPLICA_SKIPPED <month> <code>` line and is not
 // retried until its acknowledged size changes; the rest still replicate. A month is never closed. The agent sends `events`
 // only when it knows the replica sizes, so an old Hub API (a 2xx without a valid `replica`) never gets one, and an old
 // agent's `events: null` stays valid. Catch-up rounds carry `null` for `status` and `readings` once a push of the trigger has
@@ -28,7 +29,9 @@
 //               Resource id -> the state the last push carried. A reading seen later that differs is a change worth a push.
 //   sync(replica)  `POST /agent/sync` (Story 10.1): adopts the given replica sizes as the acknowledged ones, then runs one
 //               trigger (serialized like a push) and answers `{pushed, synced, replica}`: `pushed` whether the drain succeeded,
-//               `synced` always true (the sizes were adopted), `replica` the acknowledged sizes after the push.
+//               `synced` whether the drain left every source month replicated (its complete-line end equals its acknowledged
+//               size — a failed push, an answer with no valid replica sizes or a skipped month all leave it false), `replica`
+//               the acknowledged sizes after the push.
 // `status()` and `readings()` are the agent's own reads (`agentStatus(ctx)`, `laneReadings(ctx)`); a `status` that throws is
 // sent as null, a `readings` that throws as null.
 import { readdirSync } from 'node:fs';
@@ -117,6 +120,9 @@ export function createPusher({ policy, env = process.env, hostKey, hostId = () =
         if (SKIPPED.has(error?.code)) { skip(month, want, error.code); continue; }
         throw error;
       }
+      // A source line with invalid UTF-8 decodes lossily (U+FFFD), so the pushed bytes would differ from the source's and
+      // the offsets would diverge. The byte count of the decoded lines must be the byte count read.
+      if (Buffer.byteLength(read.lines.join('')) !== read.offset - want) { skip(month, want, 'HUB_EVENT_NOT_UTF8'); continue; }
       if (read.lines.length === 0) continue;
       return { month, from_offset: want, lines: read.lines };
     }
@@ -191,7 +197,10 @@ export function createPusher({ policy, env = process.env, hostKey, hostId = () =
       acked = new Map(Object.entries(replica));
       const pushed = await drain();
       const sizes = Object.fromEntries([...(acked ?? new Map())].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
-      return { pushed, synced: true, replica: sizes };
+      // synced: the drain left every source month replicated (its complete-line end equals its acknowledged size). A failed
+      // push, an answer with no valid replica sizes, or a skipped month all leave it false.
+      const synced = pushed && acked !== null && monthsOf(env).every(month => skipped.get(month) !== (acked.get(month) ?? 0) && eventsEnd({ env, month }) === (acked.get(month) ?? 0));
+      return { pushed, synced, replica: sizes };
     });
   }
 

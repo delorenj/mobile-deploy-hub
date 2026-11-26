@@ -5,7 +5,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, appendFileSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, appendFileSync, existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadDevices } from '../ci/lib/devices.mjs';
@@ -15,6 +15,7 @@ import { fakeWire } from '../device/wire-fixtures.mjs';
 import { createReadings } from '../hub-api/readings.mjs';
 import { createRemotes } from '../hub-api/remotes.mjs';
 import { ROUTES, handle } from '../hub-api/routes.mjs';
+import { REPLICA_PUSH_MAX_BYTES } from '../hub-api/replica.mjs';
 import { AGENT_ROUTES } from './routes.mjs';
 import { createPusher } from './push.mjs';
 
@@ -29,7 +30,7 @@ const sha256 = path => createHash('sha256').update(readFileSync(path)).digest('h
 
 const lineOf = (n, extra = '') => `${JSON.stringify({ format: 1, ts: iso(T0 + n * 1000), host: 'mommymac', host_id: 'MAC-UUID', hub_version: 'v1.2.60', event: 'lease', n: `${n}${extra}` })}\n`;
 
-// The Mac's source and the Hub API's replica, on separate temp event dirs. `writes` maps month -> its lines.
+// The Mac's source and the Hub API's replica, on separate temp event dirs. `months` maps month -> its lines.
 function hosts({ months = {}, hub: hubExtra = {} } = {}) {
   const macRoot = mkdtempSync(join(tmpdir(), 'agent-replica-mac-'));
   const macEnv = { PATH: process.env.PATH, HOME: macRoot, HUB_LOCK_DIR: join(macRoot, 'locks'), HUB_EVENT_DIR: join(macRoot, 'events') };
@@ -51,7 +52,6 @@ function hosts({ months = {}, hub: hubExtra = {} } = {}) {
     source: month => join(macEnv.HUB_EVENT_DIR, `${month}.jsonl`),
     replica: month => join(hubEnv.HUB_EVENT_DIR, 'replicas', 'mac', `${month}.jsonl`),
     appendSource: (month, lines) => appendFileSync(join(macEnv.HUB_EVENT_DIR, `${month}.jsonl`), lines.join('')),
-    sizes: month => ({ source: readFileSync(join(macEnv.HUB_EVENT_DIR, `${month}.jsonl`), 'utf8').length }),
     pusher: seams => createPusher({ env: macEnv, policy, hostKey: () => 'mac', hostId: () => 'MAC-UUID', boot: BOOT, now: () => T0, send: bridge, status: async () => ({ phones: [] }), readings: async () => [], log: { err: line => err.push(line) }, ...seams }),
     agentHandle: (body, sync) => handle({ method: 'POST', url: '/agent/sync', body }, { routes: AGENT_ROUTES, sync, log: { out: () => {}, err: () => {} } }),
     cleanup: () => { rmSync(macRoot, { recursive: true, force: true }); rmSync(hubRoot, { recursive: true, force: true }); },
@@ -213,6 +213,20 @@ test('a month whose acknowledged size is past its source end is skipped; the res
   } finally { s.cleanup(); }
 });
 
+test('a month whose acknowledged size is not at a line start is skipped with one line, and recovers once the answer corrects it', async () => {
+  const s = hosts({ months: { '2026-11': [lineOf(1), lineOf(2)] } });
+  try {
+    const pusher = s.pusher();
+    // 5 bytes in is inside the first line: readEventsFrom refuses it (HUB_EVENT_OFFSET), so nothing is pushed from there.
+    const answer = await s.agentHandle({ replica: { '2026-11': 5 } }, sizes => pusher.sync(sizes));
+    assert.equal(answer.status, 200, JSON.stringify(answer.body));
+    assert.deepEqual(s.err.filter(line => line.startsWith('HUB_AGENT_REPLICA_SKIPPED')), ['HUB_AGENT_REPLICA_SKIPPED 2026-11 HUB_EVENT_OFFSET']);
+    assert.ok(s.pushes.every(body => body.events === null || body.events.from_offset !== 5), 'nothing was pushed from a mid-line offset');
+    // The Hub API's answer said it holds nothing of the month (0): a changed acknowledged size, so it replicated from 0.
+    assert.ok(s.hashEqual('2026-11'));
+  } finally { s.cleanup(); }
+});
+
 test('an old Hub API (a 2xx without a valid replica) never gets events', async () => {
   const s = hosts({ months: { '2026-11': [lineOf(1)] } });
   try {
@@ -225,5 +239,88 @@ test('an old Hub API (a 2xx without a valid replica) never gets events', async (
     assert.equal(s.pushes.length, 1, 'one push, and the trigger ends');
     assert.equal(s.pushes[0].events, null, 'events stay null when the replica sizes are unknown');
     assert.deepEqual(s.err, []);
+  } finally { s.cleanup(); }
+});
+
+test('a blank line in the source replicates byte-for-byte', async () => {
+  const lines = [lineOf(1), '\n', lineOf(2)];
+  const s = hosts({ months: { '2026-11': lines } });
+  try {
+    const pusher = s.pusher();
+    assert.equal(await pusher.push(), true);
+    const events = s.pushes.find(body => body.events !== null).events;
+    assert.deepEqual(events.lines, lines, 'the blank line is a complete line and is pushed as-is');
+    assert.ok(events.lines.includes('\n'));
+    assert.ok(s.hashEqual('2026-11'));
+    assert.deepEqual(s.err, []);
+  } finally { s.cleanup(); }
+});
+
+test('a month with invalid UTF-8 is skipped with HUB_EVENT_NOT_UTF8; the rest still replicate', async () => {
+  const s = hosts({ months: { '2026-11': [lineOf(3)] } });
+  try {
+    // A byte sequence that is not valid UTF-8: decoding lossily would change the bytes, so the month is never pushed.
+    writeFileSync(s.source('2026-10'), Buffer.concat([Buffer.from('{"a":1}'), Buffer.from([0xfe]), Buffer.from('\n')]));
+    const pusher = s.pusher();
+    assert.equal(await pusher.push(), true);
+    assert.deepEqual(s.err.filter(line => line.startsWith('HUB_AGENT_REPLICA_SKIPPED')), ['HUB_AGENT_REPLICA_SKIPPED 2026-10 HUB_EVENT_NOT_UTF8']);
+    assert.ok(s.pushes.every(body => body.events === null || body.events.month !== '2026-10'), 'nothing of the month was pushed');
+    assert.ok(!existsSync(s.replica('2026-10')), 'the Hub API has no replica of it');
+    assert.ok(s.hashEqual('2026-11'), 'the month that can be pushed is pushed');
+  } finally { s.cleanup(); }
+});
+
+test('a month over 700 KiB replicates in slices of at most REPLICA_PUSH_MAX_BYTES, with rising offsets', async () => {
+  const lines = [];
+  for (let n = 1; n <= 200; n += 1) lines.push(lineOf(n, '-'.repeat(4000)));
+  const size = Buffer.byteLength(lines.join(''));
+  assert.ok(size > 700 * 1024, `${size} bytes is the big source month`);
+  const s = hosts({ months: { '2026-11': lines } });
+  try {
+    const pusher = s.pusher();
+    assert.equal(await pusher.push(), true);
+    const slices = s.pushes.map(body => body.events).filter(events => events !== null);
+    assert.ok(slices.length >= 3, `the month came over in ${slices.length} pushes`);
+    let want = 0;
+    for (const events of slices) {
+      const bytes = Buffer.byteLength(events.lines.join(''));
+      assert.ok(bytes <= REPLICA_PUSH_MAX_BYTES, `one push carries ${bytes} bytes, at most ${REPLICA_PUSH_MAX_BYTES}`);
+      assert.equal(events.from_offset, want, 'each push continues where the answer acknowledged');
+      want += bytes;
+    }
+    assert.equal(want, size, 'the whole month came over');
+    assert.ok(s.hashEqual('2026-11'));
+    assert.deepEqual(s.err, []);
+  } finally { s.cleanup(); }
+});
+
+test('a line longer than REPLICA_PUSH_MAX_BYTES is skipped; a later month still replicates', async () => {
+  const big = `${JSON.stringify({ format: 1, ts: iso(T0), host: 'mommymac', host_id: 'MAC-UUID', event: 'lease', n: 'x'.repeat(REPLICA_PUSH_MAX_BYTES) })}\n`;
+  const s = hosts({ months: { '2026-10': [big], '2026-11': [lineOf(3)] } });
+  try {
+    const pusher = s.pusher();
+    assert.equal(await pusher.push(), true);
+    assert.deepEqual(s.err.filter(line => line.startsWith('HUB_AGENT_REPLICA_SKIPPED')), ['HUB_AGENT_REPLICA_SKIPPED 2026-10 HUB_EVENT_LINE_TOO_LONG']);
+    assert.ok(s.pushes.every(body => body.events === null || body.events.month !== '2026-10'), 'nothing of the month was pushed');
+    assert.ok(s.hashEqual('2026-11'), 'the later month replicates');
+  } finally { s.cleanup(); }
+});
+
+test('a Hub API that keeps answering HUB_REPLICA_GAP fails the push once and the trigger ends', async () => {
+  const s = hosts({ months: { '2026-11': [lineOf(1)] } });
+  try {
+    let first = true;
+    const stubborn = async ({ method, path, body }) => {
+      s.pushes.push(structuredClone(body));
+      if (first) { first = false; return new Response(JSON.stringify({ applied: true, replica: { '2026-11': 0 } }), { status: 200 }); }
+      return new Response(JSON.stringify({ code: 'HUB_REPLICA_GAP', size: 0 }), { status: 409 });
+    };
+    const pusher = s.pusher({ send: stubborn });
+    assert.equal(await pusher.push(), false, 'the gap never settles, so the push stays owed');
+    assert.equal(pusher.owed(), true);
+    const failed = s.err.filter(line => line.startsWith('HUB_AGENT_PUSH_FAILED'));
+    assert.deepEqual(failed, ['HUB_AGENT_PUSH_FAILED the Hub API keeps answering HUB_REPLICA_GAP for 2026-11'], 'one failure line, and the drain stopped');
+    const rounds = s.pushes.map(body => body.events).filter(events => events !== null);
+    assert.equal(rounds.length, 3, 'three adopted gaps (GAP_MAX), then the drain gives up');
   } finally { s.cleanup(); }
 });

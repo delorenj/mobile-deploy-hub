@@ -2,7 +2,7 @@
 title: 'Replicate the Mac''s Event Log'
 type: 'feature'
 created: '2026-11-26'
-status: 'in-progress'
+status: 'in-review'
 baseline_revision: 'ade5a8d56e515589f133941403967657a1aad998'
 review_loop_iteration: 0
 followup_review_recommended: false

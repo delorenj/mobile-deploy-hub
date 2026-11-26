@@ -2,6 +2,7 @@
 // clock and Hub API request, a temp lock and event dir per test. No live adb, devicectl, bucket or host key is reached.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -15,8 +16,11 @@ import { hermetic } from '../ci/test-fixtures.mjs';
 import { statusView, createContext } from '../device/claims.mjs';
 import { HOST_AGENT_SERVICE, HUB_API_CONTRACT } from '../hub-client.mjs';
 import { requestListener } from '../hub-api/server.mjs';
-import { handle } from '../hub-api/routes.mjs';
+import { ROUTES, handle } from '../hub-api/routes.mjs';
+import { createReadings } from '../hub-api/readings.mjs';
+import { createRemotes } from '../hub-api/remotes.mjs';
 import { CHANGE_DEBOUNCE_MS } from '../hub-api/stream.mjs';
+import { fakeWire } from '../device/wire-fixtures.mjs';
 import { seed } from '../registry/seed.mjs';
 import { AGENT_ROUTES } from './routes.mjs';
 import { createKnown } from './known.mjs';
@@ -503,6 +507,62 @@ test('a Hub API that is unreachable at start is one HUB_AGENT_REGISTRY_FAILED li
     assert.equal(e.res.head.status, 200);
     await running.stop();
   } finally { s.cleanup(); }
+});
+
+// A startHostAgent whose one transport is bridged into the Hub API's handle() on a separate temp event dir: the Mac's Event
+// Log lands byte-for-byte in the Hub's replica, and POST /agent/sync through the started service's listener answers
+// {pushed, synced, replica} (Story 10.1). The debounce's timers seam fires at once, so no real clock is waited on.
+test('a start replicates the Mac\'s Event Log to the Hub API\'s replica, and /agent/sync answers with the sizes', async () => {
+  const s = scratch();
+  const hubRoot = mkdtempSync(join(tmpdir(), 'host-agent-hub-'));
+  const hubEnv = { PATH: process.env.PATH, HOME: hubRoot, HUB_LOCK_DIR: join(hubRoot, 'locks'), HUB_EVENT_DIR: join(hubRoot, 'events'), HUB_ADB_SERVER_PORT: '5037' };
+  mkdirSync(hubEnv.HUB_EVENT_DIR, { recursive: true });
+  mkdirSync(s.env.HUB_EVENT_DIR, { recursive: true });
+  const lines = [
+    `${JSON.stringify({ format: 1, ts: iso(FAR), host: 'mommymac', host_id: 'MAC-UUID', event: 'lease', n: '1' })}\n`,
+    `${JSON.stringify({ format: 1, ts: iso(FAR + 1000), host: 'mommymac', host_id: 'MAC-UUID', event: 'release', n: '2' })}\n`,
+  ];
+  writeFileSync(join(s.env.HUB_EVENT_DIR, '2031-06.jsonl'), lines.join(''));
+  const sha256 = path => createHash('sha256').update(readFileSync(path)).digest('hex');
+  const replica = join(hubEnv.HUB_EVENT_DIR, 'replicas', 'mac', '2031-06.jsonl');
+  const source = join(s.env.HUB_EVENT_DIR, '2031-06.jsonl');
+  const until = async (check, what) => {
+    for (let n = 0; n < 500; n += 1) {
+      if (check()) return;
+      await new Promise(done => setImmediate(done));
+    }
+    throw new Error(`timed out waiting for ${what}`);
+  };
+  try {
+    const serverUp = () => ({ adb_servers: [{ port: 5037, pid: 4242, cwd: null }], emulators: [], xvfb: [] });
+    const hubCtx = {
+      env: hubEnv, policy, routes: ROUTES, now: () => FAR, hostId: 'hub-host', devices: structuredClone(loadDevices({})),
+      qaDevices: () => [], hostKey: () => 'linux', inventory: serverUp, adbWire: fakeWire({ listed: [] }),
+      sleep: () => Promise.resolve(), log: { out: () => {}, err: () => {} },
+      readings: createReadings({ env: hubEnv, policy, now: () => FAR, hostId: 'hub-host', hostKey: () => 'linux', probe: async () => new Map() }),
+      remotes: createRemotes(),
+    };
+    // The agent's one transport (`request`): every call, the registry refresh included, is answered by the real Hub API routes.
+    const request = async ({ method, path, body }) => {
+      const answer = await handle({ method, url: path, body }, hubCtx);
+      return new Response(JSON.stringify(answer.body), { status: answer.status, headers: { 'content-type': String(answer.headers['Content-Type']) } });
+    };
+    // The debounce's timers seam: the poke's one-shot timer fires on the next tick, so the start push runs without a real 250 ms wait.
+    const timers = { setTimeout: fn => setImmediate(fn), clearTimeout: immediate => clearImmediate(immediate) };
+    const running = await s.start({ request, timers });
+    await until(() => existsSync(replica), 'the replica of 2031-06');
+    await until(() => sha256(replica) === sha256(source), 'the replica to settle byte-for-byte');
+    assert.deepEqual(s.err, [], JSON.stringify(s.err));
+    // The Hub API hands the agent its replica sizes: the route answers the push result and the settled sizes.
+    const e = exchange('POST', '/agent/sync', { replica: { '2031-06': Buffer.byteLength(lines.join('')) } });
+    await s.servers[0].listener(e.req, e.res);
+    assert.equal(e.res.head.status, 200, e.res.text);
+    assert.deepEqual(e.json(), { pushed: true, synced: true, replica: { '2031-06': Buffer.byteLength(lines.join('')) } });
+    await running.stop();
+  } finally {
+    rmSync(hubRoot, { recursive: true, force: true });
+    s.cleanup();
+  }
 });
 
 test('no interval or poll runs across a start, /health, /status, a forward to the other host and a stop; the only timer is the push debounce, one-shot, armed by the start', async () => {

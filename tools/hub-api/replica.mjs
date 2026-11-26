@@ -35,9 +35,9 @@ const isObject = value => value !== null && typeof value === 'object' && !Array.
 const EVENT_KEYS = Object.freeze(['month', 'from_offset', 'lines']);
 
 // The strict check of a push's `events` (throws HUB_USAGE 400 `bad-events`): null, or `{month, from_offset, lines}` with a
-// month `YYYY-MM`, a whole number of bytes 0 or more and a non-empty list of complete lines: every line is a non-empty
-// string whose only newline is its last byte (an empty line, a torn one and one with a second trailing newline are all
-// refused), and their total never passes the body limit. Returns the events as checked, or null.
+// month `YYYY-MM`, a whole number of bytes 0 or more and a non-empty list of complete lines: every line is a string whose
+// only newline is its last byte (a torn one and one with a second trailing newline are refused; a blank source line is a
+// complete line and qualifies), and their total never passes the body limit. Returns the events as checked, or null.
 export function checkEvents(events) {
   if (events === null) return null;
   if (!isObject(events)) throw bad('events must be null or {month, from_offset, lines}');
@@ -48,7 +48,7 @@ export function checkEvents(events) {
   if (!Array.isArray(events.lines) || events.lines.length === 0) throw bad('events.lines must be a non-empty list of complete lines');
   let total = 0;
   for (const line of events.lines) {
-    if (typeof line !== 'string' || line.length < 2 || line.indexOf('\n') !== line.length - 1) throw bad('every events line must be a non-empty string ending in exactly one newline');
+    if (typeof line !== 'string' || line.length < 1 || line.indexOf('\n') !== line.length - 1) throw bad('every events line must be a string whose only newline is its last byte');
     total += Buffer.byteLength(line);
   }
   if (total > REPLICA_CHECK_MAX_BYTES) throw bad(`events lines are over ${REPLICA_CHECK_MAX_BYTES} bytes`);
