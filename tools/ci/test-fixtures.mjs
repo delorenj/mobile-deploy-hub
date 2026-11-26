@@ -1,8 +1,11 @@
 // Shared test fixtures (not a test file: node --test runs only *.test.mjs).
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
+import { PassThrough } from 'node:stream';
 import { join } from 'node:path';
 import { deflateRawSync } from 'node:zlib';
+import { relay } from '../hub-client.mjs';
 import { apkKey, installUrl, ipaKey, publicUrl } from './lib/latest.mjs';
 
 export const base = 'https://s3.delo.sh/builds';
@@ -173,3 +176,39 @@ export const makeBundle = (manifest, extra = []) => zipOf([
   { name: 'base/dex/classes.dex', data: 'dex' },
   ...extra,
 ]);
+
+
+// ---------------------------------------------------------------------------------------------------- the other host (Epic 9)
+// A fake `sshImpl` for hub-client's `request`: the peer's relay runs in-process, as the far host would run it, over the child's pipes (stdin is
+// what the client writes, stdout what it reads), against `fetchImpl` standing in for that host's own service. `key` is the peer's host key,
+// `policy` the one the relay reads its port and keepalive from. `.spawned` lists the argv of every call.
+export function peerSsh({ key, fetchImpl, policy, timers }) {
+  const spawned = [];
+  const sshImpl = argv => {
+    spawned.push(argv);
+    const child = new EventEmitter();
+    Object.assign(child, { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), killed: false });
+    child.kill = () => { child.killed = true; };
+    const [, , , method, path] = [...argv.at(-1).matchAll(/'((?:[^']|'\\'')*)'/g)].map(match => match[1].replaceAll("'\\''", "'"));
+    relay({ method, path, stdin: child.stdin, stdout: child.stdout, policy, hostKey: () => key, fetchImpl, ...(timers ? { timers } : {}) })
+      .then(code => { child.stdout.once('end', () => child.emit('close', code)); child.stdout.end(); });
+    return child;
+  };
+  sshImpl.spawned = spawned;
+  return sshImpl;
+}
+
+// A fake `sshImpl` for a host that is asleep or gone: ssh writes its own last line on stderr and exits 255, as it does for a failed connect.
+export function unreachable({ stderr = 'ssh: connect to host hub-mac port 22: Operation timed out' } = {}) {
+  const spawned = [];
+  const sshImpl = argv => {
+    spawned.push(argv);
+    const child = new EventEmitter();
+    Object.assign(child, { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), killed: false });
+    child.kill = () => { child.killed = true; };
+    setImmediate(() => { child.stderr.write(`${stderr}\n`); child.stdout.once('end', () => child.emit('close', 255)); child.stdout.end(); });
+    return child;
+  };
+  sshImpl.spawned = spawned;
+  return sshImpl;
+}

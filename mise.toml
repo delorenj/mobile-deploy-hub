@@ -157,7 +157,7 @@ tools = { node = "24", actionlint = "1.7.12" }
 run = "node tools/release.mjs"
 
 [tasks."hosts:install"]
-description = "The hosts' half: build directory index, hub-mac, the Mac's quickdrop .stignore and handoff cache, each host's key (linux / mac), the catch-up units on both hosts, and the Hub API service on big-chungus (units installed, enabled, restarted, /health read back for the release)"
+description = "The hosts' half: build directory index, hub-mac, the Mac's quickdrop .stignore and handoff cache, each host's key (linux / mac), the catch-up units on both hosts, the Hub API service on big-chungus (units installed, enabled, restarted, /health read back for the release) and the Host Agent LaunchAgent on the Mac (release copied only when missing, plist rendered, bootstrapped, /health read back through hub-client), then a check that both services report one contract and hub_version"
 tools = { node = "24" }
 run = "node tools/hosts.mjs"
 

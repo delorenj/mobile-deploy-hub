@@ -62,25 +62,41 @@ export function pinTag(names) {
 // How to undo a release: put the callers' pin (the major tag) and the hosts' tools back on what the major tag named before.
 // `previous` is remoteTag(major) read before the first tag of the release ({object, commit} or null when the major is new);
 // `previousTag` is pinTag of the tags on that commit. Without a tag the full commit is named (a short form can be ambiguous).
-export function rollbackLine({ major, previous, previousTag = null, stopUnits = [] }) {
+export function rollbackLine({ major, previous, previousTag = null, stopUnits = [], stopAgents = [] }) {
   if (!previous) return `Roll back: none: ${major} is new with this release.`;
   const ref = previousTag ?? previous.commit;
-  const stop = stopUnits?.length > 0 ? `then stop what this release added and ${ref} does not install (systemctl --user disable --now ${stopUnits.join(' ')} on big-chungus), ` : '';
+  // What this release added that the target's installer does not know: a systemd unit on big-chungus, a LaunchAgent on the Mac (`<label>.plist`).
+  const stops = [];
+  if (stopUnits?.length > 0) stops.push(`systemctl --user disable --now ${stopUnits.join(' ')} on big-chungus`);
+  if (stopAgents?.length > 0) {
+    // One remote command, single-quoted so `$(id -u)` and `~` expand on the Mac, not on big-chungus.
+    const labels = stopAgents.map(file => file.replace(/\.plist$/, ''));
+    stops.push(`on the Mac, run ssh hub-mac '${labels.map(label => `launchctl bootout gui/$(id -u)/${label}; rm -f ~/Library/LaunchAgents/${label}.plist`).join('; ')}'`);
+  }
+  const stop = stops.length > 0 ? `then stop what this release added and ${ref} does not install (${stops.join('; ')}), ` : '';
   return `Roll back: move ${major} back to ${ref} (git tag -f ${major} '${ref}^{commit}' && git push -f origin refs/tags/${major}), ${stop}then run mise run hosts:install on big-chungus from a clean checkout at ${ref} (it installs the Mac through hub-mac).`;
 }
 
-// The `.service` units of a `git ls-tree --name-only <commit> tools/hosts/units/` listing, as sorted basenames. It takes the output
-// text (or the `{ok, out}` the git helper returns); a failed lookup (null, undefined or `ok: false`) is null, never an empty list.
-export function unitsIn(listing) {
-  const text = listing !== null && typeof listing === 'object' ? (listing.ok ? listing.out : null) : listing;
-  if (typeof text !== 'string') return null;
-  return text.split(/\r?\n/).map(line => line.trim().split('/').pop()).filter(name => name.endsWith('.service')).sort();
+// The rollback line of a release at HEAD: the units and LaunchAgents HEAD adds that the rollback target (`previous.commit`) lacks, then `rollbackLine`.
+export function rollbackFor({ major, previous, previousTag = null, run = git }) {
+  const stopUnits = previous ? stopUnitsOf('HEAD', previous.commit, run) : [];
+  const stopAgents = previous ? stopUnitsOf('HEAD', previous.commit, run, '.plist') : [];
+  return rollbackLine({ major, previous, previousTag, stopUnits, stopAgents });
 }
 
-// The units to stop on a rollback: the services at `head` that `previousCommit` does not have. When the previous lookup fails every
-// service at `head` is listed (stopping first is always safe); when the lookup at `head` fails there is nothing to name.
-export function stopUnitsOf(head, previousCommit, run = git) {
-  const at = commit => unitsIn(run(['ls-tree', '--name-only', commit, 'tools/hosts/units/'], { allowFail: true }));
+// The files ending in `suffix` (`.service`, a systemd unit; `.plist`, a LaunchAgent) of a `git ls-tree --name-only <commit> tools/hosts/units/` listing, as
+// sorted basenames. It takes the output text (or the `{ok, out}` the git helper returns); a failed lookup (null, undefined or `ok: false`) is null,
+// never an empty list.
+export function unitsIn(listing, suffix = '.service') {
+  const text = listing !== null && typeof listing === 'object' ? (listing.ok ? listing.out : null) : listing;
+  if (typeof text !== 'string') return null;
+  return text.split(/\r?\n/).map(line => line.trim().split('/').pop()).filter(name => name.endsWith(suffix)).sort();
+}
+
+// The units to stop on a rollback: the files ending in `suffix` at `head` that `previousCommit` does not have. When the previous lookup fails every
+// one at `head` is listed (stopping first is always safe); when the lookup at `head` fails there is nothing to name.
+export function stopUnitsOf(head, previousCommit, run = git, suffix = '.service') {
+  const at = commit => unitsIn(run(['ls-tree', '--name-only', commit, 'tools/hosts/units/'], { allowFail: true }), suffix);
   const added = at(head);
   if (added === null) return [];
   const before = at(previousCommit);
@@ -150,8 +166,7 @@ export async function release(version, { log = console.log, dryRuns = true } = {
   // Where the major tag stands before this release touches anything: the rollback target (read before the first tag).
   const previous = remoteTag(major);
   const previousTag = previous ? pinTag(git(['tag', '--list', 'v*', '--points-at', previous.commit], { allowFail: true }).out.split('\n').filter(Boolean)) : null;
-  const stopUnits = previous ? stopUnitsOf('HEAD', previous.commit) : [];
-  const rollback = rollbackLine({ major, previous, previousTag, stopUnits });
+  const rollback = rollbackFor({ major, previous, previousTag });
   log(`RELEASE_ROLLBACK ${rollback}`);
   let notes = null;
   try { notes = existsSync(notesPath) ? releaseNotes(readFileSync(notesPath, 'utf8'), tag) : null; } catch (error) { log(`RELEASE_NOTES ${tag}: docs/hub-releases.md unreadable (${error.code ?? error.message}); tagging without notes`); }
