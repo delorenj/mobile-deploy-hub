@@ -162,6 +162,6 @@ tools = { node = "24" }
 run = "node tools/hosts.mjs"
 
 [tasks."hosts:smoke"]
-description = "The live check of an installed Hub API on big-chungus: /health at this release, register a test phone, lease it by name within 60 s, see it in the phone word and status, release, retire, see it gone (HUB_SMOKE_OK). Leaves one retired record in registry.json per run, so it is never part of hosts:install. Options: --hub-device <cmd>, --ref <ref>"
+description = "The live check of an installed Hub API on big-chungus: /health at this release, register a test phone, lease it by name within 60 s, see it in the phone word and status, release, run the holds phase (the same Hold sequence through the Hub API and through hub-device must give equal traces), retire, see it gone (HUB_SMOKE_OK). Leaves one retired record in registry.json per run, so it is never part of hosts:install. Options: --hub-device <cmd>, --ref <ref>, --holds-on <word> (run the holds phase on that device, e.g. s24, instead of the test phone), --no-holds"
 tools = { node = "24" }
 run = "node tools/hosts/smoke.mjs"
