@@ -442,7 +442,11 @@ test('end to end: a Lease on the Mac reaches /status.hosts.mac within 250 ms wit
     s.watcher.fire(s.env.HUB_LOCK_DIR);
     mock.timers.tick(CHANGE_DEBOUNCE_MS);
     await flush();
-    await until(() => pokes.length === 2, 'each applied push poked the change feed');
+    // The lease reaches the Hub API with the triggered push. Under load the start trigger may still be draining when the
+    // lease is taken; its catch-up round then replicates the lease event (status null), so wait for the view, not a count.
+    await until(async () => (await hubGet('/status')).body.hosts.mac.locks.length === 1, 'the triggered push carried the lease');
+    assert.ok(pokes.length >= 2, 'each applied push poked the change feed');
+    const sent = s.pushes.length;
     status = await hubGet('/status');
     const [row] = status.body.hosts.mac.locks;
     assert.equal(row.lock, 'mac-ios');
@@ -459,7 +463,7 @@ test('end to end: a Lease on the Mac reaches /status.hosts.mac within 250 ms wit
     assert.deepEqual((await hubGet('/status')).body.stale, {});
     hub.t += 1000;
     assert.deepEqual((await hubGet('/status')).body.stale, { mac: { since: iso(FAR + 25_000), unreachable: null } });
-    assert.equal(s.pushes.length, 2, 'no push for the passing of time');
+    assert.equal(s.pushes.length, sent, 'no push for the passing of time');
     assert.deepEqual(s.err, []);
   } finally { await s.running.stop(); s.cleanup(); rmSync(hubRoot, { recursive: true, force: true }); }
 });
