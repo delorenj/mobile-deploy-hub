@@ -522,6 +522,32 @@ For every write route the actor is `actor` as given, else `{holder, via: 'api'}`
 | `HUB_API_NO_HEAVY` | none | 1 | Start only: `heavy` is not on `PATH`. |
 | `HUB_API_DOWN` | none | 1 | Client side only (`tools/hub-client.mjs`), never an HTTP answer: `GET /health` was refused, silent for 2 s, not a 200 or not this service, or the request itself was refused, so nothing was sent. |
 | `HUB_API_UNKNOWN` | none | 1 | Client side only, never an HTTP answer: a write was sent and the answer did not come (timeout, reset, or something that is not a problem document), so it may have applied. `hub-device registry list` shows. |
+| `HUB_DEVICE_AWAY` | none | 75 | Client side only (`request()`, see Cross-host calls), never an HTTP answer: the ssh leg to the other host failed (`reason: host-unreachable`, `api: false`). AWAY does not prove a write did not apply: an ssh leg that dies after the relay forwarded a write, or the bound kill, can leave it applied (read the state back before repeating a write). |
+
+## Cross-host calls
+
+`tools/hub-client.mjs` is the one way a host calls the other host's loopback service (AD-26). `request({host, method, path, body, waitMs, budgetMs}, seams)` returns a `fetch` `Response`; `host` is `linux` or `mac`. There is no second transport, no retry and no bare `curl`.
+
+- **Same host.** `fetch` to this host's own front door on loopback: `http://127.0.0.1:<port>` where the port is `api.hub_api_port` for `linux` and `api.host_agent_port` for `mac`. The signal aborts at the call's bound, which is `waitMs + budgetMs + 30 s`. A failure is the `fetch` error, unchanged.
+- **Peer.** One ssh call to the peer's alias (`devices.<key>.host`: `hub-mac` from big-chungus, `big-chungus` from the Mac), killed at the bound plus 10 s:
+
+  `ssh -T -o BatchMode=yes -o ConnectTimeout=<api.peer_connect_timeout_s> -o ControlMaster=no -o ControlPath=none -o ServerAliveInterval=15 -o ServerAliveCountMax=2 <alias> <command>`
+
+  `<command>` is single-quoted words joined by spaces (`'` is written `'\''`): `.local/share/mise/installs/node/24/bin/node .local/share/mobile-deploy-hub/current/tools/hub-client.mjs relay <METHOD> <path>`. Both fixed paths are under the login home, where ssh starts the command, and never go through a `PATH` lookup.
+
+### The relay wire
+
+`hub-client.mjs relay <method> <path>` runs on the peer and calls that host's own front door (`http://127.0.0.1:<its port><path>`, the port of its own host key).
+
+- **stdin.** Line 1 is the JSON body, or empty for none. After it every byte is a heartbeat: the client writes `\n` every `api.stream_keepalive_s` seconds. The relay aborts its loopback request on stdin EOF, or when 3 intervals pass with no byte; it then writes nothing and exits 1 (see the exit codes below). The far service sees a client disconnect, so a wait the client abandoned records `cancel` (`reason: aborted`) and is never a ghost waiter.
+- **stdout.** Line 1 is a JSON head, then the raw body bytes to EOF: `{"format":1,"status":<n>,"headers":{...}}` (hop headers and `content-length` are not carried), or `{"format":1,"error":{"code":"<cause code>","message":"..."}}` when the peer-side fetch failed. The client rejects an error head as a `TypeError('fetch failed')` with `cause.code` set to that code, so a caller classifies it as it does a same-host failure (a failed fetch with no cause code carries `RELAY_FETCH_FAILED`). (A `HUB_` code other than `HUB_RELAY_USAGE` is the relay's own refusal and is `HUB_DEVICE_AWAY` instead; see below. A refusal whose cause has no `HUB_` code, such as a missing `policy.json`, is sent as `HUB_RELAY_ERROR`.) A 204, 205 or 304 has a `null` body.
+- **Usage.** A method that is not GET, POST, PUT, PATCH or DELETE, a path that does not start with `/` or holds whitespace or control characters, or a body line that is not JSON (or a body on a GET) is an error head with code `HUB_RELAY_USAGE` and exit 2; no request is made. Run with no `relay` or other arguments, it prints the usage on stderr and exits 2.
+- **Exit codes.** 0: an answer, or an error head from a failed peer-side fetch (the head carries the fetch's cause code). 1: the client vanished (nothing is written), or the relay cannot run (no host key: `HUB_HOST_UNKNOWN`, or no policy; an error head says why, unless the client is gone). 2: usage.
+- **By hand.** stdin EOF is a vanished client, so `echo | node tools/hub-client.mjs relay GET /health` aborts before it answers. Hold stdin open instead: `(echo; sleep 60) | node tools/hub-client.mjs relay GET /health`.
+
+### When the ssh leg fails
+
+A failure to connect (ssh exit 255), an ssh that does not start, a stdout whose first line is not a valid head, an exit with no head, or the bound plus 10 s passing, or an error head whose code starts with `HUB_` other than `HUB_RELAY_USAGE` (the relay's own refusal: no host key, no policy; the message carries the relay's message and its code), is `HUB_DEVICE_AWAY`: exit 75, `reason: host-unreachable`, `api: false`. The message names the host, its alias and `connect timeout <n> s`, plus the last line ssh wrote on stderr when there was no answer. ssh is killed on the bound path, and the heartbeat is cleared on every path.
 
 ## For the v1c module (non-binding)
 

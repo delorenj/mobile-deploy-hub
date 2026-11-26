@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { TICKET_FORMAT, acquireLease, acquirePool, localHost, processStart } from '../ci/lib/lock.mjs';
 import { readEvents } from '../ci/lib/events.mjs';
 import { loadPolicy } from '../ci/lib/policy.mjs';
-import { call } from '../hub-client.mjs';
+import { call, request } from '../hub-client.mjs';
 import * as claims from './claims.mjs';
 import { main } from './hub-device.mjs';
 
@@ -479,6 +479,25 @@ test('registryWrite: the three routes (id URI-encoded), an unknown op or a missi
     const waiting = await call({ method: 'POST', path: '/leases', body: {}, waitMs: 1000 }, { policy: loadPolicy().policy, fetchImpl: async url => { if (new URL(url).pathname === '/health') return new Response('{"service":"mobile-deploy-hub-api"}', { status: 200 }); throw Object.assign(new TypeError('reset'), { cause: { code: 'ECONNRESET' } }); } }).catch(error => error);
     assert.deepEqual([waiting.code, waiting.exit, waiting.retry], ['HUB_API_RESTARTING', claims.EXIT_CODES.HUB_API_RESTARTING, 'requeue']);
   } finally { s.cleanup(); }
+});
+
+// Story 9.1: the cross-host client's AWAY is the exit table's, so every front door maps it to 75.
+test('an AWAY from the cross-host client carries exit === EXIT_CODES.HUB_DEVICE_AWAY and reads as HUB_DEVICE_AWAY through exitCodeOf', async () => {
+  const { EventEmitter } = await import('node:events');
+  const { PassThrough } = await import('node:stream');
+  const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill() {} });
+  const pending = request({ host: 'mac', path: '/status' }, {
+    policy: loadPolicy().policy, hostKey: () => 'linux', devices: { mac: { host: 'hub-mac' }, linux: { host: 'big-chungus' } }, sshImpl: () => child,
+    timers: { setInterval: () => ({}), clearInterval() {}, setTimeout: () => ({}), clearTimeout() {} },
+  }).catch(error => error);
+  await new Promise(done => setImmediate(done));
+  child.stdout.once('end', () => child.emit('close', 255));
+  child.stdout.end();
+  const away = await pending;
+  assert.deepEqual([away.code, away.exit, away.reason, away.api], ['HUB_DEVICE_AWAY', claims.EXIT_CODES.HUB_DEVICE_AWAY, 'host-unreachable', false]);
+  assert.equal(claims.exitCodeOf(away), 75);
+  const usage = await request({ host: 'nope', path: '/x' }, { policy: loadPolicy().policy }).catch(error => error);
+  assert.deepEqual([usage.code, usage.exit], ['HUB_USAGE', claims.EXIT_CODES.HUB_USAGE]);
 });
 
 test('registryList: the seed at rev 0 with no file, no service, and a QA warning goes through ctx.warn', () => {
