@@ -8,7 +8,10 @@
 //   plan           Linux: the S26 (away is pending), the event contract, downgrade guards, the bump (real: commit,
 //                  tag, atomic push to main) and inflight.json
 //   android        Linux: build and check the APK, stage it for deliver, Quickdrop (real), install on the S26 or pending
-//   play           AAB to Play (real --play runs only)
+//   play           AAB to Play (real --play runs only); the upload is checked byte for byte against Play's own sha256,
+//                  and the exact AAB is retained (the private Release, else a run artifact)
+//   play-readback  read-only proof of what Play serves for one versionCode: the bundle listing and the Google-generated
+//                  universal APK, downloaded as a run artifact; an edit is opened and deleted again, never committed
 //   release        the private GitHub Release vX.Y.Z (real runs only, after the build checks)
 //   ios-export     Linux half (Tower): Godot's Xcode projects, handed to the Mac as a delta
 //   ios            Mac: the app's ios.device build, export, IPA checks, outbox, install on the iPad or pending
@@ -27,16 +30,17 @@ import { deliver, mergeLatest } from './commands/deliver.mjs';
 import { checkManifest, checkRun, gate } from './commands/gate.mjs';
 import { ios, iosExport, keepInOutbox, newerOnDevice } from './commands/ios.mjs';
 import { plan, preflightIos, sampleEvent } from './commands/plan.mjs';
+import { playReadback } from './commands/readback.mjs';
 import { checkCallerRef } from './lib/caller.mjs';
 import { parseConfig } from './lib/config.mjs';
 import { loadPolicy } from './lib/policy.mjs';
 
-export { android, announce, checkManifest, checkRun, deliver, gate, ios, iosExport, keepInOutbox, mergeLatest, newerOnDevice, plan, play, preflightIos, release, releaseArguments, sampleEvent };
+export { android, announce, checkManifest, checkRun, deliver, gate, ios, iosExport, keepInOutbox, mergeLatest, newerOnDevice, plan, play, playReadback, preflightIos, release, releaseArguments, sampleEvent };
 
 export async function main(argv = process.argv.slice(2), env = process.env) {
   const config = parseConfig(argv, env);
   checkCallerRef({ policy: loadPolicy().policy, env });
-  const commands = { gate, 'preflight-ios': preflightIos, plan, android, play, release, 'ios-export': iosExport, ios, deliver, announce };
+  const commands = { gate, 'preflight-ios': preflightIos, plan, android, play, release, 'ios-export': iosExport, ios, deliver, announce, 'play-readback': playReadback };
   return commands[config.command](config, { env });
 }
 

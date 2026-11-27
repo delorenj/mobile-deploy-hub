@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -14,7 +15,7 @@ import { highestVersionCode, uploadBundle } from './lib/play.mjs';
 import { buildReceipt, hubRef, setOutputs, summaryMarkdown, writeReceipt } from './lib/receipt.mjs';
 import { exportGodot, scriptErrors } from './lib/godot.mjs';
 import { play } from './hub.mjs';
-import { hermetic } from './test-fixtures.mjs';
+import { hermetic, makeBundle } from './test-fixtures.mjs';
 
 hermetic(); // offline and outside any workflow job, on every host (test-fixtures.mjs)
 
@@ -298,7 +299,8 @@ function playApi({ bundles = [], apks = [], uploadedCode = 5, failOn, refuse } =
     if (pathname.endsWith('/edits') && init.method === 'POST') return reply({ id: 'E1' });
     if (pathname.endsWith('/bundles') && init.method === 'GET') return reply({ bundles });
     if (pathname.endsWith('/apks')) return reply({ apks });
-    if (pathname.includes('/upload/') && pathname.endsWith('/bundles')) return reply({ versionCode: uploadedCode });
+    // Play answers with sha1/sha256 of the bytes it stored — here, the body the hub sent.
+    if (pathname.includes('/upload/') && pathname.endsWith('/bundles')) return reply({ versionCode: uploadedCode, sha256: createHash('sha256').update(init.body).digest('hex'), sha1: createHash('sha1').update(init.body).digest('hex') });
     if (init.method === 'PUT') return reply({});
     if (pathname.endsWith(':commit')) return reply({});
     if (init.method === 'DELETE') return { ok: true, status: 204, json: async () => null, text: async () => '' };
@@ -420,12 +422,25 @@ test('the play command reads its token from PLAY_TOKEN and uses the track defaul
   const f = await fixture(JSON.stringify(manifest));
   try {
     await mkdir(join(f.out, 'android'), { recursive: true });
-    await writeFile(join(f.out, 'android/App.aab'), 'aab');
+    // A real (unsigned) bundle whose manifest names the device package and the planned code: with no store split the
+    // play command still reads its identity before the upload, and the exact bytes are retained beside the receipt.
+    await writeFile(join(f.out, 'android/App.aab'), makeBundle({ package: 'io.example.app', versionCode: 4 }));
     const api = playApi({ uploadedCode: 4 });
     const real = f.configure('play', ['--dry-run', 'false', '--play', 'true', '--track', 'alpha']);
     await assert.rejects(play(real, { env: f.env, fetchImpl: api.fetchImpl }), /PLAY_TOKEN is empty/);
     const result = await play(real, { env: { ...f.env, PLAY_TOKEN: 'tok' }, fetchImpl: api.fetchImpl });
     assert.deepEqual([result.track, result.status, result.versionCode], ['alpha', 'draft', 4]);
+    const sha256 = createHash('sha256').update(await readFile(join(f.out, 'android/App.aab'))).digest('hex');
+    const name = 'example-app-0.3.0-4.aab';
+    assert.match(await readFile(join(f.out, `android/${name}.sha256`), 'utf8'), new RegExp(`^${sha256} {2}${name}\\n$`), 'the retained sha256 file');
+    assert.deepEqual(createHash('sha256').update(await readFile(join(f.out, `android/${name}`))).digest('hex'), sha256, 'the retained copy is byte for byte the uploaded bundle');
+    const receipt = JSON.parse(await readFile(join(f.out, 'android/hub-receipt-android-play.json'), 'utf8'));
+    assert.equal(receipt.play.bundle.name, name);
+    assert.equal(receipt.play.bundle.sha256, sha256);
+    assert.equal(receipt.play.bundle.play_sha256, sha256);
+    assert.equal(receipt.play.retained.via, 'release', 'this policy runs a release lane');
+    assert.equal(receipt.play.retained.fallback.artifact, 'play-bundle');
+    assert.match(await readFile(f.env.GITHUB_OUTPUT, 'utf8'), new RegExp(`^play_bundle=${name}$`, 'm'));
   } finally { await f.cleanup(); }
 });
 
@@ -492,7 +507,7 @@ test('the reusable workflow is hardened: no hosted runners, no shell interpolati
   assert.doesNotMatch(workflow, /github\.job|pull_request_target|secrets\./);
   assert.doesNotMatch(workflow, /client_payload|repository_dispatch/);
   const jobs = [...workflow.matchAll(/^ {2}([\w-]+):\n/gm)].map(match => match[1]).filter(name => !['workflow_call'].includes(name));
-  assert.deepEqual(jobs.slice(-9), ['gate', 'preflight-ios', 'plan', 'android', 'ios-export', 'ios', 'deliver-android', 'deliver-ios', 'announce']);
+  assert.deepEqual(jobs.slice(-9), ['preflight-ios', 'plan', 'android', 'ios-export', 'ios', 'deliver-android', 'deliver-ios', 'announce', 'play-readback']);
   const groups = [...workflow.matchAll(/^\s+group: (mobile-deploy-[\w-]+)-\$\{\{ github\.repository \}\}$/gm)].map(match => match[1]);
   // AD-21: android and ios lost their groups; the device Queue orders them, and a group would drop a pending run it would have served.
   assert.deepEqual(groups, ['mobile-deploy-plan', 'mobile-deploy-ios-export', 'mobile-deploy-deliver-android', 'mobile-deploy-deliver-ios']);
@@ -500,10 +515,10 @@ test('the reusable workflow is hardened: no hosted runners, no shell interpolati
   // runs-on is the policy's self-hosted labels, never a caller input: a caller cannot put a job on a hosted runner.
   assert.doesNotMatch(workflow, /runs-on: \$\{\{/, 'runs-on takes no expression');
   const labels = [...workflow.matchAll(/runs-on: \[([^\]]+)\]/g)].map(match => match[1]);
-  assert.equal(labels.length, 9);
+  assert.equal(labels.length, 10);
   for (const label of labels) assert.match(label, /^self-hosted, (Linux|macOS)$/);
-  // gate, plan and announce check out the dispatched commit; the lanes and the deliver jobs the plan's commit (the bump).
-  assert.equal([...workflow.matchAll(/uses: actions\/checkout@v4\n\s+with:\n\s+ref: \$\{\{ github\.sha \}\}/g)].length, 3);
+  // gate, plan, announce and the readback check out the dispatched commit; the lanes and the deliver jobs the plan's commit (the bump).
+  assert.equal([...workflow.matchAll(/uses: actions\/checkout@v4\n\s+with:\n\s+ref: \$\{\{ github\.sha \}\}/g)].length, 4);
   assert.equal([...workflow.matchAll(/uses: actions\/checkout@v4\n\s+with:\n\s+ref: \$\{\{ needs\.plan\.outputs\.build_sha \}\}/g)].length, 5);
   assert.match(workflow, /ref: \$\{\{ github\.sha \}\}\n\s+fetch-depth: 0\n\s+fetch-tags: true\n/, 'the plan bumps on full history');
   const refs = new Set([...workflow.matchAll(/uses: delorenj\/mobile-deploy-hub\/actions\/hub@(\S+)/g)].map(match => match[1]));
@@ -528,11 +543,11 @@ test('the reusable workflow is hardened: no hosted runners, no shell interpolati
   assert.doesNotMatch(deliverAndroid, /needs\.(ios|preflight-ios|ios-export)\b|ios-out|ios-receipt|mac_link/, 'nothing in deliver-android waits on or reads the Mac');
   assert.match(deliverAndroid, /scope: android/);
   assert.match(workflow.slice(workflow.indexOf('\n  deliver-ios:\n'), workflow.indexOf('\n  announce:\n')), /scope: ios/);
-  assert.match(workflow, /announce:\n\s+needs: \[gate, preflight-ios, plan, android, ios-export, ios, deliver-android, deliver-ios\]\n\s+if: \$\{\{ always\(\) \}\}/, 'one event per run attempt, whatever happened');
+  assert.match(workflow, /announce:\n\s+needs: \[gate, preflight-ios, plan, android, ios-export, ios, deliver-android, deliver-ios\]\n\s+if: \$\{\{ always\(\) && inputs\.play_readback == '' \}\}/, 'one event per run attempt, whatever happened; a readback sends none');
   assert.match(workflow, /ios_lane: \$\{\{ steps\.hub\.outputs\.ios_lane \}\}\n\s+steps:\n\s+# Full history/, 'the plan has the last word on the iPad lane');
   // Every upload can be redone by "Re-run failed jobs", and receipts upload even when the lane failed.
   const uploads = workflow.split('uses: actions/upload-artifact@v4').slice(1).map(block => block.split(/\n {6}- |\n\n/)[0]);
-  assert.deepEqual(uploads.map(block => /name: (\S+)/.exec(block)[1]), ['gate-out', 'plan-out', 'android-out', 'ios-receipt', 'ios-out', 'deliver-android-out', 'deliver-ios-out', 'completion-out']);
+  assert.deepEqual(uploads.map(block => /name: (\S+)/.exec(block)[1]), ['gate-out', 'plan-out', 'play-bundle', 'android-out', 'ios-receipt', 'ios-out', 'deliver-android-out', 'deliver-ios-out', 'completion-out', 'play-readback']);
   for (const block of uploads) assert.match(block, /^\s+overwrite: true$/m, block);
   // The build itself never takes artifact quota: staging, the build directory and the Release hold it.
   assert.match(workflow, /name: android-out\n\s+path: \$\{\{ runner\.temp \}\}\/hub-out\/android\/\*\.json\n/);
@@ -552,11 +567,22 @@ test('the reusable workflow is hardened: no hosted runners, no shell interpolati
   const bodies = workflow.slice(workflow.indexOf('\njobs:\n')).split(/\n {2}(?=[\w-]+:\n)/).slice(1);
   const writes = bodies.filter(body => /\n {6}contents: write\n/.test(body)).map(body => body.split(':')[0]);
   assert.deepEqual(writes, ['plan', 'android']);
-  assert.deepEqual(bodies.filter(body => /\n {6}id-token: write\n/.test(body)).map(body => body.split(':')[0]), ['android']);
+  assert.deepEqual(bodies.filter(body => /\n {6}id-token: write\n/.test(body)).map(body => body.split(':')[0]), ['android', 'play-readback'], 'the readback mints the same keyless token the upload uses');
   // A Play dry run mints the token (the keyless exchange is proven before a version is spent); only a real run uploads.
   assert.match(workflow, /- name: Authenticate to Google Cloud \(keyless\)\n\s+if: \$\{\{ needs\.plan\.outputs\.play_lane == 'true' \}\}\n/);
-  assert.match(workflow, /- name: Upload to Play\n\s+if: \$\{\{ !inputs\.dry_run && needs\.plan\.outputs\.play_lane == 'true' \}\}\n/);
+  assert.match(workflow, /- name: Upload to Play\n\s+id: play\n\s+if: \$\{\{ !inputs\.dry_run && needs\.plan\.outputs\.play_lane == 'true' \}\}\n/);
   assert.match(workflow, /create_credentials_file: false\n/, 'the token never lands in a credentials file');
+  // GRUV-184: the exact uploaded AAB is retained — on the app's private Release when the release step could attach it
+  // (play_bundle_release), else as the play-bundle run artifact (30 days). The readback is the only job on a
+  // play_readback run (the gate and announce skip; everything else needs one of them), it authenticates the same way
+  // and its receipts upload as play-readback.
+  assert.match(workflow, /- name: Publish the APK to a private Release\n\s+id: release\n/);
+  assert.match(workflow, /name: play-bundle\n\s+path: \|\n\s+\$\{\{ runner\.temp \}\}\/hub-out\/android\/\$\{\{ steps\.play\.outputs\.play_bundle \}\}\n\s+\$\{\{ runner\.temp \}\}\/hub-out\/android\/\$\{\{ steps\.play\.outputs\.play_bundle \}\}\.sha256\n\s+if-no-files-found: error\n\s+overwrite: true\n\s+retention-days: 30/);
+  assert.match(workflow, /play_readback:\n\s+description: [^\n]+\n\s+type: string\n\s+default: ''\n/);
+  assert.match(workflow, /gate:\n\s+if: \$\{\{ inputs\.play_readback == '' \}\}\n/);
+  assert.match(workflow, /play-readback:\n\s+if: \$\{\{ inputs\.play_readback != '' \}\}\n\s+runs-on: \[self-hosted, Linux\]\n\s+timeout-minutes: 20\n\s+permissions:\n\s+contents: read\n\s+id-token: write\n/);
+  assert.match(workflow, /command: play-readback\n\s+manifest: \$\{\{ inputs\.manifest \}\}\n\s+play_readback: \$\{\{ inputs\.play_readback \}\}\n\s+play_token: \$\{\{ steps\.auth\.outputs\.access_token \}\}\n\s+github_token: \$\{\{ github\.token \}\}\n/);
+  assert.match(workflow, /name: play-readback\n\s+path: \$\{\{ runner\.temp \}\}\/hub-out\/play-readback\/\n\s+if-no-files-found: ignore\n\s+overwrite: true\n\s+retention-days: 3/);
 });
 
 test('the composite action gives every run step a shell and reads inputs only', async () => {

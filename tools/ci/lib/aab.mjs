@@ -5,6 +5,8 @@
 //   - the jar signature is intact and there is exactly one signer, whose SHA-256 is the policy's Play upload certificate
 //     (store_upload_sha256). The device signer is never the answer: Play refuses an upload signed with any other key,
 //     and a hook that signed with the debug key would otherwise get as far as Play.
+// An app with no store split gets the first check only (checkBundleIdentity); every app's upload is then checked byte for
+// byte against Play's own sha256 of what it stored (lib/play.mjs).
 // No bundletool and no secret: the manifest is protobuf inside a zip (read here), the signature check is the JDK's own
 // jarsigner and keytool. Every refusal starts with HUB_PLAY_BUNDLE_REFUSED so a run log says what stopped it.
 import { readFileSync } from 'node:fs';
@@ -128,13 +130,20 @@ export function bundleSigners({ aab, env = process.env, home = homedir(), exec =
   return parseJarSigners(printed);
 }
 
-// What the hub holds a built bundle to: expect = { package, versionCode, uploadSha256 }. Returns the facts for the receipt.
-export function verifyPlayBundle({ aab, expect, env = process.env, home = homedir(), exec = run }) {
+// The identity half, for every app that ships a bundle (pure JS, no JDK): the base manifest names the package Play serves
+// and the planned versionCode. An app with no store split is held to this much; its signer is Play's to judge.
+export function checkBundleIdentity({ aab, expect }) {
   const identity = bundleIdentity(aab);
   if (identity.package !== expect.package) throw refuse('package', `the bundle is ${identity.package}, the policy says Play serves ${expect.package}`);
-  if (expect.versionCode !== undefined && expect.versionCode !== null && identity.versionCode !== Number(expect.versionCode)) {
+  if (expect.versionCode !== undefined && expect.versionCode !== null && expect.versionCode !== '' && identity.versionCode !== Number(expect.versionCode)) {
     throw refuse('versionCode', `the bundle carries versionCode ${identity.versionCode} but the plan says ${expect.versionCode}; the bump did not reach the bundle export`);
   }
+  return identity;
+}
+
+// What the hub holds a split app's bundle to: expect = { package, versionCode, uploadSha256 }. Returns the facts for the receipt.
+export function verifyPlayBundle({ aab, expect, env = process.env, home = homedir(), exec = run }) {
+  const identity = checkBundleIdentity({ aab, expect });
   const signers = bundleSigners({ aab, env, home, exec });
   if (signers.length !== 1) throw refuse('signer', `the bundle must carry exactly one signer, found ${signers.length}`);
   if (signers[0] !== String(expect.uploadSha256).toLowerCase()) {

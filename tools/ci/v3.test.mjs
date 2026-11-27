@@ -3,6 +3,7 @@
 // bb-emit that record every call. A dry run must never push, install or emit.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -1378,7 +1379,11 @@ test('a split app: the bundle hook is told the store package, the upload certifi
     assert.ok(logs.some(line => line === `HUB_PLAY_BUNDLE_OK io.example.store versionCode=5 upload_sha256=${storeUpload}`), logs.join('\n'));
     assert.equal(lane.delivery.verified, false, 'a dry run installs nothing');
     const receipt = readJson(join(f.out, 'android/hub-receipt-android.json'));
-    assert.deepEqual(receipt.play, { package: 'io.example.store', versionCode: 5, upload_sha256: storeUpload });
+    assert.deepEqual(receipt.play, {
+      package: 'io.example.store', versionCode: 5, upload_sha256: storeUpload,
+      sha256: createHash('sha256').update(readFileSync(join(f.out, 'android/App.aab'))).digest('hex'),
+      bytes: readFileSync(join(f.out, 'android/App.aab')).length,
+    });
     assert.ok(receipt.artifacts.some(item => item.name === 'App.aab'));
   } finally { await f.cleanup(); }
 });
@@ -1401,16 +1406,36 @@ test('a split app\'s bundle that is not the store package, the planned code or t
   }
 });
 
-test('an app with no store split keeps the old contract: hook gets its device package, nothing about a certificate, and the bundle is not read', async () => {
+test('an app with no store split keeps the old contract for the hook, and the bundle is still read: the package and the planned code come out of it and the upload is checked byte for byte', async () => {
   const f = await gitFixture({ manifest: storeManifest() });
   try {
-    const host = await storeHost(f, { split: false, bundle: { package: 'anything.goes', versionCode: 99 } });
+    const host = await storeHost(f, { split: false, bundle: { package: 'io.example.app', versionCode: 5 } });
     const logs = [];
     await quiet(() => storeLane(host, f, { logs }));
     assert.deepEqual(host.hookEnv().filter(line => !/SIGNING/.test(line)), ['HUB_PLAY_PACKAGE=io.example.app']);
-    assert.ok(logs.some(line => /^HUB_PLAY_BUNDLE_UNCHECKED io\.example\.app: /.test(line)), logs.join('\n'));
-    assert.equal(readJson(join(f.out, 'android/hub-receipt-android.json')).play, undefined);
+    assert.ok(logs.some(line => /^HUB_PLAY_BUNDLE_READ io\.example\.app versionCode=5: /.test(line)), logs.join('\n'));
+    const receipt = readJson(join(f.out, 'android/hub-receipt-android.json'));
+    assert.equal(receipt.play.package, 'io.example.app');
+    assert.equal(receipt.play.versionCode, 5);
+    assert.equal(receipt.play.upload_sha256, null);
+    assert.equal(receipt.play.sha256, createHash('sha256').update(readFileSync(join(f.out, 'android/App.aab'))).digest('hex'));
+    assert.equal(receipt.play.bytes, readFileSync(join(f.out, 'android/App.aab')).length);
+    assert.ok(logs.some(line => /^HUB_PLAY_BUNDLE_STAGED App\.aab sha256=[0-9a-f]{64} bytes=\d+$/.test(line)), logs.join('\n'));
   } finally { await f.cleanup(); }
+});
+
+test('an app with no store split fails the android lane when the bundle is not its package or the planned code', async () => {
+  const cases = [
+    ['the wrong package', { package: 'anything.goes', versionCode: 5 }, /HUB_PLAY_BUNDLE_REFUSED package: the bundle is anything\.goes, the policy says Play serves io\.example\.app/],
+    ['a stale versionCode', { package: 'io.example.app', versionCode: 4 }, /HUB_PLAY_BUNDLE_REFUSED versionCode: .*versionCode 4 but the plan says 5/],
+  ];
+  for (const [name, bundle, expected] of cases) {
+    const f = await gitFixture({ manifest: storeManifest() });
+    try {
+      const host = await storeHost(f, { split: false, bundle });
+      await assert.rejects(quiet(() => storeLane(host, f)), expected, name);
+    } finally { await f.cleanup(); }
+  }
 });
 
 function playRecorder() {
@@ -1422,7 +1447,7 @@ function playRecorder() {
     if (pathname.endsWith('/edits') && init.method === 'POST') return reply({ id: 'E1' });
     if (pathname.endsWith('/bundles') && init.method === 'GET') return reply({ bundles: [{ versionCode: 4 }] });
     if (pathname.endsWith('/apks')) return reply({ apks: [] });
-    if (pathname.endsWith('/bundles') && init.method === 'POST') return reply({ versionCode: 5 });
+    if (pathname.endsWith('/bundles') && init.method === 'POST') return reply({ versionCode: 5, sha256: createHash('sha256').update(init.body).digest('hex'), sha1: createHash('sha1').update(init.body).digest('hex') });
     return reply({});
   };
   return { fetchImpl, calls };
@@ -1443,8 +1468,15 @@ test('the Play upload goes to the store package: edit, bundle and track name it,
     assert.ok(!api.calls.some(call => call.includes('io.example.app')), 'the device package is never the upload target');
     assert.ok(api.calls.includes('PUT /androidpublisher/v3/applications/io.example.store/edits/E1/tracks/internal'));
     assert.ok(logs.some(line => /^HUB_PLAY_BUNDLE_OK io\.example\.store /.test(line)));
+    const sha256 = createHash('sha256').update(readFileSync(join(f.out, 'android/App.aab'))).digest('hex');
+    assert.ok(logs.some(line => new RegExp(`^HUB_PLAY_BUNDLE_VERIFIED io\\.example\\.store versionCode=5 sha256=${sha256} play_sha256=${sha256} bytes=\\d+$`).test(line)), logs.join('\n'));
+    assert.ok(logs.some(line => new RegExp(`^HUB_PLAY_BUNDLE_RETAINED example-app-0\\.2\\.2-5\\.aab sha256=${sha256} bytes=\\d+ \\(for the private Release\\)$`).test(line)), logs.join('\n'));
     const receipt = readJson(join(f.out, 'android/hub-receipt-android-play.json'));
     assert.equal(receipt.play.package, 'io.example.store');
+    assert.equal(receipt.play.bundle.name, 'example-app-0.2.2-5.aab');
+    assert.equal(receipt.play.bundle.sha256, sha256);
+    assert.equal(receipt.play.bundle.play_sha256, sha256);
+    assert.equal(receipt.play.retained.via, 'release');
     assert.match(receipt.notes[0], /^Play io\.example\.store internal: uploaded versionCode 5/);
   } finally { await f.cleanup(); }
 });

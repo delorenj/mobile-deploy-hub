@@ -1,5 +1,5 @@
 name: Deploy
-run-name: ${{ inputs.dry_run && 'Deploy (dry run)' || 'Deploy REAL' }} ${{ inputs.platform }} bump=${{ inputs.bump }}
+run-name: ${{ inputs.play_readback != '' && format('Play readback {0}', inputs.play_readback) || format('{0} {1} bump={2}', inputs.dry_run && 'Deploy (dry run)' || 'Deploy REAL', inputs.platform, inputs.bump) }}
 
 # The caller template of delorenj/mobile-deploy-hub (templates/deploy.yml). Copy it as .github/workflows/deploy.yml; only
 # comment lines may differ, because the hub's gate refuses a caller whose normalized text is not an accepted template
@@ -42,6 +42,10 @@ on:
         type: choice
         options: [auto, allow]
         default: auto
+      play_readback:
+        description: Set to a versionCode and the run is the read-only Play readback for it (the bundle's sha256 and the Google-generated universal APK, kept as a short-retention artifact); nothing deploys, nothing on Play changes
+        type: string
+        default: ''
 
 # The hub's jobs can only narrow these. contents: write is the bump commit and tag and the private Release (and the
 # checkout of this private repo); id-token: write is keyless Play; actions: read lets a job look up earlier runs.
@@ -62,5 +66,6 @@ jobs:
       play: ${{ inputs.play }}
       dry_handoff: ${{ inputs.dry_handoff }}
       metered: ${{ inputs.metered }}
+      play_readback: ${{ inputs.play_readback }}
       wif_provider: ${{ vars.GCP_WIF_PROVIDER }}
       play_sa: ${{ vars.PLAY_SA_EMAIL }}

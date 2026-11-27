@@ -115,9 +115,10 @@ export function dispatchArguments({ workflow, dryRun, bump, platform, testflight
 }
 
 // The runs a dispatch of ours can have started: newer than the newest run recorded before it, on the sha we meant.
+// A Play readback dispatch (the caller's title starts "Play readback") is never ours: it deploys nothing.
 export function newRuns(runs, { after, sha }) {
   return runs
-    .filter(run => run.event === 'workflow_dispatch' && run.databaseId > after && run.headSha === sha)
+    .filter(run => run.event === 'workflow_dispatch' && run.databaseId > after && run.headSha === sha && !/^Play readback\b/.test(run.displayTitle ?? ''))
     .sort((a, b) => a.databaseId - b.databaseId);
 }
 

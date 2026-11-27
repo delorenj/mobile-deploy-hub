@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { levels } from './version.mjs';
 import { defaultPlayStatus } from './play.mjs';
 
-export const commands = Object.freeze(['gate', 'preflight-ios', 'plan', 'android', 'play', 'release', 'ios-export', 'ios', 'deliver', 'announce']);
+export const commands = Object.freeze(['gate', 'preflight-ios', 'plan', 'android', 'play', 'release', 'ios-export', 'ios', 'deliver', 'announce', 'play-readback']);
 export const platforms = Object.freeze(['both', 'android', 'ios']);
 export const channels = Object.freeze(['sideload', 'play']);
 export const playStatuses = Object.freeze(['draft', 'completed', 'inProgress', 'halted']);
@@ -53,6 +53,7 @@ const flags = Object.freeze({
   '--linux-runner': 'linuxRunner',
   '--mac-runner': 'macRunner',
   '--scope': 'scope',
+  '--play-readback': 'playReadback',
 });
 
 const environment = Object.freeze({
@@ -87,6 +88,7 @@ const environment = Object.freeze({
   linuxRunner: 'HUB_LINUX_RUNNER',
   macRunner: 'HUB_MAC_RUNNER',
   scope: 'HUB_SCOPE',
+  playReadback: 'HUB_PLAY_READBACK',
 });
 
 function bool(name, value, fallback) {
@@ -189,6 +191,8 @@ export function parseConfig(argv, env = process.env) {
     linuxRunner: labels('linux_runner', raw.linuxRunner, '["self-hosted","Linux"]'),
     macRunner: labels('mac_runner', raw.macRunner, '["self-hosted","macOS"]'),
     scope: oneOf('scope', raw.scope || 'both', deliverScopes),
+    // Set to a versionCode: the run is the read-only Play readback (the app's store state is read, never changed).
+    playReadback: matching('play_readback', raw.playReadback, /^[1-9]\d{0,9}$/, 'a versionCode'),
     cwd: process.cwd(),
   };
 }

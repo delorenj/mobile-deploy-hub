@@ -1038,11 +1038,13 @@ test('the v1.2.60 release notes (Epic 10) say what a reader of the tag must know
     /Deploy jobs and the catch-ups never depend on either service/, /tools\/deploy-path\.test\.mjs/, /AD-22, AD-25/,
     /v1c adds `GET \/capacity`/, /Holocene page/, /No unit or plist is added/, /moving `v1` back/, /hosts:install -- --allow-downgrade/, /clean checkout at `v1\.2\.59`/, /Leave `replicas\/` in place/,
     /hosts:smoke -- --lanes --history/, /`partial: false`/, /HUB_SMOKE history:/, /`HUB_SMOKE_OK` line is unchanged/, /sleep\/wake proof is by hand/, /Test changes you will see/,
+    /Play evidence \(GRUV-184/, /`HUB_PLAY_BUNDLE_VERIFIED`/, /`HUB_PLAY_BUNDLE_MISMATCH`/, /`HUB_PLAY_BUNDLE_RETAINED`/, /`play-bundle` run artifact/, /`HUB_PLAY_READBACK_OK`/, /`HUB_PLAY_READBACK_MISMATCH`/, /`HUB_PLAY_READBACK_RETAINED`/, /`play_readback=<versionCode>`/, /`play-readback` job/, /never committed/, /`HUB_PLAY_BUNDLE_READ`/, /reverts to the old template/, /play-evidence\.test\.mjs/,
   ]) assert.match(notes, word);
   for (const suite of [
     'tools/device/claims.test.mjs', 'tools/device/lease-lane.test.mjs', 'tools/host-agent/push.test.mjs', 'tools/host-agent/server.test.mjs', 'tools/hub-api/agent-push.test.mjs',
     'tools/hub-api/contract.test.mjs', 'tools/hub-api/unreachable.test.mjs', 'tools/hosts/smoke.test.mjs', 'tools/ci/v11.test.mjs',
     'tools/device/lease-view.test.mjs', 'tools/host-agent/replicate.test.mjs', 'tools/hub-api/{history,leak,replica,utilisation}.test.mjs', 'tools/registry/{history,utilisation}.test.mjs',
+    'tools/ci/play-evidence.test.mjs', 'tools/ci/hub.test.mjs', 'tools/ci/v3.test.mjs', 'tools/ci/deadline.test.mjs',
   ]) assert.ok(changes.includes(suite), `the test-changes list names ${suite}`);
   assert.doesNotMatch(notes, /`contract` (is|becomes|moves to) 2/);
   assert.ok(notes.split('\n').every(line => !line.startsWith('## ')), 'no line of the section may look like a heading of the next release');
@@ -1105,7 +1107,8 @@ test('the v1.2.56 release notes (Epic 7) say what a reader of the tag must know:
   assert.ok(text.indexOf('## v1.2.56') !== -1 && text.indexOf('## v1.2.56') < text.indexOf('## v1.2.55'), 'newest first');
 });
 
-// v1.x never removes or retypes a caller input: callers pinned @v1 must keep working when v1 moves (D1).
+// v1.x never removes or retypes a caller input: callers pinned @v1 must keep working when v1 moves (D1). New inputs are
+// additive; an app that has not copied the new template simply never passes them (their defaults apply).
 test('the v1 caller surface is frozen: every workflow_call input keeps its name, type and default', () => {
   const workflow = readFileSync(join(repoRoot, '.github/workflows/mobile-deploy.yml'), 'utf8');
   const block = workflow.slice(workflow.indexOf('    inputs:\n'), workflow.indexOf('\npermissions:'));
@@ -1114,9 +1117,9 @@ test('the v1 caller surface is frozen: every workflow_call input keeps its name,
     'manifest:string=mobile-deploy.json', 'platform:string=both', 'bump:string=patch', 'testflight:boolean=false', 'play:boolean=false',
     'dry_run:boolean=true', 'dry_handoff:boolean=false', 'strict:boolean=true', 'metered:string=auto', "linux_runner:string='[\"self-hosted\",\"Linux\"]'",
     "mac_runner:string='[\"self-hosted\",\"macOS\"]'", "wif_provider:string=''", "play_sa:string=''", 'android_channel:string=sideload', 'track:string=internal',
-    "play_status:string=''", "build:string=''",
+    "play_status:string=''", "play_readback:string=''", "build:string=''",
   ]);
-  for (const name of ['dry_run', 'bump', 'platform', 'testflight', 'play', 'dry_handoff', 'metered']) assert.match(template, new RegExp(`^ {6}${name}: \\$\\{\\{ inputs\\.${name} \\}\\}$`, 'm'), `the template passes ${name}`);
+  for (const name of ['dry_run', 'bump', 'platform', 'testflight', 'play', 'dry_handoff', 'metered', 'play_readback']) assert.match(template, new RegExp(`^ {6}${name}: \\$\\{\\{ inputs\\.${name} \\}\\}$`, 'm'), `the template passes ${name}`);
 });
 
 // ---------------------------------------------------------------------------------------------------- the delta handoff

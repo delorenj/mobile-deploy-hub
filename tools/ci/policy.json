@@ -45,7 +45,7 @@
   "callers": {
     "workflow": ".github/workflows/deploy.yml",
     "manifest": "tools/ci/mobile-deploy.json",
-    "accept": ["130f1ef2a2f15a3babc52694b86354700e779559a24f97fb84d150936a9b40d2"]
+    "accept": ["130f1ef2a2f15a3babc52694b86354700e779559a24f97fb84d150936a9b40d2", "d7a728fbd3f75943033966796509f43dccde3e0bd8e24a552ba9580175974519"]
   },
   "runners": { "linux": ["self-hosted", "Linux"], "mac": ["self-hosted", "macOS"] },
   "devices": { "absent": "pending", "android_wait_s": 180, "ipad_wait_s": 60 },

@@ -18,7 +18,7 @@ What it is: one shared deploy pipeline (a reusable GitHub workflow, a composite 
   - `devicectl` install, with readback;
   - over-the-air install link (`manifest.plist`).
 - **TestFlight:** upload and assign to the app's beta groups (policy `testflight.groups`, default Owner Testing). Opt-in with `--testflight true` in the live hub (v1.2.25).
-- **Play internal track:** upload with `--play`, keyless via Workload Identity Federation.
+- **Play internal track:** upload with `--play`, keyless via Workload Identity Federation. The upload is checked byte for byte against Play's own sha256 of what it stored (`HUB_PLAY_BUNDLE_VERIFIED`), the exact AAB is retained (the app's private Release, else the 30-day `play-bundle` run artifact), and `play_readback=<versionCode>` on a dispatch is a read-only readback (the bundle's sha256 and the Google-generated universal APK as a run artifact; nothing on Play changes).
 - **Away devices are `pending`, not failures:** a catch-up job installs the build when the device comes back. It runs every 2 min for the S26 (big-chungus) and every 5 min for the iPad (the Mac), and never while the app is on screen.
 - **Mac awareness:** home, metered or offline is decided at the gate. The iPad lane is skipped when the Mac is offline or a metered link would exceed its data budget. A watchdog cancels an iPad job stuck waiting for its runner.
 - **Downgrade guards:** never installs an older build over a newer one; never uninstalls or clears data.

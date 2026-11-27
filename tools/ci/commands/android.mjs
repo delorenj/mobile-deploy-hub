@@ -10,13 +10,13 @@
 // and a real run at stage build. Only the device edition (the top-level android block) is ever installed or dropped in
 // Quickdrop; the extra editions go to the private Release, and a public one to its edition page in deliver.
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, statSync } from 'node:fs';
-import { copyFile, mkdir } from 'node:fs/promises';
+import { copyFileSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { accessFor } from '../lib/access.mjs';
 import { createAdb, findPhone } from '../lib/adb.mjs';
-import { verifyPlayBundle } from '../lib/aab.mjs';
+import { checkBundleIdentity, verifyPlayBundle } from '../lib/aab.mjs';
 import { apkIdentity, verifySigner } from '../lib/android.mjs';
 import { hookEnvironment } from '../lib/config.mjs';
 import { loadDevices } from '../lib/devices.mjs';
@@ -27,10 +27,10 @@ import { holdsOf, releaseReservation, withLock } from '../lib/lock.mjs';
 import { editionApkName, editionLane, isPublicEdition } from '../lib/editions.mjs';
 import { editionsOf, loadManifest } from '../lib/manifest.mjs';
 import { editionPinOf, loadPolicy, tagOf } from '../lib/policy.mjs';
-import { playHookEnv, uploadBundle } from '../lib/play.mjs';
+import { bundleFileName, digestOf, playHookEnv, uploadBundle } from '../lib/play.mjs';
 import { playTargetOf } from '../lib/policy.mjs';
 import { dropApk, s26OnLan } from '../lib/quickdrop.mjs';
-import { buildReceipt, sha256File, writeReceipt } from '../lib/receipt.mjs';
+import { buildReceipt, setOutputs, sha256File, writeReceipt } from '../lib/receipt.mjs';
 import { notesKey, notesText, validateNotes } from '../lib/release-notes.mjs';
 import { readObject } from '../lib/s3.mjs';
 import { applyBump, checkAppReceipt, exists, guarded, policyBanner, readReceipts, requirePlan, semver, stagingDir } from './common.mjs';
@@ -78,14 +78,21 @@ async function androidLane(config, manifest, { env, home, track, policy, log, qu
     if (!exists(aab)) throw new Error(`the bundle hook did not produce ${spec.bundle_artifact}`);
     const stagedAab = join(out, basename(spec.bundle_artifact));
     await copyFile(aab, stagedAab);
+    const aabSha256 = await sha256File(stagedAab);
+    const { size: aabBytes } = statSync(stagedAab);
     if (target.split) {
       const facts = verifyPlayBundle({ aab: stagedAab, expect: { package: target.package, versionCode: config.androidCode, uploadSha256: target.uploadSha256 }, env, home });
       log(`HUB_PLAY_BUNDLE_OK ${facts.package} versionCode=${facts.versionCode} upload_sha256=${facts.upload_sha256}`);
-      track.receipt.play = { package: facts.package, versionCode: facts.versionCode, upload_sha256: facts.upload_sha256 };
+      track.receipt.play = { package: facts.package, versionCode: facts.versionCode, upload_sha256: facts.upload_sha256, sha256: aabSha256, bytes: aabBytes };
     } else {
-      log(`HUB_PLAY_BUNDLE_UNCHECKED ${target.package}: the policy pins no store_package or store_upload_sha256 for this app, so the hub does not read its bundle`);
+      // No store split is pinned, so the signer is Play's to judge — but the package and the planned versionCode are
+      // read out of the bundle all the same, and the upload is checked byte for byte against Play's own sha256.
+      const facts = checkBundleIdentity({ aab: stagedAab, expect: { package: target.package, versionCode: config.androidCode } });
+      log(`HUB_PLAY_BUNDLE_READ ${facts.package} versionCode=${facts.versionCode}: no store split is pinned, so the signer is Play's to judge; the upload is checked byte for byte`);
+      track.receipt.play = { package: facts.package, versionCode: facts.versionCode, upload_sha256: null, sha256: aabSha256, bytes: aabBytes };
     }
-    artifacts.push({ name: basename(spec.bundle_artifact), sha256: await sha256File(stagedAab) });
+    log(`HUB_PLAY_BUNDLE_STAGED ${basename(spec.bundle_artifact)} sha256=${aabSha256} bytes=${aabBytes}`);
+    artifacts.push({ name: basename(spec.bundle_artifact), sha256: aabSha256 });
   }
   const { size: bytes } = statSync(apk);
   log(`HUB_ANDROID_BUILT ${basename(spec.artifact)} ${config.version} (${config.androidCode}) sha256=${sha256} bytes=${bytes}`);
@@ -256,10 +263,22 @@ export async function play(config, { env = process.env, fetchImpl, policyFile, l
     const target = playTargetOf(policy.apps[env.GITHUB_REPOSITORY ?? ''], spec.package);
     const aab = join(config.out, 'android', basename(spec.bundle_artifact));
     // The android job verified this file; it is read again here because the artifact travels between jobs and the next
-    // call is the one that spends the version on Play.
+    // call is the one that spends the version on Play. For an app with no store split the package and versionCode are
+    // still read out of the bundle.
     if (target.split) {
       const facts = verifyPlayBundle({ aab, expect: { package: target.package, versionCode: config.androidCode, uploadSha256: target.uploadSha256 }, env, home: homedir() });
       log(`HUB_PLAY_BUNDLE_OK ${facts.package} versionCode=${facts.versionCode} upload_sha256=${facts.upload_sha256}`);
+    } else {
+      const facts = checkBundleIdentity({ aab, expect: { package: target.package, versionCode: config.androidCode } });
+      log(`HUB_PLAY_BUNDLE_READ ${facts.package} versionCode=${facts.versionCode}: no store split is pinned, so the signer is Play's to judge; the upload is checked byte for byte`);
+    }
+    // Chain of custody across the artifact hop: if the android lane's receipt recorded the staged bundle's sha256, the
+    // file this step is about to upload must be exactly those bytes.
+    const staged = readReceipts(env.HUB_RECEIPTS || join(config.out, 'receipts')).android?.play;
+    const stagedSha = staged?.sha256;
+    if (stagedSha) {
+      const here = await sha256File(aab);
+      if (here !== stagedSha) throw new Error(`HUB_PLAY_BUNDLE_REFUSED changed: the android lane staged sha256=${stagedSha} for ${basename(spec.bundle_artifact)} but this step reads sha256=${here}; the bundle changed between jobs`);
     }
     const uploaded = await uploadBundle({
       pkg: target.package,
@@ -269,8 +288,30 @@ export async function play(config, { env = process.env, fetchImpl, policyFile, l
       expectedCode: config.androidCode ? Number(config.androidCode) : undefined,
       status: config.playStatusExplicit ? config.playStatus : undefined,
       fetchImpl,
+      log,
     });
-    await writeReceipt(join(config.out, 'android'), buildReceipt({ lane: 'android-play', config, env, version: config.version, androidCode: config.androidCode, play: { package: target.package, track: uploaded.track, status: uploaded.status, versionCode: uploaded.versionCode, edit: uploaded.edit }, notes: [`Play ${target.package} ${config.track}: uploaded versionCode ${uploaded.versionCode} as ${uploaded.status}`] }), env);
+    // Retention of the exact uploaded bytes: the AAB is copied out under its release asset name with a sha256sum file
+    // beside it; the release lane attaches both to the app's private Release, and the workflow's fallback keeps them as
+    // a run artifact when there is no release lane (or the Release is not private).
+    const name = bundleFileName(manifest.project.slug, config.version, uploaded.versionCode);
+    const retainedPath = join(config.out, 'android', name);
+    await copyFile(aab, retainedPath);
+    const digest = digestOf(await readFile(retainedPath));
+    if (digest.sha256 !== uploaded.bundle.sha256) throw new Error(`retained copy of ${name} has sha256=${digest.sha256}, the upload had ${uploaded.bundle.sha256}`);
+    const digestFile = `${name}.sha256`;
+    await writeFile(join(config.out, 'android', digestFile), `${digest.sha256}  ${name}\n`);
+    const hasRelease = Boolean(loadPolicy().policy.delivery?.release);
+    const retained = hasRelease
+      ? { via: 'release', name, sha256_file: digestFile, fallback: { artifact: 'play-bundle', retention_days: 30 } }
+      : { via: 'run-artifact', artifact: 'play-bundle', retention_days: 30, reason: 'the policy runs no release lane for this app', name, sha256_file: digestFile };
+    log(`HUB_PLAY_BUNDLE_RETAINED ${name} sha256=${digest.sha256} bytes=${digest.bytes}${hasRelease ? ' (for the private Release)' : ' (run artifact: the policy runs no release lane)'}`);
+    await setOutputs({ play_bundle: name }, env);
+    await writeReceipt(join(config.out, 'android'), buildReceipt({
+      lane: 'android-play', config, env, version: config.version, androidCode: config.androidCode,
+      play: { package: target.package, track: uploaded.track, status: uploaded.status, versionCode: uploaded.versionCode, edit: uploaded.edit, bundle: { name, bytes: digest.bytes, sha256: digest.sha256, sha1: uploaded.bundle.sha1, play_sha256: uploaded.bundle.play_sha256, play_sha1: uploaded.bundle.play_sha1 }, retained },
+      artifacts: [{ name, sha256: digest.sha256 }],
+      notes: [`Play ${target.package} ${config.track}: uploaded versionCode ${uploaded.versionCode} as ${uploaded.status}; the exact AAB (${digest.bytes} bytes) is retained as ${name} (sha256 matched Play's at upload)`],
+    }), env);
     return uploaded;
   });
 }
@@ -291,11 +332,12 @@ export function releaseArguments({ tag, repo, sha, title, notes, assets, verifyT
 // fetchImpl reaches the build directory (the saved release notes), like plan, deliver and announce: the one read here
 // that a test must be able to answer, since an un-injected read gets whatever the live bucket says (403 for a private
 // object since MOBI-17, ECONNREFUSED on a host with no MinIO).
-export async function release(config, { env = process.env, fetchImpl = fetch } = {}) {
+export function release(config, { env = process.env, fetchImpl = fetch } = {}) {
   return guarded('android-release', join(config.out, 'android'), config, env, async track => {
     track.stage = 'deliver';
     const done = await releaseLane(config, { env, fetchImpl });
-    await writeReceipt(join(config.out, 'android'), buildReceipt({ lane: 'android-release', config, env, version: config.version, androidCode: config.androidCode, notes: [`${done.updated ? 'updated' : 'published'} the private Release ${done.tag}`] }), env);
+    const playBundle = done.play_bundle ? { ...done.play_bundle, tag: done.tag } : undefined;
+    await writeReceipt(join(config.out, 'android'), buildReceipt({ lane: 'android-release', config, env, version: config.version, androidCode: config.androidCode, notes: [`${done.updated ? 'updated' : 'published'} the private Release ${done.tag}${playBundle ? `; the exact uploaded Play bundle ${playBundle.name} rides it` : ''}`], ...(playBundle ? { play_bundle: playBundle } : {}) }), env);
     return done;
   });
 }
@@ -316,6 +358,34 @@ async function releaseLane(config, { env, fetchImpl }) {
   const deviceOpen = deviceRidesRelease({ privateRepo, access: accessFor(loadPolicy().policy, manifest.project.slug) });
   const assets = deviceOpen ? [basename(spec.artifact), ...(spec.receipt ? [basename(spec.receipt)] : []), 'hub-receipt-android.json'].map(name => join(out, name)) : [];
   if (!deviceOpen) console.log(`HUB_RELEASE_DEVICE_HELD ${repo} is not a private repository and the policy keeps the device edition private, so its APK and receipts stay off the Release`);
+  // GRUV-184 (level up: every hub app): the exact AAB the play step uploaded rides the Release only when the Release
+  // is private — a public repository must not publish a store-signed bundle. The play receipt carries the name and the
+  // sha256; both are re-read from disk so a stale or tampered copy fails here, not silently.
+  const playReceipt = JSON.parse(await readFile(join(out, 'hub-receipt-android-play.json'), 'utf8').catch(() => 'null'));
+  let playBundle = null;
+  let playBundleHeld = false;
+  let playBundleNote = '';
+  if (playReceipt?.outcome === 'success' && playReceipt?.play?.bundle?.name && playReceipt?.play?.retained?.via === 'release') {
+    const { name, sha256: expectedSha, bytes } = playReceipt.play.bundle;
+    const digestFile = `${name}.sha256`;
+    const file = join(out, name);
+    const fileDigestFile = join(out, digestFile);
+    if (!exists(file) || !exists(fileDigestFile)) throw new Error(`the play receipt names the retained bundle ${name}, but ${file} or its .sha256 is missing from ${out}`);
+    const digest = digestOf(await readFile(file));
+    const recorded = (await readFile(fileDigestFile, 'utf8')).trim();
+    if (digest.sha256 !== expectedSha) throw new Error(`the retained Play bundle ${name} has sha256=${digest.sha256}, the play receipt says ${expectedSha}`);
+    if (recorded !== `${expectedSha}  ${name}`) throw new Error(`${digestFile} reads "${recorded}", expected "${expectedSha}  ${name}"`);
+    if (privateRepo) {
+      assets.push(file, fileDigestFile);
+      playBundle = { name, sha256: digest.sha256, bytes, retained: 'release' };
+      playBundleNote = `\nPlay bundle: ${name} sha256 ${digest.sha256} (${bytes} bytes; Play's sha256 matched at upload).`;
+      console.log(`HUB_RELEASE_PLAY_BUNDLE ${name} sha256=${digest.sha256} bytes=${bytes}: the exact uploaded AAB rides the private Release ${repo}`);
+    } else {
+      playBundleHeld = true;
+      playBundleNote = `\nPlay bundle ${name} (sha256 ${digest.sha256}, ${bytes} bytes; Play's sha256 matched at upload) stays off this public Release; it is kept as the play-bundle run artifact (30 days).`;
+      console.log(`HUB_RELEASE_PLAY_BUNDLE_HELD ${repo} is not a private repository, so the retained Play bundle ${name} stays off the Release; the play-bundle run artifact keeps it (30 days)`);
+    }
+  }
   // Every extra edition rides the Release too (its APK and its hub receipt), under names no other asset has, but a
   // private edition only when the Release is private. On a public repository only the editions the manifest and the
   // policy both made public ride along.
@@ -335,13 +405,14 @@ async function releaseLane(config, { env, fetchImpl }) {
   // The commit the APK was built from: the bump commit, never the commit before it.
   const sha = config.buildSha || env.GITHUB_SHA || 'HEAD';
   const digest = await sha256File(join(out, basename(spec.artifact)));
+  const buildLine = `\n\nBuild: ${basename(spec.artifact)} sha256 ${digest}.`;
   const planNotes = readReceipts(env.HUB_RECEIPTS || join(config.out, 'receipts')).plan?.release_notes;
   const policy = loadPolicy().policy;
   const saved = await readObject(policy, notesKey(manifest.project.slug, config.version), { env, fetchImpl });
   const canonical = saved ? validateNotes(JSON.parse(saved), { current: config.version, commit: sha }) : planNotes ? validateNotes(planNotes, { current: config.version, commit: sha }) : null;
   // MOBI-17: the Release text is read by anyone who can see the repo's Releases; a private page's URL would only answer 403.
   const pageLine = accessFor(policy, manifest.project.slug).pageOpen ? `\nBuild page: https://s3.delo.sh/builds/${manifest.project.slug}/index.html` : '';
-  const notes = canonical ? `${notesText(canonical)}\n\nBuild: ${basename(spec.artifact)} sha256 ${digest}.${pageLine}` : `No author-written release notes were supplied for this build.\nCommit ${sha}; run ${env.GITHUB_RUN_ID ?? 'local'}.${pageLine}`;
+  const notes = `${canonical ? `${notesText(canonical)}${buildLine}` : `No author-written release notes were supplied for this build.\nCommit ${sha}; run ${env.GITHUB_RUN_ID ?? 'local'}.`}${playBundleNote}${pageLine}`;
   const existing = spawnSync('gh', ['release', 'view', tag, '--repo', repo], { env, stdio: 'ignore' });
   if (existing.status === 0) {
     // The plan never reuses a version, so the Release of this tag came from an earlier attempt of this deploy
@@ -349,9 +420,11 @@ async function releaseLane(config, { env, fetchImpl }) {
     if (assets.length > 0) run('gh', ['release', 'upload', tag, ...assets, '--repo', repo, '--clobber'], { env, cwd: config.cwd });
     run('gh', ['release', 'edit', tag, '--repo', repo, '--notes', notes], { env, cwd: config.cwd });
     console.log(`HUB_RELEASE_UPDATED ${tag} ${repo}: an earlier attempt published it; assets replaced by this attempt's`);
-    return { tag, repo, assets, updated: true };
+    await setOutputs({ play_bundle_release: playBundle ? 'true' : '' }, env);
+    return { tag, repo, assets, updated: true, play_bundle: playBundle, play_bundle_held: playBundleHeld };
   }
   run('gh', releaseArguments({ tag, repo, sha, title: `Android ${config.version}`, notes, assets, verifyTag: true }), { env, cwd: config.cwd });
   console.log(`HUB_RELEASED ${tag} ${repo}`);
-  return { tag, repo, assets };
+  await setOutputs({ play_bundle_release: playBundle ? 'true' : '' }, env);
+  return { tag, repo, assets, play_bundle: playBundle, play_bundle_held: playBundleHeld };
 }

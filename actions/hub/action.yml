@@ -3,7 +3,7 @@ description: Runs tools/ci/hub.mjs from the hub repo against the checked-out app
 
 inputs:
   command:
-    description: gate, preflight-ios, plan, android, play, release, ios-export, ios, deliver, announce. Inside a job every command runs only for the app's own .github/workflows/deploy.yml
+    description: gate, preflight-ios, plan, android, play, release, ios-export, ios, deliver, announce, play-readback. Inside a job every command runs only for the app's own .github/workflows/deploy.yml
     required: true
   manifest:
     description: Path of the app manifest inside the checkout
@@ -97,10 +97,13 @@ inputs:
   play_sa:
     default: ''
   play_token:
-    description: Play access token from google-github-actions/auth, play step only
+    description: Play access token from google-github-actions/auth, play and play-readback steps only
+    default: ''
+  play_readback:
+    description: Set to a versionCode for the play-readback command (read-only; nothing else runs)
     default: ''
   github_token:
-    description: Ephemeral job token; plan and release use contents write, ios uses actions read for upload-history reconciliation
+    description: Ephemeral job token; plan and release use contents write, ios uses actions read for upload-history reconciliation, play-readback uses contents read for the retained-evidence listing
     default: ''
 
 outputs:
@@ -176,6 +179,12 @@ outputs:
   ipad_build:
     description: The iPad's installed build (preflight-ios)
     value: ${{ steps.hub.outputs.ipad_build }}
+  play_bundle:
+    description: The retained name of the exact uploaded AAB (play; the release attaches it or the workflow keeps it as the play-bundle artifact)
+    value: ${{ steps.hub.outputs.play_bundle }}
+  play_bundle_release:
+    description: 'true' when the exact uploaded AAB rides the app's private Release (release); empty means the workflow's play-bundle artifact keeps it
+    value: ${{ steps.hub.outputs.play_bundle_release }}
 
 runs:
   using: composite
@@ -219,6 +228,7 @@ runs:
         HUB_SCOPE: ${{ inputs.scope }}
         HUB_WIF_PROVIDER: ${{ inputs.wif_provider }}
         HUB_PLAY_SA: ${{ inputs.play_sa }}
+        HUB_PLAY_READBACK: ${{ inputs.play_readback }}
         PLAY_TOKEN: ${{ inputs.play_token }}
         GH_TOKEN: ${{ inputs.github_token }}
       run: node "$HUB_TOOL" "$HUB_COMMAND"

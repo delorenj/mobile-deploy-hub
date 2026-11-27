@@ -256,7 +256,7 @@ const jobBlocks = () => {
 
 test('mobile-deploy.yml: each job that waits for a device sets HUB_JOB_TIMEOUT_MINUTES equal to its timeout-minutes, and only those', () => {
   const blocks = jobBlocks();
-  assert.deepEqual([...blocks.keys()].slice(-9), ['gate', 'preflight-ios', 'plan', 'android', 'ios-export', 'ios', 'deliver-android', 'deliver-ios', 'announce']);
+  assert.deepEqual([...blocks.keys()].slice(-9), ['preflight-ios', 'plan', 'android', 'ios-export', 'ios', 'deliver-android', 'deliver-ios', 'announce', 'play-readback']);
   const waiting = Object.keys(policy.queue.hold_allowance_min);
   assert.deepEqual(waiting, ['plan', 'android', 'ios']);
   for (const [name, block] of blocks) {

@@ -94,6 +94,10 @@ on:
         description: Play release status; empty lets the hub decide (completed on the internal track, draft elsewhere; an internal app never published falls back to draft)
         type: string
         default: ''
+      play_readback:
+        description: Set to a versionCode and the run is the read-only Play readback for it (bundle sha256 + the Google-generated universal APK); every other job is skipped
+        type: string
+        default: ''
       build:
         description: v2 input, kept for the v1 interface; the gate refuses a value
         type: string
@@ -105,6 +109,7 @@ permissions:
 
 jobs:
   gate:
+    if: ${{ inputs.play_readback == '' }}
     runs-on: [self-hosted, Linux]
     timeout-minutes: 15
     permissions:
@@ -297,6 +302,7 @@ jobs:
           access_token_scopes: https://www.googleapis.com/auth/androidpublisher
           create_credentials_file: false
       - name: Upload to Play
+        id: play
         if: ${{ !inputs.dry_run && needs.plan.outputs.play_lane == 'true' }}
         uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.59
         with:
@@ -306,6 +312,7 @@ jobs:
           track: ${{ inputs.track }}
           play_status: ${{ inputs.play_status }}
           dry_run: ${{ inputs.dry_run }}
+          version: ${{ needs.plan.outputs.version }}
           android_code: ${{ needs.plan.outputs.android_code }}
           play_token: ${{ steps.auth.outputs.access_token }}
       - uses: actions/download-artifact@v4
@@ -314,6 +321,7 @@ jobs:
           name: plan-out
           path: ${{ runner.temp }}/hub-out/receipts/plan
       - name: Publish the APK to a private Release
+        id: release
         if: ${{ !inputs.dry_run && needs.plan.outputs.release_lane == 'true' }}
         uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.59
         with:
@@ -325,6 +333,19 @@ jobs:
           android_code: ${{ needs.plan.outputs.android_code }}
           build_sha: ${{ needs.plan.outputs.build_sha }}
           github_token: ${{ github.token }}
+      # The exact uploaded AAB and its sha256 file. The release step attached them to the app's private Release when it
+      # could (play_bundle_release); an app with no release lane, or a public repo, keeps them here (30 days). The play
+      # receipt says which. error: their absence with the output set is a bug to fix, not to hide.
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() && !inputs.dry_run && steps.play.outputs.play_bundle != '' && steps.release.outputs.play_bundle_release != 'true' }}
+        with:
+          name: play-bundle
+          path: |
+            ${{ runner.temp }}/hub-out/android/${{ steps.play.outputs.play_bundle }}
+            ${{ runner.temp }}/hub-out/android/${{ steps.play.outputs.play_bundle }}.sha256
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
       # Receipts only (staging, the Release and the build directory hold the APK). always(): a timed-out or
       # cancelled lane still tells deliver and announce why.
       - uses: actions/upload-artifact@v4
@@ -514,7 +535,7 @@ jobs:
 
   announce:
     needs: [gate, preflight-ios, plan, android, ios-export, ios, deliver-android, deliver-ios]
-    if: ${{ always() }}
+    if: ${{ always() && inputs.play_readback == '' }}
     runs-on: [self-hosted, Linux]
     timeout-minutes: 10
     permissions:
@@ -548,3 +569,48 @@ jobs:
           if-no-files-found: ignore
           overwrite: true
           retention-days: ${{ inputs.dry_run && 1 || 7 }}
+
+  # GRUV-184 (one level up: every hub app with android.bundle): dispatched with play_readback=<versionCode> through the
+  # app's deploy.yml, this is the only job that runs (the gate and announce skip; every other job needs one of them).
+  # Read-only proof of what Play serves for that versionCode: the bundle listing (its sha256) and the Google-generated
+  # universal APK, kept as a short-retention artifact with the receipt. An edit is opened only to read and deleted
+  # again; the hub's API allowlist makes a commit, a track change or an upload impossible. Same keyless auth as the
+  # android job: the WIF provider's condition binds it to this repository, so nothing broader is handed out.
+  play-readback:
+    if: ${{ inputs.play_readback != '' }}
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # The app's manifest at the dispatched commit.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Authenticate to Google Cloud (keyless)
+        id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ inputs.wif_provider }}
+          service_account: ${{ inputs.play_sa }}
+          token_format: access_token
+          access_token_scopes: https://www.googleapis.com/auth/androidpublisher
+          create_credentials_file: false
+      - name: Read back the bundle and the universal APK
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.59
+        with:
+          command: play-readback
+          manifest: ${{ inputs.manifest }}
+          play_readback: ${{ inputs.play_readback }}
+          play_token: ${{ steps.auth.outputs.access_token }}
+          github_token: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: play-readback
+          path: ${{ runner.temp }}/hub-out/play-readback/
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 3
