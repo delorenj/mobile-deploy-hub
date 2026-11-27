@@ -90,7 +90,13 @@ export async function playReadback(config, {
     }
     log(`HUB_PLAY_READBACK_OK ${target.package} versionCode=${code} bundle_sha256=${read.bundle.sha256} universal_apk=${apkName} apk_sha256=${read.apk.sha256} bytes=${read.apk.bytes}`);
     await writeReceipt(out, buildReceipt({
-      lane: 'play-readback', config, env, version: config.version, androidCode: config.androidCode,
+      lane: 'play-readback', config, env,
+      // A readback builds and deploys nothing, so the deploy defaults the dispatched run's config carries would lie:
+      // dry_run true, channel sideload, an empty version/code and sha = the dispatch sha. Record the truth instead,
+      // with a readback marker; dispatch_sha keeps the dispatch commit, honestly named.
+      version: null, androidCode: null, dry_run: false, channel: 'play-readback', readback: true, sha: null,
+      // Bind the receipt to the build it proves without the evidence file: the retained deploy asset, when there is one.
+      candidate_hint: retained ? { release: retained.release, asset: retained.asset } : null,
       play: { package: target.package, versionCode: Number(code), edit: read.edit, edit_deleted: read.edit_deleted, committed: false },
       bundle: read.bundle,
       universal_apk: { name: apkName, bytes: read.apk.bytes, sha256: read.apk.sha256, sha1: read.apk.sha1, download_id: read.apk.download_id, package: apkFacts.package, versionCode: apkFacts.versionCode, versionName: apkFacts.versionName, signer_sha256: signer, certificate_sha256: read.apk.certificate_sha256, certificate_matches: certificateMatches },

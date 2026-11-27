@@ -424,7 +424,12 @@ test('the play command reads its token from PLAY_TOKEN and uses the track defaul
     await mkdir(join(f.out, 'android'), { recursive: true });
     // A real (unsigned) bundle whose manifest names the device package and the planned code: with no store split the
     // play command still reads its identity before the upload, and the exact bytes are retained beside the receipt.
-    await writeFile(join(f.out, 'android/App.aab'), makeBundle({ package: 'io.example.app', versionCode: 4 }));
+    const aab = makeBundle({ package: 'io.example.app', versionCode: 4 });
+    await writeFile(join(f.out, 'android/App.aab'), aab);
+    // The android lane's receipt, where the lane really writes it (hub-out/android): its staged sha256 is the chain of
+    // custody the play step checks before it uploads.
+    const stagedSha = createHash('sha256').update(aab).digest('hex');
+    await writeFile(join(f.out, 'android/hub-receipt-android.json'), JSON.stringify({ lane: 'android', play: { package: 'io.example.app', versionCode: 4, upload_sha256: null, sha256: stagedSha, bytes: aab.length } }));
     const api = playApi({ uploadedCode: 4 });
     const real = f.configure('play', ['--dry-run', 'false', '--play', 'true', '--track', 'alpha']);
     await assert.rejects(play(real, { env: f.env, fetchImpl: api.fetchImpl }), /PLAY_TOKEN is empty/);

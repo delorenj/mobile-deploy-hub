@@ -130,11 +130,32 @@ test('the play command refuses a bundle that changed since the android lane stag
   const f = await fixture();
   try {
     const real = f.configure('play', ['--dry-run', 'false', '--play', 'true']);
+    // Seeded where the android lane really writes it: hub-out/android/hub-receipt-android.json (the android-out
+    // artifact), not hub-out/receipts (only downloads land there, and after the play step).
     const staged = { lane: 'android', play: { package: 'io.example.app', versionCode: 4, upload_sha256: null, sha256: 'f'.repeat(64), bytes: 3 } };
-    await mkdir(join(f.out, 'receipts/android'), { recursive: true });
-    await writeFile(join(f.out, 'receipts/android/hub-receipt-android.json'), JSON.stringify(staged));
+    await writeFile(join(f.out, 'android/hub-receipt-android.json'), JSON.stringify(staged));
     const api = playApi();
-    await assert.rejects(play(real, { env: { ...f.env, PLAY_TOKEN: 'tok', HUB_RECEIPTS: join(f.out, 'receipts') }, fetchImpl: api.fetchImpl }), /HUB_PLAY_BUNDLE_REFUSED changed: .*staged sha256=f{64}.*this step reads sha256=/);
+    await assert.rejects(play(real, { env: { ...f.env, PLAY_TOKEN: 'tok' }, fetchImpl: api.fetchImpl }), /HUB_PLAY_BUNDLE_REFUSED changed: .*staged sha256=f{64}.*this step reads sha256=/);
+    assert.deepEqual(api.calls, [], 'Play was never contacted');
+  } finally { await f.cleanup(); }
+});
+
+test('a real play run with no android-lane staged sha256 is refused as missing-stage, before contacting Play', async () => {
+  const f = await fixture();
+  try {
+    const real = f.configure('play', ['--dry-run', 'false', '--play', 'true']);
+    const api = playApi();
+    await assert.rejects(
+      play(real, { env: { ...f.env, PLAY_TOKEN: 'tok' }, fetchImpl: api.fetchImpl }),
+      error => {
+        assert.match(error.message, /^HUB_PLAY_BUNDLE_REFUSED missing-stage: /);
+        assert.match(error.message, /hub-receipt|android/);
+        return true;
+      });
+    assert.deepEqual(api.calls, [], 'Play was never contacted');
+    // A receipt with no play.sha256 (the android lane never staged a bundle) refuses the same way.
+    await writeFile(join(f.out, 'android/hub-receipt-android.json'), JSON.stringify({ lane: 'android', outcome: 'success' }));
+    await assert.rejects(play(real, { env: { ...f.env, PLAY_TOKEN: 'tok' }, fetchImpl: api.fetchImpl }), /^Error: HUB_PLAY_BUNDLE_REFUSED missing-stage: /);
     assert.deepEqual(api.calls, [], 'Play was never contacted');
   } finally { await f.cleanup(); }
 });
@@ -260,6 +281,15 @@ test('the play-readback command writes its receipt with the bundle, the APK and 
     assert.equal(receipt.universal_apk.certificate_matches, false, 'Google says it re-signed with its own certificate');
     assert.deepEqual(receipt.retained, { release: 'v0.3.0', asset: 'example-app-0.3.0-4.aab', api_digest: sha256, sha256_file: 'example-app-0.3.0-4.aab.sha256', matches: true });
     assert.equal(receipt.outcome, 'success');
+    // A readback deploys nothing: the receipt says so, instead of the dispatch config's deploy defaults.
+    assert.equal(receipt.dry_run, false, 'not a dry run: this readback really contacted Play');
+    assert.equal(receipt.readback, true);
+    assert.equal(receipt.channel, 'play-readback', 'not the deploy default sideload');
+    assert.equal(receipt.version, null, 'no version was built');
+    assert.equal(receipt.android_code, null);
+    assert.equal(receipt.sha, null, 'nothing was built from the dispatch sha');
+    assert.equal(receipt.dispatch_sha, 'abc123', 'the dispatch commit stays, honestly named');
+    assert.deepEqual(receipt.candidate_hint, { release: 'v0.3.0', asset: 'example-app-0.3.0-4.aab' }, 'binds the receipt to its build without the evidence file');
     assert.ok(logs.some(line => new RegExp(`^HUB_PLAY_READBACK_OK io\\.example\\.app versionCode=4 bundle_sha256=${sha256} universal_apk=example-app-4-universal\\.apk apk_sha256=[0-9a-f]{64} bytes=23$`).test(line)), logs.join('\n'));
     assert.ok(logs.some(line => /^HUB_PLAY_READBACK_RETAINED example-app-0\.3\.0-4\.aab on Release v0\.3\.0: /.test(line)), logs.join('\n'));
   } finally { await f.cleanup(); }
@@ -305,6 +335,9 @@ test('a readback with no retained evidence records none instead of inventing one
     await playReadback(config, { env: { ...f.env, PLAY_TOKEN: 'tok', GH_TOKEN: 'gh-tok' }, fetchImpl: api.fetchImpl, gh, readApkIdentity: identity, apkSigners: signers, log: line => logs.push(line) });
     const receipt = await readJson(join(f.out, 'play-readback/hub-receipt-play-readback.json'));
     assert.equal(receipt.retained, null);
+    assert.equal(receipt.candidate_hint, null, 'no retained asset, so no candidate hint is invented');
+    assert.equal(receipt.readback, true);
+    assert.equal(receipt.dry_run, false);
     assert.ok(logs.some(line => /^HUB_PLAY_READBACK_RETAINED none: /.test(line)), logs.join('\n'));
   } finally { await f.cleanup(); }
 });
@@ -350,6 +383,8 @@ test('the release lane attaches the exact uploaded AAB and its .sha256 to the pr
     assert.equal(receipt.play_bundle.retained, 'release');
     assert.equal(receipt.play_bundle.tag, 'v0.3.0');
     assert.match(await readFile(f.env.GITHUB_OUTPUT, 'utf8'), /^play_bundle_release=true$/m);
+    const playReceipt = await readJson(join(f.out, 'android/hub-receipt-android-play.json'));
+    assert.equal(playReceipt.play.retained.via, 'release', 'a private repo really attaches it: the play receipt stands as written');
   } finally { await f.cleanup(); }
 });
 
@@ -366,6 +401,15 @@ test('a public repo holds the retained AAB off the Release: the play-bundle run 
     assert.equal(receipt.play_bundle, undefined);
     assert.match(log, new RegExp(`--notes [\\s\\S]*Play bundle ${name.replaceAll('.', '\\.')} \\(sha256 ${sha256}, \\d+ bytes; Play's sha256 matched at upload\\) stays off this public Release; it is kept as the play-bundle run artifact \\(30 days\\)\\.`), log);
     assert.match(await readFile(f.env.GITHUB_OUTPUT, 'utf8'), /^play_bundle_release=$/m, 'empty: the workflow\'s fallback uploads the play-bundle artifact');
+    // H3: the play receipt said retained.via 'release' from the policy alone; the release lane rewrites it to record
+    // the artifact fallback truthfully (the android-out upload follows this step, so the truthful receipt is kept).
+    const playReceipt = await readJson(join(f.out, 'android/hub-receipt-android-play.json'));
+    assert.equal(playReceipt.play.retained.via, 'run-artifact', 'the bundle never rode a Release here');
+    assert.equal(playReceipt.play.retained.artifact, 'play-bundle');
+    assert.equal(playReceipt.play.retained.retention_days, 30);
+    assert.equal(playReceipt.play.retained.name, name);
+    assert.equal(playReceipt.play.retained.sha256_file, `${name}.sha256`);
+    assert.match(playReceipt.play.retained.reason, /is not a private repository, so the Release holds the bundle off/);
   } finally { await f.cleanup(); }
 });
 

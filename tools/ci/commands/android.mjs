@@ -272,14 +272,16 @@ export async function play(config, { env = process.env, fetchImpl, policyFile, l
       const facts = checkBundleIdentity({ aab, expect: { package: target.package, versionCode: config.androidCode } });
       log(`HUB_PLAY_BUNDLE_READ ${facts.package} versionCode=${facts.versionCode}: no store split is pinned, so the signer is Play's to judge; the upload is checked byte for byte`);
     }
-    // Chain of custody across the artifact hop: if the android lane's receipt recorded the staged bundle's sha256, the
-    // file this step is about to upload must be exactly those bytes.
-    const staged = readReceipts(env.HUB_RECEIPTS || join(config.out, 'receipts')).android?.play;
+    // Chain of custody across the artifact hop: the android lane's receipt records the staged bundle's sha256, and the
+    // file this step is about to upload must be exactly those bytes. The receipt sits where the android lane wrote it —
+    // this job's hub-out/android, uploaded as the android-out artifact (hub-out/receipts holds only downloaded
+    // artifacts, and the plan-out download lands after this step). A real run with no staged sha256 to check against is
+    // a refusal, not a silent skip.
+    const staged = readReceipts(join(config.out, 'android')).android?.play;
     const stagedSha = staged?.sha256;
-    if (stagedSha) {
-      const here = await sha256File(aab);
-      if (here !== stagedSha) throw new Error(`HUB_PLAY_BUNDLE_REFUSED changed: the android lane staged sha256=${stagedSha} for ${basename(spec.bundle_artifact)} but this step reads sha256=${here}; the bundle changed between jobs`);
-    }
+    if (!stagedSha) throw new Error(`HUB_PLAY_BUNDLE_REFUSED missing-stage: the android lane's receipt under ${join(config.out, 'android')} names no staged bundle sha256 for ${basename(spec.bundle_artifact)}; refusing to upload bytes nobody staged and checked`);
+    const here = await sha256File(aab);
+    if (here !== stagedSha) throw new Error(`HUB_PLAY_BUNDLE_REFUSED changed: the android lane staged sha256=${stagedSha} for ${basename(spec.bundle_artifact)} but this step reads sha256=${here}; the bundle changed between jobs`);
     const uploaded = await uploadBundle({
       pkg: target.package,
       track: config.track,
@@ -361,7 +363,8 @@ async function releaseLane(config, { env, fetchImpl }) {
   // GRUV-184 (level up: every hub app): the exact AAB the play step uploaded rides the Release only when the Release
   // is private — a public repository must not publish a store-signed bundle. The play receipt carries the name and the
   // sha256; both are re-read from disk so a stale or tampered copy fails here, not silently.
-  const playReceipt = JSON.parse(await readFile(join(out, 'hub-receipt-android-play.json'), 'utf8').catch(() => 'null'));
+  const playReceiptFile = join(out, 'hub-receipt-android-play.json');
+  const playReceipt = JSON.parse(await readFile(playReceiptFile, 'utf8').catch(() => 'null'));
   let playBundle = null;
   let playBundleHeld = false;
   let playBundleNote = '';
@@ -384,6 +387,11 @@ async function releaseLane(config, { env, fetchImpl }) {
       playBundleHeld = true;
       playBundleNote = `\nPlay bundle ${name} (sha256 ${digest.sha256}, ${bytes} bytes; Play's sha256 matched at upload) stays off this public Release; it is kept as the play-bundle run artifact (30 days).`;
       console.log(`HUB_RELEASE_PLAY_BUNDLE_HELD ${repo} is not a private repository, so the retained Play bundle ${name} stays off the Release; the play-bundle run artifact keeps it (30 days)`);
+      // The play receipt said retained.via 'release' from the policy alone (the policy runs a release lane for every
+      // app); this repository is public and the Release holds the bundle off, so rewrite the receipt to record the
+      // artifact fallback truthfully before the android-out upload carries it.
+      playReceipt.play.retained = { via: 'run-artifact', artifact: 'play-bundle', retention_days: 30, reason: `${repo} is not a private repository, so the Release holds the bundle off`, name, sha256_file: digestFile };
+      await writeFile(playReceiptFile, JSON.stringify(playReceipt, null, 2) + '\n');
     }
   }
   // Every extra edition rides the Release too (its APK and its hub receipt), under names no other asset has, but a

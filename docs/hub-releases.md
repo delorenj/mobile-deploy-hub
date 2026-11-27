@@ -4,6 +4,21 @@ One section per hub release, headed `## vX.Y.Z`. `mise run release -- X.Y.Z` (`t
 
 A section is plain text read in a terminal: everything after its heading up to the next `## ` heading. Use `###` for sub-headings and `-` lists; do not start a section line with `## `.
 
+## v1.2.62
+
+Three review findings on the v1.2.61 Play-evidence change, fixed (GRUV-184 independent review, findings H1-H3). No behaviour a caller sees changes; all three are evidence-honesty fixes inside the Play lane.
+
+### What changed
+
+- **The changed-bundle refusal now runs in production (H1).** `play()` read the android lane's staged sha256 from `hub-out/receipts`, but the android lane writes its receipt to `hub-out/android/hub-receipt-android.json` (the `android-out` artifact), and only the plan-out download lands in `hub-out/receipts`, after the play step — so `HUB_PLAY_BUNDLE_REFUSED changed` was dead code outside the unit test. `play()` now reads the receipt from where the lane writes it, and a real run whose android receipt (or its staged sha256) is absent fails as `HUB_PLAY_BUNDLE_REFUSED missing-stage` before contacting Play, instead of silently skipping the chain-of-custody check.
+- **The play-readback receipt tells the truth (H2).** It no longer carries the dispatch config's deploy defaults (`dry_run: true`, `channel: sideload`, an empty version and the dispatch sha as `sha`). It now records `dry_run: false`, `channel: play-readback`, a `readback: true` marker, null version/code/sha (the dispatch commit stays, honestly named, in `dispatch_sha`), and a `candidate_hint` naming the retained release asset when there is one, so the receipt binds to its build without the evidence file.
+- **A public repo's play receipt records the artifact fallback (H3).** It used to say `retained.via: release` from the policy alone even though the public Release held the bundle off; the release lane now rewrites the receipt to `retained.via: run-artifact` with the reason before the `android-out` upload carries it.
+
+### Test changes you will see
+
+- Changed suites since `v1.2.61`: `tools/ci/play-evidence.test.mjs` (the changed-bundle test seeds the android receipt where the lane really writes it, plus a new missing-stage refusal test; readback-receipt truth assertions; the public-repo hold asserts the rewritten `retained.via`) and `tools/ci/hub.test.mjs` (the play-command test seeds the android-lane receipt at the real path).
+- New suites: none.
+
 ## v1.2.61
 
 Everything of v1.2.60, with one fix: `actions/hub/action.yml` parsed no longer (a `'` inside a plain scalar description of `play_bundle_release` broke the action manifest), so every job of the v1.2.60 release dry runs died at Set up job and v1 rolled back. That is the only change since v1.2.60; the GRUV-184 Play evidence and Epic 10 it ships are unchanged. Rollback is the same as v1.2.60's: move `v1` back to `v1.2.59`, then `mise run hosts:install` on big-chungus from a clean checkout at `v1.2.59`.
