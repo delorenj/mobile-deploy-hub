@@ -183,7 +183,7 @@ outputs:
     description: The retained name of the exact uploaded AAB (play; the release attaches it or the workflow keeps it as the play-bundle artifact)
     value: ${{ steps.hub.outputs.play_bundle }}
   play_bundle_release:
-    description: 'true' when the exact uploaded AAB rides the app's private Release (release); empty means the workflow's play-bundle artifact keeps it
+    description: true when the exact uploaded AAB rides the app's private Release (release); empty means the workflow's play-bundle artifact keeps it
     value: ${{ steps.hub.outputs.play_bundle_release }}
 
 runs:
