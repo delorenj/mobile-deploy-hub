@@ -4,6 +4,15 @@ One section per hub release, headed `## vX.Y.Z`. `mise run release -- X.Y.Z` (`t
 
 A section is plain text read in a terminal: everything after its heading up to the next `## ` heading. Use `###` for sub-headings and `-` lists; do not start a section line with `## `.
 
+## v1.2.61
+
+Everything of v1.2.60, with one fix: `actions/hub/action.yml` parsed no longer (a `'` inside a plain scalar description of `play_bundle_release` broke the action manifest), so every job of the v1.2.60 release dry runs died at Set up job and v1 rolled back. That is the only change since v1.2.60; the GRUV-184 Play evidence and Epic 10 it ships are unchanged. Rollback is the same as v1.2.60's: move `v1` back to `v1.2.59`, then `mise run hosts:install` on big-chungus from a clean checkout at `v1.2.59`.
+
+### Test changes you will see
+
+- Changed suites since `v1.2.60`: none (one YAML description line).
+- New suites: none.
+
 ## v1.2.60
 
 Epic 10 (ask what happened, on either host), on top of v1.2.59. Agents, Holocene's future page and Jarad can ask the Hub API what each Resource did and how it was used, on both hosts, even while the Mac sleeps. This is v1b: it is complete with this release, and v1c adds `GET /capacity` (the Capacity Estimate) and the Holocene page on top of it. `contract` stays 1: every change to `docs/hub-api-contract.md` is additive. No unit or plist is added, so `hosts:install` restarts the Hub API and the Host Agent onto this release as before.
