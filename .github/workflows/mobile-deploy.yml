@@ -132,7 +132,7 @@ jobs:
           persist-credentials: false
       - id: hub
         name: Policy, caller, Mac link, S26, build directory
-        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.61
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.62
         with:
           command: gate
           manifest: ${{ inputs.manifest }}
@@ -180,7 +180,7 @@ jobs:
           persist-credentials: false
       - id: hub
         name: Signing, profile, disk, the store preflight, the iPad
-        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.61
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.62
         with:
           command: preflight-ios
           manifest: ${{ inputs.manifest }}
@@ -231,7 +231,7 @@ jobs:
           persist-credentials: false
       - id: hub
         name: S26, event contract, downgrade guards, version bump
-        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.61
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.62
         with:
           command: plan
           manifest: ${{ inputs.manifest }}
@@ -277,7 +277,7 @@ jobs:
           ref: ${{ needs.plan.outputs.build_sha }}
           persist-credentials: false
       - name: Build, check, stage, Quickdrop, install on the S26 (or pending)
-        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.61
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.62
         with:
           command: android
           manifest: ${{ inputs.manifest }}
@@ -304,7 +304,7 @@ jobs:
       - name: Upload to Play
         id: play
         if: ${{ !inputs.dry_run && needs.plan.outputs.play_lane == 'true' }}
-        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.61
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.62
         with:
           command: play
           manifest: ${{ inputs.manifest }}
@@ -323,7 +323,7 @@ jobs:
       - name: Publish the APK to a private Release
         id: release
         if: ${{ !inputs.dry_run && needs.plan.outputs.release_lane == 'true' }}
-        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.61
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.62
         with:
           command: release
           manifest: ${{ inputs.manifest }}
@@ -373,7 +373,7 @@ jobs:
           ref: ${{ needs.plan.outputs.build_sha }}
           persist-credentials: false
       - name: Export the Xcode projects and hand them to the Mac as a delta
-        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.61
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.62
         with:
           command: ios-export
           manifest: ${{ inputs.manifest }}
@@ -418,7 +418,7 @@ jobs:
           name: ios-receipt
           path: ${{ runner.temp }}/hub-out/ios
       - name: Build, check, outbox, install on the iPad (or pending)
-        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.61
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.62
         with:
           command: ios
           manifest: ${{ inputs.manifest }}
@@ -467,7 +467,7 @@ jobs:
           pattern: '{gate-out,plan-out,android-out}'
           path: ${{ runner.temp }}/hub-out/receipts
       - name: Publish the APK to the build directory (a dry run only checks)
-        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.61
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.62
         with:
           command: deliver
           scope: android
@@ -511,7 +511,7 @@ jobs:
           pattern: '{gate-out,plan-out,ios-receipt,ios-out}'
           path: ${{ runner.temp }}/hub-out/receipts
       - name: Publish the IPA to the build directory (a dry run only checks)
-        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.61
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.62
         with:
           command: deliver
           scope: ios
@@ -551,7 +551,7 @@ jobs:
           pattern: '{gate-out,plan-out,android-out,ios-receipt,ios-out,deliver-android-out,deliver-ios-out}'
           path: ${{ runner.temp }}/hub-out/receipts
       - name: One Bloodbank event (a dry run only checks it) and the completion verdict
-        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.61
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.62
         with:
           command: announce
           manifest: ${{ inputs.manifest }}
@@ -599,7 +599,7 @@ jobs:
           access_token_scopes: https://www.googleapis.com/auth/androidpublisher
           create_credentials_file: false
       - name: Read back the bundle and the universal APK
-        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.61
+        uses: delorenj/mobile-deploy-hub/actions/hub@v1.2.62
         with:
           command: play-readback
           manifest: ${{ inputs.manifest }}
